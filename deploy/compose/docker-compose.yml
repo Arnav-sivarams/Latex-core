@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:18.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: latex_core_dev
+      POSTGRES_USER: latex_core
+      POSTGRES_PASSWORD: latex_core_dev_password
+    ports:
+      - "127.0.0.1:${LATEX_CORE_POSTGRES_PORT:-54329}:5432"
+    volumes:
+      - latex_core_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U latex_core -d latex_core_dev"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  latex_core_postgres_data:

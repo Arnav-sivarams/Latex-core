@@ -8,3 +8,16 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+database-tests = []
+
+[dependencies]
+core-types.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+uuid.workspace = true
