@@ -24,8 +24,10 @@ rust-version = "1.85"
 version = "0.1.0"
 
 [workspace.dependencies]
+async-trait = "0.1"
 artifact-store = { path = "crates/artifact-store" }
 blob-store = { path = "crates/blob-store" }
+bytes = "1"
 compiler = { path = "crates/compiler" }
 core-types = { path = "crates/core-types" }
 extension-api = { path = "crates/extension-api" }
@@ -42,6 +44,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [workspace.lints.rust]

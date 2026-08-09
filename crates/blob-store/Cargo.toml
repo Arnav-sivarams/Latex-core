@@ -8,3 +8,10 @@ version.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+core-types.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
