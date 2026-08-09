@@ -14,6 +14,7 @@ core-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
+tree-sitter-bibtex.workspace = true
 # Semantic upstream: latex-lsp/tree-sitter-latex@fa8df448fc2c0192a8c2f8cfc97de53cb2b4ecb9
 # Generated locally with tree-sitter-cli 0.24.1; see vendor/tree-sitter-latex/PROVENANCE.md.
 tree-sitter-latex = { path = "vendor/tree-sitter-latex" }

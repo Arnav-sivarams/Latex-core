@@ -80,3 +80,70 @@ fn source_validation() {
     files.insert(p("other.tex"), Bytes::new());
     assert!(ProjectSource::new(p("main.tex"), files).is_err());
 }
+
+#[test]
+fn citations_resolve_only_from_reachable_bibliographies() {
+    let source = project(&[
+        (
+            "main.tex",
+            br"\addbibresource{refs.bib}\cite{known,missing,dup}\nocite{*}",
+        ),
+        ("refs.bib", b"@article{known}\n@book{dup}"),
+        ("unused.bib", b"@article{missing}\n@misc{dup}"),
+    ]);
+    let analysis = ProjectAnalyzer::with_default_limits()
+        .analyze(&source)
+        .unwrap();
+    assert!(analysis.bibliographies().contains_key(&p("refs.bib")));
+    assert!(analysis.diagnostics().iter().any(|d| d.diagnostic().code()
+        == DiagnosticCode::UnresolvedCitation
+        && d.diagnostic().message().contains("missing")));
+    assert!(
+        !analysis
+            .diagnostics()
+            .iter()
+            .any(|d| d.diagnostic().code() == DiagnosticCode::DuplicateBibtexKey)
+    );
+    assert!(
+        !analysis
+            .diagnostics()
+            .iter()
+            .any(|d| d.diagnostic().message().contains("known"))
+    );
+}
+
+#[test]
+fn multiple_bibliographies_duplicates_and_dynamic_are_conservative() {
+    let source = project(&[
+        ("main.tex", br"\bibliography{a,b}\cite{one,two,dup}"),
+        ("a.bib", b"@article{one}\n@book{dup}"),
+        ("b.bib", b"@article{two}\n@misc{dup}"),
+    ]);
+    let analysis = ProjectAnalyzer::with_default_limits()
+        .analyze(&source)
+        .unwrap();
+    assert_eq!(
+        analysis
+            .diagnostics()
+            .iter()
+            .filter(|d| d.diagnostic().code() == DiagnosticCode::DuplicateBibtexKey)
+            .count(),
+        2
+    );
+    assert!(
+        !analysis
+            .diagnostics()
+            .iter()
+            .any(|d| d.diagnostic().code() == DiagnosticCode::UnresolvedCitation)
+    );
+    let dynamic = project(&[("main.tex", br"\bibliography{\jobname}\cite{unknown}")]);
+    let analysis = ProjectAnalyzer::with_default_limits()
+        .analyze(&dynamic)
+        .unwrap();
+    assert!(
+        !analysis
+            .diagnostics()
+            .iter()
+            .any(|d| d.diagnostic().code() == DiagnosticCode::UnresolvedCitation)
+    );
+}

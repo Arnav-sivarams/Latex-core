@@ -1,0 +1,15 @@
+[package]
+name = "tree-sitter-bibtex"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+build = "bindings/rust/build.rs"
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter = "=0.24.1"
+
+[build-dependencies]
+cc = "1"

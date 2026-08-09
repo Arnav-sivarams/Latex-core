@@ -1,6 +1,7 @@
 use crate::{
-    DependencyKind, DependencyTarget, DiagnosticCode, DiagnosticSeverity, FileAnalysis,
-    ParserDiagnostic, ParserError, ParserLimits, ParserSession, SourceRange,
+    BibtexAnalysis, BibtexSession, DependencyKind, DependencyTarget, DiagnosticCode,
+    DiagnosticSeverity, FileAnalysis, ParserDiagnostic, ParserError, ParserLimits, ParserSession,
+    SourceRange,
 };
 use bytes::Bytes;
 use core_types::LogicalPath;
@@ -155,6 +156,7 @@ impl ProjectDiagnostic {
 pub struct ProjectAnalysis {
     main_file: LogicalPath,
     files: BTreeMap<LogicalPath, FileAnalysis>,
+    bibliographies: BTreeMap<LogicalPath, BibtexAnalysis>,
     dependency_graph: DependencyGraph,
     diagnostics: Vec<ProjectDiagnostic>,
 }
@@ -166,6 +168,10 @@ impl ProjectAnalysis {
     #[must_use]
     pub fn files(&self) -> &BTreeMap<LogicalPath, FileAnalysis> {
         &self.files
+    }
+    #[must_use]
+    pub fn bibliographies(&self) -> &BTreeMap<LogicalPath, BibtexAnalysis> {
+        &self.bibliographies
     }
     #[must_use]
     pub const fn dependency_graph(&self) -> &DependencyGraph {
@@ -197,12 +203,20 @@ impl ProjectAnalyzer {
     ///
     /// # Errors
     /// Returns [`ParserError`] when parser infrastructure or checked offsets fail.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "project analysis preserves a linear deterministic flow"
+    )]
     pub fn analyze(&self, source: &ProjectSource) -> Result<ProjectAnalysis, ParserError> {
         let mut files = BTreeMap::new();
+        let mut bibliographies = BTreeMap::new();
         for (path, bytes) in &source.files {
             if path == &source.main_file || is_latex(path) {
                 let session = ParserSession::new(path.clone(), bytes.clone(), self.limits)?;
                 files.insert(path.clone(), session.analysis().clone());
+            } else if is_bibtex(path) {
+                let session = BibtexSession::new(path.clone(), bytes.clone())?;
+                bibliographies.insert(path.clone(), session.analysis().clone());
             }
         }
         let mut graph = DependencyGraph::default();
@@ -280,6 +294,13 @@ impl ProjectAnalyzer {
         });
         add_cycle_diagnostics(&graph, &mut diagnostics);
         add_label_diagnostics(&files, &mut diagnostics);
+        add_bibliography_diagnostics(
+            &source.main_file,
+            &files,
+            &bibliographies,
+            &graph,
+            &mut diagnostics,
+        );
         diagnostics.sort_by(|a, b| {
             (&a.file, diagnostic_key(&a.diagnostic)).cmp(&(&b.file, diagnostic_key(&b.diagnostic)))
         });
@@ -287,6 +308,7 @@ impl ProjectAnalyzer {
         Ok(ProjectAnalysis {
             main_file: source.main_file.clone(),
             files,
+            bibliographies,
             dependency_graph: graph,
             diagnostics,
         })
@@ -306,6 +328,10 @@ fn is_latex(path: &LogicalPath) -> bool {
             "tex" | "ltx" | "sty" | "cls"
         )
     })
+}
+fn is_bibtex(path: &LogicalPath) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bib"))
 }
 fn parent(path: &LogicalPath) -> &str {
     path.as_str()
@@ -487,6 +513,101 @@ fn add_label_diagnostics(
                         Some(reference.range()),
                     ),
                 });
+            }
+        }
+    }
+}
+
+fn add_bibliography_diagnostics(
+    main_file: &LogicalPath,
+    files: &BTreeMap<LogicalPath, FileAnalysis>,
+    bibliographies: &BTreeMap<LogicalPath, BibtexAnalysis>,
+    graph: &DependencyGraph,
+    diagnostics: &mut Vec<ProjectDiagnostic>,
+) {
+    let mut reachable_sources = BTreeSet::from([main_file.clone()]);
+    loop {
+        let before = reachable_sources.len();
+        for edge in &graph.edges {
+            if reachable_sources.contains(&edge.from)
+                && matches!(
+                    edge.kind,
+                    DependencyKind::Input | DependencyKind::Include | DependencyKind::Subfile
+                )
+            {
+                if let DependencyResolution::ProjectFile(target) = &edge.resolution {
+                    reachable_sources.insert(target.clone());
+                }
+            }
+        }
+        if reachable_sources.len() == before {
+            break;
+        }
+    }
+    let mut reachable_bibs = BTreeSet::new();
+    let mut has_dynamic_bibliography = false;
+    for edge in &graph.edges {
+        if edge.kind == DependencyKind::Bibliography && reachable_sources.contains(&edge.from) {
+            match &edge.resolution {
+                DependencyResolution::ProjectFile(path) => {
+                    reachable_bibs.insert(path.clone());
+                }
+                DependencyResolution::Dynamic => has_dynamic_bibliography = true,
+                _ => {}
+            }
+        }
+    }
+    let mut definitions: BTreeMap<&str, Vec<(&LogicalPath, SourceRange)>> = BTreeMap::new();
+    for path in &reachable_bibs {
+        if let Some(analysis) = bibliographies.get(path) {
+            for diagnostic in analysis.diagnostics() {
+                diagnostics.push(ProjectDiagnostic {
+                    file: path.clone(),
+                    diagnostic: diagnostic.clone(),
+                });
+            }
+            for entry in analysis.entries() {
+                definitions
+                    .entry(entry.key())
+                    .or_default()
+                    .push((path, entry.range()));
+            }
+        }
+    }
+    for (key, locations) in &definitions {
+        if locations.len() > 1 {
+            for (path, range) in locations {
+                diagnostics.push(ProjectDiagnostic {
+                    file: (*path).clone(),
+                    diagnostic: ParserDiagnostic::new(
+                        DiagnosticSeverity::Warning,
+                        DiagnosticCode::DuplicateBibtexKey,
+                        format!("duplicate BibTeX key: {key}"),
+                        Some(*range),
+                    ),
+                });
+            }
+        }
+    }
+    if !has_dynamic_bibliography {
+        for path in &reachable_sources {
+            if let Some(analysis) = files.get(path) {
+                for citation in analysis.citations() {
+                    for key in citation.keys() {
+                        if !key.is_empty() && key != "*" && !definitions.contains_key(key.as_str())
+                        {
+                            diagnostics.push(ProjectDiagnostic {
+                                file: path.clone(),
+                                diagnostic: ParserDiagnostic::new(
+                                    DiagnosticSeverity::Warning,
+                                    DiagnosticCode::UnresolvedCitation,
+                                    format!("unresolved citation: {key}"),
+                                    Some(citation.range()),
+                                ),
+                            });
+                        }
+                    }
+                }
             }
         }
     }

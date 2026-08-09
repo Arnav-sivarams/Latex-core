@@ -672,6 +672,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tree-sitter",
+ "tree-sitter-bibtex",
  "tree-sitter-latex",
 ]
 
@@ -1588,6 +1589,15 @@ dependencies = [
 [[package]]
 name = "tex-index"
 version = "0.1.0"
+dependencies = [
+ "core-types",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "thiserror"
@@ -1714,6 +1724,14 @@ dependencies = [
  "regex-syntax",
  "streaming-iterator",
  "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-bibtex"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tree-sitter",
 ]
 
 [[package]]

@@ -18,6 +18,9 @@ pub enum DiagnosticCode {
     DependencyCycle,
     DuplicateLabel,
     UnresolvedReference,
+    BibtexSyntaxError,
+    DuplicateBibtexKey,
+    UnresolvedCitation,
 }
 
 /// A stable best-effort parsing or static-analysis diagnostic.
