@@ -1,0 +1,15 @@
+[package]
+name = "tree-sitter-latex"
+version = "0.6.0"
+edition = "2018"
+license = "MIT"
+build = "bindings/rust/build.rs"
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter = "=0.24.1"
+
+[build-dependencies]
+cc = "1"
