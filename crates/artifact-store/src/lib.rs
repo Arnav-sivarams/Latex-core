@@ -1,0 +1,1 @@
+//! Compilation artifact storage boundaries.

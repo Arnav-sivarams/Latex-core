@@ -1,0 +1,1 @@
+//! TeX project indexing boundaries.

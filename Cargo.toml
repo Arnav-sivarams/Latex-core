@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/artifact-store",
+    "crates/blob-store",
+    "crates/compiler",
+    "crates/core-types",
+    "crates/extension-api",
+    "crates/extension-host",
+    "crates/parser",
+    "crates/persistence",
+    "crates/queue",
+    "crates/sandbox",
+    "crates/tex-index",
+    "crates/workspace",
+    "services/cli",
+    "services/server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+version = "0.1.0"
+
+[workspace.dependencies]
+artifact-store = { path = "crates/artifact-store" }
+blob-store = { path = "crates/blob-store" }
+compiler = { path = "crates/compiler" }
+core-types = { path = "crates/core-types" }
+extension-api = { path = "crates/extension-api" }
+extension-host = { path = "crates/extension-host" }
+latex-parser = { path = "crates/parser" }
+persistence = { path = "crates/persistence" }
+queue = { path = "crates/queue" }
+sandbox = { path = "crates/sandbox" }
+tex-index = { path = "crates/tex-index" }
+workspace-model = { path = "crates/workspace" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+

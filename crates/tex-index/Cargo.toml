@@ -1,0 +1,10 @@
+[package]
+name = "tex-index"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
