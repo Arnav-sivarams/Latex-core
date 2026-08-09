@@ -36,6 +36,13 @@ queue = { path = "crates/queue" }
 sandbox = { path = "crates/sandbox" }
 tex-index = { path = "crates/tex-index" }
 workspace-model = { path = "crates/workspace" }
+hex = "0.4"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
@@ -50,4 +57,3 @@ dbg_macro = "deny"
 todo = "deny"
 undocumented_unsafe_blocks = "deny"
 unwrap_used = "deny"
-
