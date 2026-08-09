@@ -8,3 +8,20 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+database-tests = ["persistence/database-tests"]
+
+[dependencies]
+blob-store.workspace = true
+bytes.workspace = true
+core-types.workspace = true
+persistence.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true

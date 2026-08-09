@@ -17,3 +17,4 @@ docker compose -p latex-core-dev -f "${compose_file}" exec -T postgres \
 export TEST_DATABASE_URL="postgresql://latex_core:latex_core_dev_password@127.0.0.1:${postgres_port}/latex_core_test"
 cd -- "${repository_root}"
 cargo test -p persistence --features database-tests --test postgres -- --nocapture
+cargo test -p workspace-model --features database-tests --test postgres_restore -- --nocapture
