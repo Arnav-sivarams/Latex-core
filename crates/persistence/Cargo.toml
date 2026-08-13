@@ -14,6 +14,7 @@ database-tests = []
 
 [dependencies]
 core-types.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

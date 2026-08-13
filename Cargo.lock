@@ -885,6 +885,7 @@ name = "persistence"
 version = "0.1.0"
 dependencies = [
  "core-types",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror",
@@ -980,6 +981,20 @@ dependencies = [
 [[package]]
 name = "queue"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blob-store",
+ "bytes",
+ "compiler",
+ "core-types",
+ "persistence",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "quick-error"

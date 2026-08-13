@@ -29,7 +29,7 @@ impl FromStr for TexEngine {
 }
 string_enum!(ShellPolicy { Safe => "safe", Restricted => "restricted", Compatibility => "compatibility" });
 string_enum!(CostClass { Small => "small", Normal => "normal", Heavy => "heavy" });
-string_enum!(JobState { Queued => "queued", Claimed => "claimed", Running => "running", Succeeded => "succeeded", Failed => "failed", Cancelled => "cancelled" });
+string_enum!(JobState { Queued => "queued", Claimed => "claimed", Running => "running", Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled" });
 
 #[derive(Clone, Eq, PartialEq, Debug, Serialize)]
 pub struct CompileRequestV1 {

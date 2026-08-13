@@ -5,13 +5,19 @@
     reason = "integration test fixtures"
 )]
 
-use persistence::{Database, DatabaseConfig};
+use core_types::{
+    BlobHash, CompileKey, CostClass, IdempotencyKey, JobId, LatexmkProfileId, ShellPolicy,
+    SnapshotId, TenantId, TexEngine, TexEnvironmentId, UserId, WorkerId, WorkspaceId,
+};
+use persistence::{
+    Database, DatabaseConfig, EnqueueCompileJobV1, InfrastructureOutcome, PostgresCompileQueue,
+    QueueError, QueueLimits,
+};
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::{env, time::Duration};
 use uuid::Uuid;
 
-const SNAPSHOT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MANIFEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const COMPILE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const BLOB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -32,7 +38,6 @@ async fn production_schema_enforces_relational_contract() {
     let pool = PgPool::connect(&url).await.unwrap();
     verify_session_initialization(&url).await;
     verify_schema(&pool).await;
-    verify_empty(&pool).await;
 
     let tenant = Uuid::new_v4();
     let user = Uuid::new_v4();
@@ -109,14 +114,6 @@ async fn verify_schema(pool: &PgPool) {
     ];
     expected.sort_unstable();
     assert_eq!(tables, expected);
-}
-
-async fn verify_empty(pool: &PgPool) {
-    for table in ["tenants", "users", "workspaces"] {
-        let sql = format!("SELECT count(*) FROM latex_core.{table}");
-        let count: i64 = sqlx::query_scalar(&sql).fetch_one(pool).await.unwrap();
-        assert_eq!(count, 0, "migration inserted rows into {table}");
-    }
 }
 
 async fn insert_base(pool: &PgPool, tenant: Uuid, user: Uuid, workspace: Uuid) {
@@ -211,16 +208,18 @@ async fn verify_events(pool: &PgPool, workspace: Uuid, user: Uuid) {
 }
 
 async fn verify_snapshots_and_heads(pool: &PgPool, a: Uuid, b: Uuid) {
+    let snapshot = schema_snapshot(a);
+    let manifest = digest(format!("schema-manifest-{a}").as_bytes());
     sqlx::query(
         "INSERT INTO latex_core.snapshots (snapshot_id, manifest_blob_hash) VALUES ($1,$2)",
     )
-    .bind(SNAPSHOT)
-    .bind(MANIFEST)
+    .bind(&snapshot)
+    .bind(&manifest)
     .execute(pool)
     .await
     .unwrap();
     for (workspace, version) in [(a, 1_i64), (b, 1_i64), (a, 2_i64)] {
-        sqlx::query("INSERT INTO latex_core.workspace_snapshots (workspace_id, workspace_version, snapshot_id) VALUES ($1,$2,$3)").bind(workspace).bind(version).bind(SNAPSHOT).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO latex_core.workspace_snapshots (workspace_id, workspace_version, snapshot_id) VALUES ($1,$2,$3)").bind(workspace).bind(version).bind(&snapshot).execute(pool).await.unwrap();
     }
     sqlx::query("UPDATE latex_core.workspace_heads SET durable_version=2, latest_snapshot_version=2 WHERE workspace_id=$1").bind(a).execute(pool).await.unwrap();
     assert_constraint(sqlx::query("UPDATE latex_core.workspace_heads SET durable_version=1, latest_snapshot_version=2 WHERE workspace_id=$1").bind(a).execute(pool).await);
@@ -247,7 +246,7 @@ async fn insert_job(
         .bind(tenant)
         .bind(user)
         .bind(workspace)
-        .bind(SNAPSHOT)
+        .bind(schema_snapshot(workspace))
         .bind(COMPILE)
         .bind(idempotency)
         .bind(state)
@@ -327,7 +326,7 @@ async fn insert_job_result(
     key: &str,
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
     sqlx::query("INSERT INTO latex_core.compile_jobs (id,tenant_id,user_id,workspace_id,snapshot_id,compile_key,idempotency_key,engine,tex_environment_id,latexmk_profile,shell_policy,synctex,cost_class,state) VALUES ($1,$2,$3,$4,$5,$6,$7,'pdflatex','texlive-2026','default','safe',true,'normal','queued')")
-        .bind(Uuid::new_v4()).bind(tenant).bind(user).bind(workspace).bind(SNAPSHOT).bind(COMPILE).bind(key).execute(pool).await
+        .bind(Uuid::new_v4()).bind(tenant).bind(user).bind(workspace).bind(schema_snapshot(workspace)).bind(COMPILE).bind(key).execute(pool).await
 }
 
 async fn verify_queue_indexes(pool: &PgPool) {
@@ -387,9 +386,11 @@ async fn verify_artifacts_and_cache(pool: &PgPool, tenant: Uuid, user: Uuid, wor
             .await,
     );
     let successful = insert_job(pool, tenant, user, workspace, "cache-job", "succeeded").await;
-    sqlx::query("INSERT INTO latex_core.compile_cache (compile_key,source_job_id,artifact_manifest_blob_hash) VALUES ($1,$2,$3)").bind("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").bind(successful).bind(MANIFEST).execute(pool).await.unwrap();
+    let cache_key = digest(format!("schema-cache-key-{workspace}").as_bytes());
+    let cache_manifest = digest(format!("schema-cache-manifest-{workspace}").as_bytes());
+    sqlx::query("INSERT INTO latex_core.compile_cache (compile_key,source_job_id,artifact_manifest_blob_hash) VALUES ($1,$2,$3)").bind(&cache_key).bind(successful).bind(&cache_manifest).execute(pool).await.unwrap();
     assert_constraint(sqlx::query("INSERT INTO latex_core.compile_cache (compile_key,source_job_id,artifact_manifest_blob_hash) VALUES ('bad',$1,$2)").bind(successful).bind(MANIFEST).execute(pool).await);
-    assert_constraint(sqlx::query("INSERT INTO latex_core.compile_cache (compile_key,source_job_id,artifact_manifest_blob_hash) VALUES ($1,$2,$3)").bind("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").bind(Uuid::new_v4()).bind(MANIFEST).execute(pool).await);
+    assert_constraint(sqlx::query("INSERT INTO latex_core.compile_cache (compile_key,source_job_id,artifact_manifest_blob_hash) VALUES ($1,$2,$3)").bind(digest(format!("schema-invalid-cache-{workspace}").as_bytes())).bind(Uuid::new_v4()).bind(&cache_manifest).execute(pool).await);
 }
 
 fn assert_constraint<T>(result: Result<T, sqlx::Error>) {
@@ -403,4 +404,197 @@ fn assert_constraint<T>(result: Result<T, sqlx::Error>) {
             if database.code().is_some_and(|code| code.starts_with("23"))
     );
     assert!(is_constraint, "expected constraint violation: {error}");
+}
+
+fn digest(seed: &[u8]) -> String {
+    BlobHash::digest(seed).to_hex()
+}
+
+fn schema_snapshot(workspace: Uuid) -> String {
+    digest(format!("schema-snapshot-{workspace}").as_bytes())
+}
+
+async fn queue_fixture() -> (
+    PostgresCompileQueue,
+    PgPool,
+    TenantId,
+    UserId,
+    WorkspaceId,
+    SnapshotId,
+) {
+    let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let database = Database::connect(DatabaseConfig::development(&url).unwrap())
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
+    let tenant = TenantId::new();
+    let user = UserId::new();
+    let workspace = WorkspaceId::new();
+    sqlx::query("INSERT INTO latex_core.tenants (id) VALUES ($1)")
+        .bind(tenant.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.users (id,tenant_id) VALUES ($1,$2)")
+        .bind(user.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")
+        .bind(workspace.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(user.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let snapshot: SnapshotId = digest(format!("queue snapshot {workspace}").as_bytes())
+        .parse()
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.snapshots (snapshot_id,manifest_blob_hash) VALUES ($1,$2)")
+        .bind(snapshot.to_hex())
+        .bind(digest(format!("queue manifest {workspace}").as_bytes()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let limits = QueueLimits::new(2, 1, 3, Duration::from_secs(30), 2).unwrap();
+    (
+        PostgresCompileQueue::new(database, limits),
+        pool,
+        tenant,
+        user,
+        workspace,
+        snapshot,
+    )
+}
+
+fn request(
+    tenant: TenantId,
+    user: UserId,
+    workspace: WorkspaceId,
+    snapshot: SnapshotId,
+    priority: i16,
+    suffix: &str,
+) -> EnqueueCompileJobV1 {
+    EnqueueCompileJobV1 {
+        job_id: JobId::new(),
+        tenant_id: tenant,
+        user_id: user,
+        workspace_id: workspace,
+        snapshot_id: snapshot,
+        compile_key: digest(format!("key-{workspace}-{suffix}").as_bytes())
+            .parse::<CompileKey>()
+            .unwrap(),
+        idempotency_key: IdempotencyKey::parse(&format!("request-{workspace}-{suffix}")).unwrap(),
+        engine: TexEngine::PdfLatex,
+        tex_environment_id: TexEnvironmentId::parse("texlive-2026+full@1").unwrap(),
+        latexmk_profile: LatexmkProfileId::parse("safe-v1").unwrap(),
+        shell_policy: ShellPolicy::Safe,
+        synctex: true,
+        cost_class: CostClass::Normal,
+        priority,
+    }
+}
+
+#[tokio::test]
+async fn durable_queue_orders_claims_enforces_caps_and_rejects_stale_completion() {
+    let (queue, pool, tenant, user, workspace, snapshot) = queue_fixture().await;
+    let low = request(tenant, user, workspace, snapshot, 1, "low");
+    let high = request(tenant, user, workspace, snapshot, 9, "high");
+    queue.enqueue(low.clone()).await.unwrap();
+    queue.enqueue(high.clone()).await.unwrap();
+    let worker = WorkerId::new();
+    let winner = queue.claim(worker).await.unwrap().unwrap();
+    assert_eq!(winner.id, high.job_id);
+    assert!(
+        queue.claim(WorkerId::new()).await.unwrap().is_none(),
+        "per-user running cap applies during claim"
+    );
+    assert!(matches!(
+        queue.renew_lease(winner.id, WorkerId::new()).await,
+        Err(QueueError::LeaseLost)
+    ));
+    let overflow = request(tenant, user, workspace, snapshot, 0, "overflow");
+    assert_eq!(
+        queue.enqueue(overflow.clone()).await.unwrap(),
+        overflow.job_id
+    );
+    assert!(matches!(
+        queue
+            .enqueue(request(
+                tenant,
+                user,
+                workspace,
+                snapshot,
+                0,
+                "overflow-two"
+            ))
+            .await,
+        Err(QueueError::AdmissionRejected { .. })
+    ));
+    queue
+        .complete_compile_failure(winner.id, worker, false, json!({"class":"test-cleanup"}))
+        .await
+        .unwrap();
+    for job in [low.job_id, overflow.job_id] {
+        queue
+            .request_cancellation(job, Some("test cleanup"))
+            .await
+            .unwrap();
+    }
+    let running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1 AND state='running'",
+    )
+    .bind(workspace.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn cancellation_recovery_and_infrastructure_retry_are_durable() {
+    let (queue, pool, tenant, user, workspace, snapshot) = queue_fixture().await;
+    let queued = request(tenant, user, workspace, snapshot, 0, "cancel");
+    queue.enqueue(queued.clone()).await.unwrap();
+    queue
+        .request_cancellation(queued.job_id, Some("user request"))
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM latex_core.compile_jobs WHERE id=$1")
+        .bind(queued.job_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "cancelled");
+    let running = request(tenant, user, workspace, snapshot, 0, "retry");
+    queue.enqueue(running.clone()).await.unwrap();
+    let worker = WorkerId::new();
+    let claimed = queue.claim(worker).await.unwrap().unwrap();
+    assert_eq!(claimed.id, running.job_id);
+    assert_eq!(
+        queue
+            .complete_infrastructure_failure(claimed.id, worker, json!({"class":"infrastructure"}))
+            .await
+            .unwrap(),
+        InfrastructureOutcome::Requeued
+    );
+    let retry = queue.claim(worker).await.unwrap().unwrap();
+    assert_eq!(retry.attempt_count, 2);
+    assert_eq!(
+        queue
+            .complete_infrastructure_failure(retry.id, worker, json!({"class":"infrastructure"}))
+            .await
+            .unwrap(),
+        InfrastructureOutcome::Failed
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM latex_core.compile_jobs WHERE id=$1")
+        .bind(running.job_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "failed");
+    pool.close().await;
 }
