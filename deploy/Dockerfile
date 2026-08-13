@@ -11,3 +11,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /src/target/release/latex-core-api /usr/local/bin/latex-core-api
 COPY --from=build /src/target/release/latex-core-worker /usr/local/bin/latex-core-worker
 COPY --from=build /src/target/release/latex-core-doctor /usr/local/bin/latex-core-doctor
+COPY --from=build /src/target/release/latex-core-admin /usr/local/bin/latex-core-admin

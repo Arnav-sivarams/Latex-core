@@ -8,10 +8,7 @@
     reason = "HTTP handlers use early response returns to keep authorization checks adjacent to each operation"
 )]
 
-use argon2::{
-    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+mod auth;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -48,6 +45,7 @@ struct AppState {
     blobs: Arc<FsBlobStore>,
     environment: TexEnvironmentId,
     cookie_secure: bool,
+    allow_registration: bool,
     session_seconds: i64,
 }
 #[derive(Deserialize)]
@@ -143,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         blobs,
         environment,
         cookie_secure: bool_env("SESSION_COOKIE_SECURE", false),
+        allow_registration: bool_env("ALLOW_REGISTRATION", false),
         session_seconds: int_env("SESSION_TTL_SECONDS", 60 * 60 * 24 * 7)?,
     };
     let app = router(state);
@@ -193,19 +192,18 @@ async fn register(
     headers: HeaderMap,
     Json(input): Json<Credentials>,
 ) -> Response {
+    if !state.allow_registration {
+        return error(StatusCode::FORBIDDEN, "registration is disabled");
+    }
     if let Err(r) = csrf(&headers) {
         return r;
     }
-    let email = match normalized_email(&input.email) {
+    let email = match auth::normalized_email(&input.email) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid credentials"),
     };
-    if input.password.len() < 12 || input.password.len() > 256 {
-        return error(StatusCode::BAD_REQUEST, "invalid credentials");
-    };
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = match Argon2::default().hash_password(input.password.as_bytes(), &salt) {
-        Ok(v) => v.to_string(),
+    let hash = match auth::hash_password(&input.password) {
+        Ok(v) => v,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure"),
     };
     match state.repo.create_account(&email, &hash).await {
@@ -222,20 +220,20 @@ async fn login(
     if let Err(r) = csrf(&headers) {
         return r;
     };
-    let email = match normalized_email(&input.email) {
+    let email = match auth::normalized_email(&input.email) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::UNAUTHORIZED, "invalid credentials"),
     };
     let Ok(Some(user)) = state.repo.user_by_email(&email).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid credentials");
     };
-    let Ok(parsed) = PasswordHash::new(&user.password_hash) else {
+    if !user.enabled {
+        return error(StatusCode::UNAUTHORIZED, "invalid credentials");
+    }
+    let Ok(valid) = auth::verify_password(&input.password, &user.password_hash) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure");
     };
-    if Argon2::default()
-        .verify_password(input.password.as_bytes(), &parsed)
-        .is_err()
-    {
+    if !valid {
         return error(StatusCode::UNAUTHORIZED, "invalid credentials");
     };
     session_response(&state, user.user_id, user.email).await
@@ -871,14 +869,6 @@ async fn workspace_etag(state: &AppState, id: WorkspaceId) -> String {
         |_| "\"0\"".to_owned(),
         |v| format!("\"{}\"", v.version().get()),
     )
-}
-fn normalized_email(value: &str) -> Result<String, ()> {
-    let e = value.trim().to_ascii_lowercase();
-    if e.len() >= 3 && e.len() <= 320 && e.contains('@') && !e.chars().any(char::is_whitespace) {
-        Ok(e)
-    } else {
-        Err(())
-    }
 }
 fn parsed<T: FromStr>(value: &str) -> Result<T, Response> {
     value

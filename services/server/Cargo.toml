@@ -17,6 +17,10 @@ path = "src/bin/worker.rs"
 name = "latex-core-doctor"
 path = "src/bin/doctor.rs"
 
+[[bin]]
+name = "latex-core-admin"
+path = "src/bin/admin.rs"
+
 [dependencies]
 argon2.workspace = true
 axum.workspace = true

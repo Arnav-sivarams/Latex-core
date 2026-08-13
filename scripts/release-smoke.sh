@@ -7,9 +7,10 @@ trap 'rm -f "${cookie_file}"' EXIT
 email="smoke-$(date +%s)-${RANDOM}@example.test"
 password='release-smoke-password'
 
+"$(dirname "$0")/create-user.sh" "${email}" "${password}" >/dev/null
 curl -fsS -c "${cookie_file}" -H 'Content-Type: application/json' \
   -d "{\"email\":\"${email}\",\"password\":\"${password}\"}" \
-  "${base_url}/api/auth/register" >/dev/null
+  "${base_url}/api/auth/login" >/dev/null
 project="$(curl -fsS -b "${cookie_file}" -H 'Content-Type: application/json' -d '{"name":"release smoke"}' "${base_url}/api/projects")"
 project_id="$(printf '%s' "${project}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
 version="$(printf '%s' "${project}" | sed -n 's/.*"version":\([0-9]*\).*/\1/p')"
