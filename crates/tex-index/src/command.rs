@@ -61,6 +61,7 @@ impl CommandRunner for ProcessCommandRunner {
     ) -> Result<CommandResult, TexIndexError> {
         let mut child = Command::new(program)
             .args(args)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

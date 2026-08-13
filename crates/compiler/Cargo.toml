@@ -5,6 +5,23 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = []
+docker-tests = []
+
+[dependencies]
+blob-store.workspace = true
+bytes.workspace = true
+core-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tex-index.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true
-

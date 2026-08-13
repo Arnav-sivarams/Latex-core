@@ -1,5 +1,5 @@
 use crate::TexIndexError;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +45,7 @@ impl TlpdbPackageRecord {
 
 pub fn parse_tlpdb(input: &str) -> Result<BTreeMap<String, TlpdbPackageRecord>, TexIndexError> {
     let mut result = BTreeMap::new();
+    let mut seen_names = BTreeSet::new();
     for block in input.replace("\r\n", "\n").split("\n\n") {
         if block.trim().is_empty() {
             continue;
@@ -88,11 +89,23 @@ pub fn parse_tlpdb(input: &str) -> Result<BTreeMap<String, TlpdbPackageRecord>, 
         let name = name
             .filter(|v| !v.is_empty())
             .ok_or_else(|| TexIndexError::InvalidTlpdb("record missing name".into()))?;
+        let category = category
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| TexIndexError::InvalidTlpdb(format!("{name}: missing category")))?;
+        if !seen_names.insert(name.clone()) {
+            return Err(TexIndexError::InvalidTlpdb(format!(
+                "duplicate package: {name}"
+            )));
+        }
+        if matches!(name.as_str(), "00texlive.config" | "00texlive.installation")
+            && category == "TLCore"
+            && revision.is_none()
+        {
+            continue;
+        }
         let record = TlpdbPackageRecord {
             name: name.clone(),
-            category: category
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| TexIndexError::InvalidTlpdb(format!("{name}: missing category")))?,
+            category,
             revision: revision
                 .ok_or_else(|| TexIndexError::InvalidTlpdb(format!("{name}: missing revision")))?,
             catalogue_version,
@@ -100,11 +113,7 @@ pub fn parse_tlpdb(input: &str) -> Result<BTreeMap<String, TlpdbPackageRecord>, 
             runfiles,
             binfiles,
         };
-        if result.insert(name.clone(), record).is_some() {
-            return Err(TexIndexError::InvalidTlpdb(format!(
-                "duplicate package: {name}"
-            )));
-        }
+        result.insert(name, record);
     }
     Ok(result)
 }

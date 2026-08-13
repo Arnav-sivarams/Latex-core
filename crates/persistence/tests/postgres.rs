@@ -259,9 +259,18 @@ async fn insert_job(
 }
 
 async fn verify_jobs(pool: &PgPool, tenant: Uuid, user: Uuid, workspace: Uuid) {
-    insert_job(pool, tenant, user, workspace, "valid:queued", "queued").await;
+    let valid = insert_job(pool, tenant, user, workspace, "valid:queued", "queued").await;
+    for engine in ["latex", "pdflatex", "lualatex", "xelatex"] {
+        sqlx::query("UPDATE latex_core.compile_jobs SET engine = $1 WHERE id = $2")
+            .bind(engine)
+            .bind(valid)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
     let invalid_sqls = [
         "engine='unknown'",
+        "engine='tectonic'",
         "shell_policy='unknown'",
         "cost_class='unknown'",
         "state='unknown'",

@@ -145,6 +145,18 @@ version = "0.1.0"
 [[package]]
 name = "compiler"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blob-store",
+ "bytes",
+ "core-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tex-index",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "const-oid"

@@ -20,6 +20,7 @@ fn seed_hash(seed: &[u8]) -> SnapshotId {
 #[test]
 fn enums_have_locked_strings() {
     for (engine, text) in [
+        (TexEngine::Latex, "latex"),
         (TexEngine::PdfLatex, "pdflatex"),
         (TexEngine::LuaLatex, "lualatex"),
         (TexEngine::XeLatex, "xelatex"),
@@ -54,7 +55,7 @@ fn request_round_trip() {
     let request = CompileRequestV1::new(
         workspace_id,
         snapshot_id,
-        TexEngine::LuaLatex,
+        TexEngine::Latex,
         ShellPolicy::Safe,
         true,
         idempotency_key.clone(),
@@ -66,7 +67,7 @@ fn request_round_trip() {
     let restored = serde_json::from_str::<CompileRequestV1>(&json).unwrap();
     assert_eq!(restored.workspace_id(), workspace_id);
     assert_eq!(restored.snapshot_id(), snapshot_id);
-    assert_eq!(restored.engine(), TexEngine::LuaLatex);
+    assert_eq!(restored.engine(), TexEngine::Latex);
     assert_eq!(restored.shell_policy(), ShellPolicy::Safe);
     assert!(restored.synctex());
     assert_eq!(restored.idempotency_key(), &idempotency_key);
@@ -107,6 +108,14 @@ fn compile_key_is_deterministic_and_all_material_invalidates() {
         CompileKeyMaterialV1::new(
             seed_hash(b"b"),
             TexEngine::PdfLatex,
+            TexEnvironmentId::parse("texlive-2026-v1").unwrap(),
+            LatexmkProfileId::parse("default-v1").unwrap(),
+            ShellPolicy::Safe,
+            true,
+        ),
+        CompileKeyMaterialV1::new(
+            seed_hash(b"a"),
+            TexEngine::Latex,
             TexEnvironmentId::parse("texlive-2026-v1").unwrap(),
             LatexmkProfileId::parse("default-v1").unwrap(),
             ShellPolicy::Safe,

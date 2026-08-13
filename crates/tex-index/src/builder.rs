@@ -131,22 +131,26 @@ impl TexIndexBuilder {
             let path = executables
                 .get(&kind)
                 .ok_or_else(|| TexIndexError::InternalInvariant("tool missing".into()))?;
-            let args = [OsStr::new(if kind == TexToolKind::Makeglossaries {
-                "--help"
+            let version = if kind == TexToolKind::Makeindex {
+                run_makeindex(self.runner.as_ref(), path, self.config.command_timeout())?
             } else {
-                "--version"
-            })];
-            let version = if kind == TexToolKind::Kpsewhich {
-                kpse_version.clone()
-            } else if kind == TexToolKind::Tlmgr {
-                tlmgr_version.clone()
-            } else {
-                run_text(
-                    self.runner.as_ref(),
-                    path,
-                    &args,
-                    self.config.command_timeout(),
-                )?
+                let args = [OsStr::new(if kind == TexToolKind::Makeglossaries {
+                    "--help"
+                } else {
+                    "--version"
+                })];
+                if kind == TexToolKind::Kpsewhich {
+                    kpse_version.clone()
+                } else if kind == TexToolKind::Tlmgr {
+                    tlmgr_version.clone()
+                } else {
+                    run_text(
+                        self.runner.as_ref(),
+                        path,
+                        &args,
+                        self.config.command_timeout(),
+                    )?
+                }
             };
             tools.insert(kind, TexToolRecord::new(kind, version, hash_file(path)?)?);
         }
@@ -206,6 +210,36 @@ impl TexIndexBuilder {
         }
         Ok(map)
     }
+}
+fn run_makeindex(
+    runner: &dyn CommandRunner,
+    program: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, TexIndexError> {
+    let result = runner.run(program, &[], timeout)?;
+    if !result.success() {
+        return Err(TexIndexError::CommandFailed {
+            program: program.display().to_string(),
+            status: result.status_code(),
+            stderr: String::from_utf8_lossy(result.stderr()).into_owned(),
+        });
+    }
+    let stderr = String::from_utf8(result.stderr().to_vec()).map_err(|error| {
+        TexIndexError::InvalidCommandOutput {
+            program: program.display().to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    let version = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .filter(|line| line.starts_with("This is makeindex, version"))
+        .ok_or_else(|| TexIndexError::InvalidCommandOutput {
+            program: program.display().to_string(),
+            message: "makeindex version line unavailable".into(),
+        })?;
+    Ok(version.to_owned())
 }
 fn optional_kpse(
     runner: &dyn CommandRunner,

@@ -23,3 +23,39 @@ fn rejects_malformed_records_and_paths() {
         assert!(parse_tlpdb(db).is_err(), "{db}");
     }
 }
+
+#[test]
+fn parses_tex_live_special_metadata_prefix() {
+    let db = "name 00texlive.config\ncategory TLCore\ndepend minrelease/2016\ndepend release/2026\n\nname 00texlive.installation\ncategory TLCore\ndepend opt_create_formats:1\ndepend setting_available_architectures:x86_64-linux\n\nname article\ncategory Package\nrevision 123\nrunfiles\n tex/latex/base/article.cls";
+    let p = parse_tlpdb(db).unwrap();
+
+    assert_eq!(p.len(), 1);
+    assert!(!p.contains_key("00texlive.config"));
+    assert!(!p.contains_key("00texlive.installation"));
+    assert_eq!(p["article"].revision(), 123);
+}
+
+#[test]
+fn rejects_revisionless_non_metadata_records() {
+    for db in [
+        "name ordinary\ncategory Package",
+        "name ordinary\ncategory Collection",
+        "name arbitrary-meta\ncategory TLCore",
+    ] {
+        assert!(parse_tlpdb(db).is_err(), "{db}");
+    }
+}
+
+#[test]
+fn rejects_revisionless_special_metadata_with_wrong_category() {
+    for name in ["00texlive.config", "00texlive.installation"] {
+        let db = format!("name {name}\ncategory Package");
+        assert!(parse_tlpdb(&db).is_err(), "{db}");
+    }
+}
+
+#[test]
+fn rejects_duplicate_special_metadata_records() {
+    let db = "name 00texlive.config\ncategory TLCore\n\nname 00texlive.config\ncategory TLCore";
+    assert!(parse_tlpdb(db).is_err());
+}

@@ -14,11 +14,12 @@ macro_rules! string_enum {
         impl fmt::Display for $name { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { let value = match self { $(Self::$variant => $value),+ }; f.write_str(value) } }
     };
 }
-string_enum!(TexEngine { PdfLatex => "pdflatex", LuaLatex => "lualatex", XeLatex => "xelatex" });
+string_enum!(TexEngine { Latex => "latex", PdfLatex => "pdflatex", LuaLatex => "lualatex", XeLatex => "xelatex" });
 impl FromStr for TexEngine {
     type Err = CompileDomainError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "latex" => Ok(Self::Latex),
             "pdflatex" => Ok(Self::PdfLatex),
             "lualatex" => Ok(Self::LuaLatex),
             "xelatex" => Ok(Self::XeLatex),

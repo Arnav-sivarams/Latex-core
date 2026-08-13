@@ -55,15 +55,20 @@ impl CommandRunner for Fake {
             }
         } else if name == "tlmgr" {
             "tlmgr revision 1 (TeX Live 2026)".into()
+        } else if name == "makeindex" {
+            assert!(args.is_empty());
+            String::new()
         } else {
             format!("{name} version 1")
         };
-        Ok(CommandResult::new(
-            Some(0),
-            true,
-            out.into_bytes(),
-            Vec::new(),
-        ))
+        let stderr = if name == "makeindex" {
+            "This is makeindex, version 2.18 [TeX Live 2026] (kpathsea + Thai support).\nScanning input file stdin...done (0 entries accepted, 0 rejected).\nNothing written in stdout.\nTranscript written in stderr.\n"
+                .as_bytes()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(CommandResult::new(Some(0), true, out.into_bytes(), stderr))
     }
 }
 fn fixture(parent: &Path, name: &str) -> PathBuf {
@@ -124,6 +129,12 @@ fn deterministic_portable_queries_and_roundtrip() {
     fs::write(&database, format!("{}\n", records.join("\n\n"))).unwrap();
     let ia = build(&a);
     let ib = build(&b);
+    let makeindex = ia.tool(TexToolKind::Makeindex).unwrap();
+    assert_eq!(
+        makeindex.version_output(),
+        "This is makeindex, version 2.18 [TeX Live 2026] (kpathsea + Thai support)."
+    );
+    assert!(!makeindex.version_output().contains("Scanning input file"));
     assert_eq!(ia.environment_id().unwrap(), ib.environment_id().unwrap());
     assert!(
         ia.package_exists("amsmath")
@@ -218,6 +229,8 @@ fn cli_builds_and_writes_canonical_index() {
             )
         } else if kind == TexToolKind::Tlmgr {
             "#!/bin/sh\necho 'tlmgr revision 1 (TeX Live 2026)'\n".to_owned()
+        } else if kind == TexToolKind::Makeindex {
+            "#!/bin/sh\nif [ \"$#\" -ne 0 ]; then\n  echo 'Unknown option --.' >&2\n  exit 1\nfi\nprintf '%s\\n' 'This is makeindex, version 2.18 [TeX Live 2026] (kpathsea + Thai support).' 'Scanning input file stdin...done (0 entries accepted, 0 rejected).' 'Nothing written in stdout.' 'Transcript written in stderr.' >&2\n".to_owned()
         } else {
             format!("#!/bin/sh\necho '{} version 1'\n", kind.basename())
         };

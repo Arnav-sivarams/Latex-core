@@ -1,0 +1,15 @@
+selected_scheme scheme-full
+TEXDIR /opt/texlive/2026
+TEXMFCONFIG ~/.texlive2026/texmf-config
+TEXMFHOME ~/texmf
+TEXMFLOCAL /opt/texlive/texmf-local
+TEXMFSYSCONFIG /opt/texlive/2026/texmf-config
+TEXMFSYSVAR /opt/texlive/2026/texmf-var
+TEXMFVAR ~/.texlive2026/texmf-var
+option_doc 0
+option_src 0
+option_path 0
+option_desktop_integration 0
+option_file_assocs 0
+option_menu_integration 0
+option_w32_multi_user 0
