@@ -1,0 +1,6 @@
+.git
+target
+.agents
+.codex
+*.log
+backups

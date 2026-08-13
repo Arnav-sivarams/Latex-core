@@ -23,15 +23,24 @@ const MAX_ARTIFACT_FILES: usize = 4096;
 #[derive(Clone, Debug)]
 pub struct CompilerConfig {
     limits: CompileLimits,
+    staging_root: Option<PathBuf>,
 }
 impl CompilerConfig {
     #[must_use]
     pub fn new(limits: CompileLimits) -> Self {
-        Self { limits }
+        Self {
+            limits,
+            staging_root: None,
+        }
     }
     #[must_use]
     pub const fn limits(&self) -> &CompileLimits {
         &self.limits
+    }
+    #[must_use]
+    pub fn with_staging_root(mut self, root: PathBuf) -> Self {
+        self.staging_root = Some(root);
+        self
     }
 }
 
@@ -97,6 +106,29 @@ impl<R: ContainerRuntime> CompilerService<R> {
         shell_policy: ShellPolicy,
         synctex: bool,
     ) -> Result<CompileExecution, CompilerError> {
+        self.compile_with_execution_id(
+            snapshot_id,
+            manifest,
+            engine,
+            shell_policy,
+            synctex,
+            "adhoc",
+        )
+        .await
+    }
+    #[allow(
+        clippy::too_many_lines,
+        reason = "compile execution owns one cleanup boundary"
+    )]
+    pub async fn compile_with_execution_id(
+        &self,
+        snapshot_id: SnapshotId,
+        manifest: &WorkspaceManifestV1,
+        engine: TexEngine,
+        shell_policy: ShellPolicy,
+        synctex: bool,
+        execution_id: &str,
+    ) -> Result<CompileExecution, CompilerError> {
         let profile = profile_for(shell_policy)?;
         let actual = manifest
             .snapshot_id()
@@ -121,13 +153,22 @@ impl<R: ContainerRuntime> CompilerService<R> {
         .map_err(|error| CompilerError::InternalInvariant {
             message: error.to_string(),
         })?;
-        let temporary = tempfile::Builder::new()
-            .prefix("latex-core-compile-")
-            .tempdir()
-            .map_err(|source| CompilerError::Io {
-                operation: "create compile workspace",
-                source,
-            })?;
+        let mut builder = tempfile::Builder::new();
+        let builder = builder.prefix("latex-core-compile-");
+        let temporary = match &self.config.staging_root {
+            Some(root) => {
+                fs::create_dir_all(root).map_err(|source| CompilerError::Io {
+                    operation: "create worker staging root",
+                    source,
+                })?;
+                builder.tempdir_in(root)
+            }
+            None => builder.tempdir(),
+        }
+        .map_err(|source| CompilerError::Io {
+            operation: "create compile workspace",
+            source,
+        })?;
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755)).map_err(
             |source| CompilerError::Io {
                 operation: "set workspace permissions",
@@ -156,7 +197,8 @@ impl<R: ContainerRuntime> CompilerService<R> {
             shell_policy,
             synctex,
             self.config.limits().clone(),
-        );
+        )
+        .with_execution_id(execution_id);
         let runtime = Arc::clone(&self.runtime);
         let output = tokio::task::spawn_blocking(move || runtime.execute(&request))
             .await

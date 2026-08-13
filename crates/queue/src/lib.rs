@@ -92,12 +92,13 @@ impl<R: ContainerRuntime> CompileExecutor for CompilerService<R> {
         job: &CompileJobRecordV1,
         manifest: &WorkspaceManifestV1,
     ) -> Result<WorkerExecution, CompilerError> {
-        self.compile(
+        self.compile_with_execution_id(
             job.snapshot_id,
             manifest,
             job.engine,
             job.shell_policy,
             job.synctex,
+            &job.id.to_string(),
         )
         .await
         .map(WorkerExecution::from)

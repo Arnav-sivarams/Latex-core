@@ -19,6 +19,7 @@ tempfile.workspace = true
 tex-index.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

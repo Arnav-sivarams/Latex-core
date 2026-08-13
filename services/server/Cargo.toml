@@ -5,6 +5,38 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "latex-core-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "latex-core-worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "latex-core-doctor"
+path = "src/bin/doctor.rs"
+
+[dependencies]
+argon2.workspace = true
+axum.workspace = true
+blob-store.workspace = true
+bytes.workspace = true
+compiler.workspace = true
+core-types.workspace = true
+hex.workspace = true
+persistence.workspace = true
+queue.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+workspace-model.workspace = true
+uuid.workspace = true
+
 [lints]
 workspace = true
-

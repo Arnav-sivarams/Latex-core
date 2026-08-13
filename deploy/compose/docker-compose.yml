@@ -1,20 +1,75 @@
+name: latex-core
+
 services:
   postgres:
     image: postgres:18.4
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: latex_core_dev
-      POSTGRES_USER: latex_core
-      POSTGRES_PASSWORD: latex_core_dev_password
+    env_file:
+      - ../../.env
     ports:
       - "127.0.0.1:${LATEX_CORE_POSTGRES_PORT:-54329}:5432"
     volumes:
       - latex_core_postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U latex_core -d latex_core_dev"]
-      interval: 2s
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
       timeout: 5s
       retries: 30
 
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    command: ["/usr/local/bin/latex-core-api"]
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      BLOB_STORAGE_ROOT: /var/lib/latex-core/blobs
+      BIND_ADDR: 0.0.0.0:8080
+    volumes:
+      - latex_core_blob_data:/var/lib/latex-core/blobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    command: ["/usr/local/bin/latex-core-worker"]
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      BLOB_STORAGE_ROOT: /var/lib/latex-core/blobs
+      RUST_LOG: info
+      # The daemon resolves compiler bind sources on the host. Keeping this
+      # dedicated directory at the same absolute path lets it mount only the
+      # worker-created per-job child directory.
+      WORKER_STAGING_ROOT: ${WORKER_STAGING_HOST_ROOT:-/tmp/latex-core-worker-staging}
+    volumes:
+      - latex_core_blob_data:/var/lib/latex-core/blobs
+      - type: bind
+        source: ${WORKER_STAGING_HOST_ROOT:-/tmp/latex-core-worker-staging}
+        target: ${WORKER_STAGING_HOST_ROOT:-/tmp/latex-core-worker-staging}
+        bind:
+          create_host_path: true
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
 volumes:
   latex_core_postgres_data:
+  latex_core_blob_data:

@@ -18,6 +18,7 @@ pub struct CompileContainerRequest {
     shell_policy: ShellPolicy,
     synctex: bool,
     limits: CompileLimits,
+    execution_id: String,
 }
 
 impl CompileContainerRequest {
@@ -37,6 +38,7 @@ impl CompileContainerRequest {
             shell_policy,
             synctex,
             limits,
+            execution_id: "adhoc".to_owned(),
         }
     }
 
@@ -68,6 +70,15 @@ impl CompileContainerRequest {
     #[must_use]
     pub const fn limits(&self) -> &CompileLimits {
         &self.limits
+    }
+    #[must_use]
+    pub fn with_execution_id(mut self, execution_id: impl Into<String>) -> Self {
+        self.execution_id = execution_id.into();
+        self
+    }
+    #[must_use]
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
     }
 }
 
@@ -112,6 +123,8 @@ impl DockerCliRuntime {
             "run".into(),
             "--rm".into(),
             format!("--name={name}").into(),
+            "--label=latex-core.application=latex-core".into(),
+            format!("--label=latex-core.job-id={}", request.execution_id()).into(),
             "--pull=never".into(),
             "--network=none".into(),
             "--read-only".into(),
@@ -187,6 +200,12 @@ impl ContainerRuntime for DockerCliRuntime {
     fn execute(&self, request: &CompileContainerRequest) -> Result<ContainerOutput, CompilerError> {
         let name = unique_name(request.workspace());
         let args = self.compile_args(request, &name);
+        tracing::info!(
+            execution_id = request.execution_id(),
+            container_name = %name,
+            image = %self.image,
+            "starting hardened compiler container"
+        );
         let mut child = docker_command()
             .args(&args)
             .stdout(Stdio::piped())
@@ -217,6 +236,13 @@ impl ContainerRuntime for DockerCliRuntime {
         let (status, timed_out) = wait_for_docker(&mut child, deadline, &name)?;
         let (stdout, stdout_truncated) = join_reader(stdout_reader)?;
         let (stderr, stderr_truncated) = join_reader(stderr_reader)?;
+        tracing::info!(
+            execution_id = request.execution_id(),
+            container_name = %name,
+            exit_code = ?status.code(),
+            timed_out,
+            "hardened compiler container finished"
+        );
         if !timed_out {
             match status.code() {
                 Some(125) => {
@@ -247,6 +273,53 @@ impl ContainerRuntime for DockerCliRuntime {
             stdout_truncated,
             stderr_truncated,
         })
+    }
+}
+
+impl DockerCliRuntime {
+    /// Reaps only exited/running compiler containers bearing this application's fixed label.
+    pub fn reap_orphans(&self) -> Result<u64, CompilerError> {
+        ensure_docker_healthy()?;
+        let output = docker_command()
+            .args([
+                "ps",
+                "-aq",
+                "--filter",
+                "label=latex-core.application=latex-core",
+            ])
+            .output()
+            .map_err(|source| CompilerError::DockerUnavailable {
+                message: source.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(CompilerError::DockerCommandFailed {
+                message: bounded_diagnostic(&output.stderr),
+            });
+        }
+        let ids = String::from_utf8_lossy(&output.stdout);
+        let mut count = 0_u64;
+        for id in ids.lines().filter(|id| !id.is_empty()) {
+            let result = docker_command()
+                .args(["rm", "-f", id])
+                .output()
+                .map_err(|source| CompilerError::DockerUnavailable {
+                    message: source.to_string(),
+                })?;
+            if !result.status.success() {
+                return Err(CompilerError::DockerCommandFailed {
+                    message: format!(
+                        "cannot reap labelled compiler container {id}: {}",
+                        bounded_diagnostic(&result.stderr)
+                    ),
+                });
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| CompilerError::InternalInvariant {
+                    message: "orphan cleanup counter overflow".to_owned(),
+                })?;
+        }
+        Ok(count)
     }
 }
 

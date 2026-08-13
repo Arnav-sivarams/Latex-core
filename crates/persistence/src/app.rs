@@ -1,0 +1,265 @@
+//! Release-facing `PostgreSQL` records, deliberately scoped by authenticated owner.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    reason = "public repository methods share AppError and decoding consumes SQL rows at call sites"
+)]
+
+use crate::Database;
+use core_types::{ArtifactId, BlobHash, JobId, TenantId, UserId, WorkspaceId};
+use sqlx::Row;
+use std::str::FromStr;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("record not found")]
+    NotFound,
+    #[error("record already exists")]
+    Conflict,
+    #[error("persistence failed")]
+    Database(#[source] sqlx::Error),
+    #[error("persistent data is invalid: {message}")]
+    Integrity { message: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct AppUserRecord {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub email: String,
+    pub password_hash: String,
+}
+#[derive(Clone, Debug)]
+pub struct AppSessionRecord {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub email: String,
+}
+#[derive(Clone, Debug)]
+pub struct AppProjectRecord {
+    pub workspace_id: WorkspaceId,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Clone, Debug)]
+pub struct AppJobRecord {
+    pub id: JobId,
+    pub workspace_id: WorkspaceId,
+    pub state: String,
+    pub snapshot_id: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub last_error: Option<serde_json::Value>,
+}
+#[derive(Clone, Debug)]
+pub struct AppArtifactRecord {
+    pub id: ArtifactId,
+    pub logical_name: String,
+    pub blob_hash: BlobHash,
+    pub size_bytes: u64,
+    pub content_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppRepository {
+    database: Database,
+}
+
+impl AppRepository {
+    #[must_use]
+    pub const fn new(database: Database) -> Self {
+        Self { database }
+    }
+
+    pub async fn create_account(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<AppUserRecord, AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let tenant = TenantId::new();
+        let user = UserId::new();
+        sqlx::query("INSERT INTO latex_core.tenants (id) VALUES ($1)")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        sqlx::query("INSERT INTO latex_core.users (id,tenant_id) VALUES ($1,$2)")
+            .bind(user.as_uuid())
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        let insert = sqlx::query("INSERT INTO latex_core.user_credentials (user_id,email,password_hash) VALUES ($1,$2,$3)").bind(user.as_uuid()).bind(email).bind(password_hash).execute(&mut *tx).await;
+        match insert {
+            Ok(_) => {}
+            Err(error) if matches!(error.as_database_error().and_then(sqlx::error::DatabaseError::code), Some(code) if code == "23505") =>
+            {
+                return Err(AppError::Conflict);
+            }
+            Err(error) => return Err(AppError::Database(error)),
+        }
+        tx.commit().await.map_err(AppError::Database)?;
+        Ok(AppUserRecord {
+            user_id: user,
+            tenant_id: tenant,
+            email: email.to_owned(),
+            password_hash: password_hash.to_owned(),
+        })
+    }
+    pub async fn user_by_email(&self, email: &str) -> Result<Option<AppUserRecord>, AppError> {
+        let row = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id WHERE c.email=$1").bind(email).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
+        row.map(decode_user).transpose()
+    }
+    pub async fn create_session(
+        &self,
+        digest: &str,
+        user: UserId,
+        expires_seconds: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query("INSERT INTO latex_core.sessions (token_digest,user_id,expires_at) VALUES ($1,$2,statement_timestamp()+($3::bigint * interval '1 second'))").bind(digest).bind(user.as_uuid()).bind(expires_seconds).execute(self.database.pool()).await.map_err(AppError::Database)?;
+        Ok(())
+    }
+    pub async fn session(&self, digest: &str) -> Result<Option<AppSessionRecord>, AppError> {
+        let row=sqlx::query("SELECT u.id,u.tenant_id,c.email FROM latex_core.sessions s JOIN latex_core.users u ON u.id=s.user_id JOIN latex_core.user_credentials c ON c.user_id=u.id WHERE s.token_digest=$1 AND s.expires_at>statement_timestamp()") .bind(digest).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
+        row.map(|r| {
+            Ok(AppSessionRecord {
+                user_id: UserId::from_uuid(r.try_get("id").map_err(AppError::Database)?),
+                tenant_id: TenantId::from_uuid(r.try_get("tenant_id").map_err(AppError::Database)?),
+                email: r.try_get("email").map_err(AppError::Database)?,
+            })
+        })
+        .transpose()
+    }
+    pub async fn delete_session(&self, digest: &str) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM latex_core.sessions WHERE token_digest=$1")
+            .bind(digest)
+            .execute(self.database.pool())
+            .await
+            .map_err(AppError::Database)?;
+        Ok(())
+    }
+    pub async fn create_project(
+        &self,
+        workspace: WorkspaceId,
+        owner: UserId,
+        name: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO latex_core.projects (workspace_id,owner_user_id,name) VALUES ($1,$2,$3)",
+        )
+        .bind(workspace.as_uuid())
+        .bind(owner.as_uuid())
+        .bind(name)
+        .execute(self.database.pool())
+        .await
+        .map_err(map_conflict)?;
+        Ok(())
+    }
+    pub async fn list_projects(&self, owner: UserId) -> Result<Vec<AppProjectRecord>, AppError> {
+        let rows=sqlx::query("SELECT workspace_id,name,created_at::text,updated_at::text FROM latex_core.projects WHERE owner_user_id=$1 ORDER BY updated_at DESC").bind(owner.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(decode_project).collect()
+    }
+    pub async fn project(
+        &self,
+        owner: UserId,
+        workspace: WorkspaceId,
+    ) -> Result<AppProjectRecord, AppError> {
+        let row=sqlx::query("SELECT workspace_id,name,created_at::text,updated_at::text FROM latex_core.projects WHERE workspace_id=$1 AND owner_user_id=$2").bind(workspace.as_uuid()).bind(owner.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        decode_project(row)
+    }
+    pub async fn assert_project_owner(
+        &self,
+        owner: UserId,
+        workspace: WorkspaceId,
+    ) -> Result<(), AppError> {
+        self.project(owner, workspace).await.map(|_| ())
+    }
+    pub async fn job(&self, owner: UserId, job: JobId) -> Result<AppJobRecord, AppError> {
+        let row=sqlx::query("SELECT j.id,j.workspace_id,j.state,j.snapshot_id,j.created_at::text,j.finished_at::text,j.last_error FROM latex_core.compile_jobs j JOIN latex_core.workspaces w ON w.id=j.workspace_id WHERE j.id=$1 AND w.owner_user_id=$2").bind(job.as_uuid()).bind(owner.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        decode_job(row)
+    }
+    pub async fn artifacts(
+        &self,
+        owner: UserId,
+        job: JobId,
+    ) -> Result<Vec<AppArtifactRecord>, AppError> {
+        self.job(owner, job).await?;
+        let rows=sqlx::query("SELECT artifact_id,logical_name,blob_hash,size_bytes,content_type FROM latex_core.compilation_artifacts WHERE job_id=$1 ORDER BY logical_name").bind(job.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(decode_artifact).collect()
+    }
+    pub async fn artifact(
+        &self,
+        owner: UserId,
+        job: JobId,
+        artifact: ArtifactId,
+    ) -> Result<AppArtifactRecord, AppError> {
+        self.job(owner, job).await?;
+        let row=sqlx::query("SELECT artifact_id,logical_name,blob_hash,size_bytes,content_type FROM latex_core.compilation_artifacts WHERE job_id=$1 AND artifact_id=$2").bind(job.as_uuid()).bind(artifact.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        decode_artifact(row)
+    }
+}
+fn map_conflict(error: sqlx::Error) -> AppError {
+    if matches!(error.as_database_error().and_then(sqlx::error::DatabaseError::code), Some(code) if code == "23505")
+    {
+        AppError::Conflict
+    } else {
+        AppError::Database(error)
+    }
+}
+fn decode_user(r: sqlx::postgres::PgRow) -> Result<AppUserRecord, AppError> {
+    Ok(AppUserRecord {
+        user_id: UserId::from_uuid(r.try_get("id").map_err(AppError::Database)?),
+        tenant_id: TenantId::from_uuid(r.try_get("tenant_id").map_err(AppError::Database)?),
+        email: r.try_get("email").map_err(AppError::Database)?,
+        password_hash: r.try_get("password_hash").map_err(AppError::Database)?,
+    })
+}
+fn decode_project(r: sqlx::postgres::PgRow) -> Result<AppProjectRecord, AppError> {
+    Ok(AppProjectRecord {
+        workspace_id: WorkspaceId::from_uuid(
+            r.try_get("workspace_id").map_err(AppError::Database)?,
+        ),
+        name: r.try_get("name").map_err(AppError::Database)?,
+        created_at: r.try_get("created_at").map_err(AppError::Database)?,
+        updated_at: r.try_get("updated_at").map_err(AppError::Database)?,
+    })
+}
+fn decode_job(r: sqlx::postgres::PgRow) -> Result<AppJobRecord, AppError> {
+    Ok(AppJobRecord {
+        id: JobId::from_uuid(r.try_get("id").map_err(AppError::Database)?),
+        workspace_id: WorkspaceId::from_uuid(
+            r.try_get("workspace_id").map_err(AppError::Database)?,
+        ),
+        state: r.try_get("state").map_err(AppError::Database)?,
+        snapshot_id: r.try_get("snapshot_id").map_err(AppError::Database)?,
+        created_at: r.try_get("created_at").map_err(AppError::Database)?,
+        finished_at: r.try_get("finished_at").map_err(AppError::Database)?,
+        last_error: r.try_get("last_error").map_err(AppError::Database)?,
+    })
+}
+fn decode_artifact(r: sqlx::postgres::PgRow) -> Result<AppArtifactRecord, AppError> {
+    let size: i64 = r.try_get("size_bytes").map_err(AppError::Database)?;
+    Ok(AppArtifactRecord {
+        id: ArtifactId::from_uuid(r.try_get("artifact_id").map_err(AppError::Database)?),
+        logical_name: r.try_get("logical_name").map_err(AppError::Database)?,
+        blob_hash: BlobHash::from_str(
+            &r.try_get::<String, _>("blob_hash")
+                .map_err(AppError::Database)?,
+        )
+        .map_err(|e| AppError::Integrity {
+            message: e.to_string(),
+        })?,
+        size_bytes: u64::try_from(size).map_err(|_| AppError::Integrity {
+            message: "negative artifact size".into(),
+        })?,
+        content_type: r.try_get("content_type").map_err(AppError::Database)?,
+    })
+}

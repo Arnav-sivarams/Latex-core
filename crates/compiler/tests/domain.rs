@@ -69,12 +69,15 @@ fn docker_arguments_match_the_frozen_runtime_contract_exactly() {
         ShellPolicy::Safe,
         true,
         limits,
-    );
+    )
+    .with_execution_id("job-42");
     let args = runtime.compile_args(&request, "fixed-name");
     let expected = [
         "run",
         "--rm",
         "--name=fixed-name",
+        "--label=latex-core.application=latex-core",
+        "--label=latex-core.job-id=job-42",
         "--pull=never",
         "--network=none",
         "--read-only",

@@ -21,6 +21,8 @@ use uuid::Uuid;
 const MANIFEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const COMPILE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const BLOB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+// Queue claims are intentionally global, so concurrent integration fixtures share one queue.
+static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn production_schema_enforces_relational_contract() {
@@ -104,8 +106,11 @@ async fn verify_schema(pool: &PgPool) {
         "compile_cache",
         "compile_jobs",
         "compilation_artifacts",
+        "projects",
+        "sessions",
         "snapshots",
         "tenants",
+        "user_credentials",
         "users",
         "workspace_events",
         "workspace_heads",
@@ -499,6 +504,7 @@ fn request(
 
 #[tokio::test]
 async fn durable_queue_orders_claims_enforces_caps_and_rejects_stale_completion() {
+    let _guard = QUEUE_TEST_LOCK.lock().await;
     let (queue, pool, tenant, user, workspace, snapshot) = queue_fixture().await;
     let low = request(tenant, user, workspace, snapshot, 1, "low");
     let high = request(tenant, user, workspace, snapshot, 9, "high");
@@ -556,6 +562,7 @@ async fn durable_queue_orders_claims_enforces_caps_and_rejects_stale_completion(
 
 #[tokio::test]
 async fn cancellation_recovery_and_infrastructure_retry_are_durable() {
+    let _guard = QUEUE_TEST_LOCK.lock().await;
     let (queue, pool, tenant, user, workspace, snapshot) = queue_fixture().await;
     let queued = request(tenant, user, workspace, snapshot, 0, "cancel");
     queue.enqueue(queued.clone()).await.unwrap();

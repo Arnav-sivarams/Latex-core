@@ -1,6 +1,7 @@
 //! Structured persistence boundaries.
 #![forbid(unsafe_code)]
 
+mod app;
 #[allow(
     clippy::doc_markdown,
     clippy::missing_errors_doc,
@@ -13,6 +14,10 @@ mod database;
 mod error;
 mod workspace;
 
+pub use app::{
+    AppArtifactRecord, AppError, AppJobRecord, AppProjectRecord, AppRepository, AppSessionRecord,
+    AppUserRecord,
+};
 pub use compile_queue::{
     CompileCacheRecordV1, CompileJobRecordV1, CompletionOutcome, EnqueueCompileJobV1,
     InfrastructureOutcome, PersistedArtifactV1, PostgresCompileQueue, QueueError, QueueLimits,
