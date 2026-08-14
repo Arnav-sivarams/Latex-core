@@ -162,11 +162,11 @@ impl WorkspaceState {
                 );
             }
             WorkspaceOperationV1::DeleteFile { path } => {
-                if self.main_file.as_ref() == Some(path) {
-                    return Err(WorkspaceError::CannotDeleteMainFile { path: path.clone() });
-                }
                 if self.files.remove(path).is_none() {
                     return Err(WorkspaceError::FileNotFound { path: path.clone() });
+                }
+                if self.main_file.as_ref() == Some(path) {
+                    self.main_file = None;
                 }
             }
             WorkspaceOperationV1::RenameFile { from, to } => {

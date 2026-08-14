@@ -13,8 +13,6 @@ pub enum WorkspaceError {
     FileNotFound { path: LogicalPath },
     #[error("workspace file already exists: {path}")]
     FileAlreadyExists { path: LogicalPath },
-    #[error("cannot delete current main file: {path}")]
-    CannotDeleteMainFile { path: LogicalPath },
     #[error("invalid workspace state: {message}")]
     InvalidWorkspaceState { message: String },
     #[error("workspace version conflict: expected {expected:?}, actual {actual:?}")]

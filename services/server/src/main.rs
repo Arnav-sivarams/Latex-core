@@ -67,6 +67,10 @@ struct SetMain {
     path: String,
     version: u64,
 }
+#[derive(Deserialize)]
+struct RenameFile {
+    path: String,
+}
 #[derive(Deserialize, Default)]
 struct CompileInput {
     engine: Option<TexEngine>,
@@ -179,7 +183,10 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/files", get(files))
         .route(
             "/api/projects/{id}/files/{*path}",
-            get(file).put(put_file).delete(delete_file),
+            get(file)
+                .put(put_file)
+                .patch(rename_file)
+                .delete(delete_file),
         )
         .route("/api/projects/{id}/main", post(set_main))
         .route("/api/projects/{id}/compile", post(submit_compile))
@@ -700,7 +707,65 @@ async fn delete_file(
         Err(workspace_model::WorkspaceError::VersionConflict { .. }) => {
             error(StatusCode::CONFLICT, "stale workspace version")
         }
+        Err(workspace_model::WorkspaceError::FileNotFound { .. }) => {
+            error(StatusCode::NOT_FOUND, "file no longer exists")
+        }
         Err(_) => error(StatusCode::BAD_REQUEST, "file delete failed"),
+    }
+}
+async fn rename_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, from)): Path<(String, String)>,
+    Json(input): Json<RenameFile>,
+) -> Response {
+    if let Err(r) = csrf(&headers) {
+        return r;
+    };
+    let s = match auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let id = match parsed::<WorkspaceId>(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let from = match LogicalPath::parse(&from) {
+        Ok(v) => v,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid file path"),
+    };
+    let to = match LogicalPath::parse(&input.path) {
+        Ok(v) => v,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid file path"),
+    };
+    if state
+        .repo
+        .assert_project_owner(s.user_id, id)
+        .await
+        .is_err()
+    {
+        return error(StatusCode::NOT_FOUND, "not found");
+    };
+    let version = match if_match(&headers) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match state
+        .workspaces
+        .rename_file(id, s.user_id, version, from, to)
+        .await
+    {
+        Ok(v) => Json(VersionWire { version: v.get() }).into_response(),
+        Err(workspace_model::WorkspaceError::VersionConflict { .. }) => {
+            error(StatusCode::CONFLICT, "stale workspace version")
+        }
+        Err(workspace_model::WorkspaceError::FileAlreadyExists { .. }) => {
+            error(StatusCode::CONFLICT, "destination file already exists")
+        }
+        Err(workspace_model::WorkspaceError::FileNotFound { .. }) => {
+            error(StatusCode::NOT_FOUND, "file no longer exists")
+        }
+        Err(_) => error(StatusCode::BAD_REQUEST, "file rename failed"),
     }
 }
 async fn set_main(

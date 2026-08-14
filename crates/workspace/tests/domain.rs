@@ -107,16 +107,6 @@ fn mutation_is_atomic_and_version_conflicts_do_not_change_state() {
 fn rename_and_main_file_rules_are_exact() {
     let mut state = initial();
     let before = state.file(&path("main.tex")).unwrap().clone();
-    assert!(matches!(
-        state.apply(
-            &WorkspaceMutationV1::new(vec![WorkspaceOperationV1::DeleteFile {
-                path: path("main.tex")
-            }])
-            .unwrap(),
-            WorkspaceVersion::new(1)
-        ),
-        Err(WorkspaceError::CannotDeleteMainFile { .. })
-    ));
     state
         .apply(
             &WorkspaceMutationV1::new(vec![WorkspaceOperationV1::RenameFile {
@@ -156,6 +146,87 @@ fn rename_and_main_file_rules_are_exact() {
         )
         .unwrap();
     assert_eq!(state.main_file(), Some(&path("second.tex")));
+}
+
+#[test]
+fn deleting_main_file_clears_main_and_preserves_other_file_blobs() {
+    let mut state = initial();
+    let original = state.file(&path("main.tex")).unwrap().clone();
+    state
+        .apply(
+            &WorkspaceMutationV1::new(vec![
+                put("sections/intro.tex", b"intro"),
+                WorkspaceOperationV1::DeleteFile {
+                    path: path("main.tex"),
+                },
+            ])
+            .unwrap(),
+            WorkspaceVersion::new(1),
+        )
+        .unwrap();
+    assert_eq!(state.main_file(), None);
+    assert!(!state.contains_file(&path("main.tex")));
+    assert_eq!(
+        state
+            .file(&path("sections/intro.tex"))
+            .unwrap()
+            .size_bytes(),
+        5
+    );
+    assert_eq!(original.size_bytes(), 1);
+    assert!(state.to_manifest().is_err());
+}
+
+#[test]
+fn nested_rename_is_atomic_reuses_the_blob_and_rejects_conflicts() {
+    let mut state = initial();
+    state
+        .apply(
+            &WorkspaceMutationV1::new(vec![put("sections/intro.tex", b"intro")]).unwrap(),
+            WorkspaceVersion::new(1),
+        )
+        .unwrap();
+    let original = state.file(&path("sections/intro.tex")).unwrap().clone();
+    state
+        .apply(
+            &WorkspaceMutationV1::new(vec![WorkspaceOperationV1::RenameFile {
+                from: path("sections/intro.tex"),
+                to: path("chapters/introduction.tex"),
+            }])
+            .unwrap(),
+            WorkspaceVersion::new(2),
+        )
+        .unwrap();
+    assert_eq!(state.version(), WorkspaceVersion::new(3));
+    assert!(!state.contains_file(&path("sections/intro.tex")));
+    assert_eq!(
+        state.file(&path("chapters/introduction.tex")),
+        Some(&original)
+    );
+    let before_conflict = state.clone();
+    assert!(matches!(
+        state.apply(
+            &WorkspaceMutationV1::new(vec![WorkspaceOperationV1::RenameFile {
+                from: path("chapters/introduction.tex"),
+                to: path("main.tex"),
+            }])
+            .unwrap(),
+            WorkspaceVersion::new(3),
+        ),
+        Err(WorkspaceError::FileAlreadyExists { .. })
+    ));
+    assert_eq!(state, before_conflict);
+    assert!(matches!(
+        state.apply(
+            &WorkspaceMutationV1::new(vec![WorkspaceOperationV1::RenameFile {
+                from: path("chapters/introduction.tex"),
+                to: path("appendix/introduction.tex"),
+            }])
+            .unwrap(),
+            WorkspaceVersion::new(2),
+        ),
+        Err(WorkspaceError::VersionConflict { .. })
+    ));
 }
 
 #[test]
@@ -225,21 +296,4 @@ fn persistent_replay_rejects_corruption() {
         assert!(WorkspaceService::replay_event(&mut state, &record).is_err());
         assert_eq!(state, original);
     }
-    let invalid = WorkspaceEventRecord::new(
-        WorkspaceVersion::new(2),
-        WorkspaceVersion::new(1),
-        "workspace.mutation".into(),
-        1,
-        serde_json::to_value(
-            WorkspaceMutationV1::new(vec![WorkspaceOperationV1::DeleteFile {
-                path: path("main.tex"),
-            }])
-            .unwrap(),
-        )
-        .unwrap(),
-    );
-    let mut state = initial();
-    let original = state.clone();
-    assert!(WorkspaceService::replay_event(&mut state, &invalid).is_err());
-    assert_eq!(state, original);
 }
