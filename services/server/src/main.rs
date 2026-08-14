@@ -1160,5 +1160,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::IF_MATCH, HeaderValue::from_static("\"7\""));
         assert_eq!(if_match(&headers).expect("valid ETag").get(), 7);
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"NaN\""));
+        assert!(if_match(&headers).is_err());
     }
 }
