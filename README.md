@@ -1,25 +1,22 @@
 # LaTeX Core
 
-Server-side infrastructure for durable LaTeX project storage, parsing, indexing, and manual compilation.
+LaTeX Core is a self-hosted, browser-based workspace for durable LaTeX projects and manual server-side compilation.
 
-The repository is currently at Milestone 0: a compileable Rust workspace foundation. Its crates define architectural boundaries only; application features have not been implemented.
+## Quick start
 
-## Requirements
-
-- Stable Rust with `rustfmt` and Clippy
-- Git (used by the validation script)
-
-The pinned stable toolchain and required components are described in `rust-toolchain.toml`.
-
-## Workspace
-
-Reusable components live under `crates/`. Executables live under `services/`.
-
-Run all repository checks with:
+On the server:
 
 ```sh
-./scripts/validate.sh
+./install.sh
+latex-core user create alice@example.com
+latex-core status
 ```
 
-The script resolves the repository root itself and may be invoked from any working directory.
+Open the URL printed by `latex-core url`, then sign in with the credentials displayed when the account was created.
 
+The compiler is a pinned, server-side TeX Live environment. Browser clients never need Docker or a local TeX installation.
+
+- [Server setup](docs/SERVER_SETUP.md)
+- [Client guide](docs/CLIENT_GUIDE.md)
+- [Template library](docs/TEMPLATES.md)
+- [CLI reference](docs/CLI.md)

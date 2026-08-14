@@ -90,6 +90,47 @@ impl WorkspaceService {
         Ok(state)
     }
 
+    /// Creates a workspace from a fully validated set of project files in one
+    /// durable initial event. Callers must validate archive input before this
+    /// method so a rejected import cannot expose a partial workspace.
+    pub async fn create_workspace_from_files(
+        &self,
+        tenant: TenantId,
+        owner: UserId,
+        workspace_id: WorkspaceId,
+        files: Vec<(LogicalPath, Bytes)>,
+        main: Option<LogicalPath>,
+    ) -> Result<WorkspaceState, WorkspaceError> {
+        let mut operations = Vec::with_capacity(files.len() + usize::from(main.is_some()));
+        for (path, bytes) in files {
+            let stored = self.blobs.put(bytes).await?;
+            operations.push(WorkspaceOperationV1::PutFile {
+                path,
+                blob_hash: stored.hash(),
+                size_bytes: stored.size_bytes(),
+            });
+        }
+        if let Some(path) = main {
+            operations.push(WorkspaceOperationV1::SetMainFile { path });
+        }
+        let mutation = WorkspaceMutationV1::new(operations)?;
+        let mut state = WorkspaceState::empty(workspace_id);
+        state.apply(&mutation, WorkspaceVersion::initial())?;
+        let payload = serde_json::to_value(&mutation)?;
+        self.repository
+            .create_workspace_with_initial_event(
+                tenant,
+                owner,
+                workspace_id,
+                EVENT_TYPE,
+                EVENT_SCHEMA,
+                payload,
+            )
+            .await
+            .map_err(WorkspaceError::map_persistence)?;
+        Ok(state)
+    }
+
     pub async fn put_file(
         &self,
         workspace_id: WorkspaceId,

@@ -29,8 +29,13 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 if [[ "$ready" != true ]]; then echo 'Services did not become ready.' >&2; exit 1; fi
-echo 'LaTeX-Core is ready.'
-echo 'URL: http://SERVER:8080'
-echo 'Create a user: ./scripts/create-user.sh alice@example.com'
-echo 'Health: ./scripts/server.sh doctor'
-echo 'Backup: ./scripts/server.sh backup /path/to/backup'
+if [[ -w /usr/local/bin ]]; then
+  install -m 755 "$root/latex-core" /usr/local/bin/latex-core
+  echo 'Installed latex-core at /usr/local/bin/latex-core.'
+else
+  echo 'Using repository CLI: ./latex-core (install globally with administrator permissions if desired).'
+fi
+echo 'LaTeX Core is ready.'
+echo 'Create a user: latex-core user create alice@example.com'
+echo 'Health: latex-core doctor'
+echo 'Backup: latex-core backup /path/to/backup'

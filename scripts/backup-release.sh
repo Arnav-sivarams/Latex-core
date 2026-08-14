@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
 destination="${1:?usage: backup-release.sh DESTINATION_DIRECTORY}"
 mkdir -p "${destination}"
 destination_absolute="$(cd "${destination}" && pwd)"

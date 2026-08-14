@@ -62,6 +62,20 @@ pub struct AppArtifactRecord {
     pub size_bytes: u64,
     pub content_type: String,
 }
+#[derive(Clone, Debug)]
+pub struct AppTemplateRecord {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub main_file: Option<String>,
+    pub created_at: String,
+}
+#[derive(Clone, Debug)]
+pub struct AppTemplateFileRecord {
+    pub path: String,
+    pub blob_hash: BlobHash,
+    pub size_bytes: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct AppRepository {
@@ -209,6 +223,69 @@ impl AppRepository {
         .map_err(map_conflict)?;
         Ok(())
     }
+    pub async fn create_template(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        description: Option<&str>,
+        main_file: Option<&str>,
+        files: &[AppTemplateFileRecord],
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.templates (id,name,description,main_file) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(description)
+        .bind(main_file)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_conflict)?;
+        for file in files {
+            let size = i64::try_from(file.size_bytes).map_err(|_| AppError::Integrity {
+                message: "template file size exceeds PostgreSQL BIGINT".into(),
+            })?;
+            sqlx::query("INSERT INTO latex_core.template_files (template_id,path,blob_hash,size_bytes) VALUES ($1,$2,$3,$4)")
+                .bind(id).bind(&file.path).bind(file.blob_hash.to_string()).bind(size).execute(&mut *tx).await.map_err(AppError::Database)?;
+        }
+        tx.commit().await.map_err(AppError::Database)
+    }
+    pub async fn list_templates(&self) -> Result<Vec<AppTemplateRecord>, AppError> {
+        let rows = sqlx::query("SELECT id,name,description,main_file,created_at::text FROM latex_core.templates ORDER BY name")
+            .fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(decode_template).collect()
+    }
+    pub async fn template(&self, id: uuid::Uuid) -> Result<AppTemplateRecord, AppError> {
+        let row = sqlx::query("SELECT id,name,description,main_file,created_at::text FROM latex_core.templates WHERE id=$1")
+            .bind(id).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        decode_template(row)
+    }
+    pub async fn template_files(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Vec<AppTemplateFileRecord>, AppError> {
+        let rows = sqlx::query("SELECT path,blob_hash,size_bytes FROM latex_core.template_files WHERE template_id=$1 ORDER BY path")
+            .bind(id).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(decode_template_file).collect()
+    }
+    pub async fn delete_template_by_name(&self, name: &str) -> Result<(), AppError> {
+        let result = sqlx::query("DELETE FROM latex_core.templates WHERE name=$1")
+            .bind(name)
+            .execute(self.database.pool())
+            .await
+            .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            Err(AppError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
     pub async fn list_projects(&self, owner: UserId) -> Result<Vec<AppProjectRecord>, AppError> {
         let rows=sqlx::query("SELECT workspace_id,name,created_at::text,updated_at::text FROM latex_core.projects WHERE owner_user_id=$1 ORDER BY updated_at DESC").bind(owner.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_project).collect()
@@ -308,5 +385,30 @@ fn decode_artifact(r: sqlx::postgres::PgRow) -> Result<AppArtifactRecord, AppErr
             message: "negative artifact size".into(),
         })?,
         content_type: r.try_get("content_type").map_err(AppError::Database)?,
+    })
+}
+fn decode_template(r: sqlx::postgres::PgRow) -> Result<AppTemplateRecord, AppError> {
+    Ok(AppTemplateRecord {
+        id: r.try_get("id").map_err(AppError::Database)?,
+        name: r.try_get("name").map_err(AppError::Database)?,
+        description: r.try_get("description").map_err(AppError::Database)?,
+        main_file: r.try_get("main_file").map_err(AppError::Database)?,
+        created_at: r.try_get("created_at").map_err(AppError::Database)?,
+    })
+}
+fn decode_template_file(r: sqlx::postgres::PgRow) -> Result<AppTemplateFileRecord, AppError> {
+    let size: i64 = r.try_get("size_bytes").map_err(AppError::Database)?;
+    Ok(AppTemplateFileRecord {
+        path: r.try_get("path").map_err(AppError::Database)?,
+        blob_hash: BlobHash::from_str(
+            &r.try_get::<String, _>("blob_hash")
+                .map_err(AppError::Database)?,
+        )
+        .map_err(|error| AppError::Integrity {
+            message: error.to_string(),
+        })?,
+        size_bytes: u64::try_from(size).map_err(|_| AppError::Integrity {
+            message: "negative template file size".into(),
+        })?,
     })
 }

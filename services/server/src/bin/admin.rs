@@ -1,23 +1,31 @@
 //! Narrow server-owner account provisioning command. Never expose this over HTTP.
 #![forbid(unsafe_code)]
 
+#[path = "../archive.rs"]
+mod archive;
 #[path = "../auth.rs"]
 mod auth;
 
-use persistence::{AppError, AppRepository, Database, DatabaseConfig};
+use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
+use persistence::{AppError, AppRepository, AppTemplateFileRecord, Database, DatabaseConfig};
 use std::env;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
-    if args.next().as_deref() != Some("user") {
-        return usage();
-    }
-    let command = args.next().ok_or("missing user command")?;
+    let group = args.next().ok_or("missing command")?;
+    let command = args.next().ok_or("missing subcommand")?;
     let database =
         Database::connect(DatabaseConfig::development(required("DATABASE_URL")?)?).await?;
     database.migrate().await?;
     let repo = AppRepository::new(database);
+    if group == "template" {
+        return templates(repo, args, &command).await;
+    }
+    if group != "user" {
+        return usage();
+    }
     if command == "list" {
         for user in repo.list_users().await? {
             println!(
@@ -28,8 +36,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let email =
-        auth::normalized_email(&option(&mut args, "--email")?).map_err(|()| "invalid email")?;
+    let first = args.next().ok_or("missing email")?;
+    let email = if first == "--email" {
+        args.next().ok_or("missing email")?
+    } else {
+        first
+    };
+    let email = auth::normalized_email(&email).map_err(|()| "invalid email")?;
     let password = option(&mut args, "--password").ok();
     match command.as_str() {
         "create" => {
@@ -62,6 +75,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn templates(
+    repo: AppRepository,
+    mut args: impl Iterator<Item = String>,
+    command: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        "list" => {
+            println!("Templates");
+            for template in repo.list_templates().await? {
+                println!(
+                    "{}\t{}",
+                    template.name,
+                    template.main_file.unwrap_or_else(|| "-".into())
+                );
+            }
+        }
+        "remove" => {
+            let name = args.next().ok_or("missing template name")?;
+            repo.delete_template_by_name(&name).await?;
+            println!("Template removed: {name}");
+        }
+        "add" => {
+            let zip = args.next().ok_or("missing ZIP path")?;
+            let mut name = None;
+            let mut description = None;
+            let mut requested_main = None;
+            while let Some(flag) = args.next() {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                match flag.as_str() {
+                    "--name" => name = Some(value),
+                    "--description" => description = Some(value),
+                    "--main" => requested_main = Some(value),
+                    _ => return Err(format!("unknown option {flag}").into()),
+                }
+            }
+            let name = name.ok_or("template name is required")?;
+            if name.trim().is_empty() || name.len() > 200 {
+                return Err("invalid template name".into());
+            }
+            let input = tokio::fs::read(zip).await?;
+            let imported = archive::read_archive(&input).map_err(|error| error.to_string())?;
+            let main = match requested_main {
+                Some(path) => {
+                    let path =
+                        core_types::LogicalPath::parse(&path).map_err(|_| "invalid main path")?;
+                    if !imported.files.iter().any(|file| file.path == path) {
+                        return Err("template main file is absent from archive".into());
+                    }
+                    Some(path)
+                }
+                None => imported.detected_main.clone(),
+            };
+            let store = Arc::new(
+                FsBlobStore::open(
+                    required("BLOB_STORAGE_ROOT")?,
+                    FsBlobStoreConfig::development_default(),
+                )
+                .await?,
+            );
+            let mut files = Vec::with_capacity(imported.files.len());
+            for file in imported.files {
+                let stored = store.put(file.bytes).await?;
+                files.push(AppTemplateFileRecord {
+                    path: file.path.as_str().to_owned(),
+                    blob_hash: stored.hash(),
+                    size_bytes: stored.size_bytes(),
+                });
+            }
+            let id = uuid::Uuid::new_v4();
+            repo.create_template(
+                id,
+                name.trim(),
+                description.as_deref(),
+                main.as_ref().map(core_types::LogicalPath::as_str),
+                &files,
+            )
+            .await?;
+            println!(
+                "Template added\nName: {}\nFiles: {}\nMain: {}",
+                name.trim(),
+                files.len(),
+                main.map_or_else(|| "-".into(), |path| path.to_string())
+            );
+        }
+        _ => return usage(),
+    }
+    Ok(())
+}
+
 fn option(
     args: &mut impl Iterator<Item = String>,
     name: &str,
@@ -77,5 +181,5 @@ fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
 }
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
-    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password> --email EMAIL [--password PASSWORD]".into())
+    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password> EMAIL [--password PASSWORD] | template <add|list|remove>".into())
 }

@@ -17,7 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let runtime = DockerCliRuntime::new(required("COMPILER_IMAGE")?)?;
     let _ = runtime.probe_image()?;
-    println!("latex-core doctor: database, blob storage, compiler image, and Docker are ready");
+    println!(
+        "LaTeX Core Doctor\n────────────────────────────────\nDatabase         ✓ Healthy\nBlob storage     ✓ Healthy\nDocker runtime   ✓ Healthy\nCompiler M7      ✓ Verified\n\nAll systems healthy."
+    );
     Ok(())
 }
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {

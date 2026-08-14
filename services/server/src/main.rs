@@ -8,11 +8,12 @@
     reason = "HTTP handlers use early response returns to keep authorization checks adjacent to each operation"
 )]
 
+mod archive;
 mod auth;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -55,6 +56,10 @@ struct Credentials {
 }
 #[derive(Deserialize)]
 struct NewProject {
+    name: String,
+}
+#[derive(Deserialize)]
+struct ImportQuery {
     name: String,
 }
 #[derive(Deserialize)]
@@ -117,6 +122,13 @@ struct VersionWire {
 struct ErrorWire {
     error: &'static str,
 }
+#[derive(Serialize)]
+struct TemplateWire {
+    id: String,
+    name: String,
+    description: Option<String>,
+    main_file: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -162,6 +174,7 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
         .route("/api/projects", get(projects).post(create_project))
+        .route("/api/projects/import", post(import_project))
         .route("/api/projects/{id}", get(project))
         .route("/api/projects/{id}/files", get(files))
         .route(
@@ -170,11 +183,16 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/projects/{id}/main", post(set_main))
         .route("/api/projects/{id}/compile", post(submit_compile))
+        .route("/api/templates", get(templates))
+        .route(
+            "/api/templates/{id}/projects",
+            post(create_project_from_template),
+        )
         .route("/api/jobs/{id}", get(job))
         .route("/api/jobs/{id}/cancel", post(cancel))
         .route("/api/jobs/{id}/artifacts", get(artifacts))
         .route("/api/jobs/{id}/artifacts/{artifact}", get(artifact))
-        .layer(RequestBodyLimitLayer::new(MAX_FILE_BYTES))
+        .layer(RequestBodyLimitLayer::new(archive::MAX_ARCHIVE_BYTES))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -305,6 +323,199 @@ async fn create_project(
         Ok(()) => project_response(&state, s.user_id, id).await,
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "project creation failed"),
     }
+}
+async fn import_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ImportQuery>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = csrf(&headers) {
+        return r;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = match project_name(&query.name) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let archive = match archive::read_archive(body.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return import_error(error),
+    };
+    create_imported_project(&state, session.tenant_id, session.user_id, name, archive).await
+}
+async fn templates(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if auth(&state, &headers).await.is_err() {
+        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    match state.repo.list_templates().await {
+        Ok(records) => Json(
+            records
+                .into_iter()
+                .map(|template| TemplateWire {
+                    id: template.id.to_string(),
+                    name: template.name,
+                    description: template.description,
+                    main_file: template.main_file,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn create_project_from_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<NewProject>,
+) -> Response {
+    if let Err(r) = csrf(&headers) {
+        return r;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = match project_name(&input.name) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let template = match state.repo.template(id).await {
+        Ok(value) => value,
+        Err(AppError::NotFound) => return error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    let records = match state.repo.template_files(id).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    let mut files = Vec::with_capacity(records.len());
+    for record in records {
+        let path = match LogicalPath::parse(&record.path) {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template data is invalid",
+                );
+            }
+        };
+        let bytes = match state.blobs.get(record.blob_hash).await {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template storage failure",
+                );
+            }
+        };
+        if u64::try_from(bytes.len()).ok() != Some(record.size_bytes) {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template data is invalid",
+            );
+        }
+        files.push(archive::ImportedFile { path, bytes });
+    }
+    let main = match template.main_file {
+        Some(value) => match LogicalPath::parse(&value) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template data is invalid",
+                );
+            }
+        },
+        None => None,
+    };
+    create_imported_project(
+        &state,
+        session.tenant_id,
+        session.user_id,
+        name,
+        archive::ImportedArchive {
+            files,
+            detected_main: main,
+        },
+    )
+    .await
+}
+async fn create_imported_project(
+    state: &AppState,
+    tenant: core_types::TenantId,
+    owner: UserId,
+    name: &str,
+    archive: archive::ImportedArchive,
+) -> Response {
+    let id = WorkspaceId::new();
+    let main = archive.detected_main;
+    let files = archive
+        .files
+        .into_iter()
+        .map(|file| (file.path, file.bytes))
+        .collect();
+    if state
+        .workspaces
+        .create_workspace_from_files(tenant, owner, id, files, main)
+        .await
+        .is_err()
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace import failed");
+    }
+    match state.repo.create_project(id, owner, name).await {
+        Ok(()) => project_response(state, owner, id).await,
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "project import failed"),
+    }
+}
+fn project_name(value: &str) -> Result<&str, Response> {
+    let name = value.trim();
+    if name.is_empty() || name.len() > 200 {
+        Err(error(StatusCode::BAD_REQUEST, "invalid project name"))
+    } else {
+        Ok(name)
+    }
+}
+fn import_error(archive_error: archive::ArchiveError) -> Response {
+    let (status, message) = match archive_error {
+        archive::ArchiveError::ArchiveTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "archive exceeds upload size limit",
+        ),
+        archive::ArchiveError::ExpandedTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "archive exceeds project size limit",
+        ),
+        archive::ArchiveError::TooManyFiles => {
+            (StatusCode::BAD_REQUEST, "archive contains too many files")
+        }
+        archive::ArchiveError::UnsafePath => {
+            (StatusCode::BAD_REQUEST, "archive contains an unsafe path")
+        }
+        archive::ArchiveError::UnsupportedEntry => (
+            StatusCode::BAD_REQUEST,
+            "archive contains an unsupported entry",
+        ),
+        archive::ArchiveError::DuplicatePath => {
+            (StatusCode::BAD_REQUEST, "archive contains a duplicate path")
+        }
+        archive::ArchiveError::FileTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "archive contains an oversized file",
+        ),
+        archive::ArchiveError::Invalid | archive::ArchiveError::Empty => {
+            (StatusCode::BAD_REQUEST, "import failed")
+        }
+    };
+    error(status, message)
 }
 async fn project(
     State(state): State<AppState>,
@@ -513,6 +724,9 @@ async fn set_main(
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid path"),
     };
+    if path.extension() != Some("tex") {
+        return error(StatusCode::BAD_REQUEST, "main file must be a .tex file");
+    }
     if state
         .repo
         .assert_project_owner(s.user_id, id)

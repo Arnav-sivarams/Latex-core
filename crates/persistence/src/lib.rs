@@ -16,7 +16,7 @@ mod workspace;
 
 pub use app::{
     AppArtifactRecord, AppError, AppJobRecord, AppProjectRecord, AppRepository, AppSessionRecord,
-    AppUserRecord,
+    AppTemplateFileRecord, AppTemplateRecord, AppUserRecord,
 };
 pub use compile_queue::{
     CompileCacheRecordV1, CompileJobRecordV1, CompletionOutcome, EnqueueCompileJobV1,

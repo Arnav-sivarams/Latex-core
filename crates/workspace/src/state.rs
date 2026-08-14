@@ -200,9 +200,11 @@ impl WorkspaceState {
 
     fn validate(&self) -> Result<(), WorkspaceError> {
         match (&self.main_file, self.files.is_empty()) {
-            (None, true) => Ok(()),
+            // Imported projects may intentionally have no main file when several
+            // root documents are plausible. They remain editable but cannot be
+            // snapshotted for compilation until the owner chooses one.
+            (None, _) => Ok(()),
             (Some(main), false) if self.files.contains_key(main) => Ok(()),
-            (None, false) => Err(invalid("non-empty workspace has no main file")),
             (Some(_), true) => Err(invalid("empty workspace has a main file")),
             (Some(_), false) => Err(invalid("main file is absent from workspace files")),
         }
