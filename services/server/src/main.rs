@@ -37,6 +37,7 @@ use tower_http::{
 use workspace_model::WorkspaceService;
 
 const COOKIE: &str = "latex_core_session";
+const LEGACY_COOKIE_PATHS: [&str; 2] = ["/api", "/api/auth"];
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
@@ -374,7 +375,7 @@ async fn register(
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure"),
     };
     match state.repo.create_account(&email, &hash).await {
-        Ok(user) => session_response(&state, user.user_id, user.email).await,
+        Ok(user) => session_response(&state, &headers, user.user_id, user.email).await,
         Err(AppError::Conflict) => error(StatusCode::CONFLICT, "account exists"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     }
@@ -403,17 +404,22 @@ async fn login(
     if !valid {
         return error(StatusCode::UNAUTHORIZED, "invalid credentials");
     };
-    session_response(&state, user.user_id, user.email).await
+    session_response(&state, &headers, user.user_id, user.email).await
 }
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = csrf(&headers) {
         return r;
     };
-    if let Some(token) = cookie(&headers) {
-        let _ = state.repo.delete_session(&digest(&token)).await;
+    for token in session_cookies(&headers) {
+        if state.repo.delete_session(&digest(&token)).await.is_err() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
+        }
     }
-    let value = format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, value)]).into_response()
+    let cookies = match expired_session_cookie_headers(state.cookie_secure) {
+        Ok(value) => value,
+        Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    };
+    (StatusCode::NO_CONTENT, cookies).into_response()
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match auth(&state, &headers).await {
@@ -2156,7 +2162,17 @@ async fn auth(
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "authentication required"))
 }
-async fn session_response(state: &AppState, user: UserId, email: String) -> Response {
+async fn session_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: UserId,
+    email: String,
+) -> Response {
+    for token in session_cookies(headers) {
+        if state.repo.delete_session(&digest(&token)).await.is_err() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
+        }
+    }
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
@@ -2168,18 +2184,17 @@ async fn session_response(state: &AppState, user: UserId, email: String) -> Resp
     {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
     };
-    let secure = if state.cookie_secure { "; Secure" } else { "" };
     let account_type = match state.repo.account_type(user).await {
         Ok(value) => value.as_str().to_owned(),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
     };
-    let cookie = format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
-        state.session_seconds
-    );
+    let cookies = match session_cookie_headers(&token, state.session_seconds, state.cookie_secure) {
+        Ok(value) => value,
+        Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    };
     (
         StatusCode::CREATED,
-        [(header::SET_COOKIE, cookie)],
+        cookies,
         Json(UserWire {
             id: user.to_string(),
             email,
@@ -2206,13 +2221,46 @@ fn csrf(headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 fn cookie(headers: &HeaderMap) -> Option<String> {
+    // Browsers order duplicate cookie names by path length, so the canonical
+    // root-scoped cookie follows any legacy narrower-path cookie.
+    session_cookies(headers).pop()
+}
+fn session_cookies(headers: &HeaderMap) -> Vec<String> {
     headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
         .map(str::trim)
-        .find_map(|part| part.strip_prefix(&format!("{COOKIE}=")).map(str::to_owned))
+        .filter_map(|part| part.strip_prefix(&format!("{COOKIE}=")).map(str::to_owned))
+        .collect()
+}
+fn session_cookie(value: &str, path: &str, max_age: i64, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{COOKIE}={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+}
+fn session_cookie_headers(
+    token: &str,
+    session_seconds: i64,
+    secure: bool,
+) -> Result<HeaderMap, ()> {
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(&session_cookie(token, "/", session_seconds, secure))
+        .map_err(|_| ())?;
+    headers.append(header::SET_COOKIE, value);
+    for path in LEGACY_COOKIE_PATHS {
+        let value = HeaderValue::from_str(&session_cookie("", path, 0, secure)).map_err(|_| ())?;
+        headers.append(header::SET_COOKIE, value);
+    }
+    Ok(headers)
+}
+fn expired_session_cookie_headers(secure: bool) -> Result<HeaderMap, ()> {
+    let mut headers = HeaderMap::new();
+    for path in ["/"].into_iter().chain(LEGACY_COOKIE_PATHS) {
+        let value = HeaderValue::from_str(&session_cookie("", path, 0, secure)).map_err(|_| ())?;
+        headers.append(header::SET_COOKIE, value);
+    }
+    Ok(headers)
 }
 fn digest(value: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -2373,6 +2421,48 @@ mod tests {
             HeaderValue::from_static("other=x; latex_core_session=token; x=y"),
         );
         assert_eq!(cookie(&headers).as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn session_cookie_parser_prefers_the_canonical_root_cookie_after_a_legacy_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("latex_core_session=legacy; latex_core_session=canonical"),
+        );
+        assert_eq!(cookie(&headers).as_deref(), Some("canonical"));
+    }
+
+    #[test]
+    fn session_cookie_headers_use_compatible_canonical_scope() {
+        let login = session_cookie_headers("token", 60, true).expect("valid cookie headers");
+        let login_values = login
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("valid header value"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            login_values[0],
+            "latex_core_session=token; Path=/; HttpOnly; SameSite=Lax; Max-Age=60; Secure"
+        );
+
+        let logout = expired_session_cookie_headers(true).expect("valid cookie headers");
+        let logout_values = logout
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("valid header value"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logout_values[0],
+            "latex_core_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
+        );
+        assert!(logout_values.contains(
+            &"latex_core_session=; Path=/api/auth; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
+        ));
+        assert_eq!(
+            session_cookie("token", "/", 60, false),
+            "latex_core_session=token; Path=/; HttpOnly; SameSite=Lax; Max-Age=60"
+        );
     }
 
     #[test]
