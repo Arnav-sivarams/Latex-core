@@ -279,6 +279,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(ui))
+        .route("/admin", get(admin_ui))
+        .route("/static/styles.css", get(styles))
+        .route("/static/app.js", get(app_js))
+        .route("/static/api.js", get(api_js))
+        .route("/static/state.js", get(state_js))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
@@ -2308,6 +2313,51 @@ fn queue_limits() -> Result<QueueLimits, Box<dyn std::error::Error>> {
 
 async fn ui() -> Html<&'static str> {
     Html(include_str!("ui.html"))
+}
+
+async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match auth(&state, &headers).await {
+        Ok(session) if session.account_type == "admin" => {
+            Html(include_str!("ui.html")).into_response()
+        }
+        Ok(_) => error(
+            StatusCode::FORBIDDEN,
+            "global administrator capability required",
+        ),
+        Err(response) => response,
+    }
+}
+
+async fn styles() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/styles.css"),
+    )
+        .into_response()
+}
+
+async fn app_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/app.js"),
+    )
+        .into_response()
+}
+
+async fn api_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/api.js"),
+    )
+        .into_response()
+}
+
+async fn state_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/state.js"),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
