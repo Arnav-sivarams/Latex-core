@@ -1,6 +1,6 @@
 //! PostgreSQL-authoritative compilation job state machine.
 
-use crate::Database;
+use crate::{AppError, AppRepository, Database, Permission};
 use core_types::{
     ArtifactId, ArtifactKind, BlobHash, CompileKey, CostClass, IdempotencyKey, JobId,
     LatexmkProfileId, ShellPolicy, SnapshotId, TenantId, TexEngine, TexEnvironmentId, UserId,
@@ -182,6 +182,13 @@ impl PostgresCompileQueue {
     }
 
     pub async fn enqueue(&self, request: EnqueueCompileJobV1) -> Result<JobId, QueueError> {
+        let permissions = AppRepository::new(self.database.clone())
+            .effective_permissions(request.user_id, request.workspace_id)
+            .await
+            .map_err(map_permission_error)?;
+        if !permissions.allows(Permission::CompileSubmit) {
+            return Err(QueueError::NotFound);
+        }
         let mut tx = self
             .database
             .pool()
@@ -539,11 +546,22 @@ impl PostgresCompileQueue {
     }
 }
 
+fn map_permission_error(error: AppError) -> QueueError {
+    match error {
+        AppError::NotFound | AppError::Forbidden => QueueError::NotFound,
+        AppError::Conflict | AppError::DraftConflict => QueueError::Integrity {
+            message: error.to_string(),
+        },
+        AppError::Integrity { message } => QueueError::Integrity { message },
+        AppError::Database(error) => QueueError::Database(error),
+    }
+}
+
 async fn ensure_ownership(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &EnqueueCompileJobV1,
 ) -> Result<(), QueueError> {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.workspaces w LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=w.id LEFT JOIN latex_core.team_members tm ON tm.team_id=tp.team_id AND tm.user_id=$3 WHERE w.id=$1 AND ((w.tenant_id=$2 AND w.owner_user_id=$3) OR tm.can_write))")
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.workspaces w LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=w.id LEFT JOIN latex_core.team_project_members pm ON pm.team_project_id=tp.id AND pm.user_id=$3 WHERE w.id=$1 AND ((w.tenant_id=$2 AND w.owner_user_id=$3) OR pm.writer OR pm.mentor))")
         .bind(request.workspace_id.as_uuid()).bind(request.tenant_id.as_uuid()).bind(request.user_id.as_uuid()).fetch_one(&mut **tx).await.map_err(QueueError::Database)?;
     if !exists {
         return Err(QueueError::NotFound);

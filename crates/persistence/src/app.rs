@@ -5,7 +5,9 @@
     reason = "public repository methods share AppError and decoding consumes SQL rows at call sites"
 )]
 
-use crate::Database;
+use crate::{
+    AccountType, Database, GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles,
+};
 use core_types::{ArtifactId, BlobHash, JobId, TenantId, UserId, WorkspaceId};
 use sqlx::Row;
 use std::str::FromStr;
@@ -206,17 +208,30 @@ impl AppRepository {
                 message: "invalid institutional account type".into(),
             });
         }
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        if account_type == "student" {
+            let unsafe_demotion: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.teams t JOIN latex_core.team_members target ON target.team_id=t.id JOIN latex_core.user_credentials target_credentials ON target_credentials.user_id=target.user_id WHERE t.group_type='mentor_group' AND target.group_manager AND target_credentials.email=$1 AND (SELECT count(*) FROM latex_core.team_members manager JOIN latex_core.user_credentials credentials ON credentials.user_id=manager.user_id WHERE manager.team_id=t.id AND manager.group_manager AND credentials.account_type IN ('professor','admin')) <= 1)")
+                .bind(email).fetch_one(&mut *tx).await.map_err(AppError::Database)?;
+            if unsafe_demotion {
+                return Err(AppError::Integrity { message: "assign another professor or administrator mentor-group manager before this account-type change".into() });
+            }
+        }
         let result =
             sqlx::query("UPDATE latex_core.user_credentials SET account_type=$2 WHERE email=$1")
                 .bind(email)
                 .bind(account_type)
-                .execute(self.database.pool())
+                .execute(&mut *tx)
                 .await
                 .map_err(AppError::Database)?;
         if result.rows_affected() == 0 {
             Err(AppError::NotFound)
         } else {
-            Ok(())
+            tx.commit().await.map_err(AppError::Database)
         }
     }
     pub async fn reset_password(&self, email: &str, password_hash: &str) -> Result<(), AppError> {
@@ -311,6 +326,45 @@ impl AppRepository {
         user: UserId,
         template: uuid::Uuid,
     ) -> Result<(), AppError> {
+        let account: String = sqlx::query_scalar(
+            "SELECT account_type FROM latex_core.user_credentials WHERE user_id=$1",
+        )
+        .bind(user.as_uuid())
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(AppError::Database)?
+        .ok_or(AppError::NotFound)?;
+        let overrides = sqlx::query(
+            "SELECT permission,effect FROM latex_core.permission_overrides WHERE user_id=$1 AND context_kind='global'",
+        )
+        .bind(user.as_uuid())
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(AppError::Database)?
+        .into_iter()
+        .map(|row| {
+            let permission: String = row.try_get("permission").map_err(AppError::Database)?;
+            let effect: String = row.try_get("effect").map_err(AppError::Database)?;
+            let permission = Permission::parse(&permission).ok_or_else(|| AppError::Integrity {
+                message: "invalid permission override".into(),
+            })?;
+            let effect = match effect.as_str() {
+                "allow" => OverrideEffect::Allow,
+                "deny" => OverrideEffect::Deny,
+                _ => return Err(AppError::Integrity { message: "invalid permission override effect".into() }),
+            };
+            Ok((permission, effect))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+        let resolver = PermissionResolver::new(
+            AccountType::parse(&account)?,
+            GroupRoles::default(),
+            ProjectRoles::default(),
+            overrides,
+        );
+        if !resolver.allows(Permission::TemplateUse) {
+            return Err(AppError::Forbidden);
+        }
         let visible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.templates t JOIN latex_core.user_credentials c ON c.user_id=$1 LEFT JOIN latex_core.template_account_types a ON a.template_id=t.id AND a.account_type=c.account_type LEFT JOIN latex_core.template_user_grants g ON g.template_id=t.id AND g.user_id=$1 WHERE t.id=$2 AND (a.template_id IS NOT NULL OR g.user_id IS NOT NULL))")
             .bind(user.as_uuid()).bind(template).fetch_one(self.database.pool()).await.map_err(AppError::Database)?;
         if visible {
@@ -418,7 +472,7 @@ impl AppRepository {
         self.project(owner, workspace).await.map(|_| ())
     }
     pub async fn job(&self, owner: UserId, job: JobId) -> Result<AppJobRecord, AppError> {
-        let row=sqlx::query("SELECT j.id,j.workspace_id,j.state,j.snapshot_id,j.created_at::text,j.finished_at::text,j.last_error,CASE WHEN j.state='queued' THEN 1 + (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS queue_position,CASE WHEN j.state='queued' THEN (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS jobs_ahead FROM latex_core.compile_jobs j LEFT JOIN latex_core.projects p ON p.workspace_id=j.workspace_id AND p.owner_user_id=$2 LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=j.workspace_id LEFT JOIN latex_core.team_members tm ON tm.team_id=tp.team_id AND tm.user_id=$2 JOIN latex_core.user_credentials c ON c.user_id=$2 WHERE j.id=$1 AND (p.workspace_id IS NOT NULL OR tm.user_id IS NOT NULL OR c.account_type='admin')").bind(job.as_uuid()).bind(owner.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        let row=sqlx::query("SELECT j.id,j.workspace_id,j.state,j.snapshot_id,j.created_at::text,j.finished_at::text,j.last_error,CASE WHEN j.state='queued' THEN 1 + (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS queue_position,CASE WHEN j.state='queued' THEN (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS jobs_ahead FROM latex_core.compile_jobs j LEFT JOIN latex_core.projects p ON p.workspace_id=j.workspace_id AND p.owner_user_id=$2 LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=j.workspace_id LEFT JOIN latex_core.team_project_members pm ON pm.team_project_id=tp.id AND pm.user_id=$2 WHERE j.id=$1 AND (p.workspace_id IS NOT NULL OR pm.user_id IS NOT NULL)").bind(job.as_uuid()).bind(owner.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
         decode_job(row)
     }
     pub async fn artifacts(
@@ -426,7 +480,14 @@ impl AppRepository {
         owner: UserId,
         job: JobId,
     ) -> Result<Vec<AppArtifactRecord>, AppError> {
-        self.job(owner, job).await?;
+        let job_record = self.job(owner, job).await?;
+        if !self
+            .effective_permissions(owner, job_record.workspace_id)
+            .await?
+            .allows(Permission::ArtifactRead)
+        {
+            return Err(AppError::Forbidden);
+        }
         let rows=sqlx::query("SELECT artifact_id,logical_name,blob_hash,size_bytes,content_type FROM latex_core.compilation_artifacts WHERE job_id=$1 ORDER BY logical_name").bind(job.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_artifact).collect()
     }
@@ -436,7 +497,14 @@ impl AppRepository {
         job: JobId,
         artifact: ArtifactId,
     ) -> Result<AppArtifactRecord, AppError> {
-        self.job(owner, job).await?;
+        let job_record = self.job(owner, job).await?;
+        if !self
+            .effective_permissions(owner, job_record.workspace_id)
+            .await?
+            .allows(Permission::ArtifactRead)
+        {
+            return Err(AppError::Forbidden);
+        }
         let row=sqlx::query("SELECT artifact_id,logical_name,blob_hash,size_bytes,content_type FROM latex_core.compilation_artifacts WHERE job_id=$1 AND artifact_id=$2").bind(job.as_uuid()).bind(artifact.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
         decode_artifact(row)
     }

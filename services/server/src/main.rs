@@ -24,8 +24,9 @@ use core_types::{
     LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId, WorkspaceVersion,
 };
 use persistence::{
-    AppError, AppRepository, Database, DatabaseConfig, EnqueueCompileJobV1, FilePolicy,
-    PostgresCompileQueue, ProjectAccess, PublishResult, QueueLimits, TeamFileRecord,
+    AppError, AppRepository, ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1,
+    FilePolicy, GroupType, PostgresCompileQueue, ProjectAccess, ProjectRoles, PublishResult,
+    QueueLimits, TeamFileRecord,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -61,16 +62,26 @@ struct NewProject {
 #[derive(Deserialize)]
 struct NewTeam {
     name: String,
+    group_type: Option<String>,
 }
 #[derive(Deserialize)]
 struct TeamMemberInput {
     email: String,
-    can_write: bool,
-    can_mentor: bool,
-    can_manage: bool,
+    group_manager: bool,
+}
+#[derive(Deserialize)]
+struct ProjectMemberInput {
+    email: String,
+    writer: bool,
+    mentor: bool,
+    project_manager: bool,
 }
 #[derive(Deserialize)]
 struct TeamProjectInput {
+    name: String,
+}
+#[derive(Deserialize)]
+struct TeamTemplateProjectInput {
     name: String,
 }
 #[derive(Deserialize)]
@@ -118,6 +129,8 @@ struct FileWire {
     revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_revision: Option<u64>,
     has_draft: bool,
 }
 #[derive(Serialize)]
@@ -175,6 +188,7 @@ struct TemplateWire {
 struct TeamWire {
     id: String,
     name: String,
+    group_type: String,
     created_at: String,
     updated_at: String,
 }
@@ -182,9 +196,19 @@ struct TeamWire {
 struct TeamMemberWire {
     user_id: String,
     email: String,
-    can_write: bool,
-    can_mentor: bool,
-    can_manage: bool,
+    group_manager: bool,
+}
+#[derive(Serialize)]
+struct ProjectMemberWire {
+    user_id: String,
+    email: String,
+    writer: bool,
+    mentor: bool,
+    project_manager: bool,
+}
+#[derive(Serialize)]
+struct MemberRemovalWire {
+    unpublished_change_count: u64,
 }
 #[derive(Serialize)]
 struct TeamProjectWire {
@@ -199,6 +223,21 @@ struct PublishWire {
     canonical_generation: Option<u64>,
     workspace_version: Option<u64>,
     file_revision: u64,
+}
+#[derive(Serialize)]
+struct ChangeSetPublishWire {
+    published: bool,
+    canonical_generation: Option<u64>,
+    workspace_version: Option<u64>,
+    change_count: Option<u64>,
+    conflicts: Vec<ChangeConflictWire>,
+}
+#[derive(Serialize)]
+struct ChangeConflictWire {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
+    reason: &'static str,
 }
 
 #[tokio::main]
@@ -272,8 +311,17 @@ fn router(state: AppState) -> Router {
             get(team_projects).post(create_team_project),
         )
         .route(
+            "/api/teams/{team}/templates/{template}/projects",
+            post(create_team_project_from_template),
+        )
+        .route(
             "/api/team-projects/{id}/drafts/{*path}",
             post(publish_draft),
+        )
+        .route("/api/team-projects/{id}/publish", post(publish_change_set))
+        .route(
+            "/api/team-projects/{id}/members",
+            get(project_members).post(set_project_member),
         )
         .route(
             "/api/team-projects/{id}/policies/{*path}",
@@ -433,6 +481,7 @@ async fn teams(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 .map(|team| TeamWire {
                     id: team.id.to_string(),
                     name: team.name,
+                    group_type: team.group_type.as_str().to_owned(),
                     created_at: team.created_at,
                     updated_at: team.updated_at,
                 })
@@ -458,18 +507,32 @@ async fn create_team(
         Ok(value) => value,
         Err(response) => return response,
     };
-    match state.repo.create_team(session.user_id, name).await {
+    let group_type = match GroupType::parse(input.group_type.as_deref().unwrap_or("research_team"))
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid group type"),
+    };
+    match state
+        .repo
+        .create_group(session.user_id, name, group_type)
+        .await
+    {
         Ok(team) => (
             StatusCode::CREATED,
             Json(TeamWire {
                 id: team.id.to_string(),
                 name: team.name,
+                group_type: team.group_type.as_str().to_owned(),
                 created_at: team.created_at,
                 updated_at: team.updated_at,
             }),
         )
             .into_response(),
         Err(AppError::Conflict) => error(StatusCode::CONFLICT, "team already exists"),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "professor or administrator capability required",
+        ),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     }
 }
@@ -490,6 +553,7 @@ async fn team(
         Ok(team) => Json(TeamWire {
             id: team.id.to_string(),
             name: team.name,
+            group_type: team.group_type.as_str().to_owned(),
             created_at: team.created_at,
             updated_at: team.updated_at,
         })
@@ -518,9 +582,7 @@ async fn team_members(
                 .map(|member| TeamMemberWire {
                     user_id: member.user_id.to_string(),
                     email: member.email,
-                    can_write: member.can_write,
-                    can_mentor: member.can_mentor,
-                    can_manage: member.can_manage,
+                    group_manager: member.group_manager,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -557,14 +619,7 @@ async fn set_team_member(
     };
     match state
         .repo
-        .set_team_member(
-            session.user_id,
-            id,
-            target,
-            input.can_write,
-            input.can_mentor,
-            input.can_manage,
-        )
+        .set_group_member(session.user_id, id, target, input.group_manager)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -594,12 +649,26 @@ async fn remove_team_member(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let unpublished_change_count = match state
+        .repo
+        .unpublished_change_count_for_member(session.user_id, team_id, target)
+        .await
+    {
+        Ok(value) => value,
+        Err(AppError::Forbidden) => {
+            return error(StatusCode::FORBIDDEN, "team manager capability required");
+        }
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
     match state
         .repo
         .remove_team_member(session.user_id, team_id, target)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => Json(MemberRemovalWire {
+            unpublished_change_count,
+        })
+        .into_response(),
         Err(AppError::Forbidden) => {
             error(StatusCode::FORBIDDEN, "team manager capability required")
         }
@@ -666,7 +735,7 @@ async fn create_team_project(
     if session.account_type != "admin"
         && !members
             .iter()
-            .any(|member| member.user_id == session.user_id && member.can_manage)
+            .any(|member| member.user_id == session.user_id && member.group_manager)
     {
         return error(StatusCode::FORBIDDEN, "team manager capability required");
     }
@@ -709,6 +778,155 @@ async fn create_team_project(
             error(StatusCode::FORBIDDEN, "team manager capability required")
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+#[allow(
+    clippy::too_many_lines,
+    reason = "template blob validation and workspace creation must remain adjacent to the authorization boundary"
+)]
+async fn create_team_project_from_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((team, template)): Path<(String, String)>,
+    Json(input): Json<TeamTemplateProjectInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let team_id = match uuid::Uuid::parse_str(&team) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let template_id = match uuid::Uuid::parse_str(&template) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let name = match project_name(&input.name) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(template_error) = state
+        .repo
+        .assert_template_visible(session.user_id, template_id)
+        .await
+    {
+        return match template_error {
+            AppError::Forbidden => error(StatusCode::FORBIDDEN, "template use capability required"),
+            _ => error(StatusCode::NOT_FOUND, "not found"),
+        };
+    }
+    let template = match state.repo.template(template_id).await {
+        Ok(value) => value,
+        Err(AppError::NotFound) => return error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    let main = match template.main_file {
+        Some(value) => match LogicalPath::parse(&value) {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template data is invalid",
+                );
+            }
+        },
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template data is invalid",
+            );
+        }
+    };
+    let records = match state.repo.template_files(template_id).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    let mut files = Vec::with_capacity(records.len());
+    for record in records {
+        let path = match LogicalPath::parse(&record.path) {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template data is invalid",
+                );
+            }
+        };
+        let bytes = match state.blobs.get(record.blob_hash).await {
+            Ok(value) if u64::try_from(value.len()).ok() == Some(record.size_bytes) => value,
+            Ok(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template data is invalid",
+                );
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template storage failure",
+                );
+            }
+        };
+        files.push(archive::ImportedFile { path, bytes });
+    }
+    if !files.iter().any(|file| file.path == main) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "template data is invalid",
+        );
+    }
+    let workspace = WorkspaceId::new();
+    if state
+        .workspaces
+        .create_workspace_from_files(
+            session.tenant_id,
+            session.user_id,
+            workspace,
+            files
+                .into_iter()
+                .map(|file| (file.path, file.bytes))
+                .collect(),
+            Some(main),
+        )
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace creation failed",
+        );
+    }
+    match state
+        .repo
+        .instantiate_team_project_from_template(
+            session.user_id,
+            team_id,
+            workspace,
+            name,
+            template_id,
+        )
+        .await
+    {
+        Ok(project) => (
+            StatusCode::CREATED,
+            Json(TeamProjectWire {
+                id: project.id.to_string(),
+                workspace_id: project.workspace_id.to_string(),
+                name: project.name,
+                canonical_generation: project.canonical_generation,
+            }),
+        )
+            .into_response(),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "not authorized to create this team project",
+        ),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "project creation failed"),
     }
 }
 async fn publish_draft(
@@ -779,6 +997,149 @@ async fn publish_draft(
             .into_response(),
         Err(AppError::Forbidden) => error(StatusCode::FORBIDDEN, "protected by project policy"),
         Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "draft not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn publish_change_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let project_id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    match state
+        .repo
+        .publish_change_set(session.user_id, project_id)
+        .await
+    {
+        Ok(ChangeSetPublishResult::Published {
+            canonical_generation,
+            workspace_version,
+            change_count,
+        }) => Json(ChangeSetPublishWire {
+            published: true,
+            canonical_generation: Some(canonical_generation),
+            workspace_version: Some(workspace_version),
+            change_count: Some(change_count),
+            conflicts: Vec::new(),
+        })
+        .into_response(),
+        Ok(ChangeSetPublishResult::Conflict { conflicts }) => (
+            StatusCode::CONFLICT,
+            Json(ChangeSetPublishWire {
+                published: false,
+                canonical_generation: None,
+                workspace_version: None,
+                change_count: None,
+                conflicts: conflicts
+                    .into_iter()
+                    .map(|conflict| ChangeConflictWire {
+                        path: conflict.path,
+                        destination: conflict.destination,
+                        reason: conflict.reason.as_str(),
+                    })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(AppError::Forbidden) => error(StatusCode::FORBIDDEN, "protected by project policy"),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "no unpublished changes"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn project_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let project_id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    match state
+        .repo
+        .project_members(session.user_id, project_id)
+        .await
+    {
+        Ok(records) => Json(
+            records
+                .into_iter()
+                .map(|member| ProjectMemberWire {
+                    user_id: member.user_id.to_string(),
+                    email: member.email,
+                    writer: member.writer,
+                    mentor: member.mentor,
+                    project_manager: member.project_manager,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(AppError::Forbidden) => {
+            error(StatusCode::FORBIDDEN, "project manager capability required")
+        }
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn set_project_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ProjectMemberInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let project_id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let email = match auth::normalized_email(&input.email) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
+    };
+    let target = match state.repo.user_by_email(&email).await {
+        Ok(Some(user)) => user.user_id,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "user not found"),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    match state
+        .repo
+        .set_project_member(
+            session.user_id,
+            project_id,
+            target,
+            ProjectRoles {
+                writer: input.writer,
+                mentor: input.mentor,
+                project_manager: input.project_manager,
+            },
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "you cannot grant those project roles",
+        ),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     }
 }
@@ -1065,6 +1426,7 @@ async fn files(
                         size_bytes: file.size_bytes,
                         revision: Some(file.revision),
                         policy: Some(file.policy.as_str().to_owned()),
+                        draft_revision: None,
                         has_draft: false,
                     })
                     .collect::<Vec<_>>();
@@ -1078,6 +1440,7 @@ async fn files(
                         size_bytes: draft.size_bytes,
                         revision: Some(draft.base_revision),
                         policy: Some(FilePolicy::Editable.as_str().to_owned()),
+                        draft_revision: Some(draft.draft_revision),
                         has_draft: true,
                     })),
                     Err(_) => {
@@ -1098,6 +1461,7 @@ async fn files(
                     size_bytes: f.size_bytes(),
                     revision: None,
                     policy: None,
+                    draft_revision: None,
                     has_draft: false,
                 })
                 .collect::<Vec<_>>(),
@@ -1212,23 +1576,28 @@ async fn put_file(
             Ok(value) => value,
             Err(response) => return response,
         };
+        let expected_draft_revision = match draft_revision(&headers) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
         let stored = match state.blobs.put(body).await {
             Ok(value) => value,
             Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
         };
         return match state
             .repo
-            .save_draft(
+            .save_draft_with_revision(
                 s.user_id,
                 project.id,
                 path.as_str(),
                 base,
                 stored.hash(),
                 stored.size_bytes(),
+                Some(expected_draft_revision),
             )
             .await
         {
-            Ok(()) => Json(VersionWire {
+            Ok(_) => Json(VersionWire {
                 version: workspace_etag(&state, id)
                     .await
                     .trim_matches('"')
@@ -1237,6 +1606,9 @@ async fn put_file(
             })
             .into_response(),
             Err(AppError::Forbidden) => error(StatusCode::FORBIDDEN, "protected by project policy"),
+            Err(AppError::DraftConflict) => {
+                error(StatusCode::CONFLICT, "draft changed in another session")
+            }
             Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
             Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
         };
@@ -1450,18 +1822,16 @@ async fn submit_compile(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let access = match state.repo.project_access(s.user_id, id).await {
+    let permissions = match state.repo.effective_permissions(s.user_id, id).await {
         Ok(value) => value,
         Err(AppError::NotFound) => return error(StatusCode::NOT_FOUND, "not found"),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     };
-    if let ProjectAccess::Team { can_write, .. } = access {
-        if !can_write {
-            return error(
-                StatusCode::FORBIDDEN,
-                "writer capability required to compile team projects",
-            );
-        }
+    if !permissions.allows(persistence::Permission::CompileSubmit) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "compile capability required for this project",
+        );
     }
     let checkpoint = match state.workspaces.force_snapshot(id).await {
         Ok(v) => v,
@@ -1643,6 +2013,10 @@ async fn artifact(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "personal and project-scoped collaboration response assembly must share one authorization boundary"
+)]
 async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Response {
     let access = match state.repo.project_access(user, id).await {
         Ok(value) => value,
@@ -1665,6 +2039,7 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                             size_bytes: file.size_bytes(),
                             revision: None,
                             policy: None,
+                            draft_revision: None,
                             has_draft: false,
                         })
                         .collect();
@@ -1692,16 +2067,20 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                     };
                     let mut files = Vec::with_capacity(records.len() + drafts.len());
                     for file in records {
-                        let has_draft = state
+                        let draft = state
                             .repo
                             .draft_for_user(user, project.id, &file.path)
                             .await
-                            .is_ok_and(|draft| draft.is_some());
+                            .ok()
+                            .flatten();
+                        let has_draft = draft.is_some();
+                        let draft_revision = draft.map(|draft| draft.draft_revision);
                         files.push(FileWire {
                             path: file.path,
                             size_bytes: file.size_bytes,
                             revision: Some(file.revision),
                             policy: Some(file.policy.as_str().to_owned()),
+                            draft_revision,
                             has_draft,
                         });
                     }
@@ -1710,6 +2089,7 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                         size_bytes: draft.size_bytes,
                         revision: Some(draft.base_revision),
                         policy: Some(FilePolicy::Editable.as_str().to_owned()),
+                        draft_revision: Some(draft.draft_revision),
                         has_draft: true,
                     }));
                     (
@@ -1856,6 +2236,15 @@ fn file_revision(headers: &HeaderMap) -> Result<u64, Response> {
         })?
         .parse()
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid X-File-Revision"))
+}
+fn draft_revision(headers: &HeaderMap) -> Result<u64, Response> {
+    headers
+        .get("if-draft-match")
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "private save revision is required"))?
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid private save revision"))
 }
 async fn text_file_response(state: &AppState, id: WorkspaceId, bytes: Bytes) -> Response {
     let mut response = bytes.into_response();

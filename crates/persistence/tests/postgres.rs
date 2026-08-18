@@ -11,8 +11,8 @@ use core_types::{
 };
 use persistence::{
     AppError, AppRepository, Database, DatabaseConfig, EnqueueCompileJobV1, FilePolicy,
-    InfrastructureOutcome, PostgresCompileQueue, PublishResult, QueueError, QueueLimits,
-    TeamFileRecord,
+    InfrastructureOutcome, PostgresCompileQueue, ProjectRoles, PublishResult, QueueError,
+    QueueLimits, TeamFileRecord,
 };
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -130,10 +130,10 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
         .create_team(alice.user_id, "Thesis team")
         .await
         .unwrap();
-    repo.set_team_member(bob.user_id, team.id, bob.user_id, true, false, false)
+    repo.set_group_member(bob.user_id, team.id, bob.user_id, false)
         .await
         .unwrap_err();
-    repo.set_team_member(alice.user_id, team.id, bob.user_id, true, false, false)
+    repo.set_group_member(alice.user_id, team.id, bob.user_id, false)
         .await
         .unwrap();
     let canonical = BlobHash::digest(b"canonical chapter one");
@@ -162,6 +162,18 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
         )
         .await
         .unwrap();
+    repo.set_project_member(
+        alice.user_id,
+        project.id,
+        bob.user_id,
+        ProjectRoles {
+            writer: true,
+            mentor: false,
+            project_manager: false,
+        },
+    )
+    .await
+    .unwrap();
     let alice_draft = BlobHash::digest(b"alice chapter one");
     let bob_draft = BlobHash::digest(b"bob chapter one");
     repo.save_draft(
@@ -318,7 +330,7 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
         alice.user_id,
         project.id,
         "chapters/chapter1.tex",
-        FilePolicy::Hidden,
+        FilePolicy::Managed,
     )
     .await
     .unwrap();
@@ -327,30 +339,22 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
             .await
             .unwrap()
             .iter()
-            .all(|file| file.path != "chapters/chapter1.tex")
+            .any(|file| file.path == "chapters/chapter1.tex")
     );
     assert!(matches!(
         repo.team_file_for_user(bob.user_id, project.id, "chapters/chapter1.tex")
             .await,
-        Err(AppError::NotFound)
+        Ok(_)
     ));
     repo.set_user_account_type(&carol_email, "admin")
         .await
         .unwrap();
-    assert!(
-        repo.teams_for_user(carol.user_id)
-            .await
-            .unwrap()
-            .iter()
-            .any(|record| record.id == team.id)
-    );
-    assert_eq!(
+    assert!(repo.teams_for_user(carol.user_id).await.unwrap().is_empty());
+    assert!(matches!(
         repo.team_file_for_user(carol.user_id, project.id, "chapters/chapter1.tex")
-            .await
-            .unwrap()
-            .blob_hash,
-        alice_draft
-    );
+            .await,
+        Err(AppError::NotFound)
+    ));
     repo.set_user_account_type(&bob_email, "professor")
         .await
         .unwrap();
@@ -417,18 +421,23 @@ async fn verify_schema(pool: &PgPool) {
         "compile_cache",
         "compile_jobs",
         "compilation_artifacts",
+        "audit_events",
         "file_policies",
+        "member_change_operations",
         "member_drafts",
+        "permission_overrides",
         "projects",
         "sessions",
         "snapshots",
         "team_members",
         "team_project_audit",
         "team_project_files",
+        "team_project_members",
         "team_projects",
         "teams",
         "template_account_types",
         "template_files",
+        "template_policy_rules",
         "template_user_grants",
         "templates",
         "tenants",
@@ -436,6 +445,7 @@ async fn verify_schema(pool: &PgPool) {
         "users",
         "workspace_events",
         "workspace_heads",
+        "workspace_resume",
         "workspace_snapshots",
         "workspaces",
     ];
