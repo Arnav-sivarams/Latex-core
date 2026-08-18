@@ -10,8 +10,9 @@ use core_types::{
     SnapshotId, TenantId, TexEngine, TexEnvironmentId, UserId, WorkerId, WorkspaceId,
 };
 use persistence::{
-    Database, DatabaseConfig, EnqueueCompileJobV1, InfrastructureOutcome, PostgresCompileQueue,
-    QueueError, QueueLimits,
+    AppError, AppRepository, Database, DatabaseConfig, EnqueueCompileJobV1, FilePolicy,
+    InfrastructureOutcome, PostgresCompileQueue, PublishResult, QueueError, QueueLimits,
+    TeamFileRecord,
 };
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -26,6 +27,7 @@ static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 #[tokio::test]
 async fn production_schema_enforces_relational_contract() {
+    let _guard = QUEUE_TEST_LOCK.lock().await;
     let url = env::var("TEST_DATABASE_URL")
         .expect("database-tests requires TEST_DATABASE_URL; use ./scripts/test-db.sh");
     let config = DatabaseConfig::new(&url, 1, 4, Duration::from_secs(5)).unwrap();
@@ -85,6 +87,265 @@ async fn production_schema_enforces_relational_contract() {
     verify_queue_indexes(&pool).await;
     verify_artifacts_and_cache(&pool, tenant, user, workspace_a).await;
 
+    sqlx::query("UPDATE latex_core.compile_jobs SET state='cancelled',finished_at=statement_timestamp() WHERE workspace_id=$1 AND state='queued'")
+        .bind(workspace_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    pool.close().await;
+    database.close().await;
+}
+
+#[tokio::test]
+async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
+    let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let database = Database::connect(DatabaseConfig::development(&url).unwrap())
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let repo = AppRepository::new(database.clone());
+    let suffix = Uuid::new_v4();
+    let alice_email = format!("team-alice-{suffix}@example.test");
+    let bob_email = format!("team-bob-{suffix}@example.test");
+    let carol_email = format!("team-carol-{suffix}@example.test");
+    let alice = repo.create_account(&alice_email, "hash").await.unwrap();
+    let bob = repo.create_account(&bob_email, "hash").await.unwrap();
+    let carol = repo.create_account(&carol_email, "hash").await.unwrap();
+    let workspace = WorkspaceId::new();
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")
+        .bind(workspace.as_uuid())
+        .bind(alice.tenant_id.as_uuid())
+        .bind(alice.user_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.workspace_heads (workspace_id) VALUES ($1)")
+        .bind(workspace.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let team = repo
+        .create_team(alice.user_id, "Thesis team")
+        .await
+        .unwrap();
+    repo.set_team_member(bob.user_id, team.id, bob.user_id, true, false, false)
+        .await
+        .unwrap_err();
+    repo.set_team_member(alice.user_id, team.id, bob.user_id, true, false, false)
+        .await
+        .unwrap();
+    let canonical = BlobHash::digest(b"canonical chapter one");
+    let project = repo
+        .create_team_project(
+            alice.user_id,
+            team.id,
+            workspace,
+            "Shared thesis",
+            &[
+                TeamFileRecord {
+                    path: "chapters/chapter1.tex".to_owned(),
+                    blob_hash: canonical,
+                    size_bytes: 21,
+                    revision: 1,
+                    policy: FilePolicy::Editable,
+                },
+                TeamFileRecord {
+                    path: "chapters/chapter2.tex".to_owned(),
+                    blob_hash: BlobHash::digest(b"canonical chapter two"),
+                    size_bytes: 21,
+                    revision: 1,
+                    policy: FilePolicy::Editable,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let alice_draft = BlobHash::digest(b"alice chapter one");
+    let bob_draft = BlobHash::digest(b"bob chapter one");
+    repo.save_draft(
+        alice.user_id,
+        project.id,
+        "chapters/chapter1.tex",
+        1,
+        alice_draft,
+        17,
+    )
+    .await
+    .unwrap();
+    repo.save_draft(
+        bob.user_id,
+        project.id,
+        "chapters/chapter1.tex",
+        1,
+        bob_draft,
+        15,
+    )
+    .await
+    .unwrap();
+    let bob_second_chapter = BlobHash::digest(b"bob chapter two");
+    repo.save_draft(
+        bob.user_id,
+        project.id,
+        "chapters/chapter2.tex",
+        1,
+        bob_second_chapter,
+        15,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        repo.publish_draft(bob.user_id, project.id, "chapters/chapter2.tex")
+            .await
+            .unwrap(),
+        PublishResult::Published {
+            canonical_generation: 2,
+            file_revision: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        repo.publish_draft(alice.user_id, project.id, "chapters/chapter1.tex")
+            .await
+            .unwrap(),
+        PublishResult::Published {
+            canonical_generation: 3,
+            file_revision: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        repo.publish_draft(bob.user_id, project.id, "chapters/chapter1.tex")
+            .await
+            .unwrap(),
+        PublishResult::Conflict {
+            current_file_revision: 2
+        }
+    ));
+    assert_eq!(
+        repo.draft_for_user(bob.user_id, project.id, "chapters/chapter1.tex")
+            .await
+            .unwrap()
+            .unwrap()
+            .blob_hash,
+        bob_draft
+    );
+    assert_eq!(
+        repo.team_file_for_user(alice.user_id, project.id, "chapters/chapter1.tex")
+            .await
+            .unwrap()
+            .blob_hash,
+        alice_draft
+    );
+    assert_eq!(
+        repo.team_file_for_user(alice.user_id, project.id, "chapters/chapter2.tex")
+            .await
+            .unwrap()
+            .blob_hash,
+        bob_second_chapter
+    );
+    let event_hash: String = sqlx::query_scalar("SELECT payload->'operations'->0->>'blob_hash' FROM latex_core.workspace_events WHERE workspace_id=$1 ORDER BY sequence DESC LIMIT 1")
+        .bind(workspace.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(event_hash, alice_draft.to_hex());
+    repo.set_file_policy(
+        alice.user_id,
+        project.id,
+        "chapters/chapter1.tex",
+        FilePolicy::ReadOnly,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        repo.save_draft(
+            bob.user_id,
+            project.id,
+            "chapters/chapter1.tex",
+            2,
+            bob_draft,
+            15
+        )
+        .await,
+        Err(AppError::Forbidden)
+    ));
+    repo.set_file_policy(
+        alice.user_id,
+        project.id,
+        "chapters/chapter1.tex",
+        FilePolicy::Hidden,
+    )
+    .await
+    .unwrap();
+    assert!(
+        repo.team_files_for_user(bob.user_id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|file| file.path != "chapters/chapter1.tex")
+    );
+    assert!(matches!(
+        repo.team_file_for_user(bob.user_id, project.id, "chapters/chapter1.tex")
+            .await,
+        Err(AppError::NotFound)
+    ));
+    repo.set_user_account_type(&carol_email, "admin")
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.team_file_for_user(carol.user_id, project.id, "chapters/chapter1.tex")
+            .await
+            .unwrap()
+            .blob_hash,
+        alice_draft
+    );
+    repo.set_user_account_type(&bob_email, "professor")
+        .await
+        .unwrap();
+    assert!(matches!(
+        repo.project_access(bob.user_id, workspace).await.unwrap(),
+        persistence::ProjectAccess::Team {
+            can_write: true,
+            can_mentor: false,
+            ..
+        }
+    ));
+    let template_name = format!("Faculty template {suffix}");
+    repo.create_template(Uuid::new_v4(), &template_name, None, None, &[])
+        .await
+        .unwrap();
+    repo.set_template_audiences(&template_name, &["professor"])
+        .await
+        .unwrap();
+    assert!(
+        repo.list_templates_for_user(alice.user_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|template| template.name != template_name)
+    );
+    assert!(
+        repo.list_templates_for_user(bob.user_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|template| template.name == template_name)
+    );
+    repo.grant_template_to_user(&template_name, alice.user_id, carol.user_id)
+        .await
+        .unwrap();
+    assert!(
+        repo.list_templates_for_user(alice.user_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|template| template.name == template_name)
+    );
+    let second = repo.create_team(bob.user_id, "Second team").await.unwrap();
+    assert_eq!(repo.teams_for_user(bob.user_id).await.unwrap().len(), 2);
+    assert_ne!(team.id, second.id);
     pool.close().await;
     database.close().await;
 }
@@ -106,9 +367,20 @@ async fn verify_schema(pool: &PgPool) {
         "compile_cache",
         "compile_jobs",
         "compilation_artifacts",
+        "file_policies",
+        "member_drafts",
         "projects",
         "sessions",
         "snapshots",
+        "team_members",
+        "team_project_audit",
+        "team_project_files",
+        "team_projects",
+        "teams",
+        "template_account_types",
+        "template_files",
+        "template_user_grants",
+        "templates",
         "tenants",
         "user_credentials",
         "users",

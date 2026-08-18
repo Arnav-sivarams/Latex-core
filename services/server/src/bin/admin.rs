@@ -29,9 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if command == "list" {
         for user in repo.list_users().await? {
             println!(
-                "{}\t{}",
+                "{}\t{}\t{}",
                 user.email,
-                if user.enabled { "enabled" } else { "disabled" }
+                if user.enabled { "enabled" } else { "disabled" },
+                user.account_type,
             );
         }
         return Ok(());
@@ -43,6 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         first
     };
     let email = auth::normalized_email(&email).map_err(|()| "invalid email")?;
+    if command == "set-type" {
+        let account_type = args.next().ok_or("missing account type")?;
+        if !matches!(account_type.as_str(), "student" | "professor" | "admin") {
+            return Err("account type must be student, professor, or admin".into());
+        }
+        repo.set_user_account_type(&email, &account_type).await?;
+        println!("Institutional account type set: {email} → {account_type}");
+        return Ok(());
+    }
     let password = option(&mut args, "--password").ok();
     match command.as_str() {
         "create" => {
@@ -75,6 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the small administration CLI keeps commands together"
+)]
 async fn templates(
     repo: AppRepository,
     mut args: impl Iterator<Item = String>,
@@ -95,6 +109,37 @@ async fn templates(
             let name = args.next().ok_or("missing template name")?;
             repo.delete_template_by_name(&name).await?;
             println!("Template removed: {name}");
+        }
+        "set-audience" => {
+            let name = args.next().ok_or("missing template name")?;
+            let audiences: Vec<String> = args.collect();
+            let values: Vec<&str> = audiences.iter().map(String::as_str).collect();
+            repo.set_template_audiences(&name, &values).await?;
+            println!("Template audience updated: {name}");
+        }
+        "grant-user" => {
+            let name = args.next().ok_or("missing template name")?;
+            let target_email = auth::normalized_email(&args.next().ok_or("missing user email")?)
+                .map_err(|()| "invalid user email")?;
+            if args.next().as_deref() != Some("--by") {
+                return Err("grant-user requires --by ADMIN_EMAIL".into());
+            }
+            let actor_email = auth::normalized_email(&args.next().ok_or("missing admin email")?)
+                .map_err(|()| "invalid admin email")?;
+            let target = repo
+                .user_by_email(&target_email)
+                .await?
+                .ok_or("target account not found")?;
+            let actor = repo
+                .user_by_email(&actor_email)
+                .await?
+                .ok_or("granting account not found")?;
+            if actor.account_type != "admin" {
+                return Err("granting account must have institutional type admin".into());
+            }
+            repo.grant_template_to_user(&name, target.user_id, actor.user_id)
+                .await?;
+            println!("Template grant added: {name} → {target_email}");
         }
         "add" => {
             let zip = args.next().ok_or("missing ZIP path")?;
@@ -181,5 +226,5 @@ fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
 }
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
-    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password> EMAIL [--password PASSWORD] | template <add|list|remove>".into())
+    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password|set-type> EMAIL [--password PASSWORD] | template <add|list|remove|set-audience|grant-user>".into())
 }

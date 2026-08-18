@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod collaboration;
 #[allow(
     clippy::doc_markdown,
     clippy::missing_errors_doc,
@@ -17,6 +18,10 @@ mod workspace;
 pub use app::{
     AppArtifactRecord, AppError, AppJobRecord, AppProjectRecord, AppRepository, AppSessionRecord,
     AppTemplateFileRecord, AppTemplateRecord, AppUserRecord,
+};
+pub use collaboration::{
+    AccountType, FilePolicy, MemberDraftRecord, ProjectAccess, PublishResult, TeamFileRecord,
+    TeamMemberRecord, TeamProjectRecord, TeamRecord,
 };
 pub use compile_queue::{
     CompileCacheRecordV1, CompileJobRecordV1, CompletionOutcome, EnqueueCompileJobV1,

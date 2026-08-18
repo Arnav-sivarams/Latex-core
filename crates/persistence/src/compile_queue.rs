@@ -543,7 +543,7 @@ async fn ensure_ownership(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &EnqueueCompileJobV1,
 ) -> Result<(), QueueError> {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.workspaces WHERE id=$1 AND tenant_id=$2 AND owner_user_id=$3)")
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.workspaces w LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=w.id LEFT JOIN latex_core.team_members tm ON tm.team_id=tp.team_id AND tm.user_id=$3 WHERE w.id=$1 AND ((w.tenant_id=$2 AND w.owner_user_id=$3) OR tm.can_write))")
         .bind(request.workspace_id.as_uuid()).bind(request.tenant_id.as_uuid()).bind(request.user_id.as_uuid()).fetch_one(&mut **tx).await.map_err(QueueError::Database)?;
     if !exists {
         return Err(QueueError::NotFound);
