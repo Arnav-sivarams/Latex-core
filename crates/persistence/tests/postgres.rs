@@ -245,12 +245,55 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
             .blob_hash,
         bob_second_chapter
     );
+    let new_file_draft = BlobHash::digest(b"private new chapter");
+    repo.save_draft(
+        alice.user_id,
+        project.id,
+        "chapters/new.tex",
+        0,
+        new_file_draft,
+        19,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.draft_only_paths_for_user(alice.user_id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|draft| draft.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["chapters/new.tex"]
+    );
+    assert_eq!(
+        repo.draft_only_for_user(alice.user_id, project.id, "chapters/new.tex")
+            .await
+            .unwrap()
+            .unwrap()
+            .blob_hash,
+        new_file_draft
+    );
+    assert!(matches!(
+        repo.publish_draft(alice.user_id, project.id, "chapters/new.tex")
+            .await
+            .unwrap(),
+        PublishResult::Published {
+            file_revision: 1,
+            ..
+        }
+    ));
+    assert!(
+        repo.draft_only_for_user(alice.user_id, project.id, "chapters/new.tex")
+            .await
+            .unwrap()
+            .is_none()
+    );
     let event_hash: String = sqlx::query_scalar("SELECT payload->'operations'->0->>'blob_hash' FROM latex_core.workspace_events WHERE workspace_id=$1 ORDER BY sequence DESC LIMIT 1")
         .bind(workspace.as_uuid())
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(event_hash, alice_draft.to_hex());
+    assert_eq!(event_hash, new_file_draft.to_hex());
     repo.set_file_policy(
         alice.user_id,
         project.id,
@@ -294,6 +337,13 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
     repo.set_user_account_type(&carol_email, "admin")
         .await
         .unwrap();
+    assert!(
+        repo.teams_for_user(carol.user_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.id == team.id)
+    );
     assert_eq!(
         repo.team_file_for_user(carol.user_id, project.id, "chapters/chapter1.tex")
             .await

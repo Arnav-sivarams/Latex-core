@@ -1057,8 +1057,8 @@ async fn files(
     };
     if let ProjectAccess::Team { project, .. } = access {
         return match state.repo.team_files_for_user(s.user_id, project.id).await {
-            Ok(records) => Json(
-                records
+            Ok(records) => {
+                let mut files = records
                     .into_iter()
                     .map(|file| FileWire {
                         path: file.path,
@@ -1067,9 +1067,25 @@ async fn files(
                         policy: Some(file.policy.as_str().to_owned()),
                         has_draft: false,
                     })
-                    .collect::<Vec<_>>(),
-            )
-            .into_response(),
+                    .collect::<Vec<_>>();
+                match state
+                    .repo
+                    .draft_only_paths_for_user(s.user_id, project.id)
+                    .await
+                {
+                    Ok(drafts) => files.extend(drafts.into_iter().map(|draft| FileWire {
+                        path: draft.path,
+                        size_bytes: draft.size_bytes,
+                        revision: Some(draft.base_revision),
+                        policy: Some(FilePolicy::Editable.as_str().to_owned()),
+                        has_draft: true,
+                    })),
+                    Err(_) => {
+                        return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure");
+                    }
+                }
+                Json(files).into_response()
+            }
             Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
         };
     }
@@ -1119,7 +1135,26 @@ async fn file(
             .await
         {
             Ok(value) => value,
-            Err(AppError::NotFound) => return error(StatusCode::NOT_FOUND, "not found"),
+            Err(AppError::NotFound) => match state
+                .repo
+                .draft_only_for_user(s.user_id, project.id, path.as_str())
+                .await
+            {
+                Ok(Some(draft)) => {
+                    return match state.blobs.get(draft.blob_hash).await {
+                        Ok(bytes) if u64::try_from(bytes.len()).ok() == Some(draft.size_bytes) => {
+                            text_file_response(&state, id, bytes).await
+                        }
+                        Ok(_) | Err(_) => {
+                            error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure")
+                        }
+                    };
+                }
+                Ok(None) | Err(AppError::NotFound) => {
+                    return error(StatusCode::NOT_FOUND, "not found");
+                }
+                Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+            },
             Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
         };
         let record = match state
@@ -1648,7 +1683,14 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                             return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure");
                         }
                     };
-                    let mut files = Vec::with_capacity(records.len());
+                    let drafts = match state.repo.draft_only_paths_for_user(user, project.id).await
+                    {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure");
+                        }
+                    };
+                    let mut files = Vec::with_capacity(records.len() + drafts.len());
                     for file in records {
                         let has_draft = state
                             .repo
@@ -1663,6 +1705,13 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                             has_draft,
                         });
                     }
+                    files.extend(drafts.into_iter().map(|draft| FileWire {
+                        path: draft.path,
+                        size_bytes: draft.size_bytes,
+                        revision: Some(draft.base_revision),
+                        policy: Some(FilePolicy::Editable.as_str().to_owned()),
+                        has_draft: true,
+                    }));
                     (
                         project.name,
                         files,

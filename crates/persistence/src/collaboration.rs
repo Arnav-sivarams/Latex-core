@@ -195,8 +195,9 @@ impl AppRepository {
     }
 
     pub async fn teams_for_user(&self, user: UserId) -> Result<Vec<TeamRecord>, AppError> {
-        let rows = sqlx::query("SELECT t.id,t.name,t.created_at::text,t.updated_at::text FROM latex_core.teams t JOIN latex_core.team_members m ON m.team_id=t.id WHERE m.user_id=$1 ORDER BY t.updated_at DESC,t.id")
-            .bind(user.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        let account = self.account_type(user).await?;
+        let rows = sqlx::query("SELECT t.id,t.name,t.created_at::text,t.updated_at::text FROM latex_core.teams t LEFT JOIN latex_core.team_members m ON m.team_id=t.id AND m.user_id=$1 WHERE m.user_id IS NOT NULL OR $2 ORDER BY t.updated_at DESC,t.id")
+            .bind(user.as_uuid()).bind(account.is_admin()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_team).collect()
     }
 
@@ -395,6 +396,51 @@ impl AppRepository {
         let row = sqlx::query("SELECT logical_path,base_file_revision,draft_blob_hash,draft_size_bytes FROM latex_core.member_drafts WHERE team_project_id=$1 AND user_id=$2 AND logical_path=$3")
             .bind(project_id).bind(user.as_uuid()).bind(path).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
         row.map(decode_draft).transpose()
+    }
+
+    /// Returns the caller's drafts for paths that are not canonical files yet.
+    ///
+    /// These entries are intentionally kept separate from canonical file listings:
+    /// private drafts must be reachable by their author without becoming visible to
+    /// other members or the compiler.
+    pub async fn draft_only_paths_for_user(
+        &self,
+        user: UserId,
+        project_id: Uuid,
+    ) -> Result<Vec<MemberDraftRecord>, AppError> {
+        let access = self.team_access_by_id(user, project_id).await?;
+        let may_read_own_drafts = matches!(
+            access,
+            ProjectAccess::Team {
+                account_type: AccountType::Admin,
+                ..
+            } | ProjectAccess::Team {
+                can_write: true,
+                ..
+            }
+        );
+        if !may_read_own_drafts {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT d.logical_path,d.base_file_revision,d.draft_blob_hash,d.draft_size_bytes FROM latex_core.member_drafts d LEFT JOIN latex_core.team_project_files f ON f.team_project_id=d.team_project_id AND f.logical_path=d.logical_path WHERE d.team_project_id=$1 AND d.user_id=$2 AND f.logical_path IS NULL ORDER BY d.logical_path")
+            .bind(project_id).bind(user.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(decode_draft).collect()
+    }
+
+    /// Finds the caller's private draft only when the path has no canonical file.
+    /// This prevents a draft saved before a policy change from bypassing hidden or
+    /// admin-only canonical file read rules.
+    pub async fn draft_only_for_user(
+        &self,
+        user: UserId,
+        project_id: Uuid,
+        path: &str,
+    ) -> Result<Option<MemberDraftRecord>, AppError> {
+        Ok(self
+            .draft_only_paths_for_user(user, project_id)
+            .await?
+            .into_iter()
+            .find(|draft| draft.path == path))
     }
 
     pub async fn save_draft(
