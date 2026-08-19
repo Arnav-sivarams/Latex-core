@@ -30,7 +30,7 @@ use persistence::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tower_http::{
     limit::RequestBodyLimitLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer,
 };
@@ -1435,38 +1435,41 @@ async fn files(
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     };
     if let ProjectAccess::Team { project, .. } = access {
-        return match state.repo.team_files_for_user(s.user_id, project.id).await {
-            Ok(records) => {
-                let mut files = records
+        let canonical = match state.repo.team_files_for_user(s.user_id, project.id).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+        };
+        let policies = canonical
+            .into_iter()
+            .map(|file| (file.path, file.policy))
+            .collect::<BTreeMap<_, _>>();
+        return match state.repo.private_working_tree(s.user_id, project.id).await {
+            Ok(tree) => Json(
+                tree.files
                     .into_iter()
-                    .map(|file| FileWire {
-                        path: file.path,
-                        size_bytes: file.size_bytes,
-                        revision: Some(file.revision),
-                        policy: Some(file.policy.as_str().to_owned()),
-                        draft_revision: None,
-                        has_draft: false,
+                    .filter(|file| !file.pending_delete)
+                    .map(|file| {
+                        let policy = file
+                            .canonical_path
+                            .as_ref()
+                            .and_then(|path| policies.get(path))
+                            .copied()
+                            .unwrap_or(FilePolicy::Editable);
+                        FileWire {
+                            path: file.path,
+                            size_bytes: file.size_bytes,
+                            revision: Some(file.canonical_revision.unwrap_or(0)),
+                            policy: Some(policy.as_str().to_owned()),
+                            draft_revision: file.draft_revision,
+                            has_draft: file.added
+                                || file.modified
+                                || file.renamed
+                                || file.draft_revision.is_some(),
+                        }
                     })
-                    .collect::<Vec<_>>();
-                match state
-                    .repo
-                    .draft_only_paths_for_user(s.user_id, project.id)
-                    .await
-                {
-                    Ok(drafts) => files.extend(drafts.into_iter().map(|draft| FileWire {
-                        path: draft.path,
-                        size_bytes: draft.size_bytes,
-                        revision: Some(draft.base_revision),
-                        policy: Some(FilePolicy::Editable.as_str().to_owned()),
-                        draft_revision: Some(draft.draft_revision),
-                        has_draft: true,
-                    })),
-                    Err(_) => {
-                        return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure");
-                    }
-                }
-                Json(files).into_response()
-            }
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
             Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
         };
     }
@@ -1511,45 +1514,18 @@ async fn file(
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     };
     if let ProjectAccess::Team { project, .. } = access {
-        let canonical = match state
-            .repo
-            .team_file_for_user(s.user_id, project.id, path.as_str())
-            .await
-        {
-            Ok(value) => value,
-            Err(AppError::NotFound) => match state
-                .repo
-                .draft_only_for_user(s.user_id, project.id, path.as_str())
-                .await
-            {
-                Ok(Some(draft)) => {
-                    return match state.blobs.get(draft.blob_hash).await {
-                        Ok(bytes) if u64::try_from(bytes.len()).ok() == Some(draft.size_bytes) => {
-                            text_file_response(&state, id, bytes).await
-                        }
-                        Ok(_) | Err(_) => {
-                            error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure")
-                        }
-                    };
-                }
-                Ok(None) | Err(AppError::NotFound) => {
-                    return error(StatusCode::NOT_FOUND, "not found");
-                }
-                Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
-            },
+        let projected = match state.repo.private_working_tree(s.user_id, project.id).await {
+            Ok(tree) => tree
+                .files
+                .into_iter()
+                .find(|file| file.path == path.as_str() && !file.pending_delete),
             Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
         };
-        let record = match state
-            .repo
-            .draft_for_user(s.user_id, project.id, path.as_str())
-            .await
-        {
-            Ok(Some(draft)) => (draft.blob_hash, draft.size_bytes),
-            Ok(None) => (canonical.blob_hash, canonical.size_bytes),
-            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+        let Some(record) = projected else {
+            return error(StatusCode::NOT_FOUND, "not found");
         };
-        return match state.blobs.get(record.0).await {
-            Ok(bytes) if u64::try_from(bytes.len()).ok() == Some(record.1) => {
+        return match state.blobs.get(record.blob_hash).await {
+            Ok(bytes) if u64::try_from(bytes.len()).ok() == Some(record.size_bytes) => {
                 text_file_response(&state, id, bytes).await
             }
             Ok(_) | Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
@@ -2043,7 +2019,7 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
     };
     match state.workspaces.restore(id).await {
         Ok(v) => {
-            let (name, files, collaboration) = match access {
+            let (name, files, collaboration, main_file) = match access {
                 ProjectAccess::Personal { .. } => {
                     let project = match state.repo.project(user, id).await {
                         Ok(value) => value,
@@ -2061,7 +2037,12 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                             has_draft: false,
                         })
                         .collect();
-                    (project.name, files, None)
+                    (
+                        project.name,
+                        files,
+                        None,
+                        v.main_file().map(|path| path.as_str().to_owned()),
+                    )
                 }
                 ProjectAccess::Team {
                     project,
@@ -2070,46 +2051,49 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                     can_mentor,
                     can_manage,
                 } => {
-                    let records = match state.repo.team_files_for_user(user, project.id).await {
+                    let canonical = match state.repo.team_files_for_user(user, project.id).await {
                         Ok(value) => value,
                         Err(_) => {
                             return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure");
                         }
                     };
-                    let drafts = match state.repo.draft_only_paths_for_user(user, project.id).await
-                    {
+                    let policies = canonical
+                        .into_iter()
+                        .map(|file| (file.path, file.policy))
+                        .collect::<BTreeMap<_, _>>();
+                    let tree = match state.repo.private_working_tree(user, project.id).await {
                         Ok(value) => value,
                         Err(_) => {
                             return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure");
                         }
                     };
-                    let mut files = Vec::with_capacity(records.len() + drafts.len());
-                    for file in records {
-                        let draft = state
-                            .repo
-                            .draft_for_user(user, project.id, &file.path)
-                            .await
-                            .ok()
-                            .flatten();
-                        let has_draft = draft.is_some();
-                        let draft_revision = draft.map(|draft| draft.draft_revision);
-                        files.push(FileWire {
-                            path: file.path,
-                            size_bytes: file.size_bytes,
-                            revision: Some(file.revision),
-                            policy: Some(file.policy.as_str().to_owned()),
-                            draft_revision,
-                            has_draft,
-                        });
-                    }
-                    files.extend(drafts.into_iter().map(|draft| FileWire {
-                        path: draft.path,
-                        size_bytes: draft.size_bytes,
-                        revision: Some(draft.base_revision),
-                        policy: Some(FilePolicy::Editable.as_str().to_owned()),
-                        draft_revision: Some(draft.draft_revision),
-                        has_draft: true,
-                    }));
+                    let main_file = tree
+                        .pending_main
+                        .or_else(|| v.main_file().map(|path| path.as_str().to_owned()));
+                    let files = tree
+                        .files
+                        .into_iter()
+                        .filter(|file| !file.pending_delete)
+                        .map(|file| {
+                            let policy = file
+                                .canonical_path
+                                .as_ref()
+                                .and_then(|path| policies.get(path))
+                                .copied()
+                                .unwrap_or(FilePolicy::Editable);
+                            FileWire {
+                                path: file.path,
+                                size_bytes: file.size_bytes,
+                                revision: Some(file.canonical_revision.unwrap_or(0)),
+                                policy: Some(policy.as_str().to_owned()),
+                                draft_revision: file.draft_revision,
+                                has_draft: file.added
+                                    || file.modified
+                                    || file.renamed
+                                    || file.draft_revision.is_some(),
+                            }
+                        })
+                        .collect();
                     (
                         project.name,
                         files,
@@ -2122,6 +2106,7 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                             can_manage,
                             account_type: account_type.as_str().to_owned(),
                         }),
+                        main_file,
                     )
                 }
             };
@@ -2129,7 +2114,7 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                 id: id.to_string(),
                 name,
                 version: v.version().get(),
-                main_file: v.main_file().map(|p| p.as_str().to_owned()),
+                main_file,
                 files,
                 collaboration,
             })

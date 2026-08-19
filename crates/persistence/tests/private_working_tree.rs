@@ -219,6 +219,46 @@ async fn canonical_and_private_draft_projection_is_member_isolated() {
 }
 
 #[tokio::test]
+async fn project_manager_can_assign_each_supported_project_role() {
+    let fixture = fixture().await;
+    for roles in [
+        persistence::ProjectRoles {
+            writer: true,
+            mentor: false,
+            project_manager: false,
+        },
+        persistence::ProjectRoles {
+            writer: false,
+            mentor: true,
+            project_manager: false,
+        },
+        persistence::ProjectRoles {
+            writer: false,
+            mentor: false,
+            project_manager: true,
+        },
+    ] {
+        fixture
+            .repo
+            .set_project_member(fixture.alice, fixture.project, fixture.bob, roles)
+            .await
+            .unwrap();
+        let assigned = fixture
+            .repo
+            .project_members(fixture.alice, fixture.project)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|member| member.user_id == fixture.bob)
+            .unwrap();
+        assert_eq!(assigned.writer, roles.writer);
+        assert_eq!(assigned.mentor, roles.mentor);
+        assert_eq!(assigned.project_manager, roles.project_manager);
+    }
+    close(fixture).await;
+}
+
+#[tokio::test]
 async fn projection_normalizes_rename_chains_and_projected_path_drafts() {
     let fixture = fixture().await;
     fixture

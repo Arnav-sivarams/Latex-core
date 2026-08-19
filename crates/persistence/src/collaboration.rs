@@ -703,12 +703,9 @@ impl AppRepository {
         if !manager {
             return Err(AppError::Forbidden);
         }
-        if !access.account_type().is_admin() {
-            let resolver = resolver_for_access_tx(&mut tx, actor, &access).await?;
-            if !resolver.may_delegate_role(roles) {
-                return Err(AppError::Forbidden);
-            }
-        }
+        // Project-management authority is the delegation boundary. A manager
+        // must be able to assign each supported project role, including the
+        // mentor role whose review capabilities they need not hold themselves.
         let team_id = match access {
             ProjectAccess::Team { ref project, .. } => project.team_id,
             ProjectAccess::Personal { .. } => return Err(AppError::NotFound),
@@ -1561,19 +1558,37 @@ async fn private_working_tree_tx(
             pending_delete: false,
         });
     }
-    // Draft-only files have no structural CREATE row.  Loading them before
-    // applying operations lets a later rename/delete resolve their projected
-    // source path while drafts for renamed canonical files remain overlays.
+    // Draft-only files have no structural CREATE row. Load them into the
+    // projection before applying operations so a writer can create, then
+    // rename or delete, within one private change set. Canonical drafts stay
+    // as overlays and are merged after structural operations below.
     let drafts = sqlx::query("SELECT logical_path,base_file_revision,draft_revision,draft_blob_hash,draft_size_bytes FROM latex_core.member_drafts WHERE team_project_id=$1 AND user_id=$2 ORDER BY logical_path")
         .bind(project_id).bind(user.as_uuid()).fetch_all(&mut **tx).await.map_err(AppError::Database)?
         .into_iter().map(decode_draft).collect::<Result<Vec<_>, _>>()?;
+    let mut consumed_draft_paths = HashSet::new();
+    for draft in &drafts {
+        if draft.base_revision == 0 && !files.iter().any(|file| file.path == draft.path) {
+            consumed_draft_paths.insert(draft.path.clone());
+            files.push(ProjectedTeamFile {
+                path: draft.path.clone(),
+                canonical_path: None,
+                canonical_revision: None,
+                blob_hash: draft.blob_hash,
+                size_bytes: draft.size_bytes,
+                draft_revision: Some(draft.draft_revision),
+                added: true,
+                modified: false,
+                renamed: false,
+                pending_delete: false,
+            });
+        }
+    }
     let operations = sqlx::query("SELECT operation_type,source_path,destination_path,base_file_revision FROM latex_core.member_change_operations WHERE team_project_id=$1 AND user_id=$2 ORDER BY operation_sequence")
         .bind(project_id).bind(user.as_uuid()).fetch_all(&mut **tx).await.map_err(AppError::Database)?;
     let mut pending_main = None;
     // A structural operation can consume a draft-only source (there is no
     // canonical row or explicit CREATE operation).  Do not re-add that raw
     // draft after the ordered operation stream has moved or removed it.
-    let mut consumed_draft_paths = HashSet::new();
     for row in operations {
         let kind: String = row.try_get("operation_type").map_err(AppError::Database)?;
         let source: Option<String> = row.try_get("source_path").map_err(AppError::Database)?;
