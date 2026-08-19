@@ -1,5 +1,7 @@
-import { api, apiText } from '/static/api.js?v=server-login-1';
-import { state, savePreferences, cacheBuffer, clearBufferCache } from '/static/state.js?v=server-login-1';
+import { api, apiText } from '/static/api.js?v=client-runtime-2';
+import { state, savePreferences, cacheBuffer, clearBufferCache } from '/static/state.js?v=client-runtime-2';
+
+document.body.dataset.clientBoot = 'starting';
 
 const $ = (selector) => document.querySelector(selector);
 const textExtensions = new Set(['tex', 'bib', 'cls', 'sty', 'bst', 'cfg', 'def', 'txt', 'csv', 'md', 'log', 'aux', 'toc']);
@@ -19,6 +21,7 @@ function recentFiles() { try { return JSON.parse(localStorage.getItem(projectCac
 function remember(path) { const values = [path, ...recentFiles().filter((item) => item !== path)].slice(0, 8); localStorage.setItem(projectCacheKey(), JSON.stringify(values)); }
 
 function toast(message, error = false) { const item = document.createElement('div'); item.className = `toast${error ? ' error' : ''}`; item.textContent = message; $('#toastArea').append(item); setTimeout(() => item.remove(), 4300); }
+function showClientBootFailure() { toast('Workspace controls failed to start. Reload.', true); }
 function showAuthenticatedShell() { $('#loginView')?.classList.add('hidden'); $('#appView').classList.remove('hidden'); }
 function readableError(error) {
   if (error.status === 401) return 'Session expired — your local changes are still retained.';
@@ -32,8 +35,13 @@ function setSaveState(value) {
   state.saveState = value;
   const labels = { CLEAN: 'Saved', DIRTY: 'Unsaved changes', SAVING: 'Saving…', SAVED: 'Saved', SAVED_PRIVATE: 'Private changes saved', PUBLISHING: 'Publishing…', CONFLICT: 'Save conflict', OFFLINE_UNSAVED: 'Offline — changes not saved' };
   const el = $('#saveState'); el.textContent = labels[value] || value; el.dataset.state = value === 'SAVED_PRIVATE' ? 'private' : value === 'OFFLINE_UNSAVED' || value === 'CONFLICT' || value === 'DIRTY' ? 'offline' : '';
-  $('#saveButton').disabled = !state.currentFile || !buffer()?.dirty || !canEdit() || state.saveState === 'SAVING';
+  setProjectRequiredControl('#saveButton', !state.project || !state.currentFile || !buffer()?.dirty || !canEdit() || state.saveState === 'SAVING');
   document.title = `${buffer()?.dirty ? '• ' : ''}${state.project?.name || 'LaTeX Core'} — LaTeX Core`;
+}
+function setProjectRequiredControl(selector, disabled) {
+  const element = $(selector); element.disabled = disabled;
+  if (!disabled) { element.removeAttribute('title'); element.removeAttribute('aria-label'); return; }
+  if (!state.project) { element.title = 'Open a project first'; element.setAttribute('aria-label', 'Open a project first'); }
 }
 function updateTop() {
   $('#projectTitle').textContent = state.project ? state.project.name : 'No project selected';
@@ -41,7 +49,14 @@ function updateTop() {
   publish.classList.toggle('hidden', !isTeam() || !state.project.collaboration.can_write);
   publish.textContent = 'Publish Changes';
   $('#membersButton').classList.toggle('hidden', !isTeam() || !state.project.collaboration.can_manage);
-  $('#newFileButton').disabled = !state.project || (isTeam() && !state.project.collaboration.can_write);
+  setProjectRequiredControl('#newFileButton', !state.project || (isTeam() && !state.project.collaboration.can_write));
+  setProjectRequiredControl('#compileButton', !state.project || !!state.job);
+  setSaveState(state.saveState);
+}
+function updateTeamControls() {
+  const professor = state.user?.account_type === 'professor';
+  $('#teamCreateButton').classList.toggle('hidden', !professor);
+  $('#teamsHeading').textContent = professor ? 'TEAMS' : 'TEAMS YOU BELONG TO';
 }
 
 function applyTheme() {
@@ -76,7 +91,7 @@ async function loadNavigation() {
 function fileIcon(path) { const extension = (path.split('.').pop() || '').toLowerCase(); return extension === 'tex' ? 'T' : extension === 'bib' ? 'B' : ['png','jpg','jpeg','pdf'].includes(extension) ? '◫' : '·'; }
 function renderTree() {
   const root = $('#fileTree'); root.replaceChildren(); if (!state.project) { root.append(node('p', 'muted', 'Open a project to browse files.')); return; }
-  const folders = new Map([['', { children: [], files: [] }]);
+  const folders = new Map([['', { children: [], files: [] }]]);
   for (const file of state.project.files.slice().sort((a,b) => a.path.localeCompare(b.path))) { let parent = ''; const parts = file.path.split('/'); for (let index = 0; index < parts.length - 1; index += 1) { const name = parts[index]; const path = parent ? `${parent}/${name}` : name; if (!folders.has(path)) { folders.set(path, { children: [], files: [] }); folders.get(parent).children.push(path); } parent = path; } folders.get(parent).files.push(file); }
   const visit = (path, depth) => { const group = folders.get(path); for (const child of group.children.sort()) { const expanded = !state.expanded.has(`closed:${child}`); const row = node('button', 'tree-item tree-folder'); row.dataset.depth = String(Math.min(depth, 4)); row.textContent = `${expanded ? '⌄' : '›'}  ${child.split('/').pop()}`; row.onclick = () => { const key = `closed:${child}`; state.expanded.has(key) ? state.expanded.delete(key) : state.expanded.add(key); renderTree(); }; root.append(row); if (expanded) visit(child, depth + 1); }
     for (const file of group.files) { const row = node('div', 'file-row'); const select = node('button', `tree-item tree-file${state.currentFile === file.path ? ' active' : ''}`); select.dataset.depth = String(Math.min(depth, 4)); select.append(node('span', '', fileIcon(file.path)), node('span', 'file-label', file.path.split('/').pop())); if (state.project.main_file === file.path) select.append(node('span', 'badge', 'Main')); if (file.policy && file.policy !== 'editable') select.append(node('span', 'badge locked', 'Locked')); if (file.has_draft) select.append(node('span', 'badge private', 'Private')); select.onclick = () => openFile(file.path); row.append(select); if (canEdit(file)) { const actions = node('button', 'file-actions', '⋯'); actions.type = 'button'; actions.title = `Actions for ${file.path}`; actions.setAttribute('aria-label', `Actions for ${file.path}`); actions.onclick = () => openFileActions(file.path); row.append(actions); } root.append(row); }
@@ -179,29 +194,34 @@ function showAdmin() {
   const showSection = (section) => { content.replaceChildren(node('h2', '', section), node('p', 'muted', 'Not available in this release.')); nav.querySelectorAll('button').forEach((button) => button.classList.toggle('active', button.textContent === section)); };
   sections.forEach((section) => { const button = node('button', 'admin-nav-item', section); button.onclick = () => showSection(section); nav.append(button); }); panel.append(heading, nav, content); $('#workspace').append(panel); showSection('Overview');
 }
+function openTeamDialog() { $('#teamDialogError').textContent = ''; $('#teamForm').reset(); $('#teamDialog').showModal(); $('#teamNameInput').focus(); }
+async function createTeam(event) {
+  event.preventDefault(); const name = $('#teamNameInput').value.trim(); if (!name) return;
+  try { await api('/api/teams', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, group_type: 'research_team' }) }); $('#teamDialog').close(); await loadNavigation(); toast('Team created'); }
+  catch (error) { $('#teamDialogError').textContent = readableError(error); }
+}
 function showAccessDenied() {
   adminShellControls(true); $('#workspace').replaceChildren(); const panel = node('main', 'admin-shell'); const card = node('section', 'login-card'); card.append(node('div', 'wordmark', 'LaTeX Core'), node('h1', '', 'Admin access required'), node('p', '', 'Your account does not have access to the administrative control plane.')); const back = node('button', 'primary', 'Return to Workspace'); back.onclick = () => location.assign('/'); card.append(back); panel.append(card); $('#workspace').append(panel);
 }
 
 function bindResizer(selector, field, min, max) { const bar = $(selector); let start = 0; let value = 0; const move = (event) => { const delta = field === 'bottom' ? start - event.clientY : event.clientX - start; state.preferences[field] = Math.max(min, Math.min(max, value + delta)); applyLayout(); }; const end = () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', end); bar.classList.remove('dragging'); savePreferences(); }; bar.addEventListener('pointerdown', (event) => { start = field === 'bottom' ? event.clientY : event.clientX; value = state.preferences[field]; bar.classList.add('dragging'); document.addEventListener('pointermove', move); document.addEventListener('pointerup', end); }); }
-  function handleAction(action) { const all = { 'toggle-sidebar': () => { state.preferences.sidebar = !state.preferences.sidebar; savePreferences(); applyLayout(); }, 'new-project': openProjectDialog, 'new-file': () => { if (state.project) { $('#fileDialogError').textContent = ''; $('#fileForm').reset(); $('#fileDialog').showModal(); $('#filePathInput').focus(); } }, save, compile, publish, members: openMembers, help: openHelp, theme: cycleTheme, 'set-main': setMain, 'rename-move': openRenameDialog, 'set-main-file': () => setMainForPath(fileActionPath), 'delete-file': openDeleteDialog, 'confirm-delete': deleteFile, 'reload-pdf': () => { const frame = $('#pdfFrame'); if (frame.src) frame.src = frame.src.replace(/([?&]v=)\d+/, `$1${Date.now()}`); }, 'toggle-pdf': () => { state.preferences.pdf = true; savePreferences(); applyLayout(); }, 'toggle-bottom': toggleBottom, 'close-dialog': () => document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()), 'import-project': importProject }; all[action]?.(); }
+  function handleAction(action) { const all = { 'toggle-sidebar': () => { state.preferences.sidebar = !state.preferences.sidebar; savePreferences(); applyLayout(); }, 'new-project': openProjectDialog, 'new-team': openTeamDialog, 'new-file': () => { if (state.project) { $('#fileDialogError').textContent = ''; $('#fileForm').reset(); $('#fileDialog').showModal(); $('#filePathInput').focus(); } }, save, compile, publish, members: openMembers, help: openHelp, theme: cycleTheme, 'set-main': setMain, 'rename-move': openRenameDialog, 'set-main-file': () => setMainForPath(fileActionPath), 'delete-file': openDeleteDialog, 'confirm-delete': deleteFile, 'reload-pdf': () => { const frame = $('#pdfFrame'); if (frame.src) frame.src = frame.src.replace(/([?&]v=)\d+/, `$1${Date.now()}`); }, 'toggle-pdf': () => { state.preferences.pdf = true; savePreferences(); applyLayout(); }, 'toggle-bottom': toggleBottom, 'close-dialog': () => document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()), 'import-project': importProject }; all[action]?.(); }
 function bindEvents() {
   document.addEventListener('click', (event) => { const target = event.target.closest('[data-action]'); if (target) handleAction(target.dataset.action); }); $('#editor').addEventListener('input', onEditorInput); $('#editor').addEventListener('keydown', (event) => { if (event.key === 'Tab') { event.preventDefault(); const start = event.target.selectionStart; event.target.setRangeText('  ', start, event.target.selectionEnd, 'end'); onEditorInput(); } });
-  $('#fileForm').addEventListener('submit', (event) => { event.preventDefault(); createFile(); }); $('#renameForm').addEventListener('submit', renameFile); $('#projectForm').addEventListener('submit', createProject); $('#memberForm').addEventListener('submit', addMember); $('#commandSearch').addEventListener('input', () => { state.commandIndex = 0; renderCommands(); });
+  $('#fileForm').addEventListener('submit', (event) => { event.preventDefault(); createFile(); }); $('#renameForm').addEventListener('submit', renameFile); $('#projectForm').addEventListener('submit', createProject); $('#teamForm').addEventListener('submit', createTeam); $('#memberForm').addEventListener('submit', addMember); $('#commandSearch').addEventListener('input', () => { state.commandIndex = 0; renderCommands(); });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()); if (!(event.ctrlKey || event.metaKey)) return; const key = event.key.toLowerCase(); if (key === 's') { event.preventDefault(); save(); } if (key === 'enter') { event.preventDefault(); compile(); } if (key === 'p') { event.preventDefault(); openQuickOpen(); } if (key === 'k') { event.preventDefault(); openPalette(); } });
   $('#commandDialog').addEventListener('keydown', (event) => { const count = Number($('#commandDialog').dataset.count || 0); if (event.key === 'ArrowDown') { event.preventDefault(); state.commandIndex = Math.min(count - 1, state.commandIndex + 1); renderCommands(); } else if (event.key === 'ArrowUp') { event.preventDefault(); state.commandIndex = Math.max(0, state.commandIndex - 1); renderCommands(); } else if (event.key === 'Enter') { event.preventDefault(); const query = $('#commandSearch').value.toLowerCase(); const item = state.commands.filter(([label]) => label.toLowerCase().includes(query))[state.commandIndex]; if (item) { $('#commandDialog').close(); item[1](); } } });
   bindResizer('#leftResizer', 'left', 180, 420); bindResizer('#splitResizer', 'right', 300, 900); bindResizer('#bottomResizer', 'bottom', 100, 480); addEventListener('resize', applyLayout);
 }
 async function resolveIdentity() { return api('/api/auth/me'); }
 async function bootAuthenticated(user) {
-  state.user = user; $('#userEmail').textContent = user.email;
+  state.user = user; $('#userEmail').textContent = user.email ? `${user.email} · ` : ''; updateTeamControls();
   if (user.account_type === 'admin' && location.pathname !== '/admin') { location.assign('/admin'); return; }
   if (user.account_type !== 'admin' && location.pathname === '/admin') { location.assign('/'); return; }
   showAuthenticatedShell(); applyTheme(); applyLayout();
   if (location.pathname === '/admin') { if (user.account_type === 'admin') showAdmin(); else showAccessDenied(); return; }
   adminShellControls(false);
-  try { await loadNavigation(); }
-  catch (error) { toast('Unable to load workspace. Retry.', true); }
+  await loadNavigation();
 }
-async function init() { bindEvents(); applyTheme(); if (document.body.dataset.serverAuthenticated !== 'true') return; try { await bootAuthenticated(await resolveIdentity()); } catch (error) { toast('Unable to load workspace. Retry.', true); } }
-init();
+async function init() { bindEvents(); document.body.dataset.clientBoot = 'bound'; applyTheme(); updateTop(); if (document.body.dataset.serverAuthenticated !== 'true') return; await bootAuthenticated(await resolveIdentity()); document.body.dataset.clientBoot = 'ready'; }
+init().catch((error) => { document.body.dataset.clientBoot = 'failed'; console.error('[latex-core] client boot failed', error); showClientBootFailure(); });

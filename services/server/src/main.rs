@@ -2593,6 +2593,8 @@ mod tests {
         assert!(workspace.contains("id=\"appView\" class=\"app\""));
         assert!(!workspace.contains("Welcome back"));
         assert!(!workspace.contains("id=\"loginForm\""));
+        assert!(workspace.contains("/static/app.js?v=client-runtime-2"));
+        assert!(workspace.contains("Log out"));
     }
 
     #[test]
