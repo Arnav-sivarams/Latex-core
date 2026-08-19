@@ -65,7 +65,7 @@ function applyTheme() {
   $('#themeButton').textContent = theme[0].toUpperCase() + theme.slice(1);
 }
 function applyLayout() {
-  const workspace = $('#workspace'); const { left, right, bottom, sidebar, pdf } = state.preferences;
+  const workspace = $('#workspace'); if (!$('#sidebar')) return; const { left, right, bottom, sidebar, pdf } = state.preferences;
   $('#sidebar').classList.toggle('hidden', sidebar); $('#leftResizer').classList.toggle('hidden', sidebar);
   $('#pdfPane').classList.toggle('hidden', pdf); $('#splitResizer').classList.toggle('hidden', pdf);
   if (innerWidth > 1050) workspace.style.gridTemplateColumns = `${sidebar ? 0 : left}px ${sidebar ? 0 : 5}px minmax(360px,1fr) ${pdf ? 0 : 5}px ${pdf ? 0 : right}px`;
@@ -189,10 +189,10 @@ function cycleTheme() { const values = ['light','dark','system']; state.preferen
 function openHelp() { toast('Shortcuts: Ctrl/Cmd+S save · Ctrl/Cmd+Enter compile · Ctrl/Cmd+P quick open · Ctrl/Cmd+K commands'); }
 function adminShellControls(hidden) { ['#publishButton', '#compileButton', '#membersButton', '#saveButton', '#setMainButton'].forEach((selector) => $(selector).classList.toggle('hidden', hidden)); }
 function showAdmin() {
-  adminShellControls(true); $('#workspace').replaceChildren(); const panel = node('main', 'admin-shell'); const nav = node('nav', 'admin-nav'); const content = node('section', 'admin-content'); const heading = node('div', 'admin-heading'); heading.append(node('div', 'wordmark', 'LaTeX Core Admin'), node('h1', '', 'Control plane'), node('p', 'muted', 'Global administration is separate from membership-scoped projects.'));
+  adminShellControls(true); $('#projectTitle').textContent = 'Admin'; $('#saveState').classList.add('hidden'); const workspace = $('#workspace'); workspace.classList.add('admin-workspace'); workspace.replaceChildren(); const panel = node('main', 'admin-shell'); const nav = node('nav', 'admin-nav'); const content = node('section', 'admin-content'); const heading = node('div', 'admin-heading'); heading.append(node('div', 'wordmark', 'LaTeX Core Admin'), node('h1', '', 'Control plane'), node('p', 'muted', 'Global administration is separate from membership-scoped projects.'));
   const sections = ['Overview', 'Users', 'Teams', 'Mentor Groups', 'Projects', 'Templates', 'Build Queue', 'Audit', 'System'];
   const showSection = (section) => { content.replaceChildren(node('h2', '', section), node('p', 'muted', 'Not available in this release.')); nav.querySelectorAll('button').forEach((button) => button.classList.toggle('active', button.textContent === section)); };
-  sections.forEach((section) => { const button = node('button', 'admin-nav-item', section); button.onclick = () => showSection(section); nav.append(button); }); panel.append(heading, nav, content); $('#workspace').append(panel); showSection('Overview');
+  sections.forEach((section) => { const button = node('button', 'admin-nav-item', section); button.onclick = () => showSection(section); nav.append(button); }); panel.append(heading, nav, content); workspace.append(panel); showSection('Overview');
 }
 function openTeamDialog() { $('#teamDialogError').textContent = ''; $('#teamForm').reset(); $('#teamDialog').showModal(); $('#teamNameInput').focus(); }
 async function createTeam(event) {
