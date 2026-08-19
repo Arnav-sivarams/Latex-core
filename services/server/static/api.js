@@ -4,7 +4,7 @@ export class ApiError extends Error {
 
 export async function api(path, options = {}) {
   let response;
-  try { response = await fetch(path, options); }
+  try { response = await fetch(path, { ...options, credentials: 'same-origin' }); }
   catch (_) { throw new ApiError('Offline — changes not saved', 0); }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
@@ -14,9 +14,9 @@ export async function api(path, options = {}) {
   return kind.includes('application/json') ? response.json() : response.text();
 }
 
-export async function apiText(path) {
+export async function apiText(path, options = {}) {
   let response;
-  try { response = await fetch(path); }
+  try { response = await fetch(path, { ...options, credentials: 'same-origin' }); }
   catch (_) { throw new ApiError('Offline — changes not saved', 0); }
   if (!response.ok) throw new ApiError(response.statusText, response.status);
   return response.text();

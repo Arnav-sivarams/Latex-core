@@ -19,6 +19,9 @@ function recentFiles() { try { return JSON.parse(localStorage.getItem(projectCac
 function remember(path) { const values = [path, ...recentFiles().filter((item) => item !== path)].slice(0, 8); localStorage.setItem(projectCacheKey(), JSON.stringify(values)); }
 
 function toast(message, error = false) { const item = document.createElement('div'); item.className = `toast${error ? ' error' : ''}`; item.textContent = message; $('#toastArea').append(item); setTimeout(() => item.remove(), 4300); }
+function showLogin(message = '') { $('#appView').classList.add('hidden'); $('#loginView').classList.remove('hidden'); $('#loginError').textContent = message; }
+function showLoginWithServerError(message) { $('#loginError').textContent = message; }
+function showAuthenticatedShell() { $('#loginView').classList.add('hidden'); $('#appView').classList.remove('hidden'); }
 function readableError(error) {
   if (error.status === 401) return 'Session expired — your local changes are still retained.';
   if (error.status === 0) return 'Offline — changes not saved.';
@@ -186,18 +189,23 @@ function showAccessDenied() {
 function bindResizer(selector, field, min, max) { const bar = $(selector); let start = 0; let value = 0; const move = (event) => { const delta = field === 'bottom' ? start - event.clientY : event.clientX - start; state.preferences[field] = Math.max(min, Math.min(max, value + delta)); applyLayout(); }; const end = () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', end); bar.classList.remove('dragging'); savePreferences(); }; bar.addEventListener('pointerdown', (event) => { start = field === 'bottom' ? event.clientY : event.clientX; value = state.preferences[field]; bar.classList.add('dragging'); document.addEventListener('pointermove', move); document.addEventListener('pointerup', end); }); }
   function handleAction(action) { const all = { 'toggle-sidebar': () => { state.preferences.sidebar = !state.preferences.sidebar; savePreferences(); applyLayout(); }, 'new-project': openProjectDialog, 'new-file': () => { if (state.project) { $('#fileDialogError').textContent = ''; $('#fileForm').reset(); $('#fileDialog').showModal(); $('#filePathInput').focus(); } }, save, compile, publish, members: openMembers, help: openHelp, theme: cycleTheme, logout, 'set-main': setMain, 'rename-move': openRenameDialog, 'set-main-file': () => setMainForPath(fileActionPath), 'delete-file': openDeleteDialog, 'confirm-delete': deleteFile, 'reload-pdf': () => { const frame = $('#pdfFrame'); if (frame.src) frame.src = frame.src.replace(/([?&]v=)\d+/, `$1${Date.now()}`); }, 'toggle-pdf': () => { state.preferences.pdf = true; savePreferences(); applyLayout(); }, 'toggle-bottom': toggleBottom, 'close-dialog': () => document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()), 'import-project': importProject }; all[action]?.(); }
 function bindEvents() {
-  $('#loginForm').addEventListener('submit', async (event) => { event.preventDefault(); try { const email = $('#email').value.trim().toLowerCase(); await api('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password: $('#password').value }) }); const user = await api('/api/auth/me'); if (user.email !== email) throw new ApiError('authenticated session does not match the requested account', 401); if (user.landing_path !== location.pathname) { location.assign(user.landing_path); return; } await boot(user); } catch (error) { $('#loginError').textContent = readableError(error); } });
+  $('#loginForm').addEventListener('submit', async (event) => { event.preventDefault(); try { const email = $('#email').value.trim().toLowerCase(); await api('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password: $('#password').value }) }); const user = await resolveIdentity(); if (user.email !== email) throw new ApiError('authenticated session does not match the requested account', 401); await bootAuthenticated(user); } catch (error) { if (error.status === 401) showLogin(readableError(error)); else showLoginWithServerError(readableError(error)); } });
   document.addEventListener('click', (event) => { const target = event.target.closest('[data-action]'); if (target) handleAction(target.dataset.action); }); $('#editor').addEventListener('input', onEditorInput); $('#editor').addEventListener('keydown', (event) => { if (event.key === 'Tab') { event.preventDefault(); const start = event.target.selectionStart; event.target.setRangeText('  ', start, event.target.selectionEnd, 'end'); onEditorInput(); } });
   $('#fileForm').addEventListener('submit', (event) => { event.preventDefault(); createFile(); }); $('#renameForm').addEventListener('submit', renameFile); $('#projectForm').addEventListener('submit', createProject); $('#memberForm').addEventListener('submit', addMember); $('#commandSearch').addEventListener('input', () => { state.commandIndex = 0; renderCommands(); });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()); if (!(event.ctrlKey || event.metaKey)) return; const key = event.key.toLowerCase(); if (key === 's') { event.preventDefault(); save(); } if (key === 'enter') { event.preventDefault(); compile(); } if (key === 'p') { event.preventDefault(); openQuickOpen(); } if (key === 'k') { event.preventDefault(); openPalette(); } });
   $('#commandDialog').addEventListener('keydown', (event) => { const count = Number($('#commandDialog').dataset.count || 0); if (event.key === 'ArrowDown') { event.preventDefault(); state.commandIndex = Math.min(count - 1, state.commandIndex + 1); renderCommands(); } else if (event.key === 'ArrowUp') { event.preventDefault(); state.commandIndex = Math.max(0, state.commandIndex - 1); renderCommands(); } else if (event.key === 'Enter') { event.preventDefault(); const query = $('#commandSearch').value.toLowerCase(); const item = state.commands.filter(([label]) => label.toLowerCase().includes(query))[state.commandIndex]; if (item) { $('#commandDialog').close(); item[1](); } } });
   bindResizer('#leftResizer', 'left', 180, 420); bindResizer('#splitResizer', 'right', 300, 900); bindResizer('#bottomResizer', 'bottom', 100, 480); addEventListener('resize', applyLayout);
 }
-async function boot(user) {
-  state.user = user; $('#userEmail').textContent = user.email; $('#loginView').classList.add('hidden'); $('#appView').classList.remove('hidden'); applyTheme(); applyLayout();
-  if (user.landing_path === '/admin' && location.pathname === '/') { location.replace('/admin'); return; }
+async function resolveIdentity() { return api('/api/auth/me'); }
+async function bootAuthenticated(user) {
+  state.user = user; $('#userEmail').textContent = user.email;
+  if (user.account_type === 'admin' && location.pathname !== '/admin') { location.assign('/admin'); return; }
+  if (user.account_type !== 'admin' && location.pathname === '/admin') { location.assign('/'); return; }
+  showAuthenticatedShell(); applyTheme(); applyLayout();
   if (location.pathname === '/admin') { if (user.account_type === 'admin') showAdmin(); else showAccessDenied(); return; }
-  adminShellControls(false); await loadNavigation();
+  adminShellControls(false);
+  try { await loadNavigation(); }
+  catch (error) { toast('Unable to load workspace. Retry.', true); }
 }
-async function init() { bindEvents(); try { const user = await api('/api/auth/me'); await boot(user); } catch (_) { applyTheme(); } }
+async function init() { bindEvents(); try { const user = await resolveIdentity(); await bootAuthenticated(user); } catch (error) { applyTheme(); if (error.status === 401) showLogin(); else showLoginWithServerError('Unable to reach the server. Retry.'); } }
 init();
