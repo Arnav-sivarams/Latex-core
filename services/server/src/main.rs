@@ -13,7 +13,7 @@ mod auth;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -292,6 +292,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(ui))
+        .route("/login", post(browser_login))
+        .route("/logout", post(browser_logout))
         .route("/admin", get(admin_ui))
         .route("/static/styles.css", get(styles))
         .route("/static/app.js", get(app_js))
@@ -400,38 +402,103 @@ async fn login(
     if let Err(r) = csrf(&headers) {
         return r;
     };
-    let email = match auth::normalized_email(&input.email) {
-        Ok(v) => v,
-        Err(_) => return error(StatusCode::UNAUTHORIZED, "invalid credentials"),
-    };
-    let Ok(Some(user)) = state.repo.user_by_email(&email).await else {
+    let Some((user, email)) = (match valid_credentials(&state, &input).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    }) else {
         return error(StatusCode::UNAUTHORIZED, "invalid credentials");
+    };
+    session_response(&state, &headers, user, email).await
+}
+
+async fn browser_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(input): Form<Credentials>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let Some((user, _email)) = (match valid_credentials(&state, &input).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    }) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(login_html(Some("Invalid email or password."))),
+        )
+            .into_response();
+    };
+    let cookies = match create_session_headers(&state, &headers, user).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let location = match state.repo.account_type(user).await {
+        Ok(account_type) if account_type.is_admin() => "/admin",
+        Ok(_) => "/",
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    };
+    redirect_with_cookies(location, cookies)
+}
+
+async fn valid_credentials(
+    state: &AppState,
+    input: &Credentials,
+) -> Result<Option<(UserId, String)>, Response> {
+    let email = match auth::normalized_email(&input.email) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let user = match state.repo.user_by_email(&email).await {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authentication failure",
+            ));
+        }
+    };
+    let Some(user) = user else {
+        return Ok(None);
     };
     if !user.enabled {
-        return error(StatusCode::UNAUTHORIZED, "invalid credentials");
+        return Ok(None);
     }
-    let Ok(valid) = auth::verify_password(&input.password, &user.password_hash) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure");
-    };
-    if !valid {
-        return error(StatusCode::UNAUTHORIZED, "invalid credentials");
-    };
-    session_response(&state, &headers, user.user_id, user.email).await
+    let valid = auth::verify_password(&input.password, &user.password_hash)
+        .map_err(|()| error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure"))?;
+    Ok(valid.then_some((user.user_id, user.email)))
 }
+
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = csrf(&headers) {
         return r;
     };
-    for token in named_cookies(&headers, COOKIE) {
-        if state.repo.delete_session(&digest(&token)).await.is_err() {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
-        }
-    }
-    let cookies = match expired_session_cookie_headers(state.cookie_secure) {
+    let cookies = match revoke_session(&state, &headers).await {
         Ok(value) => value,
-        Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+        Err(response) => return response,
     };
     (StatusCode::NO_CONTENT, cookies).into_response()
+}
+
+async fn browser_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let cookies = match revoke_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    redirect_with_cookies("/", cookies)
+}
+
+async fn revoke_session(state: &AppState, headers: &HeaderMap) -> Result<HeaderMap, Response> {
+    for token in named_cookies(&headers, COOKIE) {
+        if state.repo.delete_session(&digest(&token)).await.is_err() {
+            return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"));
+        }
+    }
+    expired_session_cookie_headers(state.cookie_secure)
+        .map_err(|()| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match auth(&state, &headers).await {
@@ -2160,11 +2227,31 @@ async fn session_response(
     user: UserId,
     email: String,
 ) -> Response {
+    let cookies = match create_session_headers(state, headers, user).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    (
+        StatusCode::CREATED,
+        cookies,
+        Json(match identity_for_user(state, user, email).await {
+            Ok(identity) => identity,
+            Err(response) => return response,
+        }),
+    )
+        .into_response()
+}
+
+async fn create_session_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: UserId,
+) -> Result<HeaderMap, Response> {
     // Session rotation applies only to V2.  Legacy tokens were never part of the
     // V2 authentication contract and must not affect which session is created.
     for token in named_cookies(headers, COOKIE) {
         if state.repo.delete_session(&digest(&token)).await.is_err() {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
+            return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"));
         }
     }
     let mut bytes = [0u8; 32];
@@ -2176,21 +2263,10 @@ async fn session_response(
         .await
         .is_err()
     {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
+        return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"));
     };
-    let cookies = match session_cookie_headers(&token, state.session_seconds, state.cookie_secure) {
-        Ok(value) => value,
-        Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
-    };
-    (
-        StatusCode::CREATED,
-        cookies,
-        Json(match identity_for_user(state, user, email).await {
-            Ok(identity) => identity,
-            Err(response) => return response,
-        }),
-    )
-        .into_response()
+    session_cookie_headers(&token, state.session_seconds, state.cookie_secure)
+        .map_err(|()| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))
 }
 async fn identity_response(state: &AppState, session: persistence::AppSessionRecord) -> Response {
     match identity_for_user(state, session.user_id, session.email).await {
@@ -2407,19 +2483,61 @@ fn queue_limits() -> Result<QueueLimits, Box<dyn std::error::Error>> {
     .map_err(Into::into)
 }
 
-async fn ui() -> Html<&'static str> {
-    Html(include_str!("ui.html"))
+fn login_html(error_message: Option<&str>) -> String {
+    include_str!("ui.html")
+        .replacen("<body>", "<body data-server-authenticated=\"false\">", 1)
+        .replace("{{LOGIN_ERROR}}", error_message.unwrap_or(""))
+}
+
+fn workspace_html() -> String {
+    let source = include_str!("ui.html");
+    let start = source
+        .find("  <!-- login-view:start -->\n")
+        .expect("login view start marker is present");
+    let end = source
+        .find("  <!-- login-view:end -->\n")
+        .expect("login view end marker is present")
+        + "  <!-- login-view:end -->\n".len();
+    let mut page = String::with_capacity(source.len());
+    page.push_str(&source[..start]);
+    page.push_str(&source[end..]);
+    page.replacen("<body>", "<body data-server-authenticated=\"true\">", 1)
+        .replacen("class=\"app hidden\"", "class=\"app\"", 1)
+}
+
+fn redirect_with_cookies(location: &'static str, cookies: HeaderMap) -> Response {
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response();
+    response.headers_mut().extend(cookies);
+    response
+}
+
+async fn ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
+        Err(response) => return response,
+    };
+    match state.repo.account_type(session.user_id).await {
+        Ok(account_type) if account_type.is_admin() => {
+            redirect_with_cookies("/admin", HeaderMap::new())
+        }
+        Ok(_) => Html(workspace_html()).into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    }
 }
 
 async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let session = match auth(&state, &headers).await {
         Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
         Err(response) => return response,
     };
     match state.repo.account_type(session.user_id).await {
-        Ok(account_type) if account_type.is_admin() => {
-            Html(include_str!("ui.html")).into_response()
-        }
+        Ok(account_type) if account_type.is_admin() => Html(workspace_html()).into_response(),
         Ok(_) => error(StatusCode::FORBIDDEN, "administrative access required"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
     }
@@ -2461,6 +2579,40 @@ async fn state_js() -> Response {
 #[allow(clippy::expect_used, reason = "unit assertion fixture")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_login_html_has_a_native_form_and_workspace_html_omits_it() {
+        let login = login_html(Some("Invalid email or password."));
+        assert!(login.contains("method=\"post\" action=\"/login\""));
+        assert!(login.contains("name=\"email\""));
+        assert!(login.contains("name=\"password\""));
+        assert!(login.contains("Invalid email or password."));
+
+        let workspace = workspace_html();
+        assert!(workspace.contains("data-server-authenticated=\"true\""));
+        assert!(workspace.contains("id=\"appView\" class=\"app\""));
+        assert!(!workspace.contains("Welcome back"));
+        assert!(!workspace.contains("id=\"loginForm\""));
+    }
+
+    #[test]
+    fn browser_login_redirect_has_a_canonical_session_cookie() {
+        let response = redirect_with_cookies(
+            "/",
+            session_cookie_headers("token", 60, false).expect("valid cookie headers"),
+        );
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/");
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .as_bytes()
+                    .starts_with(b"latex_core_session_v2=token; Path=/; HttpOnly; SameSite=Lax"))
+        );
+    }
 
     #[test]
     fn v2_cookie_parser_ignores_legacy_and_unrelated_cookie_values() {

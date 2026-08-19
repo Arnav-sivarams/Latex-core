@@ -1,5 +1,5 @@
-import { api, apiText, ApiError } from '/static/api.js?v=auth-race-2';
-import { state, savePreferences, cacheBuffer, clearBufferCache } from '/static/state.js?v=auth-race-2';
+import { api, apiText } from '/static/api.js?v=server-login-1';
+import { state, savePreferences, cacheBuffer, clearBufferCache } from '/static/state.js?v=server-login-1';
 
 const $ = (selector) => document.querySelector(selector);
 const textExtensions = new Set(['tex', 'bib', 'cls', 'sty', 'bst', 'cfg', 'def', 'txt', 'csv', 'md', 'log', 'aux', 'toc']);
@@ -7,7 +7,6 @@ const conflictCopy = { changed_since_edit: 'This file changed after you started 
 const structuralPrivateProjects = new Set();
 let fileActionPath = null;
 let fileMutationActive = false;
-let authGeneration = 0;
 
 function isText(path) { return textExtensions.has((path.split('.').pop() || '').toLowerCase()); }
 function currentRecord() { return state.project?.files.find((file) => file.path === state.currentFile); }
@@ -20,9 +19,7 @@ function recentFiles() { try { return JSON.parse(localStorage.getItem(projectCac
 function remember(path) { const values = [path, ...recentFiles().filter((item) => item !== path)].slice(0, 8); localStorage.setItem(projectCacheKey(), JSON.stringify(values)); }
 
 function toast(message, error = false) { const item = document.createElement('div'); item.className = `toast${error ? ' error' : ''}`; item.textContent = message; $('#toastArea').append(item); setTimeout(() => item.remove(), 4300); }
-function showLogin(message = '') { $('#appView').classList.add('hidden'); $('#loginView').classList.remove('hidden'); $('#loginError').textContent = message; }
-function showLoginWithServerError(message) { $('#loginError').textContent = message; }
-function showAuthenticatedShell() { $('#loginView').classList.add('hidden'); $('#appView').classList.remove('hidden'); }
+function showAuthenticatedShell() { $('#loginView')?.classList.add('hidden'); $('#appView').classList.remove('hidden'); }
 function readableError(error) {
   if (error.status === 401) return 'Session expired — your local changes are still retained.';
   if (error.status === 0) return 'Offline — changes not saved.';
@@ -175,7 +172,6 @@ function openQuickOpen() { if (!state.project) return; state.commands = state.pr
 function toggleBottom() { const panel = $('#bottomPanel'); panel.classList.toggle('collapsed'); document.querySelector('[data-action="toggle-bottom"]').setAttribute('aria-expanded', String(!panel.classList.contains('collapsed'))); }
 function cycleTheme() { const values = ['light','dark','system']; state.preferences.theme = values[(values.indexOf(state.preferences.theme) + 1) % values.length]; savePreferences(); applyTheme(); toast(`${state.preferences.theme[0].toUpperCase() + state.preferences.theme.slice(1)} theme`); }
 function openHelp() { toast('Shortcuts: Ctrl/Cmd+S save · Ctrl/Cmd+Enter compile · Ctrl/Cmd+P quick open · Ctrl/Cmd+K commands'); }
-function logout() { ++authGeneration; api('/api/auth/logout', { method: 'POST' }).catch(() => {}).finally(() => { state.user = null; state.project = null; state.currentFile = null; state.activeTeam = null; state.tabs.clear(); state.job = null; location.assign('/'); }); }
 function adminShellControls(hidden) { ['#publishButton', '#compileButton', '#membersButton', '#saveButton', '#setMainButton'].forEach((selector) => $(selector).classList.toggle('hidden', hidden)); }
 function showAdmin() {
   adminShellControls(true); $('#workspace').replaceChildren(); const panel = node('main', 'admin-shell'); const nav = node('nav', 'admin-nav'); const content = node('section', 'admin-content'); const heading = node('div', 'admin-heading'); heading.append(node('div', 'wordmark', 'LaTeX Core Admin'), node('h1', '', 'Control plane'), node('p', 'muted', 'Global administration is separate from membership-scoped projects.'));
@@ -188,9 +184,8 @@ function showAccessDenied() {
 }
 
 function bindResizer(selector, field, min, max) { const bar = $(selector); let start = 0; let value = 0; const move = (event) => { const delta = field === 'bottom' ? start - event.clientY : event.clientX - start; state.preferences[field] = Math.max(min, Math.min(max, value + delta)); applyLayout(); }; const end = () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', end); bar.classList.remove('dragging'); savePreferences(); }; bar.addEventListener('pointerdown', (event) => { start = field === 'bottom' ? event.clientY : event.clientX; value = state.preferences[field]; bar.classList.add('dragging'); document.addEventListener('pointermove', move); document.addEventListener('pointerup', end); }); }
-  function handleAction(action) { const all = { 'toggle-sidebar': () => { state.preferences.sidebar = !state.preferences.sidebar; savePreferences(); applyLayout(); }, 'new-project': openProjectDialog, 'new-file': () => { if (state.project) { $('#fileDialogError').textContent = ''; $('#fileForm').reset(); $('#fileDialog').showModal(); $('#filePathInput').focus(); } }, save, compile, publish, members: openMembers, help: openHelp, theme: cycleTheme, logout, 'set-main': setMain, 'rename-move': openRenameDialog, 'set-main-file': () => setMainForPath(fileActionPath), 'delete-file': openDeleteDialog, 'confirm-delete': deleteFile, 'reload-pdf': () => { const frame = $('#pdfFrame'); if (frame.src) frame.src = frame.src.replace(/([?&]v=)\d+/, `$1${Date.now()}`); }, 'toggle-pdf': () => { state.preferences.pdf = true; savePreferences(); applyLayout(); }, 'toggle-bottom': toggleBottom, 'close-dialog': () => document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()), 'import-project': importProject }; all[action]?.(); }
+  function handleAction(action) { const all = { 'toggle-sidebar': () => { state.preferences.sidebar = !state.preferences.sidebar; savePreferences(); applyLayout(); }, 'new-project': openProjectDialog, 'new-file': () => { if (state.project) { $('#fileDialogError').textContent = ''; $('#fileForm').reset(); $('#fileDialog').showModal(); $('#filePathInput').focus(); } }, save, compile, publish, members: openMembers, help: openHelp, theme: cycleTheme, 'set-main': setMain, 'rename-move': openRenameDialog, 'set-main-file': () => setMainForPath(fileActionPath), 'delete-file': openDeleteDialog, 'confirm-delete': deleteFile, 'reload-pdf': () => { const frame = $('#pdfFrame'); if (frame.src) frame.src = frame.src.replace(/([?&]v=)\d+/, `$1${Date.now()}`); }, 'toggle-pdf': () => { state.preferences.pdf = true; savePreferences(); applyLayout(); }, 'toggle-bottom': toggleBottom, 'close-dialog': () => document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()), 'import-project': importProject }; all[action]?.(); }
 function bindEvents() {
-  $('#loginForm').addEventListener('submit', async (event) => { event.preventDefault(); const generation = ++authGeneration; const submit = $('#loginForm button[type="submit"], #loginForm button.primary'); submit.disabled = true; submit.textContent = 'Signing in…'; try { const email = $('#email').value.trim().toLowerCase(); await api('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password: $('#password').value }) }); if (generation !== authGeneration) return; const user = await resolveIdentity(); if (generation !== authGeneration) return; if (user.email !== email) throw new ApiError('authenticated session does not match the requested account', 401); if (generation !== authGeneration) return; await bootAuthenticated(user, generation); } catch (error) { if (generation !== authGeneration) return; if (error.status === 401) showLogin(readableError(error)); else showLoginWithServerError(readableError(error)); } finally { if (generation === authGeneration && !$('#loginView').classList.contains('hidden')) { submit.disabled = false; submit.textContent = 'Sign in'; } } });
   document.addEventListener('click', (event) => { const target = event.target.closest('[data-action]'); if (target) handleAction(target.dataset.action); }); $('#editor').addEventListener('input', onEditorInput); $('#editor').addEventListener('keydown', (event) => { if (event.key === 'Tab') { event.preventDefault(); const start = event.target.selectionStart; event.target.setRangeText('  ', start, event.target.selectionEnd, 'end'); onEditorInput(); } });
   $('#fileForm').addEventListener('submit', (event) => { event.preventDefault(); createFile(); }); $('#renameForm').addEventListener('submit', renameFile); $('#projectForm').addEventListener('submit', createProject); $('#memberForm').addEventListener('submit', addMember); $('#commandSearch').addEventListener('input', () => { state.commandIndex = 0; renderCommands(); });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()); if (!(event.ctrlKey || event.metaKey)) return; const key = event.key.toLowerCase(); if (key === 's') { event.preventDefault(); save(); } if (key === 'enter') { event.preventDefault(); compile(); } if (key === 'p') { event.preventDefault(); openQuickOpen(); } if (key === 'k') { event.preventDefault(); openPalette(); } });
@@ -198,8 +193,7 @@ function bindEvents() {
   bindResizer('#leftResizer', 'left', 180, 420); bindResizer('#splitResizer', 'right', 300, 900); bindResizer('#bottomResizer', 'bottom', 100, 480); addEventListener('resize', applyLayout);
 }
 async function resolveIdentity() { return api('/api/auth/me'); }
-async function bootAuthenticated(user, generation) {
-  if (generation !== authGeneration) return;
+async function bootAuthenticated(user) {
   state.user = user; $('#userEmail').textContent = user.email;
   if (user.account_type === 'admin' && location.pathname !== '/admin') { location.assign('/admin'); return; }
   if (user.account_type !== 'admin' && location.pathname === '/admin') { location.assign('/'); return; }
@@ -207,7 +201,7 @@ async function bootAuthenticated(user, generation) {
   if (location.pathname === '/admin') { if (user.account_type === 'admin') showAdmin(); else showAccessDenied(); return; }
   adminShellControls(false);
   try { await loadNavigation(); }
-  catch (error) { if (generation === authGeneration) toast('Unable to load workspace. Retry.', true); }
+  catch (error) { toast('Unable to load workspace. Retry.', true); }
 }
-async function init() { bindEvents(); const generation = ++authGeneration; try { const user = await resolveIdentity(); if (generation !== authGeneration) return; await bootAuthenticated(user, generation); } catch (error) { if (generation !== authGeneration) return; applyTheme(); if (error.status === 401) showLogin(); else showLoginWithServerError('Unable to reach the server. Retry.'); } }
+async function init() { bindEvents(); applyTheme(); if (document.body.dataset.serverAuthenticated !== 'true') return; try { await bootAuthenticated(await resolveIdentity()); } catch (error) { toast('Unable to load workspace. Retry.', true); } }
 init();

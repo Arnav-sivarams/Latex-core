@@ -5,14 +5,16 @@
   <title>LaTeX Core</title><link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+  <!-- login-view:start -->
   <section id="loginView" class="login-view">
-    <form id="loginForm" class="login-card">
+    <form id="loginForm" class="login-card" method="post" action="/login">
       <div class="wordmark">LaTeX Core</div><h1>Welcome back</h1><p>Sign in to your document workspace.</p>
-      <label>Email<input id="email" type="email" autocomplete="username" required></label>
-      <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
-      <p id="loginError" class="inline-error" role="alert"></p><button class="primary wide">Sign in</button>
+      <label>Email<input id="email" name="email" type="email" autocomplete="username" required></label>
+      <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+      <p id="loginError" class="inline-error" role="alert">{{LOGIN_ERROR}}</p><button type="submit" class="primary wide">Sign in</button>
     </form>
   </section>
+  <!-- login-view:end -->
   <section id="appView" class="app hidden">
     <header class="topbar">
       <button class="brand button-reset" data-action="toggle-sidebar" aria-label="Toggle sidebar">LaTeX Core</button>
@@ -23,7 +25,7 @@
       <button id="membersButton" class="hidden" data-action="members">Members</button>
       <button data-action="help" aria-label="Keyboard shortcuts">Help</button>
       <button id="themeButton" data-action="theme" aria-label="Change theme">Theme</button>
-      <button id="accountButton" data-action="logout" title="Sign out"><span id="userEmail">Account</span></button>
+      <form method="post" action="/logout"><button id="accountButton" type="submit" title="Sign out"><span id="userEmail">Account</span></button></form>
     </header>
     <div id="workspace" class="workspace">
       <aside id="sidebar" class="sidebar">
@@ -53,5 +55,5 @@
   <dialog id="membersDialog"><section class="dialog-card"><header><h2>Project members</h2><button class="icon" data-action="close-dialog" aria-label="Close">×</button></header><p id="capabilitySummary" class="muted"></p><div id="membersList" class="members-list"></div><form id="memberForm" class="member-form"><label>Email<input id="memberEmail" type="email" required placeholder="writer@example.edu"></label><label>Role<select id="memberRole"><option value="writer">Writer</option><option value="mentor">Mentor</option><option value="manager">Project Manager</option></select></label><button class="primary">Add member</button></form><p id="memberError" class="inline-error"></p></section></dialog>
   <dialog id="commandDialog"><section class="dialog-card palette" role="dialog" aria-label="Command palette"><input id="commandSearch" placeholder="Type a command…" autocomplete="off"><div id="commandList" role="listbox"></div></section></dialog>
   <dialog id="conflictDialog"><section class="dialog-card"><header><h2>Publishing needs attention</h2><button class="icon" data-action="close-dialog" aria-label="Close">×</button></header><p>Your private work remains safe. Resolve the items below, then try again.</p><div id="conflictList" class="conflict-list"></div></section></dialog>
-  <script type="module" src="/static/app.js?v=auth-race-2"></script>
+  <script type="module" src="/static/app.js?v=server-login-1"></script>
 </body></html>
