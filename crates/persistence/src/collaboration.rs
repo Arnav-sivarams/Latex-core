@@ -294,6 +294,20 @@ impl ChangeConflictReason {
 }
 
 impl AppRepository {
+    /// Returns whether this non-global capability is present on at least one project.
+    ///
+    /// This is deliberately presentation-only: authorization continues to resolve every
+    /// request against the specific project's roles and policy.
+    pub async fn has_mentor_project_role(&self, user: UserId) -> Result<bool, AppError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.team_project_members WHERE user_id=$1 AND mentor=TRUE)",
+        )
+        .bind(user.as_uuid())
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(AppError::Database)
+    }
+
     pub async fn account_type(&self, user: UserId) -> Result<AccountType, AppError> {
         let value: Option<String> = sqlx::query_scalar(
             "SELECT account_type FROM latex_core.user_credentials WHERE user_id=$1",

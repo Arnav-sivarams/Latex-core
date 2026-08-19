@@ -36,7 +36,11 @@ use tower_http::{
 };
 use workspace_model::WorkspaceService;
 
-const COOKIE: &str = "latex_core_session";
+/// The only browser cookie accepted for authentication.  The previous cookie name is
+/// intentionally never parsed for authentication, since browsers can retain it under
+/// more than one path scope.
+const COOKIE: &str = "latex_core_session_v2";
+const LEGACY_COOKIE: &str = "latex_core_session";
 const LEGACY_COOKIE_PATHS: [&str; 2] = ["/api", "/api/auth"];
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 
@@ -112,6 +116,14 @@ struct UserWire {
     id: String,
     email: String,
     account_type: String,
+    persona: String,
+    landing_path: String,
+    capabilities: IdentityCapabilitiesWire,
+}
+#[derive(Serialize)]
+struct IdentityCapabilitiesWire {
+    can_open_admin: bool,
+    has_mentor_projects: bool,
 }
 #[derive(Serialize)]
 struct ProjectWire {
@@ -410,7 +422,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = csrf(&headers) {
         return r;
     };
-    for token in session_cookies(&headers) {
+    for token in named_cookies(&headers, COOKIE) {
         if state.repo.delete_session(&digest(&token)).await.is_err() {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
         }
@@ -423,12 +435,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match auth(&state, &headers).await {
-        Ok(session) => Json(UserWire {
-            id: session.user_id.to_string(),
-            email: session.email,
-            account_type: session.account_type,
-        })
-        .into_response(),
+        Ok(session) => identity_response(&state, session).await,
         Err(r) => r,
     }
 }
@@ -2168,7 +2175,9 @@ async fn session_response(
     user: UserId,
     email: String,
 ) -> Response {
-    for token in session_cookies(headers) {
+    // Session rotation applies only to V2.  Legacy tokens were never part of the
+    // V2 authentication contract and must not affect which session is created.
+    for token in named_cookies(headers, COOKIE) {
         if state.repo.delete_session(&digest(&token)).await.is_err() {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
         }
@@ -2184,10 +2193,6 @@ async fn session_response(
     {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure");
     };
-    let account_type = match state.repo.account_type(user).await {
-        Ok(value) => value.as_str().to_owned(),
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
-    };
     let cookies = match session_cookie_headers(&token, state.session_seconds, state.cookie_secure) {
         Ok(value) => value,
         Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
@@ -2195,14 +2200,62 @@ async fn session_response(
     (
         StatusCode::CREATED,
         cookies,
-        Json(UserWire {
-            id: user.to_string(),
-            email,
-            account_type,
+        Json(match identity_for_user(state, user, email).await {
+            Ok(identity) => identity,
+            Err(response) => return response,
         }),
     )
         .into_response()
 }
+async fn identity_response(state: &AppState, session: persistence::AppSessionRecord) -> Response {
+    match identity_for_user(state, session.user_id, session.email).await {
+        Ok(identity) => Json(identity).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn identity_for_user(
+    state: &AppState,
+    user: UserId,
+    email: String,
+) -> Result<UserWire, Response> {
+    // Re-read account type instead of trusting a client value or a historical session
+    // claim.  Administrative account changes are therefore visible on the next /me.
+    let account_type = state
+        .repo
+        .account_type(user)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?;
+    let is_admin = account_type.is_admin();
+    let has_mentor_projects = if is_admin {
+        false
+    } else {
+        state
+            .repo
+            .has_mentor_project_role(user)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
+    };
+    let persona = if is_admin {
+        "admin"
+    } else if has_mentor_projects {
+        "mentor"
+    } else {
+        account_type.as_str()
+    };
+    Ok(UserWire {
+        id: user.to_string(),
+        email,
+        account_type: account_type.as_str().to_owned(),
+        persona: persona.to_owned(),
+        landing_path: if is_admin { "/admin" } else { "/" }.to_owned(),
+        capabilities: IdentityCapabilitiesWire {
+            can_open_admin: is_admin,
+            has_mentor_projects,
+        },
+    })
+}
+
 fn csrf(headers: &HeaderMap) -> Result<(), Response> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
@@ -2221,23 +2274,28 @@ fn csrf(headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 fn cookie(headers: &HeaderMap) -> Option<String> {
-    // Browsers order duplicate cookie names by path length, so the canonical
-    // root-scoped cookie follows any legacy narrower-path cookie.
-    session_cookies(headers).pop()
+    let tokens = named_cookies(headers, COOKIE);
+    // A well-formed V2 browser has precisely one root-scoped cookie.  Refusing
+    // an ambiguous manually crafted Cookie header is safer than guessing an order.
+    (tokens.len() == 1).then(|| tokens[0].clone())
 }
-fn session_cookies(headers: &HeaderMap) -> Vec<String> {
+fn named_cookies(headers: &HeaderMap, name: &str) -> Vec<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .map(str::trim)
-        .filter_map(|part| part.strip_prefix(&format!("{COOKIE}=")).map(str::to_owned))
+        .filter_map(|part| {
+            part.strip_prefix(name)
+                .and_then(|value| value.strip_prefix('='))
+                .map(str::to_owned)
+        })
         .collect()
 }
-fn session_cookie(value: &str, path: &str, max_age: i64, secure: bool) -> String {
+fn session_cookie(name: &str, value: &str, path: &str, max_age: i64, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!("{COOKIE}={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+    format!("{name}={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
 }
 fn session_cookie_headers(
     token: &str,
@@ -2245,19 +2303,24 @@ fn session_cookie_headers(
     secure: bool,
 ) -> Result<HeaderMap, ()> {
     let mut headers = HeaderMap::new();
-    let value = HeaderValue::from_str(&session_cookie(token, "/", session_seconds, secure))
+    let value = HeaderValue::from_str(&session_cookie(COOKIE, token, "/", session_seconds, secure))
         .map_err(|_| ())?;
     headers.append(header::SET_COOKIE, value);
-    for path in LEGACY_COOKIE_PATHS {
-        let value = HeaderValue::from_str(&session_cookie("", path, 0, secure)).map_err(|_| ())?;
+    for path in ["/"].into_iter().chain(LEGACY_COOKIE_PATHS) {
+        let value = HeaderValue::from_str(&session_cookie(LEGACY_COOKIE, "", path, 0, secure))
+            .map_err(|_| ())?;
         headers.append(header::SET_COOKIE, value);
     }
     Ok(headers)
 }
 fn expired_session_cookie_headers(secure: bool) -> Result<HeaderMap, ()> {
     let mut headers = HeaderMap::new();
+    let canonical =
+        HeaderValue::from_str(&session_cookie(COOKIE, "", "/", 0, secure)).map_err(|_| ())?;
+    headers.append(header::SET_COOKIE, canonical);
     for path in ["/"].into_iter().chain(LEGACY_COOKIE_PATHS) {
-        let value = HeaderValue::from_str(&session_cookie("", path, 0, secure)).map_err(|_| ())?;
+        let value = HeaderValue::from_str(&session_cookie(LEGACY_COOKIE, "", path, 0, secure))
+            .map_err(|_| ())?;
         headers.append(header::SET_COOKIE, value);
     }
     Ok(headers)
@@ -2364,16 +2427,11 @@ async fn ui() -> Html<&'static str> {
 }
 
 async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match auth(&state, &headers).await {
-        Ok(session) if session.account_type == "admin" => {
-            Html(include_str!("ui.html")).into_response()
-        }
-        Ok(_) => error(
-            StatusCode::FORBIDDEN,
-            "global administrator capability required",
-        ),
-        Err(response) => response,
-    }
+    // The browser shell contains no privileged data.  Loading it permits a polished
+    // login or access-denied experience; every protected API remains authenticated and
+    // authorized server-side.
+    let _ = (state, headers);
+    Html(include_str!("ui.html")).into_response()
 }
 
 async fn styles() -> Response {
@@ -2414,23 +2472,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_cookie_parser_ignores_unrelated_cookie_values() {
+    fn v2_cookie_parser_ignores_legacy_and_unrelated_cookie_values() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("other=x; latex_core_session=token; x=y"),
+            HeaderValue::from_static(
+                "other=x; latex_core_session=legacy; x=y; latex_core_session_v2=token",
+            ),
         );
         assert_eq!(cookie(&headers).as_deref(), Some("token"));
     }
 
     #[test]
-    fn session_cookie_parser_prefers_the_canonical_root_cookie_after_a_legacy_cookie() {
+    fn v2_cookie_parser_rejects_ambiguous_v2_values_and_ignores_multiple_legacy_values() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("latex_core_session=legacy; latex_core_session=canonical"),
+            HeaderValue::from_static("latex_core_session=old-a; latex_core_session=old-b"),
         );
-        assert_eq!(cookie(&headers).as_deref(), Some("canonical"));
+        assert_eq!(cookie(&headers), None);
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("latex_core_session_v2=one; latex_core_session_v2=two"),
+        );
+        assert_eq!(cookie(&headers), None);
     }
 
     #[test]
@@ -2443,8 +2508,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             login_values[0],
-            "latex_core_session=token; Path=/; HttpOnly; SameSite=Lax; Max-Age=60; Secure"
+            "latex_core_session_v2=token; Path=/; HttpOnly; SameSite=Lax; Max-Age=60; Secure"
         );
+        assert!(
+            login_values.contains(
+                &"latex_core_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
+            )
+        );
+        assert!(login_values.contains(
+            &"latex_core_session=; Path=/api; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
+        ));
 
         let logout = expired_session_cookie_headers(true).expect("valid cookie headers");
         let logout_values = logout
@@ -2454,14 +2527,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             logout_values[0],
-            "latex_core_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
+            "latex_core_session_v2=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
         );
         assert!(logout_values.contains(
             &"latex_core_session=; Path=/api/auth; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
         ));
         assert_eq!(
-            session_cookie("token", "/", 60, false),
-            "latex_core_session=token; Path=/; HttpOnly; SameSite=Lax; Max-Age=60"
+            session_cookie(COOKIE, "token", "/", 60, false),
+            "latex_core_session_v2=token; Path=/; HttpOnly; SameSite=Lax; Max-Age=60"
         );
     }
 
