@@ -2412,11 +2412,17 @@ async fn ui() -> Html<&'static str> {
 }
 
 async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    // The browser shell contains no privileged data.  Loading it permits a polished
-    // login or access-denied experience; every protected API remains authenticated and
-    // authorized server-side.
-    let _ = (state, headers);
-    Html(include_str!("ui.html")).into_response()
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.repo.account_type(session.user_id).await {
+        Ok(account_type) if account_type.is_admin() => {
+            Html(include_str!("ui.html")).into_response()
+        }
+        Ok(_) => error(StatusCode::FORBIDDEN, "administrative access required"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    }
 }
 
 async fn styles() -> Response {
