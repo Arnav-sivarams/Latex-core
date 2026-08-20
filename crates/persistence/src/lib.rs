@@ -17,8 +17,9 @@ mod permissions;
 mod workspace;
 
 pub use app::{
-    AppArtifactRecord, AppError, AppJobRecord, AppProjectRecord, AppRepository, AppSessionRecord,
-    AppTemplateFileRecord, AppTemplateRecord, AppUserRecord,
+    AdminUserRecord, AppArtifactRecord, AppError, AppJobRecord, AppProjectRecord, AppRepository,
+    AppSessionRecord, AppTemplateFileRecord, AppTemplateRecord, AppUserRecord,
+    ResearchGroupMemberRecord, ResearchGroupRecord,
 };
 pub use collaboration::{
     AccountType, ChangeSetPublishResult, FilePolicy, GroupType, MemberDraftRecord,

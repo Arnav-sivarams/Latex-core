@@ -572,6 +572,80 @@ async fn project_manager_can_assign_composable_roles_and_cannot_remove_last_mana
     database.close().await;
 }
 
+#[tokio::test]
+async fn research_group_has_one_workspace_and_equal_members() {
+    let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let database = Database::connect(DatabaseConfig::development(&url).unwrap())
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let repo = AppRepository::new(database.clone());
+    let suffix = Uuid::new_v4();
+    let owner = repo
+        .create_account(&format!("group-owner-{suffix}@example.test"), "hash")
+        .await
+        .unwrap();
+    let member = repo
+        .create_account(&format!("group-member-{suffix}@example.test"), "hash")
+        .await
+        .unwrap();
+    let outsider = repo
+        .create_account(&format!("group-outsider-{suffix}@example.test"), "hash")
+        .await
+        .unwrap();
+    let workspace = WorkspaceId::new();
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")
+        .bind(workspace.as_uuid())
+        .bind(owner.tenant_id.as_uuid())
+        .bind(owner.user_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.workspace_heads (workspace_id) VALUES ($1)")
+        .bind(workspace.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let group = repo
+        .create_research_group(owner.user_id, workspace, "Vision Lab")
+        .await
+        .unwrap();
+    assert_eq!(group.workspace_id, workspace);
+    repo.add_research_group_member(owner.user_id, group.id, member.user_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.research_group_members(member.user_id, group.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(matches!(
+        repo.add_research_group_member(member.user_id, group.id, outsider.user_id)
+            .await,
+        Err(AppError::Forbidden)
+    ));
+    assert!(matches!(
+        repo.remove_research_group_member(owner.user_id, group.id, owner.user_id)
+            .await,
+        Err(AppError::Integrity { .. })
+    ));
+    assert!(matches!(
+        repo.research_group_for_user(outsider.user_id, group.id)
+            .await,
+        Err(AppError::NotFound)
+    ));
+    assert!(matches!(
+        repo.create_research_group(owner.user_id, workspace, "Duplicate")
+            .await,
+        Err(AppError::Conflict)
+    ));
+    pool.close().await;
+    database.close().await;
+}
+
 async fn verify_session_initialization(url: &str) {
     let config = DatabaseConfig::new(url, 1, 1, Duration::from_secs(5)).unwrap();
     let database = Database::connect(config).await.unwrap();
@@ -595,6 +669,8 @@ async fn verify_schema(pool: &PgPool) {
         "member_drafts",
         "permission_overrides",
         "projects",
+        "research_group_members",
+        "research_groups",
         "sessions",
         "snapshots",
         "team_members",

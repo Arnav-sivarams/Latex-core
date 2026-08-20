@@ -70,6 +70,33 @@ struct NewTeam {
     group_type: Option<String>,
 }
 #[derive(Deserialize)]
+struct NewResearchGroup {
+    name: String,
+}
+#[derive(Deserialize)]
+struct RenameResearchGroup {
+    name: String,
+}
+#[derive(Deserialize)]
+struct ResearchGroupMemberInput {
+    email: String,
+}
+#[derive(Deserialize)]
+struct AdminUserInput {
+    email: String,
+    account_type: String,
+    password: Option<String>,
+}
+#[derive(Deserialize)]
+struct AdminUserPatch {
+    account_type: Option<String>,
+    enabled: Option<bool>,
+}
+#[derive(Deserialize)]
+struct AdminPasswordInput {
+    password: Option<String>,
+}
+#[derive(Deserialize)]
 struct TeamMemberInput {
     email: String,
     group_manager: bool,
@@ -162,6 +189,21 @@ struct ProjectListWire {
     name: String,
     created_at: String,
     updated_at: String,
+}
+#[derive(Serialize)]
+struct ResearchGroupWire {
+    id: String,
+    name: String,
+    workspace_id: String,
+    owner_user_id: String,
+    created_at: String,
+    updated_at: String,
+}
+#[derive(Serialize)]
+struct ResearchGroupMemberWire {
+    user_id: String,
+    email: String,
+    joined_at: String,
 }
 #[derive(Serialize)]
 struct JobWire {
@@ -289,6 +331,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "routes remain auditable at the application boundary"
+)]
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(ui))
@@ -304,6 +350,23 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/admin/overview", get(admin_overview))
+        .route("/api/admin/users", get(admin_users).post(admin_create_user))
+        .route(
+            "/api/admin/users/{email}",
+            axum::routing::patch(admin_patch_user).delete(admin_delete_user),
+        )
+        .route(
+            "/api/admin/users/{email}/reset-password",
+            post(admin_reset_password),
+        )
+        .route("/api/admin/teams", get(admin_teams))
+        .route("/api/admin/research-groups", get(admin_research_groups))
+        .route("/api/admin/projects", get(admin_projects))
+        .route("/api/admin/templates", get(admin_templates))
+        .route("/api/admin/jobs", get(admin_jobs))
+        .route("/api/admin/audit", get(admin_audit))
+        .route("/api/admin/system", get(admin_system))
         .route("/api/projects", get(projects).post(create_project))
         .route("/api/projects/import", post(import_project))
         .route("/api/projects/{id}", get(project))
@@ -317,6 +380,24 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/projects/{id}/main", post(set_main))
         .route("/api/projects/{id}/compile", post(submit_compile))
+        .route(
+            "/api/research-groups",
+            get(research_groups).post(create_research_group),
+        )
+        .route(
+            "/api/research-groups/{id}",
+            get(research_group)
+                .patch(rename_research_group)
+                .delete(delete_research_group),
+        )
+        .route(
+            "/api/research-groups/{id}/members",
+            get(research_group_members).post(add_research_group_member),
+        )
+        .route(
+            "/api/research-groups/{id}/members/{user}",
+            axum::routing::delete(remove_research_group_member),
+        )
         .route("/api/teams", get(teams).post(create_team))
         .route("/api/teams/{id}", get(team))
         .route(
@@ -511,6 +592,237 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Err(r) => r,
     }
 }
+async fn admin_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<persistence::AppSessionRecord, Response> {
+    let session = auth(state, headers).await?;
+    if session.account_type != "admin" {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "administrator capability required",
+        ));
+    }
+    Ok(session)
+}
+async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.repo.admin_overview().await {
+        Ok(mut overview) => {
+            overview["version"] = serde_json::Value::String("latex-core 0.1.0".into());
+            overview["current_admin"] = serde_json::Value::String(session.email);
+            Json(overview).into_response()
+        }
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn admin_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.repo.admin_users().await { Ok(users) => Json(users.into_iter().map(|user| serde_json::json!({"id":user.user_id.to_string(),"email":user.email,"account_type":user.account_type,"enabled":user.enabled,"created_at":user.created_at})).collect::<Vec<_>>()).into_response(), Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure") }
+}
+async fn admin_create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<AdminUserInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let email = match auth::normalized_email(&input.email) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
+    };
+    if !matches!(
+        input.account_type.as_str(),
+        "student" | "professor" | "admin"
+    ) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid institutional account type",
+        );
+    }
+    let password = input.password.unwrap_or_else(auth::temporary_password);
+    let hash = match auth::hash_password(&password) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "password must be 12-256 characters",
+            );
+        }
+    };
+    match state.repo.create_account(&email, &hash).await {
+        Ok(_) => match state
+            .repo
+            .set_user_account_type(&email, &input.account_type)
+            .await
+        {
+            Ok(()) => Json(serde_json::json!({"email":email,"temporary_password":password}))
+                .into_response(),
+            Err(_) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "account type update failed",
+            ),
+        },
+        Err(AppError::Conflict) => error(StatusCode::CONFLICT, "account exists"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "account creation failed"),
+    }
+}
+async fn admin_patch_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(email): Path<String>,
+    Json(input): Json<AdminUserPatch>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let email = match auth::normalized_email(&email) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
+    };
+    if let Some(account_type) = input.account_type {
+        match state
+            .repo
+            .set_user_account_type(&email, &account_type)
+            .await
+        {
+            Ok(()) => {}
+            Err(AppError::Integrity { .. }) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid institutional account type",
+                );
+            }
+            Err(AppError::NotFound) => return error(StatusCode::NOT_FOUND, "not found"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+        }
+    }
+    if let Some(enabled) = input.enabled {
+        match state.repo.set_user_enabled(&email, enabled).await {
+            Ok(()) => {}
+            Err(AppError::NotFound) => return error(StatusCode::NOT_FOUND, "not found"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+async fn admin_reset_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(email): Path<String>,
+    Json(input): Json<AdminPasswordInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let email = match auth::normalized_email(&email) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
+    };
+    let password = input.password.unwrap_or_else(auth::temporary_password);
+    let hash = match auth::hash_password(&password) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "password must be 12-256 characters",
+            );
+        }
+    };
+    match state.repo.reset_password(&email, &hash).await {
+        Ok(()) => {
+            Json(serde_json::json!({"email":email,"temporary_password":password})).into_response()
+        }
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn admin_delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(email): Path<String>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.repo.delete_user_if_unreferenced(&email).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Account deletion is deliberately conservative: this endpoint never
+        // attempts a cascade, so a persistence failure is reported as an
+        // unavailable safe deletion rather than exposing database internals.
+        Err(AppError::Integrity { .. } | AppError::Database(_)) => error(
+            StatusCode::CONFLICT,
+            "User owns resources and cannot be deleted. Disable the account instead.",
+        ),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn admin_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    kind: &'static str,
+) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let value = match kind {
+        "teams" => state.repo.admin_teams().await,
+        "research_groups" => state.repo.admin_research_groups().await,
+        "projects" => state.repo.admin_projects().await,
+        "jobs" => state.repo.admin_jobs().await,
+        "audit" => state.repo.admin_audit().await,
+        _ => Ok(Vec::new()),
+    };
+    match value {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn admin_teams(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_data(State(state), headers, "teams").await
+}
+async fn admin_research_groups(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_data(State(state), headers, "research_groups").await
+}
+async fn admin_projects(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_data(State(state), headers, "projects").await
+}
+async fn admin_jobs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_data(State(state), headers, "jobs").await
+}
+async fn admin_audit(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_data(State(state), headers, "audit").await
+}
+async fn admin_templates(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.repo.list_templates().await { Ok(templates) => Json(templates.into_iter().map(|template| serde_json::json!({"id":template.id.to_string(),"name":template.name,"description":template.description,"main_file":template.main_file,"created_at":template.created_at})).collect::<Vec<_>>()).into_response(), Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure") }
+}
+async fn admin_system(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    Json(serde_json::json!({"version":"latex-core 0.1.0","database":"application database configured","queue":"durable PostgreSQL queue","compiler":"M7 verified by operator doctor","host_operations":"Operator service required"})).into_response()
+}
 async fn projects(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let s = match auth(&state, &headers).await {
         Ok(v) => v,
@@ -557,6 +869,259 @@ async fn create_project(
     match state.repo.create_project(id, s.user_id, name).await {
         Ok(()) => project_response(&state, s.user_id, id).await,
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "project creation failed"),
+    }
+}
+fn research_group_wire(group: persistence::ResearchGroupRecord) -> ResearchGroupWire {
+    ResearchGroupWire {
+        id: group.id.to_string(),
+        name: group.name,
+        workspace_id: group.workspace_id.to_string(),
+        owner_user_id: group.owner_user_id.to_string(),
+        created_at: group.created_at,
+        updated_at: group.updated_at,
+    }
+}
+async fn research_groups(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.repo.research_groups_for_user(session.user_id).await {
+        Ok(groups) => Json(
+            groups
+                .into_iter()
+                .map(research_group_wire)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn create_research_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<NewResearchGroup>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = match project_name(&input.name) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let workspace = WorkspaceId::new();
+    let main = match LogicalPath::parse("main.tex") {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "path failure"),
+    };
+    if state.workspaces.create_workspace(session.tenant_id, session.user_id, workspace, main, Bytes::from_static(b"\\documentclass{article}\n\\begin{document}\nResearch group project\n\\end{document}\n")).await.is_err() { return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace creation failed"); }
+    match state
+        .repo
+        .create_research_group(session.user_id, workspace, name)
+        .await
+    {
+        Ok(group) => (StatusCode::CREATED, Json(research_group_wire(group))).into_response(),
+        Err(AppError::Conflict) => error(StatusCode::CONFLICT, "research group already exists"),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "research group creation failed",
+        ),
+    }
+}
+async fn research_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    match state
+        .repo
+        .research_group_for_user(session.user_id, id)
+        .await
+    {
+        Ok(group) => Json(research_group_wire(group)).into_response(),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn research_group_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    match state.repo.research_group_members(session.user_id, id).await {
+        Ok(members) => Json(
+            members
+                .into_iter()
+                .map(|member| ResearchGroupMemberWire {
+                    user_id: member.user_id.to_string(),
+                    email: member.email,
+                    joined_at: member.joined_at,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn add_research_group_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ResearchGroupMemberInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let email = match auth::normalized_email(&input.email) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
+    };
+    let target = match state.repo.user_by_email(&email).await {
+        Ok(Some(user)) if user.enabled => user.user_id,
+        Ok(Some(_)) => return error(StatusCode::BAD_REQUEST, "user is disabled"),
+        Ok(None) => return error(StatusCode::NOT_FOUND, "user not found"),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    match state
+        .repo
+        .add_research_group_member(session.user_id, id, target)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "research group owner capability required",
+        ),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn remove_research_group_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, user)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let target = match parsed::<UserId>(&user) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .repo
+        .remove_research_group_member(session.user_id, id, target)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "research group owner capability required",
+        ),
+        Err(AppError::Integrity { .. }) => error(
+            StatusCode::CONFLICT,
+            "the research group owner cannot be removed",
+        ),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn rename_research_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RenameResearchGroup>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let name = match project_name(&input.name) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .repo
+        .rename_research_group(session.user_id, id, name)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "research group owner capability required",
+        ),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn delete_research_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    match state.repo.delete_research_group(session.user_id, id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "research group owner capability required",
+        ),
+        Err(_) => error(
+            StatusCode::CONFLICT,
+            "Research group deletion is unavailable because its workspace is retained.",
+        ),
     }
 }
 async fn teams(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -2179,6 +2744,26 @@ async fn project_response(state: &AppState, user: UserId, id: WorkspaceId) -> Re
                         v.main_file().map(|path| path.as_str().to_owned()),
                     )
                 }
+                ProjectAccess::ResearchGroup { group, .. } => {
+                    let files = v
+                        .files()
+                        .iter()
+                        .map(|(path, file)| FileWire {
+                            path: path.as_str().to_owned(),
+                            size_bytes: file.size_bytes(),
+                            revision: None,
+                            policy: None,
+                            draft_revision: None,
+                            has_draft: false,
+                        })
+                        .collect();
+                    (
+                        group.name,
+                        files,
+                        None,
+                        v.main_file().map(|path| path.as_str().to_owned()),
+                    )
+                }
                 ProjectAccess::Team {
                     project,
                     account_type,
@@ -2671,7 +3256,7 @@ mod tests {
         assert!(workspace.contains("id=\"appView\" class=\"app\""));
         assert!(!workspace.contains("Welcome back"));
         assert!(!workspace.contains("id=\"loginForm\""));
-        assert!(workspace.contains("/static/app.js?v=flow-model-1"));
+        assert!(workspace.contains("/static/app.js?v=control-plane-groups-1"));
         assert!(workspace.contains("Log out"));
     }
 

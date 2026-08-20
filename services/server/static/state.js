@@ -1,5 +1,5 @@
 const key = 'latex-core.workspace-preferences.v1';
-const defaults = { theme: 'system', left: 242, right: 520, bottom: 190, sidebar: false, pdf: false };
+const defaults = { left: 242, right: 520, bottom: 190, sidebar: false, pdf: false };
 function preferences() { try { return { ...defaults, ...JSON.parse(localStorage.getItem(key) || '{}') }; } catch (_) { return { ...defaults }; } }
 export const state = { user: null, project: null, currentFile: null, tabs: new Map(), saveState: 'CLEAN', saveTimer: null, job: null, activeTeam: null, expanded: new Set(), preferences: preferences(), templates: [], commands: [], commandIndex: 0 };
 export function savePreferences() { localStorage.setItem(key, JSON.stringify(state.preferences)); }

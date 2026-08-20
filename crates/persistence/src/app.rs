@@ -9,6 +9,7 @@ use crate::{
     AccountType, Database, GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles,
 };
 use core_types::{ArtifactId, BlobHash, JobId, TenantId, UserId, WorkspaceId};
+use serde_json::json;
 use sqlx::Row;
 use std::str::FromStr;
 use thiserror::Error;
@@ -85,6 +86,29 @@ pub struct AppTemplateFileRecord {
     pub path: String,
     pub blob_hash: BlobHash,
     pub size_bytes: u64,
+}
+#[derive(Clone, Debug)]
+pub struct ResearchGroupRecord {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub owner_user_id: UserId,
+    pub workspace_id: WorkspaceId,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Clone, Debug)]
+pub struct ResearchGroupMemberRecord {
+    pub user_id: UserId,
+    pub email: String,
+    pub joined_at: String,
+}
+#[derive(Clone, Debug)]
+pub struct AdminUserRecord {
+    pub user_id: UserId,
+    pub email: String,
+    pub enabled: bool,
+    pub account_type: String,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +294,220 @@ impl AppRepository {
         .await
         .map_err(map_conflict)?;
         Ok(())
+    }
+    pub async fn create_research_group(
+        &self,
+        owner: UserId,
+        workspace: WorkspaceId,
+        name: &str,
+    ) -> Result<ResearchGroupRecord, AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO latex_core.research_groups (id,name,owner_user_id,workspace_id) VALUES ($1,$2,$3,$4)")
+            .bind(id).bind(name).bind(owner.as_uuid()).bind(workspace.as_uuid()).execute(&mut *tx).await.map_err(map_conflict)?;
+        sqlx::query(
+            "INSERT INTO latex_core.research_group_members (group_id,user_id) VALUES ($1,$2)",
+        )
+        .bind(id)
+        .bind(owner.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        let row = sqlx::query("SELECT id,name,owner_user_id,workspace_id,created_at::text,updated_at::text FROM latex_core.research_groups WHERE id=$1")
+            .bind(id).fetch_one(&mut *tx).await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::Database)?;
+        decode_research_group(row)
+    }
+    pub async fn research_groups_for_user(
+        &self,
+        user: UserId,
+    ) -> Result<Vec<ResearchGroupRecord>, AppError> {
+        let rows = sqlx::query("SELECT g.id,g.name,g.owner_user_id,g.workspace_id,g.created_at::text,g.updated_at::text FROM latex_core.research_groups g JOIN latex_core.research_group_members m ON m.group_id=g.id WHERE m.user_id=$1 ORDER BY g.updated_at DESC,g.id")
+            .bind(user.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(decode_research_group).collect()
+    }
+    pub async fn research_group_for_user(
+        &self,
+        user: UserId,
+        id: uuid::Uuid,
+    ) -> Result<ResearchGroupRecord, AppError> {
+        let row = sqlx::query("SELECT g.id,g.name,g.owner_user_id,g.workspace_id,g.created_at::text,g.updated_at::text FROM latex_core.research_groups g JOIN latex_core.research_group_members m ON m.group_id=g.id WHERE g.id=$1 AND m.user_id=$2")
+            .bind(id).bind(user.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        decode_research_group(row)
+    }
+    pub async fn research_group_members(
+        &self,
+        user: UserId,
+        id: uuid::Uuid,
+    ) -> Result<Vec<ResearchGroupMemberRecord>, AppError> {
+        self.research_group_for_user(user, id).await?;
+        let rows = sqlx::query("SELECT m.user_id,c.email,m.joined_at::text FROM latex_core.research_group_members m JOIN latex_core.user_credentials c ON c.user_id=m.user_id WHERE m.group_id=$1 ORDER BY c.email")
+            .bind(id).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ResearchGroupMemberRecord {
+                    user_id: UserId::from_uuid(row.try_get("user_id").map_err(AppError::Database)?),
+                    email: row.try_get("email").map_err(AppError::Database)?,
+                    joined_at: row.try_get("joined_at").map_err(AppError::Database)?,
+                })
+            })
+            .collect()
+    }
+    pub async fn rename_research_group(
+        &self,
+        actor: UserId,
+        id: uuid::Uuid,
+        name: &str,
+    ) -> Result<(), AppError> {
+        let result = sqlx::query("UPDATE latex_core.research_groups SET name=$3,updated_at=now() WHERE id=$1 AND owner_user_id=$2").bind(id).bind(actor.as_uuid()).bind(name).execute(self.database.pool()).await.map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::Forbidden);
+        }
+        Ok(())
+    }
+    pub async fn add_research_group_member(
+        &self,
+        actor: UserId,
+        id: uuid::Uuid,
+        target: UserId,
+    ) -> Result<(), AppError> {
+        let owner: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.research_groups WHERE id=$1 AND owner_user_id=$2)").bind(id).bind(actor.as_uuid()).fetch_one(self.database.pool()).await.map_err(AppError::Database)?;
+        if !owner {
+            return Err(AppError::Forbidden);
+        }
+        sqlx::query("INSERT INTO latex_core.research_group_members (group_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(id).bind(target.as_uuid()).execute(self.database.pool()).await.map_err(AppError::Database)?;
+        Ok(())
+    }
+    pub async fn remove_research_group_member(
+        &self,
+        actor: UserId,
+        id: uuid::Uuid,
+        target: UserId,
+    ) -> Result<(), AppError> {
+        let owner: UserId =
+            sqlx::query_scalar("SELECT owner_user_id FROM latex_core.research_groups WHERE id=$1")
+                .bind(id)
+                .fetch_optional(self.database.pool())
+                .await
+                .map_err(AppError::Database)?
+                .map(UserId::from_uuid)
+                .ok_or(AppError::NotFound)?;
+        if owner != actor {
+            return Err(AppError::Forbidden);
+        }
+        if owner == target {
+            return Err(AppError::Integrity {
+                message: "the research group owner cannot be removed".into(),
+            });
+        }
+        let result = sqlx::query(
+            "DELETE FROM latex_core.research_group_members WHERE group_id=$1 AND user_id=$2",
+        )
+        .bind(id)
+        .bind(target.as_uuid())
+        .execute(self.database.pool())
+        .await
+        .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            Err(AppError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+    pub async fn delete_research_group(
+        &self,
+        actor: UserId,
+        id: uuid::Uuid,
+    ) -> Result<(), AppError> {
+        let owner: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.research_groups WHERE id=$1 AND owner_user_id=$2)").bind(id).bind(actor.as_uuid()).fetch_one(self.database.pool()).await.map_err(AppError::Database)?;
+        if !owner {
+            return Err(AppError::Forbidden);
+        }
+        Err(AppError::Integrity {
+            message: "research group workspace deletion is not implemented".into(),
+        })
+    }
+    pub async fn admin_users(&self) -> Result<Vec<AdminUserRecord>, AppError> {
+        let rows = sqlx::query("SELECT c.user_id,c.email,c.enabled,c.account_type,u.created_at::text FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id ORDER BY c.email").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AdminUserRecord {
+                    user_id: UserId::from_uuid(row.try_get("user_id").map_err(AppError::Database)?),
+                    email: row.try_get("email").map_err(AppError::Database)?,
+                    enabled: row.try_get("enabled").map_err(AppError::Database)?,
+                    account_type: row.try_get("account_type").map_err(AppError::Database)?,
+                    created_at: row.try_get("created_at").map_err(AppError::Database)?,
+                })
+            })
+            .collect()
+    }
+    pub async fn delete_user_if_unreferenced(&self, email: &str) -> Result<(), AppError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            "DELETE FROM latex_core.user_credentials WHERE email=$1 RETURNING user_id",
+        )
+        .bind(email)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or_else(|| AppError::Integrity {
+            message: "User owns resources and cannot be deleted. Disable the account instead."
+                .into(),
+        })?;
+        let result = sqlx::query("DELETE FROM latex_core.users WHERE id=$1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::Integrity {
+                message: "User owns resources and cannot be deleted. Disable the account instead."
+                    .into(),
+            });
+        }
+        transaction.commit().await.map_err(AppError::Database)
+    }
+    pub async fn admin_overview(&self) -> Result<serde_json::Value, AppError> {
+        async fn count(pool: &sqlx::PgPool, table: &str) -> Result<i64, AppError> {
+            sqlx::query_scalar(&format!("SELECT count(*) FROM latex_core.{table}"))
+                .fetch_one(pool)
+                .await
+                .map_err(AppError::Database)
+        }
+        let pool = self.database.pool();
+        Ok(
+            json!({"users": count(pool,"users").await?, "personal_projects": count(pool,"projects").await?, "research_groups": count(pool,"research_groups").await?, "teams": count(pool,"teams").await?, "team_projects": count(pool,"team_projects").await?, "queued_jobs": sqlx::query_scalar::<_,i64>("SELECT count(*) FROM latex_core.compile_jobs WHERE state='queued'").fetch_one(pool).await.map_err(AppError::Database)?, "running_jobs": sqlx::query_scalar::<_,i64>("SELECT count(*) FROM latex_core.compile_jobs WHERE state IN ('claimed','running')").fetch_one(pool).await.map_err(AppError::Database)?}),
+        )
+    }
+    pub async fn admin_teams(&self) -> Result<Vec<serde_json::Value>, AppError> {
+        let rows = sqlx::query("SELECT t.id,t.name,c.email AS creator,t.created_at::text,(SELECT count(*) FROM latex_core.team_members m WHERE m.team_id=t.id) AS members,(SELECT count(*) FROM latex_core.team_projects p WHERE p.team_id=t.id) AS projects FROM latex_core.teams t JOIN latex_core.user_credentials c ON c.user_id=t.created_by ORDER BY t.created_at DESC").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(|r| Ok(json!({"id":r.try_get::<uuid::Uuid,_>("id").map_err(AppError::Database)?.to_string(),"name":r.try_get::<String,_>("name").map_err(AppError::Database)?,"creator":r.try_get::<String,_>("creator").map_err(AppError::Database)?,"created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?,"members":r.try_get::<i64,_>("members").map_err(AppError::Database)?,"projects":r.try_get::<i64,_>("projects").map_err(AppError::Database)?}))).collect()
+    }
+    pub async fn admin_research_groups(&self) -> Result<Vec<serde_json::Value>, AppError> {
+        let rows = sqlx::query("SELECT g.id,g.name,g.workspace_id,c.email AS owner,g.created_at::text,(SELECT count(*) FROM latex_core.research_group_members m WHERE m.group_id=g.id) AS members FROM latex_core.research_groups g JOIN latex_core.user_credentials c ON c.user_id=g.owner_user_id ORDER BY g.created_at DESC").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(|r| Ok(json!({"id":r.try_get::<uuid::Uuid,_>("id").map_err(AppError::Database)?.to_string(),"name":r.try_get::<String,_>("name").map_err(AppError::Database)?,"workspace_id":r.try_get::<uuid::Uuid,_>("workspace_id").map_err(AppError::Database)?.to_string(),"owner":r.try_get::<String,_>("owner").map_err(AppError::Database)?,"created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?,"members":r.try_get::<i64,_>("members").map_err(AppError::Database)?}))).collect()
+    }
+    pub async fn admin_projects(&self) -> Result<Vec<serde_json::Value>, AppError> {
+        let rows = sqlx::query("SELECT p.workspace_id,p.name,'Personal' AS kind,c.email AS container,p.updated_at::text FROM latex_core.projects p JOIN latex_core.user_credentials c ON c.user_id=p.owner_user_id UNION ALL SELECT g.workspace_id,g.name,'Research Group',c.email,g.updated_at::text FROM latex_core.research_groups g JOIN latex_core.user_credentials c ON c.user_id=g.owner_user_id UNION ALL SELECT p.workspace_id,p.name,'Team',t.name,p.updated_at::text FROM latex_core.team_projects p JOIN latex_core.teams t ON t.id=p.team_id ORDER BY updated_at DESC").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(|r| Ok(json!({"workspace_id":r.try_get::<uuid::Uuid,_>("workspace_id").map_err(AppError::Database)?.to_string(),"name":r.try_get::<String,_>("name").map_err(AppError::Database)?,"type":r.try_get::<String,_>("kind").map_err(AppError::Database)?,"container":r.try_get::<String,_>("container").map_err(AppError::Database)?,"updated_at":r.try_get::<String,_>("updated_at").map_err(AppError::Database)?}))).collect()
+    }
+    pub async fn admin_jobs(&self) -> Result<Vec<serde_json::Value>, AppError> {
+        let rows = sqlx::query("SELECT j.id,j.workspace_id,j.state,j.created_at::text,j.started_at::text,j.finished_at::text,c.email FROM latex_core.compile_jobs j JOIN latex_core.user_credentials c ON c.user_id=j.user_id ORDER BY j.created_at DESC LIMIT 100").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(|r| Ok(json!({"id":r.try_get::<uuid::Uuid,_>("id").map_err(AppError::Database)?.to_string(),"workspace_id":r.try_get::<uuid::Uuid,_>("workspace_id").map_err(AppError::Database)?.to_string(),"state":r.try_get::<String,_>("state").map_err(AppError::Database)?,"requester":r.try_get::<String,_>("email").map_err(AppError::Database)?,"created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?,"started_at":r.try_get::<Option<String>,_>("started_at").map_err(AppError::Database)?,"finished_at":r.try_get::<Option<String>,_>("finished_at").map_err(AppError::Database)?}))).collect()
+    }
+    pub async fn admin_audit(&self) -> Result<Vec<serde_json::Value>, AppError> {
+        let rows = sqlx::query("SELECT a.event_type,a.resource_type,a.resource_id,a.created_at::text,c.email FROM latex_core.audit_events a LEFT JOIN latex_core.user_credentials c ON c.user_id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 100").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(|r| Ok(json!({"event":r.try_get::<String,_>("event_type").map_err(AppError::Database)?,"resource":r.try_get::<String,_>("resource_type").map_err(AppError::Database)?,"resource_id":r.try_get::<Option<uuid::Uuid>,_>("resource_id").map_err(AppError::Database)?.map(|v|v.to_string()),"actor":r.try_get::<Option<String>,_>("email").map_err(AppError::Database)?,"created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?}))).collect()
     }
     pub async fn create_template(
         &self,
@@ -472,7 +710,7 @@ impl AppRepository {
         self.project(owner, workspace).await.map(|_| ())
     }
     pub async fn job(&self, owner: UserId, job: JobId) -> Result<AppJobRecord, AppError> {
-        let row=sqlx::query("SELECT j.id,j.workspace_id,j.state,j.snapshot_id,j.created_at::text,j.finished_at::text,j.last_error,CASE WHEN j.state='queued' THEN 1 + (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS queue_position,CASE WHEN j.state='queued' THEN (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS jobs_ahead FROM latex_core.compile_jobs j LEFT JOIN latex_core.projects p ON p.workspace_id=j.workspace_id AND p.owner_user_id=$2 LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=j.workspace_id LEFT JOIN latex_core.team_project_members pm ON pm.team_project_id=tp.id AND pm.user_id=$2 WHERE j.id=$1 AND (p.workspace_id IS NOT NULL OR pm.user_id IS NOT NULL)").bind(job.as_uuid()).bind(owner.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
+        let row=sqlx::query("SELECT j.id,j.workspace_id,j.state,j.snapshot_id,j.created_at::text,j.finished_at::text,j.last_error,CASE WHEN j.state='queued' THEN 1 + (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS queue_position,CASE WHEN j.state='queued' THEN (SELECT count(*) FROM latex_core.compile_jobs q WHERE q.state='queued' AND (q.priority>j.priority OR (q.priority=j.priority AND (q.created_at<j.created_at OR (q.created_at=j.created_at AND q.id<j.id))))) ELSE NULL END AS jobs_ahead FROM latex_core.compile_jobs j LEFT JOIN latex_core.projects p ON p.workspace_id=j.workspace_id AND p.owner_user_id=$2 LEFT JOIN latex_core.team_projects tp ON tp.workspace_id=j.workspace_id LEFT JOIN latex_core.team_project_members pm ON pm.team_project_id=tp.id AND pm.user_id=$2 LEFT JOIN latex_core.research_groups rg ON rg.workspace_id=j.workspace_id LEFT JOIN latex_core.research_group_members rgm ON rgm.group_id=rg.id AND rgm.user_id=$2 WHERE j.id=$1 AND (p.workspace_id IS NOT NULL OR pm.user_id IS NOT NULL OR rgm.user_id IS NOT NULL)").bind(job.as_uuid()).bind(owner.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
         decode_job(row)
     }
     pub async fn artifacts(
@@ -609,5 +847,17 @@ fn decode_template_file(r: sqlx::postgres::PgRow) -> Result<AppTemplateFileRecor
         size_bytes: u64::try_from(size).map_err(|_| AppError::Integrity {
             message: "negative template file size".into(),
         })?,
+    })
+}
+fn decode_research_group(r: sqlx::postgres::PgRow) -> Result<ResearchGroupRecord, AppError> {
+    Ok(ResearchGroupRecord {
+        id: r.try_get("id").map_err(AppError::Database)?,
+        name: r.try_get("name").map_err(AppError::Database)?,
+        owner_user_id: UserId::from_uuid(r.try_get("owner_user_id").map_err(AppError::Database)?),
+        workspace_id: WorkspaceId::from_uuid(
+            r.try_get("workspace_id").map_err(AppError::Database)?,
+        ),
+        created_at: r.try_get("created_at").map_err(AppError::Database)?,
+        updated_at: r.try_get("updated_at").map_err(AppError::Database)?,
     })
 }

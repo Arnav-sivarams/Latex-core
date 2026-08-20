@@ -12,7 +12,7 @@
 
 use crate::{
     AppError, AppRepository, GroupRoles, OverrideEffect, Permission, PermissionResolver,
-    ProjectRoles,
+    ProjectRoles, ResearchGroupRecord,
 };
 use core_types::{BlobHash, UserId, WorkspaceId};
 use serde_json::json;
@@ -222,12 +222,18 @@ pub enum ProjectAccess {
         can_mentor: bool,
         can_manage: bool,
     },
+    ResearchGroup {
+        group: ResearchGroupRecord,
+        account_type: AccountType,
+    },
 }
 impl ProjectAccess {
     #[must_use]
     pub const fn account_type(&self) -> AccountType {
         match self {
-            Self::Personal { account_type } | Self::Team { account_type, .. } => *account_type,
+            Self::Personal { account_type }
+            | Self::Team { account_type, .. }
+            | Self::ResearchGroup { account_type, .. } => *account_type,
         }
     }
     #[must_use]
@@ -707,7 +713,9 @@ impl AppRepository {
         // mentor role whose review capabilities they need not hold themselves.
         let team_id = match access {
             ProjectAccess::Team { ref project, .. } => project.team_id,
-            ProjectAccess::Personal { .. } => return Err(AppError::NotFound),
+            ProjectAccess::Personal { .. } | ProjectAccess::ResearchGroup { .. } => {
+                return Err(AppError::NotFound);
+            }
         };
         let member: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM latex_core.team_members WHERE team_id=$1 AND user_id=$2)",
@@ -781,6 +789,25 @@ impl AppRepository {
         if personal {
             return Ok(ProjectAccess::Personal { account_type });
         }
+        let group = sqlx::query("SELECT g.id,g.name,g.owner_user_id,g.workspace_id,g.created_at::text,g.updated_at::text FROM latex_core.research_groups g JOIN latex_core.research_group_members m ON m.group_id=g.id AND m.user_id=$2 WHERE g.workspace_id=$1")
+            .bind(workspace.as_uuid()).bind(user.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
+        if let Some(group) = group {
+            return Ok(ProjectAccess::ResearchGroup {
+                group: ResearchGroupRecord {
+                    id: group.try_get("id").map_err(AppError::Database)?,
+                    name: group.try_get("name").map_err(AppError::Database)?,
+                    owner_user_id: UserId::from_uuid(
+                        group.try_get("owner_user_id").map_err(AppError::Database)?,
+                    ),
+                    workspace_id: WorkspaceId::from_uuid(
+                        group.try_get("workspace_id").map_err(AppError::Database)?,
+                    ),
+                    created_at: group.try_get("created_at").map_err(AppError::Database)?,
+                    updated_at: group.try_get("updated_at").map_err(AppError::Database)?,
+                },
+                account_type,
+            });
+        }
         let row = sqlx::query("SELECT tp.id,tp.team_id,tp.workspace_id,tp.name,tp.canonical_generation,tp.created_at::text,tp.updated_at::text,COALESCE(pm.writer,FALSE) AS can_write,COALESCE(pm.mentor,FALSE) AS can_mentor,COALESCE(pm.project_manager,FALSE) AS can_manage FROM latex_core.team_projects tp JOIN latex_core.team_project_members pm ON pm.team_project_id=tp.id AND pm.user_id=$2 WHERE tp.workspace_id=$1")
             .bind(workspace.as_uuid()).bind(user.as_uuid()).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
         let can_write = row.try_get("can_write").map_err(AppError::Database)?;
@@ -826,7 +853,9 @@ impl AppRepository {
                 can_manage,
                 ..
             } => (account_type, can_manage),
-            ProjectAccess::Personal { .. } => return Err(AppError::NotFound),
+            ProjectAccess::Personal { .. } | ProjectAccess::ResearchGroup { .. } => {
+                return Err(AppError::NotFound);
+            }
         };
         let rows = sqlx::query("SELECT f.logical_path,f.blob_hash,f.size_bytes,f.file_revision,COALESCE(p.access_policy,'editable') AS access_policy FROM latex_core.team_project_files f LEFT JOIN latex_core.file_policies p ON p.team_project_id=f.team_project_id AND p.logical_path=f.logical_path WHERE f.team_project_id=$1 ORDER BY f.logical_path")
             .bind(project_id).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
@@ -852,7 +881,9 @@ impl AppRepository {
                 can_manage,
                 ..
             } => (account_type, can_manage),
-            ProjectAccess::Personal { .. } => return Err(AppError::NotFound),
+            ProjectAccess::Personal { .. } | ProjectAccess::ResearchGroup { .. } => {
+                return Err(AppError::NotFound);
+            }
         };
         let row = sqlx::query("SELECT f.logical_path,f.blob_hash,f.size_bytes,f.file_revision,COALESCE(p.access_policy,'editable') AS access_policy FROM latex_core.team_project_files f LEFT JOIN latex_core.file_policies p ON p.team_project_id=f.team_project_id AND p.logical_path=f.logical_path WHERE f.team_project_id=$1 AND f.logical_path=$2")
             .bind(project_id).bind(path).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
@@ -1952,6 +1983,17 @@ async fn resolver_for_access_tx(
                 Some(project.id),
             )
         }
+        ProjectAccess::ResearchGroup { account_type, .. } => (
+            *account_type,
+            GroupRoles::default(),
+            ProjectRoles {
+                writer: true,
+                mentor: false,
+                project_manager: false,
+            },
+            None,
+            None,
+        ),
     };
     let rows = sqlx::query("SELECT permission,effect FROM latex_core.permission_overrides WHERE user_id=$1 AND (context_kind='global' OR (context_kind='team' AND context_id=$2) OR (context_kind='project' AND context_id=$3))")
         .bind(user.as_uuid()).bind(team_id).bind(project_id).fetch_all(&mut **tx).await.map_err(AppError::Database)?;
