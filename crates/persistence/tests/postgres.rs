@@ -404,6 +404,174 @@ async fn team_publish_is_canonical_and_preserves_stale_member_drafts() {
     database.close().await;
 }
 
+#[tokio::test]
+async fn project_manager_can_assign_composable_roles_and_cannot_remove_last_manager() {
+    let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let database = Database::connect(DatabaseConfig::development(&url).unwrap())
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let repo = AppRepository::new(database.clone());
+    let suffix = Uuid::new_v4();
+    let alice = repo
+        .create_account(
+            &format!("project-manager-alice-{suffix}@example.test"),
+            "hash",
+        )
+        .await
+        .unwrap();
+    let bob = repo
+        .create_account(
+            &format!("project-manager-bob-{suffix}@example.test"),
+            "hash",
+        )
+        .await
+        .unwrap();
+    let carol = repo
+        .create_account(
+            &format!("project-manager-carol-{suffix}@example.test"),
+            "hash",
+        )
+        .await
+        .unwrap();
+    let workspace = WorkspaceId::new();
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")
+        .bind(workspace.as_uuid())
+        .bind(alice.tenant_id.as_uuid())
+        .bind(alice.user_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.workspace_heads (workspace_id) VALUES ($1)")
+        .bind(workspace.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let team = repo
+        .create_team(alice.user_id, "Role matrix")
+        .await
+        .unwrap();
+    repo.set_group_member(alice.user_id, team.id, bob.user_id, false)
+        .await
+        .unwrap();
+    repo.set_group_member(alice.user_id, team.id, carol.user_id, false)
+        .await
+        .unwrap();
+    let project = repo
+        .create_team_project(alice.user_id, team.id, workspace, "Roles", &[])
+        .await
+        .unwrap();
+    let creator = repo
+        .project_members(alice.user_id, project.id)
+        .await
+        .unwrap();
+    assert_eq!(creator.len(), 1);
+    assert!(creator[0].writer && creator[0].project_manager);
+
+    for roles in [
+        ProjectRoles {
+            writer: true,
+            mentor: false,
+            project_manager: false,
+        },
+        ProjectRoles {
+            writer: false,
+            mentor: true,
+            project_manager: false,
+        },
+        ProjectRoles {
+            writer: false,
+            mentor: false,
+            project_manager: true,
+        },
+        ProjectRoles {
+            writer: true,
+            mentor: true,
+            project_manager: false,
+        },
+        ProjectRoles {
+            writer: true,
+            mentor: false,
+            project_manager: true,
+        },
+        ProjectRoles {
+            writer: false,
+            mentor: true,
+            project_manager: true,
+        },
+    ] {
+        repo.set_project_member(alice.user_id, project.id, bob.user_id, roles)
+            .await
+            .unwrap();
+        let members = repo
+            .project_members(alice.user_id, project.id)
+            .await
+            .unwrap();
+        let bob_roles = members
+            .iter()
+            .find(|member| member.user_id == bob.user_id)
+            .unwrap();
+        assert_eq!(
+            (
+                bob_roles.writer,
+                bob_roles.mentor,
+                bob_roles.project_manager
+            ),
+            (roles.writer, roles.mentor, roles.project_manager)
+        );
+    }
+
+    repo.set_project_member(
+        alice.user_id,
+        project.id,
+        alice.user_id,
+        ProjectRoles {
+            writer: true,
+            mentor: false,
+            project_manager: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        repo.set_project_member(
+            bob.user_id,
+            project.id,
+            bob.user_id,
+            ProjectRoles {
+                writer: false,
+                mentor: true,
+                project_manager: false,
+            },
+        )
+        .await,
+        Err(AppError::Integrity { .. })
+    ));
+    assert!(matches!(
+        repo.remove_project_member(bob.user_id, project.id, bob.user_id)
+            .await,
+        Err(AppError::Integrity { .. })
+    ));
+    repo.set_project_member(
+        bob.user_id,
+        project.id,
+        carol.user_id,
+        ProjectRoles {
+            writer: false,
+            mentor: true,
+            project_manager: true,
+        },
+    )
+    .await
+    .unwrap();
+    repo.remove_project_member(bob.user_id, project.id, carol.user_id)
+        .await
+        .unwrap();
+    pool.close().await;
+    database.close().await;
+}
+
 async fn verify_session_initialization(url: &str) {
     let config = DatabaseConfig::new(url, 1, 1, Duration::from_secs(5)).unwrap();
     let database = Database::connect(config).await.unwrap();

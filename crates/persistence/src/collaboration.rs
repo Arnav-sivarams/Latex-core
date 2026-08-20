@@ -543,8 +543,8 @@ impl AppRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(AppError::Database)?;
-        sqlx::query("INSERT INTO latex_core.team_project_members (team_project_id,user_id,writer,mentor,project_manager) VALUES ($1,$2,$3,$4,TRUE)")
-            .bind(id).bind(actor.as_uuid()).bind(!mentor_group).bind(mentor_group).execute(&mut *tx).await.map_err(AppError::Database)?;
+        sqlx::query("INSERT INTO latex_core.team_project_members (team_project_id,user_id,writer,mentor,project_manager) VALUES ($1,$2,TRUE,$3,TRUE)")
+            .bind(id).bind(actor.as_uuid()).bind(mentor_group).execute(&mut *tx).await.map_err(AppError::Database)?;
         for file in files {
             sqlx::query("INSERT INTO latex_core.team_project_files (team_project_id,logical_path,blob_hash,size_bytes,file_revision) VALUES ($1,$2,$3,$4,$5)")
                 .bind(id).bind(&file.path).bind(file.blob_hash.to_hex()).bind(i64_size(file.size_bytes)?).bind(i64_revision(file.revision)?).execute(&mut *tx).await.map_err(AppError::Database)?;
@@ -617,8 +617,8 @@ impl AppRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(AppError::Database)?;
-        sqlx::query("INSERT INTO latex_core.team_project_members (team_project_id,user_id,writer,mentor,project_manager) VALUES ($1,$2,$3,$4,TRUE)")
-            .bind(id).bind(actor.as_uuid()).bind(!mentor_group).bind(mentor_group).execute(&mut *tx).await.map_err(AppError::Database)?;
+        sqlx::query("INSERT INTO latex_core.team_project_members (team_project_id,user_id,writer,mentor,project_manager) VALUES ($1,$2,TRUE,$3,TRUE)")
+            .bind(id).bind(actor.as_uuid()).bind(mentor_group).execute(&mut *tx).await.map_err(AppError::Database)?;
         for file in files {
             let path: String = file.try_get("path").map_err(AppError::Database)?;
             let hash: String = file.try_get("blob_hash").map_err(AppError::Database)?;
@@ -686,6 +686,11 @@ impl AppRepository {
         target: UserId,
         roles: ProjectRoles,
     ) -> Result<(), AppError> {
+        if !roles.writer && !roles.mentor && !roles.project_manager {
+            return Err(AppError::Integrity {
+                message: "a project member must have at least one project role".into(),
+            });
+        }
         let mut tx = self
             .database
             .pool()
@@ -693,14 +698,8 @@ impl AppRepository {
             .await
             .map_err(AppError::Database)?;
         let access = team_access_tx(&mut tx, actor, project_id).await?;
-        let manager = matches!(
-            access,
-            ProjectAccess::Team {
-                can_manage: true,
-                ..
-            }
-        ) || access.account_type().is_admin();
-        if !manager {
+        let resolver = resolver_for_access_tx(&mut tx, actor, &access).await?;
+        if !resolver.may_delegate_role(roles) {
             return Err(AppError::Forbidden);
         }
         // Project-management authority is the delegation boundary. A manager
@@ -719,10 +718,46 @@ impl AppRepository {
         .await
         .map_err(AppError::Database)?;
         if !member {
-            return Err(AppError::Forbidden);
+            return Err(AppError::Integrity {
+                message: "a project member must belong to the team".into(),
+            });
         }
+        ensure_project_manager_invariant(&mut tx, project_id, target, roles.project_manager)
+            .await?;
         sqlx::query("INSERT INTO latex_core.team_project_members (team_project_id,user_id,writer,mentor,project_manager) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (team_project_id,user_id) DO UPDATE SET writer=EXCLUDED.writer,mentor=EXCLUDED.mentor,project_manager=EXCLUDED.project_manager")
             .bind(project_id).bind(target.as_uuid()).bind(roles.writer).bind(roles.mentor).bind(roles.project_manager).execute(&mut *tx).await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::Database)
+    }
+
+    pub async fn remove_project_member(
+        &self,
+        actor: UserId,
+        project_id: Uuid,
+        target: UserId,
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let access = team_access_tx(&mut tx, actor, project_id).await?;
+        let resolver = resolver_for_access_tx(&mut tx, actor, &access).await?;
+        if !resolver.allows(Permission::ProjectManage) {
+            return Err(AppError::Forbidden);
+        }
+        ensure_project_manager_invariant(&mut tx, project_id, target, false).await?;
+        let result = sqlx::query(
+            "DELETE FROM latex_core.team_project_members WHERE team_project_id=$1 AND user_id=$2",
+        )
+        .bind(project_id)
+        .bind(target.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
         tx.commit().await.map_err(AppError::Database)
     }
 
@@ -1984,6 +2019,36 @@ async fn ensure_group_manager_invariant(
                 message: "a mentor group must retain a professor or administrator manager".into(),
             });
         }
+    }
+    Ok(())
+}
+
+async fn ensure_project_manager_invariant(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    target: UserId,
+    target_is_manager: bool,
+) -> Result<(), AppError> {
+    let is_manager: bool = sqlx::query_scalar("SELECT COALESCE((SELECT project_manager FROM latex_core.team_project_members WHERE team_project_id=$1 AND user_id=$2),FALSE)")
+        .bind(project_id)
+        .bind(target.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(AppError::Database)?;
+    if !is_manager || target_is_manager {
+        return Ok(());
+    }
+    let managers: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM latex_core.team_project_members WHERE team_project_id=$1 AND project_manager FOR UPDATE",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(AppError::Database)?;
+    if managers.len() <= 1 {
+        return Err(AppError::Integrity {
+            message: "a project must retain at least one project manager".into(),
+        });
     }
     Ok(())
 }

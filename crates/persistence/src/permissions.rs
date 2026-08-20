@@ -197,44 +197,8 @@ impl PermissionResolver {
     }
     #[must_use]
     pub fn may_delegate_role(&self, role: ProjectRoles) -> bool {
-        let writer = [
-            Permission::ProjectRead,
-            Permission::FileRead,
-            Permission::FileWrite,
-            Permission::FileCreate,
-            Permission::FileUpload,
-            Permission::FileRename,
-            Permission::FileDelete,
-            Permission::FileSetMain,
-            Permission::CompileSubmit,
-            Permission::ArtifactRead,
-        ];
-        let mentor = [
-            Permission::ProjectRead,
-            Permission::FileRead,
-            Permission::CompileSubmit,
-            Permission::ArtifactRead,
-            Permission::ReviewRead,
-            Permission::ReviewComment,
-            Permission::ReviewManage,
-        ];
-        let manager = [
-            Permission::ProjectRead,
-            Permission::ProjectManage,
-            Permission::TeamProjectManage,
-        ];
-        (!role.writer
-            || writer
-                .into_iter()
-                .all(|permission| self.may_delegate(permission)))
-            && (!role.mentor
-                || mentor
-                    .into_iter()
-                    .all(|permission| self.may_delegate(permission)))
-            && (!role.project_manager
-                || manager
-                    .into_iter()
-                    .all(|permission| self.may_delegate(permission)))
+        let has_role = role.writer || role.mentor || role.project_manager;
+        has_role && self.allows(Permission::ProjectManage)
     }
 
     fn grant(&mut self, permissions: &[Permission]) {

@@ -295,6 +295,7 @@ fn router(state: AppState) -> Router {
         .route("/login", post(browser_login))
         .route("/logout", post(browser_logout))
         .route("/admin", get(admin_ui))
+        .route("/workspace", get(workspace_ui))
         .route("/static/styles.css", get(styles))
         .route("/static/app.js", get(app_js))
         .route("/static/api.js", get(api_js))
@@ -342,6 +343,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/team-projects/{id}/members",
             get(project_members).post(set_project_member),
+        )
+        .route(
+            "/api/team-projects/{id}/members/{user}",
+            axum::routing::delete(remove_project_member),
         )
         .route(
             "/api/team-projects/{id}/policies/{*path}",
@@ -492,7 +497,7 @@ async fn browser_logout(State(state): State<AppState>, headers: HeaderMap) -> Re
 }
 
 async fn revoke_session(state: &AppState, headers: &HeaderMap) -> Result<HeaderMap, Response> {
-    for token in named_cookies(&headers, COOKIE) {
+    for token in named_cookies(headers, COOKIE) {
         if state.repo.delete_session(&digest(&token)).await.is_err() {
             return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"));
         }
@@ -1223,8 +1228,71 @@ async fn set_project_member(
         Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
         Err(AppError::Forbidden) => error(
             StatusCode::FORBIDDEN,
-            "you cannot grant those project roles",
+            "you do not have permission to manage project roles",
         ),
+        Err(AppError::Integrity { message })
+            if message == "a project must retain at least one project manager" =>
+        {
+            error(
+                StatusCode::CONFLICT,
+                "you must keep at least one Project Manager",
+            )
+        }
+        Err(AppError::Integrity { message })
+            if message == "a project member must have at least one project role" =>
+        {
+            error(StatusCode::BAD_REQUEST, "select at least one project role")
+        }
+        Err(AppError::Integrity { message })
+            if message == "a project member must belong to the team" =>
+        {
+            error(
+                StatusCode::BAD_REQUEST,
+                "the user must belong to the team before project access can be granted",
+            )
+        }
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    }
+}
+async fn remove_project_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, user)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let session = match auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let project_id = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "not found"),
+    };
+    let target = match parsed::<UserId>(&user) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .repo
+        .remove_project_member(session.user_id, project_id, target)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "you do not have permission to manage project roles",
+        ),
+        Err(AppError::Integrity { message })
+            if message == "a project must retain at least one project manager" =>
+        {
+            error(
+                StatusCode::CONFLICT,
+                "you must keep at least one Project Manager",
+            )
+        }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     }
 }
@@ -2543,6 +2611,16 @@ async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response
     }
 }
 
+async fn workspace_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match auth(&state, &headers).await {
+        Ok(_) => Html(workspace_html()).into_response(),
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            Html(login_html(None)).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
 async fn styles() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
@@ -2593,7 +2671,7 @@ mod tests {
         assert!(workspace.contains("id=\"appView\" class=\"app\""));
         assert!(!workspace.contains("Welcome back"));
         assert!(!workspace.contains("id=\"loginForm\""));
-        assert!(workspace.contains("/static/app.js?v=admin-layout-1"));
+        assert!(workspace.contains("/static/app.js?v=flow-model-1"));
         assert!(workspace.contains("Log out"));
     }
 
