@@ -172,7 +172,9 @@ pub struct V2User {
     pub user_id: UserId,
     pub email: String,
     pub enabled: bool,
-    pub role: GlobalRole,
+    pub legacy_account_type: String,
+    pub v2_role: Option<GlobalRole>,
+    pub migration_state: String,
     pub created_at: String,
 }
 
@@ -270,10 +272,10 @@ impl V2Repository {
 
     pub async fn list_v2_users(&self) -> Result<Vec<V2User>, V2Error> {
         let rows = sqlx::query(
-            "SELECT u.id,c.email,c.enabled,g.role,u.created_at::text AS created_at \
-             FROM latex_core.global_user_roles g \
-             JOIN latex_core.users u ON u.id=g.user_id \
+            "SELECT u.id,c.email,c.enabled,c.account_type,g.role,u.created_at::text AS created_at \
+             FROM latex_core.users u \
              JOIN latex_core.user_credentials c ON c.user_id=u.id \
+             LEFT JOIN latex_core.global_user_roles g ON g.user_id=u.id \
              ORDER BY c.email",
         )
         .fetch_all(self.database.pool())
@@ -2306,12 +2308,19 @@ fn decode_role_assignment(row: PgRow) -> Result<GlobalRoleAssignment, V2Error> {
 }
 
 fn decode_v2_user(row: PgRow) -> Result<V2User, V2Error> {
-    let role: String = row.try_get("role").map_err(V2Error::Database)?;
+    let role: Option<String> = row.try_get("role").map_err(V2Error::Database)?;
+    let v2_role = role.as_deref().map(GlobalRole::from_str).transpose()?;
     Ok(V2User {
         user_id: UserId::from_uuid(row.try_get("id").map_err(V2Error::Database)?),
         email: row.try_get("email").map_err(V2Error::Database)?,
         enabled: row.try_get("enabled").map_err(V2Error::Database)?,
-        role: GlobalRole::from_str(&role)?,
+        legacy_account_type: row.try_get("account_type").map_err(V2Error::Database)?,
+        migration_state: if v2_role.is_some() {
+            "ASSIGNED".to_owned()
+        } else {
+            "UNASSIGNED".to_owned()
+        },
+        v2_role,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
     })
 }

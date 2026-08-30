@@ -8,8 +8,8 @@ const endpoints = {
   Overview: '/api/admin/overview',
   'Legacy Users': '/api/admin/users',
   'Legacy Teams': '/api/admin/teams',
-  'Research Groups': '/api/admin/research-groups',
-  Projects: '/api/admin/projects',
+  'Legacy Research Groups': '/api/admin/research-groups',
+  'Legacy Projects': '/api/admin/projects',
   Templates: '/api/admin/templates',
   'Build Queue': '/api/admin/jobs',
   Audit: '/api/admin/audit',
@@ -170,22 +170,34 @@ function renderV2Users(users) {
   });
   const wrap = element('div', 'admin-table-wrap');
   const table = element('table', 'admin-table');
-  table.innerHTML = '<thead><tr><th>Email</th><th>Exclusive role</th><th>Status</th><th>Created</th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Email</th><th>Legacy type</th><th>Exclusive V2 role</th><th>Migration</th><th>Status</th><th>Created</th></tr></thead>';
   const body = document.createElement('tbody');
   users.forEach((user) => {
     const row = document.createElement('tr');
     const select = document.createElement('select');
     select.setAttribute('aria-label', `Exclusive V2 role for ${user.email}`);
+    const unassigned = element('option', '', 'Unassigned');
+    unassigned.value = '';
+    unassigned.disabled = true;
+    unassigned.selected = user.v2_role === null;
+    select.append(unassigned);
     ['writer', 'mentor', 'admin'].forEach((role) => {
       const option = element('option', '', role[0].toUpperCase() + role.slice(1));
       option.value = role;
-      option.selected = role === user.role;
+      option.selected = role === user.v2_role;
       select.append(option);
     });
     select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError));
     const roleCell = document.createElement('td');
     roleCell.append(select);
-    row.append(element('td', '', user.email), roleCell, element('td', '', user.enabled ? 'enabled' : 'disabled'), element('td', '', user.created_at));
+    row.append(
+      element('td', '', user.email),
+      element('td', '', user.legacy_account_type),
+      roleCell,
+      element('td', '', user.migration_state),
+      element('td', '', user.enabled ? 'enabled' : 'disabled'),
+      element('td', '', user.created_at),
+    );
     body.append(row);
   });
   table.append(body);
@@ -198,7 +210,7 @@ function memberSelect(users, role, label) {
   const select = document.createElement('select');
   select.name = `${role}_ids`;
   select.multiple = true;
-  users.filter((user) => user.role === role).forEach((user) => {
+  users.filter((user) => user.v2_role === role).forEach((user) => {
     const option = element('option', '', user.email);
     option.value = user.user_id;
     select.append(option);
@@ -253,13 +265,13 @@ async function renderPaperTeams(teams, users) {
       list.append(row);
     });
     const assigned = new Set(members.map((member) => member.user_id));
-    const available = users.filter((user) => user.role !== 'admin' && !assigned.has(user.user_id));
+    const available = users.filter((user) => user.v2_role && user.v2_role !== 'admin' && !assigned.has(user.user_id));
     const add = element('form', 'member-add-form');
     const select = document.createElement('select');
     select.required = true;
     select.innerHTML = '<option value="">Assign Writer or Mentor…</option>';
     available.forEach((user) => {
-      const option = element('option', '', `${user.email} — ${user.role}`);
+      const option = element('option', '', `${user.email} — ${user.v2_role}`);
       option.value = user.user_id;
       select.append(option);
     });

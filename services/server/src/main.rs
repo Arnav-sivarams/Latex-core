@@ -473,6 +473,7 @@ fn router(state: AppState) -> Router {
         .route("/admin", get(admin_ui))
         .route("/write", get(writer_ui))
         .route("/review", get(mentor_ui))
+        .route("/account-setup", get(account_setup_ui))
         .route("/workspace", get(workspace_ui))
         .route("/static/styles.css", get(styles))
         .route("/static/shells.css", get(shells_css))
@@ -4698,14 +4699,11 @@ async fn job_response(state: &AppState, user: UserId, id: JobId) -> Response {
     }
 }
 async fn auth(state: &AppState, headers: &HeaderMap) -> Result<AppSessionRecord, Response> {
-    let principal = principal_auth(state, headers).await?;
-    match principal.kind {
-        PrincipalKind::Legacy(_) => Ok(principal.session),
-        PrincipalKind::V2(_) => Err(error(
-            StatusCode::FORBIDDEN,
-            "legacy workspace API is unavailable to V2 principals",
-        )),
-    }
+    let _principal = principal_auth(state, headers).await?;
+    Err(error(
+        StatusCode::FORBIDDEN,
+        "the legacy browser product is retired",
+    ))
 }
 
 async fn principal_auth(
@@ -4892,7 +4890,7 @@ const fn landing_path(kind: PrincipalKind) -> &'static str {
         PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => {
             "/admin"
         }
-        PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => "/",
+        PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => "/account-setup",
     }
 }
 
@@ -5074,22 +5072,6 @@ fn login_html(error_message: Option<&str>) -> String {
         .replace("{{LOGIN_ERROR}}", error_message.unwrap_or(""))
 }
 
-fn workspace_html() -> String {
-    let source = include_str!("ui.html");
-    let start = source
-        .find("  <!-- login-view:start -->\n")
-        .expect("login view start marker is present");
-    let end = source
-        .find("  <!-- login-view:end -->\n")
-        .expect("login view end marker is present")
-        + "  <!-- login-view:end -->\n".len();
-    let mut page = String::with_capacity(source.len());
-    page.push_str(&source[..start]);
-    page.push_str(&source[end..]);
-    page.replacen("<body>", "<body data-server-authenticated=\"true\">", 1)
-        .replacen("class=\"app hidden\"", "class=\"app\"", 1)
-}
-
 fn writer_html() -> &'static str {
     include_str!("write.html")
 }
@@ -5098,15 +5080,12 @@ fn mentor_html() -> &'static str {
     include_str!("review.html")
 }
 
-fn admin_html(legacy_admin: bool) -> String {
-    include_str!("admin.html").replace(
-        "{{LEGACY_WORKSPACE_LINK}}",
-        if legacy_admin {
-            "<a class=\"shell-link\" href=\"/workspace\">Legacy Workspace</a>"
-        } else {
-            ""
-        },
-    )
+fn admin_html() -> &'static str {
+    include_str!("admin.html")
+}
+
+fn account_setup_html() -> &'static str {
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Account setup required — LaTeX Core</title><link rel=\"stylesheet\" href=\"/static/styles.css?v=cutover\"></head><body><main class=\"login-view\"><section class=\"login-card\"><div class=\"wordmark\">LaTeX Core</div><h1>Account setup required</h1><p>This account has not yet been assigned a Writer, Mentor, or Admin role.</p><form method=\"post\" action=\"/logout\"><button class=\"primary\" type=\"submit\">Log out</button></form></section></main></body></html>"
 }
 
 fn redirect_with_cookies(location: &'static str, cookies: HeaderMap) -> Response {
@@ -5123,14 +5102,7 @@ async fn ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
         }
         Err(response) => return response,
     };
-    match principal.kind {
-        PrincipalKind::V2(_) | PrincipalKind::Legacy(AccountType::Admin) => {
-            redirect_with_cookies(landing_path(principal.kind), HeaderMap::new())
-        }
-        PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => {
-            Html(workspace_html()).into_response()
-        }
-    }
+    redirect_with_cookies(landing_path(principal.kind), HeaderMap::new())
 }
 
 async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -5142,8 +5114,9 @@ async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response
         Err(response) => return response,
     };
     match principal.kind {
-        PrincipalKind::V2(GlobalRole::Admin) => Html(admin_html(false)).into_response(),
-        PrincipalKind::Legacy(AccountType::Admin) => Html(admin_html(true)).into_response(),
+        PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => {
+            Html(admin_html()).into_response()
+        }
         PrincipalKind::V2(_) | PrincipalKind::Legacy(_) => {
             error(StatusCode::FORBIDDEN, "administrative access required")
         }
@@ -5156,6 +5129,24 @@ async fn writer_ui(State(state): State<AppState>, headers: HeaderMap) -> Respons
 
 async fn mentor_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
     role_ui(&state, &headers, GlobalRole::Mentor, mentor_html()).await
+}
+
+async fn account_setup_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
+        Err(response) => return response,
+    };
+    match principal.kind {
+        PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => {
+            Html(account_setup_html()).into_response()
+        }
+        PrincipalKind::V2(_) | PrincipalKind::Legacy(AccountType::Admin) => {
+            redirect_with_cookies(landing_path(principal.kind), HeaderMap::new())
+        }
+    }
 }
 
 async fn role_ui(
@@ -5181,17 +5172,7 @@ async fn role_ui(
 
 async fn workspace_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match principal_auth(&state, &headers).await {
-        Ok(AuthenticatedPrincipal {
-            kind: PrincipalKind::Legacy(_),
-            ..
-        }) => Html(workspace_html()).into_response(),
-        Ok(AuthenticatedPrincipal {
-            kind: PrincipalKind::V2(_),
-            ..
-        }) => error(
-            StatusCode::FORBIDDEN,
-            "legacy workspace is unavailable to V2 principals",
-        ),
+        Ok(_) => error(StatusCode::FORBIDDEN, "the legacy workspace is retired"),
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             Html(login_html(None)).into_response()
         }
@@ -5261,20 +5242,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn browser_login_html_has_a_native_form_and_workspace_html_omits_it() {
+    fn browser_login_and_account_setup_are_server_rendered_and_minimal() {
         let login = login_html(Some("Invalid email or password."));
         assert!(login.contains("method=\"post\" action=\"/login\""));
         assert!(login.contains("name=\"email\""));
         assert!(login.contains("name=\"password\""));
         assert!(login.contains("Invalid email or password."));
 
-        let workspace = workspace_html();
-        assert!(workspace.contains("data-server-authenticated=\"true\""));
-        assert!(workspace.contains("id=\"appView\" class=\"app\""));
-        assert!(!workspace.contains("Welcome back"));
-        assert!(!workspace.contains("id=\"loginForm\""));
-        assert!(workspace.contains("/static/app.js?v=control-plane-groups-1"));
-        assert!(workspace.contains("Log out"));
+        let setup = account_setup_html();
+        assert!(setup.contains("Account setup required"));
+        assert!(setup.contains("has not yet been assigned"));
+        assert!(setup.contains("method=\"post\" action=\"/logout\""));
+        for forbidden in ["/workspace", "/write", "/review", "/admin", "app.js"] {
+            assert!(!setup.contains(forbidden));
+        }
     }
 
     #[test]
@@ -5404,6 +5385,9 @@ mod tests {
         }
         for forbidden in [
             "Research Groups",
+            "Create Team",
+            "New Team",
+            "Teams +",
             "Project Manager",
             "Publish Changes",
             "Add Member",
@@ -5431,6 +5415,11 @@ mod tests {
             );
         }
         for forbidden in [
+            "Research Groups",
+            "Create Team",
+            "New Team",
+            "Teams +",
+            "Project Manager",
             ">Save<",
             "Set Main",
             "New File",
@@ -5446,12 +5435,13 @@ mod tests {
             );
         }
 
-        let v2_admin = admin_html(false);
-        assert!(!v2_admin.contains("/workspace"));
-        assert!(!v2_admin.contains("/write"));
-        assert!(!v2_admin.contains("/review"));
-        assert!(!v2_admin.contains("<textarea"));
-        assert!(admin_html(true).contains("/workspace"));
+        let admin = admin_html();
+        assert!(!admin.contains("/workspace"));
+        assert!(!admin.contains("/write"));
+        assert!(!admin.contains("/review"));
+        assert!(!admin.contains("<textarea"));
+        assert!(!admin.contains(">Workspace<"));
+        assert!(admin.contains("LEGACY RESEARCH GROUPS"));
     }
 }
 
@@ -5497,8 +5487,8 @@ mod database_tests {
         assert_login_redirect(&app, &writer.email, "/write").await;
         assert_login_redirect(&app, &mentor.email, "/review").await;
         assert_login_redirect(&app, &admin.email, "/admin").await;
-        assert_login_redirect(&app, &legacy_student.email, "/").await;
-        assert_login_redirect(&app, &legacy_professor.email, "/").await;
+        assert_login_redirect(&app, &legacy_student.email, "/account-setup").await;
+        assert_login_redirect(&app, &legacy_professor.email, "/account-setup").await;
         assert_login_redirect(&app, &legacy_admin.email, "/admin").await;
 
         assert_routes(
@@ -5508,6 +5498,7 @@ mod database_tests {
                 ("/write", 200),
                 ("/review", 403),
                 ("/admin", 403),
+                ("/account-setup", 303),
                 ("/workspace", 403),
             ],
         )
@@ -5519,6 +5510,7 @@ mod database_tests {
                 ("/write", 403),
                 ("/review", 200),
                 ("/admin", 403),
+                ("/account-setup", 303),
                 ("/workspace", 403),
             ],
         )
@@ -5530,6 +5522,7 @@ mod database_tests {
                 ("/write", 403),
                 ("/review", 403),
                 ("/admin", 200),
+                ("/account-setup", 303),
                 ("/workspace", 403),
             ],
         )
@@ -5537,19 +5530,23 @@ mod database_tests {
         assert_routes(
             &app,
             &legacy_student.cookie,
-            &[("/", 200), ("/workspace", 200)],
+            &[("/", 303), ("/account-setup", 200), ("/workspace", 403)],
         )
         .await;
         assert_routes(
             &app,
             &legacy_professor.cookie,
-            &[("/", 200), ("/workspace", 200)],
+            &[("/", 303), ("/account-setup", 200), ("/workspace", 403)],
         )
         .await;
         assert_routes(
             &app,
             &legacy_admin.cookie,
-            &[("/admin", 200), ("/workspace", 200)],
+            &[
+                ("/admin", 200),
+                ("/account-setup", 303),
+                ("/workspace", 403),
+            ],
         )
         .await;
 
@@ -5592,63 +5589,113 @@ mod database_tests {
             StatusCode::OK
         );
 
-        for fixture in [&writer, &mentor, &admin] {
+        for fixture in [
+            &writer,
+            &mentor,
+            &admin,
+            &legacy_student,
+            &legacy_professor,
+            &legacy_admin,
+        ] {
             let workspace = WorkspaceId::new();
-            let save = request(
-                &app,
-                Method::PUT,
-                &format!("/api/projects/{workspace}/files/main.tex"),
-                Some(&fixture.cookie),
-                "source",
-                Some("text/plain"),
-            )
-            .await;
-            assert_eq!(save.status(), StatusCode::FORBIDDEN);
-            let structural = request(
-                &app,
-                Method::POST,
-                "/api/projects",
-                Some(&fixture.cookie),
-                r#"{"name":"legacy bypass"}"#,
-                Some("application/json"),
-            )
-            .await;
-            assert_eq!(structural.status(), StatusCode::FORBIDDEN);
+            let group = uuid::Uuid::new_v4();
+            let team_project = uuid::Uuid::new_v4();
+            for (method, path, body, content_type) in [
+                (
+                    Method::POST,
+                    "/api/projects".to_owned(),
+                    r#"{"name":"legacy bypass"}"#,
+                    "application/json",
+                ),
+                (
+                    Method::PUT,
+                    format!("/api/projects/{workspace}/files/main.tex"),
+                    "source",
+                    "text/plain",
+                ),
+                (
+                    Method::POST,
+                    "/api/teams".to_owned(),
+                    r#"{"name":"legacy team"}"#,
+                    "application/json",
+                ),
+                (
+                    Method::POST,
+                    "/api/research-groups".to_owned(),
+                    r#"{"name":"legacy group"}"#,
+                    "application/json",
+                ),
+                (
+                    Method::PATCH,
+                    format!("/api/research-groups/{group}"),
+                    r#"{"name":"changed"}"#,
+                    "application/json",
+                ),
+                (
+                    Method::POST,
+                    format!("/api/team-projects/{team_project}/publish"),
+                    "{}",
+                    "application/json",
+                ),
+            ] {
+                assert_eq!(
+                    request(
+                        &app,
+                        method,
+                        &path,
+                        Some(&fixture.cookie),
+                        body,
+                        Some(content_type)
+                    )
+                    .await
+                    .status(),
+                    StatusCode::FORBIDDEN,
+                    "legacy route {path} leaked for {}",
+                    fixture.email
+                );
+            }
         }
 
-        sqlx::query("UPDATE latex_core.global_user_roles SET role='mentor' WHERE user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1)")
-            .bind(&writer.email)
-            .execute(&pool)
-            .await
-            .unwrap();
         assert_eq!(
-            get(&app, "/write", Some(&writer.cookie)).await.status(),
-            StatusCode::FORBIDDEN
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM latex_core.global_user_roles")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            3
         );
+        let users = test_json(get(&app, "/api/admin/v2/users", Some(&admin.cookie)).await).await;
+        let unassigned = users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|user| user["email"].as_str() == Some(legacy_student.email.as_str()))
+            .unwrap();
+        assert_eq!(unassigned["legacy_account_type"], "student");
+        assert!(unassigned["v2_role"].is_null());
+        assert_eq!(unassigned["migration_state"], "UNASSIGNED");
+        let legacy_student_id = test_user_id(&pool, &legacy_student.email).await;
         assert_eq!(
-            get(&app, "/review", Some(&writer.cookie)).await.status(),
+            request(
+                &app,
+                Method::PATCH,
+                &format!("/api/admin/v2/users/{legacy_student_id}/role"),
+                Some(&admin.cookie),
+                r#"{"role":"writer"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
             StatusCode::OK
         );
-        sqlx::query("DELETE FROM latex_core.global_user_roles WHERE user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1)")
-            .bind(&writer.email)
-            .execute(&pool)
-            .await
-            .unwrap();
         assert_eq!(
-            get(&app, "/review", Some(&writer.cookie)).await.status(),
-            StatusCode::FORBIDDEN
-        );
-
-        AppRepository::new(database.clone())
-            .set_user_enabled(&legacy_student.email, false)
-            .await
-            .unwrap();
-        assert_eq!(
-            get(&app, "/api/projects", Some(&legacy_student.cookie))
+            get(&app, "/api/v2/me", Some(&legacy_student.cookie))
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+        assert_login_redirect(&app, &legacy_student.email, "/write").await;
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM latex_core.global_user_roles WHERE user_id IN ((SELECT user_id FROM latex_core.user_credentials WHERE email=$1),(SELECT user_id FROM latex_core.user_credentials WHERE email=$2))")
+            .bind(&legacy_professor.email).bind(&legacy_admin.email).fetch_one(&pool).await.unwrap(), 0);
 
         let invalid = login_request(&app, "missing@example.test", "wrong").await;
         assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
