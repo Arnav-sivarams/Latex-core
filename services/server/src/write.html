@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Writer — LaTeX Core</title>
+  <link rel="stylesheet" href="/static/shells.css?v=c4">
+</head>
+<body>
+  <header class="shell-topbar">
+    <a class="shell-brand" href="/write" aria-current="page">LaTeX Core</a>
+    <span class="role-badge">Writer</span>
+    <span class="shell-spacer"></span>
+    <form method="post" action="/logout"><button type="submit">Log out</button></form>
+  </header>
+  <div class="writer-layout">
+    <nav class="paper-nav" aria-label="Writer papers and files">
+      <section aria-labelledby="my-papers-heading">
+        <h2 id="my-papers-heading">MY PAPERS</h2>
+        <p class="empty-copy">Personal papers will appear here after the V2 paper workflow is available.</p>
+      </section>
+      <section aria-labelledby="team-papers-heading">
+        <h2 id="team-papers-heading">TEAM PAPERS</h2>
+        <p class="empty-copy">No assigned team papers yet.</p>
+      </section>
+      <section aria-labelledby="files-heading">
+        <h2 id="files-heading">FILES</h2>
+        <p class="empty-copy">Choose a paper to view its files.</p>
+      </section>
+    </nav>
+    <main class="writer-main">
+      <section class="editor-foundation" aria-labelledby="editor-heading">
+        <div class="panel-heading"><h1 id="editor-heading">EDITOR</h1><span>Foundation only</span></div>
+        <div class="foundation-empty"><strong>No paper selected</strong><p>Source editing arrives with the V2 collaboration editor.</p></div>
+      </section>
+      <section class="pdf-foundation" aria-labelledby="pdf-heading">
+        <div class="panel-heading"><h2 id="pdf-heading">PDF</h2></div>
+        <div class="foundation-empty"><strong>No preview available</strong><p>Select a paper when V2 paper access is enabled.</p></div>
+      </section>
+      <nav class="detail-tabs" aria-label="Paper details">
+        <a href="#problems" aria-current="page">PROBLEMS</a>
+        <a href="#reviews">REVIEWS</a>
+        <a href="#history">HISTORY</a>
+      </nav>
+      <section id="problems" class="detail-panel" aria-labelledby="problems-heading">
+        <h2 id="problems-heading">PROBLEMS</h2>
+        <p>No build diagnostics are available.</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

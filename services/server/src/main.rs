@@ -24,9 +24,9 @@ use core_types::{
     LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId, WorkspaceVersion,
 };
 use persistence::{
-    AppError, AppRepository, ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1,
-    FilePolicy, GroupType, PostgresCompileQueue, ProjectAccess, ProjectRoles, PublishResult,
-    QueueLimits, TeamFileRecord,
+    AccountType, AppError, AppRepository, AppSessionRecord, ChangeSetPublishResult, Database,
+    DatabaseConfig, EnqueueCompileJobV1, FilePolicy, GlobalRole, GroupType, PostgresCompileQueue,
+    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,7 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 #[derive(Clone)]
 struct AppState {
     repo: AppRepository,
+    v2: V2Repository,
     workspaces: WorkspaceService,
     queue: PostgresCompileQueue,
     blobs: Arc<FsBlobStore>,
@@ -145,7 +146,46 @@ struct UserWire {
     account_type: String,
     persona: String,
     landing_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v2_role: Option<String>,
     capabilities: IdentityCapabilitiesWire,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PrincipalKind {
+    V2(GlobalRole),
+    Legacy(AccountType),
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedPrincipal {
+    session: AppSessionRecord,
+    kind: PrincipalKind,
+}
+
+impl AuthenticatedPrincipal {
+    fn resolve(session: AppSessionRecord) -> Result<Self, AppError> {
+        let kind = match session.global_role {
+            Some(role) => PrincipalKind::V2(role),
+            None => PrincipalKind::Legacy(AccountType::parse(&session.account_type)?),
+        };
+        Ok(Self { session, kind })
+    }
+
+    const fn user_id(&self) -> UserId {
+        self.session.user_id
+    }
+
+    fn email(&self) -> &str {
+        &self.session.email
+    }
+}
+
+#[derive(Serialize)]
+struct V2IdentityWire {
+    user_id: String,
+    email: String,
+    role: String,
 }
 #[derive(Serialize)]
 struct IdentityCapabilitiesWire {
@@ -310,6 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = PostgresCompileQueue::new(database.clone(), queue_limits()?);
     let state = AppState {
         repo: AppRepository::new(database.clone()),
+        v2: V2Repository::new(database.clone()),
         workspaces: WorkspaceService::new(
             persistence::PostgresWorkspaceRepository::new(database),
             blobs.clone(),
@@ -341,8 +382,12 @@ fn router(state: AppState) -> Router {
         .route("/login", post(browser_login))
         .route("/logout", post(browser_logout))
         .route("/admin", get(admin_ui))
+        .route("/write", get(writer_ui))
+        .route("/review", get(mentor_ui))
         .route("/workspace", get(workspace_ui))
         .route("/static/styles.css", get(styles))
+        .route("/static/shells.css", get(shells_css))
+        .route("/static/admin.js", get(admin_js))
         .route("/static/app.js", get(app_js))
         .route("/static/api.js", get(api_js))
         .route("/static/state.js", get(state_js))
@@ -350,6 +395,7 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/v2/me", get(v2_me))
         .route("/api/admin/overview", get(admin_overview))
         .route("/api/admin/users", get(admin_users).post(admin_create_user))
         .route(
@@ -519,10 +565,9 @@ async fn browser_login(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let location = match state.repo.account_type(user).await {
-        Ok(account_type) if account_type.is_admin() => "/admin",
-        Ok(_) => "/",
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    let location = match principal_kind_for_user(&state, user).await {
+        Ok(kind) => landing_path(kind),
+        Err(response) => return response,
     };
     redirect_with_cookies(location, cookies)
 }
@@ -587,23 +632,43 @@ async fn revoke_session(state: &AppState, headers: &HeaderMap) -> Result<HeaderM
         .map_err(|()| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match auth(&state, &headers).await {
-        Ok(session) => identity_response(&state, session).await,
+    match principal_auth(&state, &headers).await {
+        Ok(principal) => identity_response(&state, principal).await,
         Err(r) => r,
     }
 }
+
+async fn v2_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let PrincipalKind::V2(role) = principal.kind else {
+        return error(StatusCode::FORBIDDEN, "V2 principal required");
+    };
+    Json(V2IdentityWire {
+        user_id: principal.user_id().to_string(),
+        email: principal.email().to_owned(),
+        role: role.as_str().to_owned(),
+    })
+    .into_response()
+}
+
 async fn admin_session(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<persistence::AppSessionRecord, Response> {
-    let session = auth(state, headers).await?;
-    if session.account_type != "admin" {
+) -> Result<AuthenticatedPrincipal, Response> {
+    let principal = principal_auth(state, headers).await?;
+    if !matches!(
+        principal.kind,
+        PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin)
+    ) {
         return Err(error(
             StatusCode::FORBIDDEN,
             "administrator capability required",
         ));
     }
-    Ok(session)
+    Ok(principal)
 }
 async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let session = match admin_session(&state, &headers).await {
@@ -613,7 +678,7 @@ async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Re
     match state.repo.admin_overview().await {
         Ok(mut overview) => {
             overview["version"] = serde_json::Value::String("latex-core 0.1.0".into());
-            overview["current_admin"] = serde_json::Value::String(session.email);
+            overview["current_admin"] = serde_json::Value::String(session.email().to_owned());
             Json(overview).into_response()
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
@@ -2861,18 +2926,31 @@ async fn job_response(state: &AppState, user: UserId, id: JobId) -> Response {
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     }
 }
-async fn auth(
+async fn auth(state: &AppState, headers: &HeaderMap) -> Result<AppSessionRecord, Response> {
+    let principal = principal_auth(state, headers).await?;
+    match principal.kind {
+        PrincipalKind::Legacy(_) => Ok(principal.session),
+        PrincipalKind::V2(_) => Err(error(
+            StatusCode::FORBIDDEN,
+            "legacy workspace API is unavailable to V2 principals",
+        )),
+    }
+}
+
+async fn principal_auth(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<persistence::AppSessionRecord, Response> {
+) -> Result<AuthenticatedPrincipal, Response> {
     let token = cookie(headers)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "authentication required"))?;
-    state
+    let session = state
         .repo
         .session(&digest(&token))
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
-        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "authentication required"))
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "authentication required"))?;
+    AuthenticatedPrincipal::resolve(session)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))
 }
 async fn session_response(
     state: &AppState,
@@ -2921,8 +2999,15 @@ async fn create_session_headers(
     session_cookie_headers(&token, state.session_seconds, state.cookie_secure)
         .map_err(|()| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))
 }
-async fn identity_response(state: &AppState, session: persistence::AppSessionRecord) -> Response {
-    match identity_for_user(state, session.user_id, session.email).await {
+async fn identity_response(state: &AppState, principal: AuthenticatedPrincipal) -> Response {
+    match identity_for_kind(
+        state,
+        principal.user_id(),
+        principal.email().to_owned(),
+        principal.kind,
+    )
+    .await
+    {
         Ok(identity) => Json(identity).into_response(),
         Err(response) => response,
     }
@@ -2933,41 +3018,111 @@ async fn identity_for_user(
     user: UserId,
     email: String,
 ) -> Result<UserWire, Response> {
-    // Re-read account type instead of trusting a client value or a historical session
-    // claim.  Administrative account changes are therefore visible on the next /me.
-    let account_type = state
-        .repo
-        .account_type(user)
+    let kind = if let Some(assignment) = state
+        .v2
+        .get_global_role(user)
         .await
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?;
-    let is_admin = account_type.is_admin();
-    let has_mentor_projects = if is_admin {
-        false
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
+    {
+        PrincipalKind::V2(assignment.role)
     } else {
-        state
-            .repo
-            .has_mentor_project_role(user)
-            .await
-            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
+        PrincipalKind::Legacy(
+            state
+                .repo
+                .account_type(user)
+                .await
+                .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?,
+        )
     };
-    let persona = if is_admin {
-        "admin"
-    } else if has_mentor_projects {
-        "mentor"
-    } else {
-        account_type.as_str()
+    identity_for_kind(state, user, email, kind).await
+}
+
+async fn identity_for_kind(
+    state: &AppState,
+    user: UserId,
+    email: String,
+    kind: PrincipalKind,
+) -> Result<UserWire, Response> {
+    let (account_type, persona, landing_path, v2_role, is_admin, has_mentor_projects) = match kind {
+        PrincipalKind::V2(role) => (
+            role.as_str(),
+            role.as_str(),
+            landing_path(kind),
+            Some(role.as_str().to_owned()),
+            role == GlobalRole::Admin,
+            false,
+        ),
+        PrincipalKind::Legacy(account_type) => {
+            let is_admin = account_type.is_admin();
+            let has_mentor_projects = if is_admin {
+                false
+            } else {
+                state
+                    .repo
+                    .has_mentor_project_role(user)
+                    .await
+                    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
+            };
+            let persona = if is_admin {
+                "admin"
+            } else if has_mentor_projects {
+                "mentor"
+            } else {
+                account_type.as_str()
+            };
+            (
+                account_type.as_str(),
+                persona,
+                landing_path(kind),
+                None,
+                is_admin,
+                has_mentor_projects,
+            )
+        }
     };
     Ok(UserWire {
         id: user.to_string(),
         email,
-        account_type: account_type.as_str().to_owned(),
+        account_type: account_type.to_owned(),
         persona: persona.to_owned(),
-        landing_path: if is_admin { "/admin" } else { "/" }.to_owned(),
+        landing_path: landing_path.to_owned(),
+        v2_role,
         capabilities: IdentityCapabilitiesWire {
             can_open_admin: is_admin,
             has_mentor_projects,
         },
     })
+}
+
+async fn principal_kind_for_user(
+    state: &AppState,
+    user: UserId,
+) -> Result<PrincipalKind, Response> {
+    if let Some(assignment) = state
+        .v2
+        .get_global_role(user)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?
+    {
+        return Ok(PrincipalKind::V2(assignment.role));
+    }
+    state
+        .repo
+        .account_type(user)
+        .await
+        .map(PrincipalKind::Legacy)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))
+}
+
+const fn landing_path(kind: PrincipalKind) -> &'static str {
+    match kind {
+        PrincipalKind::V2(GlobalRole::Writer) => "/write",
+        PrincipalKind::V2(GlobalRole::Mentor) => "/review",
+        PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => {
+            "/admin"
+        }
+        PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => "/",
+    }
 }
 
 fn csrf(headers: &HeaderMap) -> Result<(), Response> {
@@ -3158,6 +3313,25 @@ fn workspace_html() -> String {
         .replacen("class=\"app hidden\"", "class=\"app\"", 1)
 }
 
+fn writer_html() -> &'static str {
+    include_str!("write.html")
+}
+
+fn mentor_html() -> &'static str {
+    include_str!("review.html")
+}
+
+fn admin_html(legacy_admin: bool) -> String {
+    include_str!("admin.html").replace(
+        "{{LEGACY_WORKSPACE_LINK}}",
+        if legacy_admin {
+            "<a class=\"shell-link\" href=\"/workspace\">Legacy Workspace</a>"
+        } else {
+            ""
+        },
+    )
+}
+
 fn redirect_with_cookies(location: &'static str, cookies: HeaderMap) -> Response {
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response();
     response.headers_mut().extend(cookies);
@@ -3165,40 +3339,82 @@ fn redirect_with_cookies(location: &'static str, cookies: HeaderMap) -> Response
 }
 
 async fn ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let session = match auth(&state, &headers).await {
+    let principal = match principal_auth(&state, &headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             return Html(login_html(None)).into_response();
         }
         Err(response) => return response,
     };
-    match state.repo.account_type(session.user_id).await {
-        Ok(account_type) if account_type.is_admin() => {
-            redirect_with_cookies("/admin", HeaderMap::new())
+    match principal.kind {
+        PrincipalKind::V2(_) | PrincipalKind::Legacy(AccountType::Admin) => {
+            redirect_with_cookies(landing_path(principal.kind), HeaderMap::new())
         }
-        Ok(_) => Html(workspace_html()).into_response(),
-        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+        PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => {
+            Html(workspace_html()).into_response()
+        }
     }
 }
 
 async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let session = match auth(&state, &headers).await {
+    let principal = match principal_auth(&state, &headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             return Html(login_html(None)).into_response();
         }
         Err(response) => return response,
     };
-    match state.repo.account_type(session.user_id).await {
-        Ok(account_type) if account_type.is_admin() => Html(workspace_html()).into_response(),
-        Ok(_) => error(StatusCode::FORBIDDEN, "administrative access required"),
-        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"),
+    match principal.kind {
+        PrincipalKind::V2(GlobalRole::Admin) => Html(admin_html(false)).into_response(),
+        PrincipalKind::Legacy(AccountType::Admin) => Html(admin_html(true)).into_response(),
+        PrincipalKind::V2(_) | PrincipalKind::Legacy(_) => {
+            error(StatusCode::FORBIDDEN, "administrative access required")
+        }
+    }
+}
+
+async fn writer_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    role_ui(&state, &headers, GlobalRole::Writer, writer_html()).await
+}
+
+async fn mentor_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    role_ui(&state, &headers, GlobalRole::Mentor, mentor_html()).await
+}
+
+async fn role_ui(
+    state: &AppState,
+    headers: &HeaderMap,
+    required: GlobalRole,
+    html: &'static str,
+) -> Response {
+    let principal = match principal_auth(state, headers).await {
+        Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
+        Err(response) => return response,
+    };
+    match principal.kind {
+        PrincipalKind::V2(role) if role == required => Html(html).into_response(),
+        PrincipalKind::V2(_) | PrincipalKind::Legacy(_) => {
+            error(StatusCode::FORBIDDEN, "role-specific access required")
+        }
     }
 }
 
 async fn workspace_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match auth(&state, &headers).await {
-        Ok(_) => Html(workspace_html()).into_response(),
+    match principal_auth(&state, &headers).await {
+        Ok(AuthenticatedPrincipal {
+            kind: PrincipalKind::Legacy(_),
+            ..
+        }) => Html(workspace_html()).into_response(),
+        Ok(AuthenticatedPrincipal {
+            kind: PrincipalKind::V2(_),
+            ..
+        }) => error(
+            StatusCode::FORBIDDEN,
+            "legacy workspace is unavailable to V2 principals",
+        ),
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             Html(login_html(None)).into_response()
         }
@@ -3210,6 +3426,22 @@ async fn styles() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../static/styles.css"),
+    )
+        .into_response()
+}
+
+async fn shells_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/shells.css"),
+    )
+        .into_response()
+}
+
+async fn admin_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/admin.js"),
     )
         .into_response()
 }
@@ -3365,5 +3597,420 @@ mod tests {
         assert_eq!(if_match(&headers).expect("valid ETag").get(), 7);
         headers.insert(header::IF_MATCH, HeaderValue::from_static("\"NaN\""));
         assert!(if_match(&headers).is_err());
+    }
+
+    #[test]
+    fn v2_shells_expose_the_frozen_information_architecture_only() {
+        let writer = writer_html();
+        for required in [
+            "MY PAPERS",
+            "TEAM PAPERS",
+            "FILES",
+            "EDITOR",
+            "PDF",
+            "PROBLEMS",
+            "REVIEWS",
+            "HISTORY",
+        ] {
+            assert!(
+                writer.contains(required),
+                "missing Writer section {required}"
+            );
+        }
+        for forbidden in [
+            "Research Groups",
+            "Project Manager",
+            "Publish Changes",
+            "Add Member",
+        ] {
+            assert!(
+                !writer.contains(forbidden),
+                "unexpected Writer control {forbidden}"
+            );
+        }
+
+        let mentor = mentor_html();
+        for required in [
+            "ASSIGNED REVIEWS",
+            "ACTIVITY",
+            "REVIEW ROUNDS",
+            "READ-ONLY SOURCE",
+            "PDF",
+            "REVIEW THREADS",
+            "APPROVALS",
+            "VERSIONS",
+        ] {
+            assert!(
+                mentor.contains(required),
+                "missing Mentor section {required}"
+            );
+        }
+        for forbidden in [
+            ">Save<",
+            "Set Main",
+            "New File",
+            "Rename",
+            "Move",
+            "Delete",
+            "Publish",
+            "<textarea",
+        ] {
+            assert!(
+                !mentor.contains(forbidden),
+                "unexpected Mentor control {forbidden}"
+            );
+        }
+
+        let v2_admin = admin_html(false);
+        assert!(!v2_admin.contains("/workspace"));
+        assert!(!v2_admin.contains("/write"));
+        assert!(!v2_admin.contains("/review"));
+        assert!(!v2_admin.contains("<textarea"));
+        assert!(admin_html(true).contains("/workspace"));
+    }
+}
+
+#[cfg(all(test, feature = "database-tests"))]
+#[allow(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    reason = "disposable PostgreSQL authorization fixtures"
+)]
+mod database_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request},
+    };
+    use persistence::{DatabaseConfig, GlobalRole};
+    use sqlx::PgPool;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    static SERVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const PASSWORD: &str = "CorrectHorseBattery1";
+
+    struct Fixture {
+        email: String,
+        cookie: String,
+    }
+
+    #[tokio::test]
+    async fn v2_and_legacy_authorization_route_login_api_and_mutation_matrix() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage) = test_application().await;
+
+        let writer = fixture(&app, &database, "admin", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        let legacy_student = fixture(&app, &database, "student", None).await;
+        let legacy_professor = fixture(&app, &database, "professor", None).await;
+        let legacy_admin = fixture(&app, &database, "admin", None).await;
+
+        assert_login_redirect(&app, &writer.email, "/write").await;
+        assert_login_redirect(&app, &mentor.email, "/review").await;
+        assert_login_redirect(&app, &admin.email, "/admin").await;
+        assert_login_redirect(&app, &legacy_student.email, "/").await;
+        assert_login_redirect(&app, &legacy_professor.email, "/").await;
+        assert_login_redirect(&app, &legacy_admin.email, "/admin").await;
+
+        assert_routes(
+            &app,
+            &writer.cookie,
+            &[
+                ("/write", 200),
+                ("/review", 403),
+                ("/admin", 403),
+                ("/workspace", 403),
+            ],
+        )
+        .await;
+        assert_routes(
+            &app,
+            &mentor.cookie,
+            &[
+                ("/write", 403),
+                ("/review", 200),
+                ("/admin", 403),
+                ("/workspace", 403),
+            ],
+        )
+        .await;
+        assert_routes(
+            &app,
+            &admin.cookie,
+            &[
+                ("/write", 403),
+                ("/review", 403),
+                ("/admin", 200),
+                ("/workspace", 403),
+            ],
+        )
+        .await;
+        assert_routes(
+            &app,
+            &legacy_student.cookie,
+            &[("/", 200), ("/workspace", 200)],
+        )
+        .await;
+        assert_routes(
+            &app,
+            &legacy_professor.cookie,
+            &[("/", 200), ("/workspace", 200)],
+        )
+        .await;
+        assert_routes(
+            &app,
+            &legacy_admin.cookie,
+            &[("/admin", 200), ("/workspace", 200)],
+        )
+        .await;
+
+        assert_eq!(
+            get(&app, "/api/projects", None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(&app, "/api/admin/overview", Some(&writer.cookie))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&app, "/api/admin/overview", Some(&mentor.cookie))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&app, "/api/admin/overview", Some(&admin.cookie))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&app, "/api/admin/overview", Some(&legacy_admin.cookie))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&app, "/api/v2/me", Some(&legacy_student.cookie))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&app, "/api/v2/me", Some(&writer.cookie)).await.status(),
+            StatusCode::OK
+        );
+
+        for fixture in [&writer, &mentor, &admin] {
+            let workspace = WorkspaceId::new();
+            let save = request(
+                &app,
+                Method::PUT,
+                &format!("/api/projects/{workspace}/files/main.tex"),
+                Some(&fixture.cookie),
+                "source",
+                Some("text/plain"),
+            )
+            .await;
+            assert_eq!(save.status(), StatusCode::FORBIDDEN);
+            let structural = request(
+                &app,
+                Method::POST,
+                "/api/projects",
+                Some(&fixture.cookie),
+                r#"{"name":"legacy bypass"}"#,
+                Some("application/json"),
+            )
+            .await;
+            assert_eq!(structural.status(), StatusCode::FORBIDDEN);
+        }
+
+        sqlx::query("UPDATE latex_core.global_user_roles SET role='mentor' WHERE user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1)")
+            .bind(&writer.email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&app, "/write", Some(&writer.cookie)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&app, "/review", Some(&writer.cookie)).await.status(),
+            StatusCode::OK
+        );
+        sqlx::query("DELETE FROM latex_core.global_user_roles WHERE user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1)")
+            .bind(&writer.email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&app, "/review", Some(&writer.cookie)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        AppRepository::new(database.clone())
+            .set_user_enabled(&legacy_student.email, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&app, "/api/projects", Some(&legacy_student.cookie))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let invalid = login_request(&app, "missing@example.test", "wrong").await;
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+        let logout = request(
+            &app,
+            Method::POST,
+            "/logout",
+            Some(&mentor.cookie),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+        assert_eq!(logout.headers()[header::LOCATION], "/");
+        assert_eq!(
+            get(&app, "/api/v2/me", Some(&mentor.cookie)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    async fn test_application() -> (Database, PgPool, Router, TempDir) {
+        let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let database =
+            Database::connect(DatabaseConfig::new(&url, 1, 5, Duration::from_secs(5)).unwrap())
+                .await
+                .unwrap();
+        database.migrate().await.unwrap();
+        let pool = PgPool::connect(&url).await.unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(
+            FsBlobStore::open(storage.path(), FsBlobStoreConfig::development_default())
+                .await
+                .unwrap(),
+        );
+        let state = AppState {
+            repo: AppRepository::new(database.clone()),
+            v2: V2Repository::new(database.clone()),
+            workspaces: WorkspaceService::new(
+                persistence::PostgresWorkspaceRepository::new(database.clone()),
+                blobs.clone(),
+            ),
+            queue: PostgresCompileQueue::new(
+                database.clone(),
+                QueueLimits::new(2, 1, 8, Duration::from_secs(120), 3).unwrap(),
+            ),
+            blobs,
+            environment: TexEnvironmentId::parse("development-env").unwrap(),
+            cookie_secure: false,
+            allow_registration: false,
+            session_seconds: 3600,
+        };
+        (database, pool, router(state), storage)
+    }
+
+    async fn fixture(
+        app: &Router,
+        database: &Database,
+        account_type: &str,
+        role: Option<GlobalRole>,
+    ) -> Fixture {
+        let repo = AppRepository::new(database.clone());
+        let email = format!("{}@c4.example", uuid::Uuid::new_v4());
+        let password_hash = auth::hash_password(PASSWORD).unwrap();
+        let user = repo.create_account(&email, &password_hash).await.unwrap();
+        repo.set_user_account_type(&email, account_type)
+            .await
+            .unwrap();
+        if let Some(role) = role {
+            V2Repository::new(database.clone())
+                .set_global_role(user.user_id, role)
+                .await
+                .unwrap();
+        }
+        let response = login_request(app, &email, PASSWORD).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        Fixture {
+            email,
+            cookie: response_cookie(&response),
+        }
+    }
+
+    async fn assert_login_redirect(app: &Router, email: &str, expected: &str) {
+        let response = login_request(app, email, PASSWORD).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], expected);
+    }
+
+    async fn login_request(app: &Router, email: &str, password: &str) -> Response {
+        request(
+            app,
+            Method::POST,
+            "/login",
+            None,
+            &format!("email={email}&password={password}"),
+            Some("application/x-www-form-urlencoded"),
+        )
+        .await
+    }
+
+    fn response_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let value = value.to_str().ok()?;
+                value
+                    .starts_with(COOKIE)
+                    .then(|| value.split(';').next().unwrap().to_owned())
+            })
+            .expect("canonical session cookie")
+    }
+
+    async fn assert_routes(app: &Router, cookie: &str, routes: &[(&str, u16)]) {
+        for (path, expected) in routes {
+            assert_eq!(
+                get(app, path, Some(cookie)).await.status().as_u16(),
+                *expected,
+                "unexpected status for {path}"
+            );
+        }
+    }
+
+    async fn get(app: &Router, path: &str, cookie: Option<&str>) -> Response {
+        request(app, Method::GET, path, cookie, "", None).await
+    }
+
+    async fn request(
+        app: &Router,
+        method: Method,
+        path: &str,
+        cookie: Option<&str>,
+        body: &str,
+        content_type: Option<&str>,
+    ) -> Response {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap()
     }
 }

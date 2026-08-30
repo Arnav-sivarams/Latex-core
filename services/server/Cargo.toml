@@ -46,3 +46,12 @@ zip.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = []
+database-tests = ["persistence/database-tests"]
+
+[dev-dependencies]
+sqlx.workspace = true
+tempfile.workspace = true
+tower.workspace = true

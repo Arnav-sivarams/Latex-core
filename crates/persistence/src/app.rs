@@ -6,7 +6,8 @@
 )]
 
 use crate::{
-    AccountType, Database, GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles,
+    AccountType, Database, GlobalRole, GroupRoles, OverrideEffect, Permission, PermissionResolver,
+    ProjectRoles,
 };
 use core_types::{ArtifactId, BlobHash, JobId, TenantId, UserId, WorkspaceId};
 use serde_json::json;
@@ -45,6 +46,7 @@ pub struct AppSessionRecord {
     pub tenant_id: TenantId,
     pub email: String,
     pub account_type: String,
+    pub global_role: Option<GlobalRole>,
 }
 #[derive(Clone, Debug)]
 pub struct AppProjectRecord {
@@ -179,13 +181,22 @@ impl AppRepository {
         Ok(())
     }
     pub async fn session(&self, digest: &str) -> Result<Option<AppSessionRecord>, AppError> {
-        let row=sqlx::query("SELECT u.id,u.tenant_id,c.email,c.account_type FROM latex_core.sessions s JOIN latex_core.users u ON u.id=s.user_id JOIN latex_core.user_credentials c ON c.user_id=u.id WHERE s.token_digest=$1 AND s.expires_at>statement_timestamp() AND c.enabled=TRUE") .bind(digest).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
+        let row=sqlx::query("SELECT u.id,u.tenant_id,c.email,c.account_type,g.role AS global_role FROM latex_core.sessions s JOIN latex_core.users u ON u.id=s.user_id JOIN latex_core.user_credentials c ON c.user_id=u.id LEFT JOIN latex_core.global_user_roles g ON g.user_id=u.id WHERE s.token_digest=$1 AND s.expires_at>statement_timestamp() AND c.enabled=TRUE") .bind(digest).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
         row.map(|r| {
+            let global_role = r
+                .try_get::<Option<String>, _>("global_role")
+                .map_err(AppError::Database)?
+                .map(|role| role.parse::<GlobalRole>())
+                .transpose()
+                .map_err(|error| AppError::Integrity {
+                    message: error.to_string(),
+                })?;
             Ok(AppSessionRecord {
                 user_id: UserId::from_uuid(r.try_get("id").map_err(AppError::Database)?),
                 tenant_id: TenantId::from_uuid(r.try_get("tenant_id").map_err(AppError::Database)?),
                 email: r.try_get("email").map_err(AppError::Database)?,
                 account_type: r.try_get("account_type").map_err(AppError::Database)?,
+                global_role,
             })
         })
         .transpose()

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admin — LaTeX Core</title>
+  <link rel="stylesheet" href="/static/shells.css?v=c4">
+</head>
+<body>
+  <header class="shell-topbar">
+    <a class="shell-brand" href="/admin" aria-current="page">LaTeX Core</a>
+    <span class="role-badge">Admin</span>
+    <span class="shell-spacer"></span>
+    {{LEGACY_WORKSPACE_LINK}}
+    <form method="post" action="/logout"><button type="submit">Log out</button></form>
+  </header>
+  <div class="admin-layout">
+    <nav id="adminNav" class="admin-nav" aria-label="Administrative sections">
+      <button type="button" data-section="Overview" aria-current="page">OVERVIEW</button>
+      <button type="button" data-section="Users">USERS</button>
+      <button type="button" data-section="Paper Teams" disabled title="Paper Team provisioning arrives in C5">PAPER TEAMS</button>
+      <button type="button" data-section="Legacy Teams">LEGACY TEAMS</button>
+      <button type="button" data-section="Research Groups">RESEARCH GROUPS</button>
+      <button type="button" data-section="Projects">PROJECTS</button>
+      <button type="button" data-section="Templates">TEMPLATES</button>
+      <button type="button" data-section="Build Queue">BUILD QUEUE</button>
+      <button type="button" data-section="Audit">AUDIT</button>
+      <button type="button" data-section="System">SYSTEM</button>
+    </nav>
+    <main id="adminContent" class="admin-content" tabindex="-1">
+      <h1>OVERVIEW</h1>
+      <p class="empty-copy">Loading operational data…</p>
+    </main>
+  </div>
+  <div id="adminStatus" class="status-region" aria-live="polite"></div>
+  <script type="module" src="/static/admin.js?v=c4"></script>
+</body>
+</html>

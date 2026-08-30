@@ -85,6 +85,50 @@ async fn global_roles_are_transitional_exclusive_and_database_constrained() {
 }
 
 #[tokio::test]
+async fn successful_role_operations_revoke_sessions_and_rejections_are_atomic() {
+    let _guard = V2_TEST_LOCK.lock().await;
+    let (database, pool, repo) = connect().await;
+
+    let (user, tenant) = insert_user_with_tenant(&pool).await;
+    insert_session(&pool, user).await;
+    repo.set_global_role(user, GlobalRole::Writer)
+        .await
+        .unwrap();
+    assert_eq!(session_count(&pool, user).await, 0);
+
+    insert_session(&pool, user).await;
+    repo.set_global_role(user, GlobalRole::Mentor)
+        .await
+        .unwrap();
+    assert_eq!(session_count(&pool, user).await, 0);
+
+    insert_session(&pool, user).await;
+    repo.remove_global_role(user).await.unwrap();
+    assert_eq!(session_count(&pool, user).await, 0);
+
+    repo.set_global_role(user, GlobalRole::Writer)
+        .await
+        .unwrap();
+    let workspace = insert_workspace(&pool, tenant, user).await;
+    repo.create_personal_paper(user, workspace, "Atomic role transition")
+        .await
+        .unwrap();
+    insert_session(&pool, user).await;
+    assert!(matches!(
+        repo.set_global_role(user, GlobalRole::Mentor).await,
+        Err(V2Error::PersonalPaperOwnershipConflict { .. })
+    ));
+    assert_eq!(session_count(&pool, user).await, 1);
+    assert_eq!(
+        repo.get_global_role(user).await.unwrap().unwrap().role,
+        GlobalRole::Writer
+    );
+
+    pool.close().await;
+    database.close().await;
+}
+
+#[tokio::test]
 async fn personal_papers_are_writer_owned_and_workspace_unique() {
     let _guard = V2_TEST_LOCK.lock().await;
     let (database, pool, repo) = connect().await;
@@ -467,6 +511,27 @@ async fn insert_workspace(
         .await
         .unwrap();
     workspace_id
+}
+
+async fn insert_session(pool: &PgPool, user_id: UserId) {
+    let token_digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO latex_core.sessions (token_digest,user_id,expires_at) \
+         VALUES ($1,$2,statement_timestamp()+interval '1 hour')",
+    )
+    .bind(token_digest)
+    .bind(user_id.as_uuid())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn session_count(pool: &PgPool, user_id: UserId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM latex_core.sessions WHERE user_id=$1")
+        .bind(user_id.as_uuid())
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 fn assert_constraint<T>(result: Result<T, sqlx::Error>) {

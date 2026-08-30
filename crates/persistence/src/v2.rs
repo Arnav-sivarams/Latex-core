@@ -218,6 +218,7 @@ impl V2Repository {
         .await
         .map_err(V2Error::Database)?;
         let assignment = decode_role_assignment(row)?;
+        revoke_user_sessions(&mut tx, user_id).await?;
         tx.commit().await.map_err(V2Error::Database)?;
         Ok(assignment)
     }
@@ -244,6 +245,7 @@ impl V2Repository {
         if result.rows_affected() == 0 {
             return Err(V2Error::RoleMissing { user_id });
         }
+        revoke_user_sessions(&mut tx, user_id).await?;
         tx.commit().await.map_err(V2Error::Database)
     }
 
@@ -758,6 +760,18 @@ async fn has_team_membership(
     .fetch_one(&mut **tx)
     .await
     .map_err(V2Error::Database)
+}
+
+async fn revoke_user_sessions(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: UserId,
+) -> Result<(), V2Error> {
+    sqlx::query("DELETE FROM latex_core.sessions WHERE user_id=$1")
+        .bind(user_id.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .map_err(V2Error::Database)?;
+    Ok(())
 }
 
 async fn workspace_is_v2_paper(
