@@ -14,6 +14,12 @@ mod config;
 mod database;
 mod error;
 mod permissions;
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    reason = "V2 repository methods share a typed domain error and transaction inputs are values"
+)]
+mod v2;
 mod workspace;
 
 pub use app::{
@@ -35,6 +41,10 @@ pub use config::DatabaseConfig;
 pub use database::Database;
 pub use error::PersistenceError;
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
+pub use v2::{
+    GlobalRole, GlobalRoleAssignment, PaperFile, PaperStatus, PaperTeam, PaperTeamMember,
+    PersonalPaper, V2Error, V2Repository,
+};
 pub use workspace::{
     PostgresWorkspaceRepository, WorkspaceEventRecord, WorkspaceHeadRecord, WorkspaceSnapshotRecord,
 };
