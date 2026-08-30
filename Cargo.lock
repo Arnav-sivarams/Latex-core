@@ -1622,6 +1622,7 @@ dependencies = [
  "core-types",
  "futures-util",
  "hex",
+ "latex-parser",
  "persistence",
  "queue",
  "rand 0.9.5",

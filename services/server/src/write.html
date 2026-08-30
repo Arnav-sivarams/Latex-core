@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Writer — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=s4">
+  <link rel="stylesheet" href="/static/shells.css?v=s6">
 </head>
 <body>
   <header class="shell-topbar">
@@ -13,6 +13,8 @@
     <span id="currentPaper" class="current-context">No paper selected</span>
     <span class="shell-spacer"></span>
     <span id="saveStatus" class="save-status" data-state="local">Local</span>
+    <button id="quickOpen" type="button" title="Quick Open (Ctrl/Cmd+P)">Quick Open</button>
+    <button id="commandPalette" type="button" title="Command Palette (Ctrl/Cmd+K)">Commands</button>
     <form method="post" action="/logout"><button type="submit">Log out</button></form>
   </header>
   <div class="writer-layout">
@@ -26,8 +28,18 @@
         <div id="teamPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="files-heading">
-        <div class="section-heading"><h2 id="files-heading">FILES</h2><button id="newFile" type="button" disabled>New File</button></div>
+        <div class="section-heading"><h2 id="files-heading">FILES</h2><div><button id="uploadImage" type="button" disabled>Upload</button><button id="newFile" type="button" disabled>New</button></div></div>
+        <input id="assetInput" type="file" accept="image/png,image/jpeg,application/pdf,text/csv,.csv" hidden>
         <div id="fileTree"><p class="empty-copy">Choose a paper to view its files.</p></div>
+      </section>
+      <section aria-labelledby="outline-heading">
+        <div class="section-heading"><h2 id="outline-heading">OUTLINE</h2><button id="refreshIntelligence" type="button" disabled>Refresh</button></div>
+        <div id="outlineTree"><p class="empty-copy">Choose a paper to view its outline.</p></div>
+      </section>
+      <section aria-labelledby="search-heading">
+        <h2 id="search-heading">SEARCH</h2>
+        <div class="project-search"><input id="projectSearch" type="search" placeholder="Search paper" disabled><label><input id="caseSensitive" type="checkbox"> Aa</label></div>
+        <div id="searchResults"></div>
       </section>
     </nav>
     <main class="writer-main">
@@ -35,6 +47,11 @@
         <div class="panel-heading editor-heading">
           <div><h1 id="editor-heading">EDITOR</h1><span id="currentFile">No file selected</span><span id="mainBadge" class="main-badge" hidden>Main</span></div>
           <div class="editor-actions">
+            <button id="insertMenu" type="button" disabled>Insert</button>
+            <button id="symbolPalette" type="button" disabled>Symbols</button>
+            <button id="showInPdf" type="button" disabled>Show in PDF</button>
+            <button id="structuralUndo" type="button" disabled>Undo File Action</button>
+            <button id="structuralRedo" type="button" disabled>Redo File Action</button>
             <button id="renameFile" type="button" disabled>Rename</button>
             <button id="deleteFile" type="button" disabled>Delete</button>
             <button id="setMain" type="button" disabled>Set Main</button>
@@ -50,10 +67,14 @@
         <iframe id="pdfFrame" class="pdf-frame" title="Current successful PDF" hidden></iframe>
       </section>
       <nav class="detail-tabs" aria-label="Paper details">
-        <a href="#problems">PROBLEMS</a>
+        <a href="#problems">PROBLEMS <span id="problemsCount">0</span></a>
         <a href="#reviews">REVIEWS</a>
         <a href="#history" aria-current="page">HISTORY</a>
       </nav>
+      <section id="problems" class="detail-panel" aria-labelledby="problems-heading">
+        <div class="history-heading"><div><h2 id="problems-heading">PROBLEMS</h2><p>Parser, reference, citation, and latest build diagnostics.</p></div></div>
+        <div id="problemsList"><p class="empty-copy">Choose a paper to analyze it.</p></div>
+      </section>
       <section id="reviews" class="detail-panel" aria-labelledby="writer-reviews-heading">
         <div class="history-heading"><div><h2 id="writer-reviews-heading">REVIEWS</h2><p>Mentor requests, discussion, and Writer-attributed suggestions.</p></div><div id="reviewCounts"></div></div>
         <div id="writerReviewFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Open</button><button type="button" data-filter="ADDRESSED">Addressed</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="blocking">Blocking</button><button type="button" data-filter="all">All</button></div>
@@ -66,7 +87,10 @@
       </section>
     </main>
   </div>
+  <dialog id="productivityDialog" class="productivity-dialog">
+    <form method="dialog" class="dialog-shell"><div class="dialog-heading"><h2 id="dialogTitle">Writer tool</h2><button value="cancel" aria-label="Close">Close</button></div><input id="dialogSearch" type="search" placeholder="Type to filter" hidden><div id="dialogBody"></div><pre id="dialogPreview" hidden></pre><div id="dialogActions" class="dialog-actions"></div></form>
+  </dialog>
   <div id="writerNotice" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/writer.js?v=s4"></script>
+  <script type="module" src="/static/writer.js?v=s6"></script>
 </body>
 </html>

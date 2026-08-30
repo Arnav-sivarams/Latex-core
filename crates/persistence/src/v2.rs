@@ -130,6 +130,15 @@ pub struct PaperFile {
     pub tombstoned_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StructuralOperationResult {
+    pub operation_id: Uuid,
+    pub operation_type: String,
+    pub file_id: Option<Uuid>,
+    pub version: u64,
+    pub state: String,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationAccessMode {
@@ -1121,6 +1130,18 @@ impl V2Repository {
         )
         .await?;
         let file = decode_paper_file(row)?;
+        record_structural_operation(
+            &mut tx,
+            workspace_id,
+            actor,
+            "CREATE_FILE",
+            Some(file.file_id),
+            json!({"op":"create_file","file_id":file.file_id,"path":file.path,"blob_hash":blob_hash,"size_bytes":size_bytes,"expected_revision":file.revision}),
+            json!({"op":"delete_file","file_id":file.file_id,"path":file.path,"expected_revision":file.revision}),
+            expected_version,
+            version,
+        )
+        .await?;
         tx.commit().await.map_err(V2Error::Database)?;
         Ok((file, version))
     }
@@ -1177,6 +1198,7 @@ impl V2Repository {
             .map_err(V2Error::Database)?;
         let current = lock_live_file(&mut tx, file_id).await?;
         require_writer_workspace_access(&mut tx, actor, current.workspace_id, true).await?;
+        let old_path = current.path.clone();
         let version = append_workspace_operation(
             &mut tx,
             current.workspace_id,
@@ -1195,6 +1217,29 @@ impl V2Repository {
         .await
         .map_err(|error| map_file_conflict(error, current.workspace_id, &path))?;
         let file = decode_paper_file(row)?;
+        let old_parent = old_path.as_str().rsplit_once('/').map(|(parent, _)| parent);
+        let new_parent = file
+            .path
+            .as_str()
+            .rsplit_once('/')
+            .map(|(parent, _)| parent);
+        let operation_type = if old_parent == new_parent {
+            "RENAME_FILE"
+        } else {
+            "MOVE_FILE"
+        };
+        record_structural_operation(
+            &mut tx,
+            current.workspace_id,
+            actor,
+            operation_type,
+            Some(file.file_id),
+            json!({"op":"rename_file","file_id":file.file_id,"from":old_path,"to":file.path,"expected_revision":file.revision}),
+            json!({"op":"rename_file","file_id":file.file_id,"from":file.path,"to":old_path,"expected_revision":file.revision}),
+            expected_version,
+            version,
+        )
+        .await?;
         tx.commit().await.map_err(V2Error::Database)?;
         Ok((file, version))
     }
@@ -1204,6 +1249,9 @@ impl V2Repository {
         file_id: Uuid,
         actor: UserId,
         expected_version: u64,
+        blob_hash: BlobHash,
+        size_bytes: u64,
+        was_main: bool,
     ) -> Result<u64, V2Error> {
         let mut tx = self
             .database
@@ -1228,6 +1276,18 @@ impl V2Repository {
         .execute(&mut *tx)
         .await
         .map_err(V2Error::Database)?;
+        record_structural_operation(
+            &mut tx,
+            current.workspace_id,
+            actor,
+            "DELETE_FILE",
+            Some(file_id),
+            json!({"op":"delete_file","file_id":file_id,"path":current.path,"expected_revision":current.revision + 1}),
+            json!({"op":"restore_file","file_id":file_id,"path":current.path,"blob_hash":blob_hash,"size_bytes":size_bytes,"was_main":was_main,"expected_revision":current.revision + 1}),
+            expected_version,
+            version,
+        )
+        .await?;
         tx.commit().await.map_err(V2Error::Database)?;
         Ok(version)
     }
@@ -1237,6 +1297,7 @@ impl V2Repository {
         file_id: Uuid,
         actor: UserId,
         expected_version: u64,
+        previous_main: Option<LogicalPath>,
     ) -> Result<u64, V2Error> {
         let mut tx = self
             .database
@@ -1254,8 +1315,161 @@ impl V2Repository {
             json!({"op":"set_main_file","path":current.path}),
         )
         .await?;
+        if let Some(previous_main) = previous_main {
+            record_structural_operation(
+                &mut tx,
+                current.workspace_id,
+                actor,
+                "SET_MAIN",
+                Some(file_id),
+                json!({"op":"set_main","from":previous_main,"to":current.path}),
+                json!({"op":"set_main","from":current.path,"to":previous_main}),
+                expected_version,
+                version,
+            )
+            .await?;
+        }
         tx.commit().await.map_err(V2Error::Database)?;
         Ok(version)
+    }
+
+    pub async fn structural_undo(
+        &self,
+        paper_id: Uuid,
+        workspace_id: WorkspaceId,
+        actor: UserId,
+    ) -> Result<StructuralOperationResult, V2Error> {
+        self.apply_structural_history(paper_id, workspace_id, actor, false)
+            .await
+    }
+
+    pub async fn structural_redo(
+        &self,
+        paper_id: Uuid,
+        workspace_id: WorkspaceId,
+        actor: UserId,
+    ) -> Result<StructuralOperationResult, V2Error> {
+        self.apply_structural_history(paper_id, workspace_id, actor, true)
+            .await
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the locked safety checks and inverse mutation remain adjacent in one transaction"
+    )]
+    async fn apply_structural_history(
+        &self,
+        paper_id: Uuid,
+        workspace_id: WorkspaceId,
+        actor: UserId,
+        redo: bool,
+    ) -> Result<StructuralOperationResult, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        require_writer_workspace_access(&mut tx, actor, workspace_id, true).await?;
+        let wanted_state = if redo { "UNDONE" } else { "APPLIED" };
+        let history_order = if redo {
+            "undone_at DESC,id DESC"
+        } else {
+            "workspace_version_before DESC,id DESC"
+        };
+        let history_query = format!(
+            "SELECT id,operation_type,file_id,forward_payload,inverse_payload,workspace_version_after \
+             FROM latex_core.reversible_structural_operations \
+             WHERE paper_id=$1 AND workspace_id=$2 AND actor_user_id=$3 AND state=$4 \
+             ORDER BY {history_order} LIMIT 1 FOR UPDATE"
+        );
+        let row = sqlx::query(&history_query)
+            .bind(paper_id)
+            .bind(workspace_id.as_uuid())
+            .bind(actor.as_uuid())
+            .bind(wanted_state)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(V2Error::Database)?
+            .ok_or(V2Error::Conflict {
+                entity: if redo {
+                    "structural redo opportunity"
+                } else {
+                    "structural undo opportunity"
+                },
+            })?;
+        let operation_id: Uuid = row.try_get("id").map_err(V2Error::Database)?;
+        let operation_type: String = row.try_get("operation_type").map_err(V2Error::Database)?;
+        let file_id: Option<Uuid> = row.try_get("file_id").map_err(V2Error::Database)?;
+        let payload: serde_json::Value = row
+            .try_get(if redo {
+                "forward_payload"
+            } else {
+                "inverse_payload"
+            })
+            .map_err(V2Error::Database)?;
+        let latest_structural: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM latex_core.reversible_structural_operations \
+             WHERE workspace_id=$1 AND state='APPLIED' ORDER BY workspace_version_before DESC,id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if !redo && latest_structural != Some(operation_id) {
+            return Err(V2Error::Conflict {
+                entity: "later structural change prevents undo",
+            });
+        }
+        let expected_version = current_workspace_version(&mut tx, workspace_id).await?;
+        let operations = apply_structural_payload(&mut tx, workspace_id, &payload).await?;
+        if let Some(file_id) = file_id {
+            let revision: i64 =
+                sqlx::query_scalar("SELECT revision FROM latex_core.paper_files WHERE file_id=$1")
+                    .bind(file_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(V2Error::Database)?;
+            let payload_column = if redo {
+                "inverse_payload"
+            } else {
+                "forward_payload"
+            };
+            let revision_query = format!(
+                "UPDATE latex_core.reversible_structural_operations \
+                 SET {payload_column}=jsonb_set({payload_column}, '{{expected_revision}}', to_jsonb($2::bigint), true) WHERE id=$1"
+            );
+            sqlx::query(&revision_query)
+                .bind(operation_id)
+                .bind(revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(V2Error::Database)?;
+        }
+        let version =
+            append_workspace_operations(&mut tx, workspace_id, actor, expected_version, operations)
+                .await?;
+        let state = if redo { "APPLIED" } else { "UNDONE" };
+        let query = if redo {
+            "UPDATE latex_core.reversible_structural_operations SET state=$2,undone_at=NULL,redone_at=statement_timestamp() WHERE id=$1"
+        } else {
+            "UPDATE latex_core.reversible_structural_operations SET state=$2,undone_at=statement_timestamp() WHERE id=$1"
+        };
+        sqlx::query(query)
+            .bind(operation_id)
+            .bind(state)
+            .execute(&mut *tx)
+            .await
+            .map_err(V2Error::Database)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        tracing::info!(%paper_id, %workspace_id, %operation_id, actor_user_id=%actor, %operation_type, %state, workspace_version=version, "Writer structural history transition committed");
+        Ok(StructuralOperationResult {
+            operation_id,
+            operation_type,
+            file_id,
+            version,
+            state: state.to_owned(),
+        })
     }
 
     pub async fn register_paper_file(
@@ -1511,6 +1725,16 @@ async fn append_workspace_operation(
     expected_version: u64,
     operation: serde_json::Value,
 ) -> Result<u64, V2Error> {
+    append_workspace_operations(tx, workspace_id, actor, expected_version, vec![operation]).await
+}
+
+async fn append_workspace_operations(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+    actor: UserId,
+    expected_version: u64,
+    operations: Vec<serde_json::Value>,
+) -> Result<u64, V2Error> {
     let expected = i64::try_from(expected_version).map_err(|_| V2Error::Integrity {
         message: "workspace version exceeds PostgreSQL BIGINT".to_owned(),
     })?;
@@ -1536,7 +1760,7 @@ async fn append_workspace_operation(
     let next = actual.checked_add(1).ok_or_else(|| V2Error::Integrity {
         message: "workspace version overflow".to_owned(),
     })?;
-    let payload = json!({"schema_version":1,"operations":[operation]});
+    let payload = json!({"schema_version":1,"operations":operations});
     sqlx::query(
         "INSERT INTO latex_core.workspace_events \
          (workspace_id,sequence,event_id,base_version,event_type,event_schema_version,payload,created_by_user_id) \
@@ -1591,6 +1815,274 @@ async fn append_workspace_operation(
     u64::try_from(next).map_err(|_| V2Error::Integrity {
         message: "negative workspace version".to_owned(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_structural_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+    actor: UserId,
+    operation_type: &str,
+    file_id: Option<Uuid>,
+    forward_payload: serde_json::Value,
+    inverse_payload: serde_json::Value,
+    version_before: u64,
+    version_after: u64,
+) -> Result<(), V2Error> {
+    let paper_id = paper_id_for_workspace(tx, workspace_id).await?;
+    sqlx::query(
+        "UPDATE latex_core.reversible_structural_operations \
+         SET state='INVALIDATED' WHERE workspace_id=$1 AND state='UNDONE'",
+    )
+    .bind(workspace_id.as_uuid())
+    .execute(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    sqlx::query(
+        "INSERT INTO latex_core.reversible_structural_operations \
+         (id,paper_id,workspace_id,actor_user_id,operation_type,file_id,forward_payload,inverse_payload,workspace_version_before,workspace_version_after) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(paper_id)
+    .bind(workspace_id.as_uuid())
+    .bind(actor.as_uuid())
+    .bind(operation_type)
+    .bind(file_id)
+    .bind(forward_payload)
+    .bind(inverse_payload)
+    .bind(i64::try_from(version_before).map_err(|_| V2Error::Integrity {
+        message: "workspace version exceeds PostgreSQL BIGINT".to_owned(),
+    })?)
+    .bind(i64::try_from(version_after).map_err(|_| V2Error::Integrity {
+        message: "workspace version exceeds PostgreSQL BIGINT".to_owned(),
+    })?)
+    .execute(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    tracing::info!(%paper_id, %workspace_id, actor_user_id=%actor, %operation_type, workspace_version_before=version_before, workspace_version_after=version_after, "Writer structural operation recorded");
+    Ok(())
+}
+
+async fn paper_id_for_workspace(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+) -> Result<Uuid, V2Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM latex_core.personal_papers WHERE workspace_id=$1 \
+         UNION ALL SELECT id FROM latex_core.paper_teams WHERE workspace_id=$1",
+    )
+    .bind(workspace_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .ok_or(V2Error::NotFound { entity: "paper" })
+}
+
+async fn current_workspace_version(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+) -> Result<u64, V2Error> {
+    let version: i64 = sqlx::query_scalar(
+        "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
+    )
+    .bind(workspace_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .ok_or(V2Error::NotFound {
+        entity: "workspace",
+    })?;
+    u64::try_from(version).map_err(|_| V2Error::Integrity {
+        message: "negative workspace version".to_owned(),
+    })
+}
+
+async fn current_main_path(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+) -> Result<Option<LogicalPath>, V2Error> {
+    let payloads: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM latex_core.workspace_events WHERE workspace_id=$1 ORDER BY sequence",
+    )
+    .bind(workspace_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    let mut main: Option<LogicalPath> = None;
+    for payload in payloads {
+        let Some(operations) = payload
+            .get("operations")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for operation in operations {
+            match operation.get("op").and_then(serde_json::Value::as_str) {
+                Some("set_main_file") => {
+                    main = operation
+                        .get("path")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|error| V2Error::Integrity {
+                            message: error.to_string(),
+                        })?;
+                }
+                Some("rename_file") => {
+                    let from: LogicalPath = payload_field(operation, "from")?;
+                    if main.as_ref() == Some(&from) {
+                        main = Some(payload_field(operation, "to")?);
+                    }
+                }
+                Some("delete_file") => {
+                    let path: LogicalPath = payload_field(operation, "path")?;
+                    if main.as_ref() == Some(&path) {
+                        main = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(main)
+}
+
+fn payload_field<T: serde::de::DeserializeOwned>(
+    payload: &serde_json::Value,
+    name: &'static str,
+) -> Result<T, V2Error> {
+    serde_json::from_value(
+        payload
+            .get(name)
+            .cloned()
+            .ok_or_else(|| V2Error::Integrity {
+                message: format!("structural payload missing {name}"),
+            })?,
+    )
+    .map_err(|error| V2Error::Integrity {
+        message: error.to_string(),
+    })
+}
+
+async fn lock_any_file(
+    tx: &mut Transaction<'_, Postgres>,
+    file_id: Uuid,
+) -> Result<PaperFile, V2Error> {
+    let row = sqlx::query(
+        "SELECT file_id,workspace_id,path,revision,tombstoned,created_at::text AS created_at,updated_at::text AS updated_at,tombstoned_at::text AS tombstoned_at \
+         FROM latex_core.paper_files WHERE file_id=$1 FOR UPDATE",
+    )
+    .bind(file_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .ok_or(V2Error::NotFound { entity: "paper file" })?;
+    decode_paper_file(row)
+}
+
+async fn apply_structural_payload(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+    payload: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, V2Error> {
+    let operation = payload
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| V2Error::Integrity {
+            message: "structural payload missing op".to_owned(),
+        })?;
+    match operation {
+        "delete_file" => {
+            let file_id = payload_field(payload, "file_id")?;
+            let path: LogicalPath = payload_field(payload, "path")?;
+            let expected_revision: u64 = payload_field(payload, "expected_revision")?;
+            let current = lock_any_file(tx, file_id).await?;
+            if current.workspace_id != workspace_id
+                || current.tombstoned
+                || current.path != path
+                || current.revision != expected_revision
+            {
+                return Err(V2Error::Conflict {
+                    entity: "file changed since structural operation",
+                });
+            }
+            sqlx::query("UPDATE latex_core.paper_files SET tombstoned=TRUE,tombstoned_at=statement_timestamp(),revision=revision+1,updated_at=statement_timestamp() WHERE file_id=$1")
+                .bind(file_id).execute(&mut **tx).await.map_err(V2Error::Database)?;
+            Ok(vec![json!({"op":"delete_file","path":path})])
+        }
+        "create_file" | "restore_file" => {
+            let file_id = payload_field(payload, "file_id")?;
+            let path: LogicalPath = payload_field(payload, "path")?;
+            let blob_hash: BlobHash = payload_field(payload, "blob_hash")?;
+            let size_bytes: u64 = payload_field(payload, "size_bytes")?;
+            let current = lock_any_file(tx, file_id).await?;
+            if current.workspace_id != workspace_id || !current.tombstoned || current.path != path {
+                return Err(V2Error::Conflict {
+                    entity: "file cannot be restored safely",
+                });
+            }
+            let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.paper_files WHERE workspace_id=$1 AND path=$2 AND NOT tombstoned)")
+                .bind(workspace_id.as_uuid()).bind(path.as_str()).fetch_one(&mut **tx).await.map_err(V2Error::Database)?;
+            if occupied {
+                return Err(V2Error::Conflict {
+                    entity: "restore path is occupied",
+                });
+            }
+            sqlx::query("UPDATE latex_core.paper_files SET tombstoned=FALSE,tombstoned_at=NULL,revision=revision+1,updated_at=statement_timestamp() WHERE file_id=$1")
+                .bind(file_id).execute(&mut **tx).await.map_err(V2Error::Database)?;
+            let mut operations = vec![
+                json!({"op":"put_file","path":path,"blob_hash":blob_hash,"size_bytes":size_bytes}),
+            ];
+            if payload
+                .get("was_main")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                operations.push(json!({"op":"set_main_file","path":path}));
+            }
+            Ok(operations)
+        }
+        "rename_file" => {
+            let file_id = payload_field(payload, "file_id")?;
+            let from: LogicalPath = payload_field(payload, "from")?;
+            let to: LogicalPath = payload_field(payload, "to")?;
+            let expected_revision: u64 = payload_field(payload, "expected_revision")?;
+            let current = lock_any_file(tx, file_id).await?;
+            if current.workspace_id != workspace_id
+                || current.tombstoned
+                || current.path != from
+                || current.revision != expected_revision
+            {
+                return Err(V2Error::Conflict {
+                    entity: "file changed since structural operation",
+                });
+            }
+            sqlx::query("UPDATE latex_core.paper_files SET path=$2,revision=revision+1,updated_at=statement_timestamp() WHERE file_id=$1")
+                .bind(file_id).bind(to.as_str()).execute(&mut **tx).await.map_err(|error| map_file_conflict(error, workspace_id, &to))?;
+            Ok(vec![json!({"op":"rename_file","from":from,"to":to})])
+        }
+        "set_main" => {
+            let from: LogicalPath = payload_field(payload, "from")?;
+            let to: LogicalPath = payload_field(payload, "to")?;
+            if current_main_path(tx, workspace_id).await?.as_ref() != Some(&from) {
+                return Err(V2Error::Conflict {
+                    entity: "main file changed since structural operation",
+                });
+            }
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.paper_files WHERE workspace_id=$1 AND path=$2 AND NOT tombstoned)")
+                .bind(workspace_id.as_uuid()).bind(to.as_str()).fetch_one(&mut **tx).await.map_err(V2Error::Database)?;
+            if !exists {
+                return Err(V2Error::Conflict {
+                    entity: "prior main file is unavailable",
+                });
+            }
+            Ok(vec![json!({"op":"set_main_file","path":to})])
+        }
+        _ => Err(V2Error::Integrity {
+            message: "unknown structural payload operation".to_owned(),
+        }),
+    }
 }
 
 async fn lock_user(tx: &mut Transaction<'_, Postgres>, user_id: UserId) -> Result<(), V2Error> {

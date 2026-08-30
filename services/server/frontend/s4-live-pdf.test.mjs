@@ -5,8 +5,9 @@ import test from 'node:test';
 const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/write.html', import.meta.url), 'utf8');
 
-test('S4 Writer exposes exact-state live PDF and History controls', () => {
-  assert.match(writer, /setTimeout\(\(\) => requestBuild\('auto'\), 2000\)/);
+test('Writer exposes exact-state PDF and History with manual compilation only', () => {
+  assert.doesNotMatch(writer, /requestBuild\('auto'\)/);
+  assert.match(writer, /requestBuild\('manual'\)/);
   assert.match(writer, /key: 'Mod-Enter'/);
   assert.match(writer, /key: 'Mod-s'/);
   assert.match(writer, /Build failed — showing last successful PDF/);

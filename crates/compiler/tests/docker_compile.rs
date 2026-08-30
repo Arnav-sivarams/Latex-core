@@ -93,6 +93,43 @@ fn pdf(execution: &compiler::CompileExecution) {
 }
 
 #[tokio::test]
+async fn s6_representative_builder_output_compiles_on_frozen_m7() {
+    let pixel: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let source = br"\documentclass{article}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\begin{document}
+\begin{table}[htbp]\centering
+\begin{tabular}{lc}\toprule Header 1 & Header 2 \\\midrule Cell 2.1 & Cell 2.2 \\\bottomrule\end{tabular}
+\caption{Generated table}\label{tab:generated}\end{table}
+\begin{figure}[htbp]\centering\includegraphics[width=0.1\linewidth]{pixel.png}\caption{Generated figure}\label{fig:generated}\end{figure}
+\begin{equation}\begin{bmatrix}a_{11} & a_{12} \\ a_{21} & a_{22}\end{bmatrix}\end{equation}
+\end{document}
+";
+    let (execution, _) = compile(
+        &[("main.tex", source), ("pixel.png", pixel)],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        execution.status(),
+        CompileStatus::Succeeded,
+        "builder proof: {}",
+        String::from_utf8_lossy(execution.stderr())
+    );
+    pdf(&execution);
+}
+
+#[tokio::test]
 async fn representative_v2_pdf_log_and_nonempty_synctex() {
     let source = b"\\documentclass{article}\n\\begin{document}\n\nS5 representative paragraph for linked review.\n\\end{document}\n";
     let (execution, _) = compile(

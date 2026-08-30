@@ -26,6 +26,7 @@ use core_types::{
     LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
     WorkspaceManifestV1, WorkspaceVersion,
 };
+use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLevel};
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, ChangeSetPublishResult, Database,
     DatabaseConfig, EnqueueCompileJobV1, FilePolicy, GlobalRole, GroupType, PostgresCompileQueue,
@@ -34,7 +35,14 @@ use persistence::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use tower_http::{
     limit::RequestBodyLimitLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer,
 };
@@ -146,6 +154,17 @@ struct V2RenameFileInput {
 }
 #[derive(Deserialize)]
 struct V2VersionInput {
+    version: u64,
+}
+#[derive(Deserialize)]
+struct V2SearchQuery {
+    q: String,
+    #[serde(default)]
+    case_sensitive: bool,
+}
+#[derive(Deserialize)]
+struct V2AssetQuery {
+    path: String,
     version: u64,
 }
 #[derive(Deserialize)]
@@ -513,6 +532,24 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v2/papers/{paper_id}/main/{file_id}",
             post(v2_set_main),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/structural-undo",
+            post(v2_structural_undo),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/structural-redo",
+            post(v2_structural_redo),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/intelligence",
+            get(v2_paper_intelligence),
+        )
+        .route("/api/v2/papers/{paper_id}/search", get(v2_project_search))
+        .route("/api/v2/papers/{paper_id}/assets", post(v2_upload_asset))
+        .route(
+            "/api/v2/papers/{paper_id}/files/{file_id}/raw",
+            get(v2_raw_file),
         )
         .route(
             "/api/v2/papers/{paper_id}/versions",
@@ -1316,8 +1353,20 @@ async fn v2_rename_file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
-        return response;
+    let (paper, _) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "collaboration flush failed",
+        );
     }
     let path = match LogicalPath::parse(&input.path) {
         Ok(value) => value,
@@ -1348,13 +1397,42 @@ async fn v2_delete_file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let (paper, _) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+    let (paper, file) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await
+    {
         Ok(value) => value,
         Err(response) => return response,
     };
+    if state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "collaboration flush failed",
+        );
+    }
+    let workspace = match state.workspaces.restore(paper.workspace_id).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    };
+    let Some(workspace_file) = workspace.file(&file.path) else {
+        return error(
+            StatusCode::CONFLICT,
+            "file is absent from canonical workspace",
+        );
+    };
     match state
         .v2
-        .delete_file_with_event(file_id, principal.user_id(), input.version)
+        .delete_file_with_event(
+            file_id,
+            principal.user_id(),
+            input.version,
+            workspace_file.blob_hash(),
+            workspace_file.size_bytes(),
+            workspace.main_file() == Some(&file.path),
+        )
         .await
     {
         Ok(version) => {
@@ -1381,17 +1459,478 @@ async fn v2_set_main(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
-        return response;
-    }
+    let (paper, _) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let previous_main = match state.workspaces.restore(paper.workspace_id).await {
+        Ok(value) => value.main_file().cloned(),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    };
     match state
         .v2
-        .set_main_with_event(file_id, principal.user_id(), input.version)
+        .set_main_with_event(file_id, principal.user_id(), input.version, previous_main)
         .await
     {
         Ok(version) => Json(serde_json::json!({"version":version})).into_response(),
         Err(error_value) => v2_error(error_value),
     }
+}
+
+async fn v2_structural_undo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    v2_structural_history(state, headers, paper_id, false).await
+}
+
+async fn v2_structural_redo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    v2_structural_history(state, headers, paper_id, true).await
+}
+
+async fn v2_structural_history(
+    state: AppState,
+    headers: HeaderMap,
+    paper_id: uuid::Uuid,
+    redo: bool,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    if state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "collaboration flush failed",
+        );
+    }
+    let result = if redo {
+        state
+            .v2
+            .structural_redo(paper_id, paper.workspace_id, principal.user_id())
+            .await
+    } else {
+        state
+            .v2
+            .structural_undo(paper_id, paper.workspace_id, principal.user_id())
+            .await
+    };
+    match result {
+        Ok(result) => {
+            let tombstoned = (!redo && result.operation_type == "CREATE_FILE")
+                || (redo && result.operation_type == "DELETE_FILE");
+            if tombstoned {
+                if let Some(file_id) = result.file_id {
+                    state
+                        .collaboration
+                        .file_deleted(paper.workspace_id, file_id)
+                        .await;
+                }
+            }
+            Json(result).into_response()
+        }
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn canonical_paper_sources(
+    state: &AppState,
+    paper: &persistence::WriterPaper,
+) -> Result<
+    (
+        workspace_model::WorkspaceState,
+        Vec<persistence::PaperFile>,
+        BTreeMap<LogicalPath, Bytes>,
+    ),
+    Response,
+> {
+    state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "collaboration flush failed",
+            )
+        })?;
+    let workspace = state
+        .workspaces
+        .restore(paper.workspace_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"))?;
+    let files = state
+        .v2
+        .list_live_paper_files(paper.workspace_id)
+        .await
+        .map_err(v2_error)?;
+    let mut sources = BTreeMap::new();
+    for (path, entry) in workspace.files() {
+        let bytes = state
+            .blobs
+            .get(entry.blob_hash())
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "paper blob unavailable"))?;
+        sources.insert(path.clone(), bytes);
+    }
+    Ok((workspace, files, sources))
+}
+
+fn source_range_json(range: latex_parser::SourceRange) -> serde_json::Value {
+    serde_json::json!({
+        "start_byte":range.start_byte(),
+        "end_byte":range.end_byte(),
+        "start_line":range.start().row() + 1,
+        "start_column":range.start().column_bytes(),
+        "end_line":range.end().row() + 1,
+        "end_column":range.end().column_bytes(),
+    })
+}
+
+fn section_level_name(level: SectionLevel) -> &'static str {
+    match level {
+        SectionLevel::Part => "part",
+        SectionLevel::Chapter => "chapter",
+        SectionLevel::Section => "section",
+        SectionLevel::Subsection => "subsection",
+        SectionLevel::Subsubsection => "subsubsection",
+        SectionLevel::Paragraph => "paragraph",
+        SectionLevel::Subparagraph => "subparagraph",
+    }
+}
+
+fn diagnostic_severity_name(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Information => "information",
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the normalized versioned intelligence response is assembled in one auditable adapter"
+)]
+async fn v2_paper_intelligence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let (workspace, files, sources) = match canonical_paper_sources(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Some(main_file) = workspace.main_file().cloned() else {
+        return error(StatusCode::CONFLICT, "paper has no main file");
+    };
+    let project = match ProjectSource::new(main_file, sources) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid paper source"),
+    };
+    let analysis = match ProjectAnalyzer::with_default_limits().analyze(&project) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "paper analysis failed"),
+    };
+    let file_ids = files
+        .iter()
+        .map(|file| (file.path.clone(), file.file_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut outline = Vec::new();
+    let mut labels = Vec::new();
+    let mut references = Vec::new();
+    let mut citations = Vec::new();
+    let mut environments = BTreeSet::new();
+    let mut packages = BTreeSet::new();
+    let known_labels = analysis
+        .files()
+        .values()
+        .flat_map(|file| file.labels().iter().map(|label| label.key().to_owned()))
+        .collect::<BTreeSet<_>>();
+    let bibliography_keys = analysis
+        .bibliographies()
+        .values()
+        .flat_map(|bibliography| {
+            bibliography
+                .entries()
+                .iter()
+                .map(|entry| entry.key().to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    for (path, file) in analysis.files() {
+        let Some(file_id) = file_ids.get(path) else {
+            continue;
+        };
+        for section in file.sections() {
+            outline.push(serde_json::json!({
+                "level":section_level_name(section.level()),"title":section.title(),
+                "file_id":file_id,"path":path,"range":source_range_json(section.range())
+            }));
+        }
+        for label in file.labels() {
+            labels.push(serde_json::json!({"key":label.key(),"file_id":file_id,"path":path,"range":source_range_json(label.range())}));
+        }
+        for reference in file.references() {
+            references.push(serde_json::json!({
+                "key":reference.key(),"resolved":known_labels.contains(reference.key()),
+                "file_id":file_id,"path":path,"range":source_range_json(reference.range())
+            }));
+        }
+        for citation in file.citations() {
+            for key in citation.keys() {
+                citations.push(serde_json::json!({
+                    "key":key,"resolved":bibliography_keys.contains(key),"command":citation.command(),
+                    "file_id":file_id,"path":path,"range":source_range_json(citation.range())
+                }));
+            }
+        }
+        environments.extend(
+            file.environments()
+                .iter()
+                .map(|environment| environment.name().to_owned()),
+        );
+        packages.extend(
+            file.packages()
+                .iter()
+                .map(|package| package.name().to_owned()),
+        );
+    }
+    let bibliography = analysis
+        .bibliographies()
+        .iter()
+        .flat_map(|(path, bibliography)| {
+            let file_id = file_ids.get(path).copied();
+            bibliography.entries().iter().map(move |entry| {
+                let field = |wanted: &str| {
+                    entry
+                        .fields()
+                        .iter()
+                        .find(|field| field.name().eq_ignore_ascii_case(wanted))
+                        .map(latex_parser::BibtexField::raw_value)
+                };
+                serde_json::json!({
+                    "key":entry.key(),"entry_type":entry.entry_type(),"title":field("title"),
+                    "author":field("author"),"file_id":file_id,"path":path,
+                    "range":source_range_json(entry.range())
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let diagnostics = analysis
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| {
+            serde_json::json!({
+                "severity":diagnostic_severity_name(diagnostic.diagnostic().severity()),
+                "code":format!("{:?}", diagnostic.diagnostic().code()),
+                "message":diagnostic.diagnostic().message(),
+                "file_id":file_ids.get(diagnostic.file()),"path":diagnostic.file(),
+                "range":diagnostic.diagnostic().range().map(source_range_json),
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "schema_version":1,"workspace_version":workspace.version().get(),"outline":outline,
+        "labels":labels,"references":references,"citations":citations,
+        "bibliography":bibliography,"environments":environments,"packages":packages,
+        "diagnostics":diagnostics
+    }))
+    .into_response()
+}
+
+async fn v2_project_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Query(query): Query<V2SearchQuery>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let needle = query.q.trim();
+    if needle.is_empty() || needle.len() > 200 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "search query must contain 1-200 characters",
+        );
+    }
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let (workspace, files, sources) = match canonical_paper_sources(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let file_ids = files
+        .iter()
+        .map(|file| (&file.path, file.file_id))
+        .collect::<BTreeMap<_, _>>();
+    let comparison = if query.case_sensitive {
+        needle.to_owned()
+    } else {
+        needle.to_lowercase()
+    };
+    let mut results = Vec::new();
+    'files: for (path, bytes) in sources {
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        for (index, line) in text.lines().enumerate() {
+            let haystack = if query.case_sensitive {
+                line.to_owned()
+            } else {
+                line.to_lowercase()
+            };
+            for (column, _) in haystack.match_indices(&comparison) {
+                results.push(serde_json::json!({
+                    "file_id":file_ids.get(&path),"path":path,"line":index + 1,
+                    "column":column,"preview":line.trim(),"match":needle
+                }));
+                if results.len() >= 200 {
+                    break 'files;
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({"schema_version":1,"workspace_version":workspace.version().get(),"results":results,"truncated":results.len() == 200})).into_response()
+}
+
+async fn v2_upload_asset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Query(query): Query<V2AssetQuery>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let path = match LogicalPath::parse(&query.path) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid asset path"),
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let extension = path.extension().unwrap_or("").to_ascii_lowercase();
+    let valid = matches!(
+        (extension.as_str(), content_type),
+        ("png", "image/png")
+            | ("jpg" | "jpeg", "image/jpeg")
+            | ("pdf", "application/pdf")
+            | ("csv", "text/csv" | "application/csv")
+    );
+    if !valid || body.is_empty() {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "asset must be a non-empty PNG, JPEG, PDF, or CSV matching its content type",
+        );
+    }
+    let stored = match state.blobs.put(body).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    match state
+        .v2
+        .create_file_with_event(
+            paper.workspace_id,
+            principal.user_id(),
+            query.version,
+            path,
+            stored.hash(),
+            stored.size_bytes(),
+        )
+        .await
+    {
+        Ok((file, version)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"file":file,"version":version})),
+        )
+            .into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_raw_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (paper, file) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let bytes = match state
+        .workspaces
+        .read_file(paper.workspace_id, &file.path)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    };
+    let content_type = match file
+        .path
+        .extension()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("pdf") => "application/pdf",
+        Some("csv") => "text/csv; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 #[derive(Clone)]
@@ -6616,6 +7155,331 @@ mod database_tests {
         let value = ws_control(socket, "DURABLE_ACK").await;
         assert_eq!(value["client_seq"], client_sequence);
         assert!(value["durable_seq"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn s6_structural_history_intelligence_and_conflict_safety() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let other = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let other_id = test_user_id(&pool, &other.email).await;
+
+        let personal = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                r#"{"name":"S6 Personal"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = personal["paper"]["id"].as_str().unwrap();
+        let root = format!("/api/v2/papers/{paper_id}");
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/files"),
+                Some(&writer.cookie),
+                r#"{"path":"sections/methods.tex","content":"Methods","version":1}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let file_id = created["file"]["file_id"].as_str().unwrap();
+        assert_eq!(created["version"], 2);
+        let undone = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/structural-undo"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(undone["operation_type"], "CREATE_FILE");
+        assert_eq!(undone["version"], 3);
+        assert!(
+            test_json(get(&app, &format!("{root}/files"), Some(&writer.cookie)).await)
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["file_id"] != file_id)
+        );
+        let redone = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/structural-redo"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(redone["version"], 4);
+
+        let renamed = test_json(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("{root}/files/{file_id}/path"),
+                Some(&writer.cookie),
+                r#"{"path":"chapters/methods.tex","version":4}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(renamed["file"]["file_id"], file_id);
+        let rename_undo = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/structural-undo"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(rename_undo["version"], 6);
+        let restored = test_json(
+            get(
+                &app,
+                &format!("{root}/files/{file_id}"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(restored["file"]["path"], "sections/methods.tex");
+
+        assert_eq!(
+            test_json(
+                request(
+                    &app,
+                    Method::DELETE,
+                    &format!("{root}/files/{file_id}"),
+                    Some(&writer.cookie),
+                    r#"{"version":6}"#,
+                    Some("application/json")
+                )
+                .await
+            )
+            .await["version"],
+            7
+        );
+        assert_eq!(
+            test_json(
+                request(
+                    &app,
+                    Method::POST,
+                    &format!("{root}/structural-undo"),
+                    Some(&writer.cookie),
+                    "{}",
+                    Some("application/json")
+                )
+                .await
+            )
+            .await["version"],
+            8
+        );
+        let set_main = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/main/{file_id}"),
+                Some(&writer.cookie),
+                r#"{"version":8}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(set_main["version"], 9);
+        assert_eq!(
+            test_json(
+                request(
+                    &app,
+                    Method::POST,
+                    &format!("{root}/structural-undo"),
+                    Some(&writer.cookie),
+                    "{}",
+                    Some("application/json")
+                )
+                .await
+            )
+            .await["version"],
+            10
+        );
+        assert_eq!(
+            test_json(get(&app, &root, Some(&writer.cookie)).await).await["main_file"],
+            "main.tex"
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/structural-undo"),
+                Some(&other.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let latex = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\n\\section{Introduction}\\label{sec:intro}\nSee \\ref{sec:intro} and \\ref{missing}. Cite \\cite{doe2026} and \\cite{missing}.\n\\bibliographystyle{plain}\\bibliography{refs}\n\\end{document}\n";
+        let analysis_file = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/files"),
+                Some(&writer.cookie),
+                &serde_json::json!({"path":"paper.tex","content":latex,"version":10}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let analysis_id = analysis_file["file"]["file_id"].as_str().unwrap();
+        assert_eq!(test_json(request(&app, Method::POST, &format!("{root}/files"), Some(&writer.cookie), &serde_json::json!({"path":"refs.bib","content":"@article{doe2026,title={A Paper},author={Doe},year={2026}}","version":11}).to_string(), Some("application/json")).await).await["version"], 12);
+        assert_eq!(
+            test_json(
+                request(
+                    &app,
+                    Method::POST,
+                    &format!("{root}/main/{analysis_id}"),
+                    Some(&writer.cookie),
+                    r#"{"version":12}"#,
+                    Some("application/json")
+                )
+                .await
+            )
+            .await["version"],
+            13
+        );
+        let intelligence =
+            test_json(get(&app, &format!("{root}/intelligence"), Some(&writer.cookie)).await).await;
+        assert_eq!(intelligence["outline"][0]["title"], "Introduction");
+        assert!(
+            intelligence["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label["key"] == "sec:intro")
+        );
+        assert!(
+            intelligence["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reference| reference["key"] == "missing" && reference["resolved"] == false)
+        );
+        assert!(
+            intelligence["bibliography"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["key"] == "doe2026")
+        );
+        assert!(
+            intelligence["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "UnresolvedCitation")
+        );
+        let search = test_json(
+            get(
+                &app,
+                &format!("{root}/search?q=Introduction&case_sensitive=false"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(search["results"][0]["file_id"], analysis_id);
+
+        sqlx::query("UPDATE latex_core.personal_papers SET status='frozen' WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/structural-undo"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        let team = test_json(request(&app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie), &serde_json::json!({"name":"S6 Team","writer_ids":[writer_id,other_id],"mentor_ids":[]}).to_string(), Some("application/json")).await).await;
+        let team_id = team["team"]["id"].as_str().unwrap();
+        let team_root = format!("/api/v2/papers/{team_id}");
+        let shared = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{team_root}/files"),
+                Some(&writer.cookie),
+                r#"{"path":"shared.tex","content":"Shared","version":1}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let shared_id = shared["file"]["file_id"].as_str().unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("{team_root}/files/{shared_id}/path"),
+                Some(&other.cookie),
+                r#"{"path":"renamed.tex","version":2}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{team_root}/structural-undo"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        pool.close().await;
+        database.close().await;
     }
 
     async fn test_application() -> (Database, PgPool, Router, TempDir, AppState) {

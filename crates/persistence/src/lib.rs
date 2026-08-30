@@ -61,8 +61,8 @@ pub use reviews::{
 pub use v2::{
     CollaborationAccess, CollaborationAccessMode, CollaborationRecovery, CollaborationUpdateInput,
     GlobalRole, GlobalRoleAssignment, PaperFile, PaperKind, PaperStatus, PaperTeam,
-    PaperTeamMember, PaperTeamMemberView, PersonalPaper, V2Error, V2Repository, V2User,
-    WriterPaper,
+    PaperTeamMember, PaperTeamMemberView, PersonalPaper, StructuralOperationResult, V2Error,
+    V2Repository, V2User, WriterPaper,
 };
 pub use versions::{
     V2ArtifactRecord, V2BuildRequest, V2BuildSubmission, V2BuildView, V2PaperVersion,
