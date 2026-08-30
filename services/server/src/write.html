@@ -54,6 +54,11 @@
         <a href="#reviews">REVIEWS</a>
         <a href="#history" aria-current="page">HISTORY</a>
       </nav>
+      <section id="reviews" class="detail-panel" aria-labelledby="writer-reviews-heading">
+        <div class="history-heading"><div><h2 id="writer-reviews-heading">REVIEWS</h2><p>Mentor requests, discussion, and Writer-attributed suggestions.</p></div><div id="reviewCounts"></div></div>
+        <div id="writerReviewFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Open</button><button type="button" data-filter="ADDRESSED">Addressed</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="blocking">Blocking</button><button type="button" data-filter="all">All</button></div>
+        <div id="writerReviewList"><p class="empty-copy">Choose a Team Paper to view reviews.</p></div>
+      </section>
       <section id="history" class="detail-panel" aria-labelledby="history-heading">
         <div class="history-heading"><div><h2 id="history-heading">HISTORY</h2><p>Immutable checkpoints and exact compile states.</p></div><button id="createCheckpoint" type="button" disabled>Create checkpoint</button></div>
         <div id="versionHistory" class="version-history"><p class="empty-copy">Choose a paper to view history.</p></div>

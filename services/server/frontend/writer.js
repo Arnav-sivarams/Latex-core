@@ -6,6 +6,7 @@ import { stex } from '@codemirror/legacy-modes/mode/stex';
 import * as Y from 'yjs';
 import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
+import { resolveSuggestionRange } from './review-helpers.mjs';
 
 const SOURCE_UPDATE = 0x01;
 const FLUSH = 0x02;
@@ -40,6 +41,11 @@ class PaperApi {
   compare(paperId, from, to) { return this.request(`/api/v2/papers/${paperId}/versions/compare?from=${from}&to=${to}`); }
   build(paperId, triggerType) { return this.json(`/api/v2/papers/${paperId}/builds`, 'POST', { trigger_type: triggerType }); }
   buildStatus(paperId) { return this.request(`/api/v2/papers/${paperId}/builds`); }
+  reviews(paperId) { return this.request(`/api/v2/reviews/papers/${paperId}/threads`); }
+  reviewMessage(paperId, threadId, body) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/messages`, 'POST', { body }); }
+  reviewState(paperId, threadId, state) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/state`, 'POST', { state }); }
+  acceptSuggestion(paperId, threadId, durableSequence) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/accept`, 'POST', { durable_sequence: durableSequence }); }
+  rejectSuggestion(paperId, threadId, rejectionReason) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/reject`, 'POST', { rejection_reason: rejectionReason || null }); }
 
   json(path, method, body) {
     return this.request(path, {
@@ -56,6 +62,7 @@ const ui = Object.fromEntries([
   'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
   'editorMount', 'writerNotice', 'compilePaper', 'buildStatus', 'pdfRelation', 'pdfEmpty',
   'pdfFrame', 'createCheckpoint', 'versionHistory', 'versionDiff',
+  'reviewCounts', 'writerReviewFilters', 'writerReviewList',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -72,6 +79,8 @@ const model = {
   autoBuildTimer: null,
   currentBuildId: null,
   versions: [],
+  reviews: [],
+  reviewFilter: 'active',
 };
 
 function notice(message, failed = false) {
@@ -192,6 +201,7 @@ class CollaborationSession {
     this.initialState = null;
     this.initializing = false;
     this.bufferedRemote = [];
+    this.ready = new Promise((resolve) => { this.resolveReady = resolve; });
   }
 
   start() {
@@ -293,6 +303,7 @@ class CollaborationSession {
           else saveState('offline');
         });
         mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
+        this.resolveReady();
       } else {
         Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
       }
@@ -377,7 +388,7 @@ async function openPaper(paper) {
   renderFiles();
   const initial = model.files.find((file) => file.path === model.paperDetail.main_file) || model.files[0];
   if (initial) await openFile(initial, true);
-  await Promise.all([refreshBuildStatus(), refreshHistory()]);
+  await Promise.all([refreshBuildStatus(), refreshHistory(), refreshReviews()]);
 }
 
 async function openFile(file, force = false) {
@@ -596,6 +607,134 @@ async function compareSelectedVersions(event) {
   }
 }
 
+async function refreshReviews() {
+  if (!model.paper || model.paper.kind !== 'team') {
+    model.reviews = [];
+    ui.reviewCounts.textContent = '';
+    ui.writerReviewList.innerHTML = '<p class="empty-copy">Mentor review applies to assigned Team Papers.</p>';
+    return;
+  }
+  try {
+    const payload = await api.reviews(model.paper.id);
+    model.reviews = payload.threads;
+    renderReviews();
+  } catch (error) {
+    ui.writerReviewList.innerHTML = `<p class="empty-copy">${error.message}</p>`;
+  }
+}
+
+function renderReviews() {
+  const active = model.reviews.filter((thread) => ['OPEN', 'REOPENED'].includes(thread.state)).length;
+  const addressed = model.reviews.filter((thread) => thread.state === 'ADDRESSED').length;
+  const resolved = model.reviews.filter((thread) => thread.state === 'RESOLVED').length;
+  const blocking = model.reviews.filter((thread) => thread.severity === 'BLOCKING' && thread.state !== 'RESOLVED').length;
+  ui.reviewCounts.textContent = `${active} open · ${addressed} addressed · ${resolved} resolved · ${blocking} blocking`;
+  const visible = model.reviews.filter((thread) => model.reviewFilter === 'all'
+    || (model.reviewFilter === 'active' && ['OPEN', 'REOPENED'].includes(thread.state))
+    || (model.reviewFilter === 'blocking' && thread.severity === 'BLOCKING' && thread.state !== 'RESOLVED')
+    || thread.state === model.reviewFilter);
+  ui.writerReviewList.replaceChildren();
+  if (!visible.length) {
+    ui.writerReviewList.innerHTML = '<p class="empty-copy">No matching review threads.</p>';
+    return;
+  }
+  visible.forEach((thread) => {
+    const card = document.createElement('article');
+    card.className = `thread-card severity-${thread.severity.toLowerCase()}`;
+    const heading = button(`${thread.thread_type.replaceAll('_', ' ')} · ${thread.severity} · ${thread.state}`, () => focusWriterReview(thread));
+    heading.className = 'thread-title';
+    const metadata = document.createElement('p');
+    metadata.textContent = `${thread.category} · ${thread.mentor_email}${thread.assigned_writer_email ? ` · assigned to ${thread.assigned_writer_email}` : ''}${thread.due_at ? ` · due ${new Date(thread.due_at).toLocaleDateString()}` : ''} · ${writerAnchorStatus(thread)}`;
+    const discussion = document.createElement('div');
+    discussion.className = 'discussion';
+    thread.messages.forEach((message) => {
+      const row = document.createElement('p');
+      const author = document.createElement('strong');
+      author.textContent = `${message.author_email}: `;
+      row.append(author, document.createTextNode(message.body));
+      discussion.append(row);
+    });
+    const actions = document.createElement('div');
+    actions.className = 'thread-actions';
+    actions.append(button('Reply', () => writerReply(thread)));
+    if (['OPEN', 'REOPENED'].includes(thread.state)) actions.append(button('Mark Addressed', () => writerAddress(thread)));
+    if (thread.suggestion?.status === 'PENDING') actions.append(button('Accept', () => writerAcceptSuggestion(thread)), button('Reject', () => writerRejectSuggestion(thread)));
+    card.append(heading, metadata, discussion, actions);
+    ui.writerReviewList.append(card);
+  });
+}
+
+function writerAnchorStatus(thread) {
+  if (thread.source_anchor?.file_deleted) return 'SOURCE_DELETED';
+  return thread.pdf_anchor?.mapping_status || (thread.source_anchor ? 'Source linked' : 'PDF_ONLY');
+}
+
+async function writerReply(thread) {
+  const body = window.prompt('Reply to Mentor');
+  if (!body) return;
+  try { await api.reviewMessage(model.paper.id, thread.id, body); await refreshReviews(); }
+  catch (error) { notice(error.message, true); }
+}
+
+async function writerAddress(thread) {
+  try { await api.reviewState(model.paper.id, thread.id, 'ADDRESSED'); await refreshReviews(); }
+  catch (error) { notice(error.message, true); }
+}
+
+async function focusWriterReview(thread) {
+  const anchor = thread.source_anchor;
+  if (anchor && !anchor.file_deleted) {
+    const file = model.files.find((candidate) => candidate.file_id === anchor.file_id);
+    if (file) {
+      if (model.file?.file_id !== file.file_id) await openFile(file);
+      await model.collaboration.ready;
+      const range = resolveSuggestionRange(model.collaboration.doc, model.collaboration.text, decodeBase64(anchor.encoded_relative_start), decodeBase64(anchor.encoded_relative_end));
+      if (range) {
+        model.view.dispatch({ selection: { anchor: range.from, head: range.to }, scrollIntoView: true });
+        return;
+      }
+      return notice('The source anchor no longer resolves; re-anchoring is required.', true);
+    }
+  }
+  if (thread.pdf_anchor && model.currentBuildId) {
+    ui.pdfFrame.src = `/api/v2/papers/${model.paper.id}/artifacts/pdf?build=${model.currentBuildId}#page=${thread.pdf_anchor.page}`;
+    notice(`PDF-only review on page ${thread.pdf_anchor.page}.`);
+  }
+}
+
+async function writerAcceptSuggestion(thread) {
+  const anchor = thread.source_anchor;
+  if (!anchor || anchor.file_deleted) return notice('Suggestion source is unavailable; re-anchor before accepting.', true);
+  const file = model.files.find((candidate) => candidate.file_id === anchor.file_id);
+  if (!file) return notice('Suggestion file no longer exists; nothing was changed.', true);
+  try {
+    if (model.file?.file_id !== file.file_id) await openFile(file);
+    await model.collaboration.ready;
+    const range = resolveSuggestionRange(model.collaboration.doc, model.collaboration.text, decodeBase64(anchor.encoded_relative_start), decodeBase64(anchor.encoded_relative_end));
+    if (!range) return notice('Suggestion anchor is stale or unresolved; nothing was changed.', true);
+    model.collaboration.doc.transact(() => {
+      model.collaboration.text.delete(range.from, range.to - range.from);
+      model.collaboration.text.insert(range.from, thread.suggestion.replacement_text);
+    }, 'writer-suggestion-accept');
+    const durableSequence = await model.collaboration.flush();
+    await api.acceptSuggestion(model.paper.id, thread.id, durableSequence);
+    await refreshReviews();
+    notice('Suggestion accepted as your durable Writer edit.');
+  } catch (error) { notice(error.message, true); }
+}
+
+async function writerRejectSuggestion(thread) {
+  const reason = window.prompt('Optional rejection reason') || null;
+  try { await api.rejectSuggestion(model.paper.id, thread.id, reason); await refreshReviews(); notice('Suggestion rejected.'); }
+  catch (error) { notice(error.message, true); }
+}
+
+function decodeBase64(value) {
+  if (!value) return null;
+  const binary = atob(value.replaceAll('\n', ''));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
 ui.newPaper.addEventListener('click', async () => {
   const name = window.prompt('Personal paper name');
   if (!name) return;
@@ -661,9 +800,19 @@ ui.createCheckpoint.addEventListener('click', async () => {
     notice(`Checkpoint “${name}” created`);
   } catch (error) { notice(error.message, true); }
 });
+ui.writerReviewFilters.addEventListener('click', (event) => {
+  const filter = event.target.dataset.filter;
+  if (!filter) return;
+  model.reviewFilter = filter;
+  [...ui.writerReviewFilters.children].forEach((node) => node.toggleAttribute('aria-current', node === event.target));
+  renderReviews();
+});
 
 window.setInterval(() => {
-  if (model.paper) refreshBuildStatus();
+  if (model.paper) {
+    refreshBuildStatus();
+    if (model.paper.kind === 'team') refreshReviews();
+  }
 }, 1500);
 
 api.me()

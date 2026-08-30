@@ -4,40 +4,60 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Mentor Review — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=c4">
+  <link rel="stylesheet" href="/static/shells.css?v=s5">
 </head>
 <body>
   <header class="shell-topbar">
     <a class="shell-brand" href="/review" aria-current="page">LaTeX Core</a>
     <span class="role-badge">Mentor</span>
+    <span id="reviewContext" class="current-context">No paper selected</span>
     <span class="shell-spacer"></span>
+    <span id="liveStatus" class="save-status" data-state="synced">Read only</span>
     <form method="post" action="/logout"><button type="submit">Log out</button></form>
   </header>
-  <div class="review-layout">
+  <div class="review-workspace">
     <nav class="review-nav" aria-label="Mentor review navigation">
-      <section aria-labelledby="assigned-heading">
-        <h2 id="assigned-heading">ASSIGNED REVIEWS</h2>
-        <p class="empty-copy">No papers are assigned for review yet.</p>
-      </section>
-      <a href="#activity">ACTIVITY</a>
-      <a href="#rounds">REVIEW ROUNDS</a>
-      <a href="#versions">VERSIONS</a>
+      <section aria-labelledby="assigned-heading"><h2 id="assigned-heading">ASSIGNED REVIEWS</h2><div id="assignedPapers"><p class="empty-copy">Loading…</p></div></section>
+      <section aria-labelledby="review-files-heading"><h2 id="review-files-heading">FILES</h2><div id="reviewFiles"><p class="empty-copy">Choose a paper.</p></div></section>
+      <a href="#activity">ACTIVITY</a><a href="#rounds">REVIEW ROUNDS</a><a href="#versions">VERSIONS</a>
+      <a id="csvExport" href="#" aria-disabled="true">EXPORT CSV</a><a id="printExport" href="#" aria-disabled="true" target="_blank">PRINT REPORT</a>
     </nav>
-    <main class="review-main">
-      <header class="review-heading">
-        <p class="eyebrow">Review workspace</p>
-        <h1>No assigned paper</h1>
-        <p>Select an assigned paper when review persistence becomes available.</p>
+    <main class="review-stage">
+      <header class="review-toolbar">
+        <div><p class="eyebrow">Review workspace</p><h1 id="reviewTitle">No assigned paper</h1><p id="reviewSummary">Select an assigned Team Paper.</p></div>
+        <div class="review-actions"><span id="buildStatus">No PDF yet</span><button id="compileReview" class="primary" type="button" disabled>Compile</button><button id="openRound" type="button" disabled>Open Review Round</button><button id="approvePaper" type="button" disabled>Approve Paper</button></div>
       </header>
-      <section class="review-grid" aria-label="Read-only review foundation">
-        <article aria-labelledby="source-heading"><h2 id="source-heading">READ-ONLY SOURCE</h2><p>Current source will be shown here without editing controls.</p></article>
-        <article aria-labelledby="review-pdf-heading"><h2 id="review-pdf-heading">PDF</h2><p>The exact compiled artifact will appear here.</p></article>
-        <article aria-labelledby="threads-heading"><h2 id="threads-heading">REVIEW THREADS</h2><p>Persistent review feedback is deferred to the review checkpoint.</p></article>
-        <article id="activity" aria-labelledby="activity-heading"><h2 id="activity-heading">ACTIVITY</h2><p>No review activity yet.</p></article>
-        <article id="rounds" aria-labelledby="rounds-heading"><h2 id="rounds-heading">APPROVALS</h2><p>Review-round approvals are not available yet.</p></article>
-        <article id="versions" aria-labelledby="versions-heading"><h2 id="versions-heading">VERSIONS</h2><p>No reviewable versions are available.</p></article>
+      <div class="review-split">
+        <section class="review-source" aria-labelledby="source-heading">
+          <div class="panel-heading"><h2 id="source-heading">READ-ONLY SOURCE</h2><span id="sourceSelection">Select text to annotate</span></div>
+          <div id="reviewEditor" class="editor-mount"><div class="foundation-empty"><strong>No source selected</strong></div></div>
+        </section>
+        <section class="review-pdf" aria-labelledby="review-pdf-heading">
+          <div class="panel-heading"><h2 id="review-pdf-heading">PDF.JS</h2><div class="pdf-controls"><button id="previousPage" type="button" disabled>Previous</button><span id="pageLabel">0 / 0</span><button id="nextPage" type="button" disabled>Next</button><button id="zoomOut" type="button" disabled>−</button><span id="zoomLabel">100%</span><button id="zoomIn" type="button" disabled>+</button></div></div>
+          <div id="pdfState" class="pdf-relation">No current PDF</div>
+          <div id="pdfViewport" class="pdfjs-viewport" aria-label="PDF region selection surface"><canvas id="pdfCanvas"></canvas><div id="pdfOverlay" class="pdf-overlay"></div></div>
+        </section>
+      </div>
+      <section id="annotationComposer" class="annotation-composer" aria-labelledby="composer-heading" hidden>
+        <div><h2 id="composer-heading">NEW ANNOTATION</h2><p id="anchorSummary">No anchor</p></div>
+        <label>Type<select id="threadType"><option>COMMENT</option><option>QUESTION</option><option>CHANGE_REQUEST</option><option>SUGGESTED_REPLACEMENT</option><option>SECTION_APPROVAL</option></select></label>
+        <label>Severity<select id="severity"><option>NOTE</option><option>MINOR</option><option>MAJOR</option><option>BLOCKING</option></select></label>
+        <label>Category<select id="category"><option>WRITING</option><option>METHODOLOGY</option><option>EVIDENCE</option><option>CITATION</option><option>FORMATTING</option><option>FIGURE</option><option>TABLE</option><option>EQUATION</option><option>SUBMISSION_REQUIREMENT</option></select></label>
+        <label>Assign Writer<select id="assignedWriter"><option value="">Unassigned</option></select></label>
+        <label>Due date<input id="dueDate" type="date"></label>
+        <label class="composer-message">Message<input id="threadMessage" type="text" maxlength="20000" placeholder="Review feedback"></label>
+        <label id="replacementField" class="composer-message" hidden>Replacement<input id="replacementText" type="text" maxlength="20000" placeholder="Suggested replacement text"></label>
+        <div class="review-actions"><button id="cancelAnnotation" type="button">Cancel</button><button id="createAnnotation" class="primary" type="button">Create</button></div>
+      </section>
+      <section class="review-details">
+        <article id="threads" class="review-card" aria-labelledby="threads-heading"><div class="panel-heading"><h2 id="threads-heading">REVIEW THREADS</h2><div id="threadFilters" class="thread-filters"><button data-filter="active" aria-current="page">Open</button><button data-filter="ADDRESSED">Addressed</button><button data-filter="RESOLVED">Resolved</button><button data-filter="blocking">Blocking</button><button data-filter="all">All</button></div></div><div id="threadList"><p class="empty-copy">No review threads.</p></div></article>
+        <article id="rounds" class="review-card" aria-labelledby="rounds-heading"><div class="panel-heading"><h2 id="rounds-heading">REVIEW ROUNDS / APPROVALS</h2></div><div id="roundList"><p class="empty-copy">No review round.</p></div></article>
+        <article id="versions" class="review-card" aria-labelledby="versions-heading"><div class="panel-heading"><h2 id="versions-heading">CHANGES SINCE LAST REVIEW</h2></div><pre id="reviewChanges">No baseline.</pre></article>
+        <article id="activity" class="review-card" aria-labelledby="activity-heading"><div class="panel-heading"><h2 id="activity-heading">ACTIVITY</h2></div><div id="activityList"><p class="empty-copy">No activity.</p></div></article>
       </section>
     </main>
   </div>
+  <div id="reviewNotice" class="status-region" aria-live="polite"></div>
+  <script type="module" src="/static/review.js?v=s5"></script>
 </body>
 </html>

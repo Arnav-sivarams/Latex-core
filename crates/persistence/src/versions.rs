@@ -184,7 +184,7 @@ impl V2Repository {
         actor: UserId,
         paper_id: Uuid,
     ) -> Result<Vec<V2PaperVersion>, V2Error> {
-        let workspace_id = writer_workspace(self.database.pool(), actor, paper_id).await?;
+        let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
         let rows = sqlx::query(
             "SELECT v.*,v.created_at::text AS created_at_text,c.email AS author_email FROM latex_core.paper_versions v \
              JOIN latex_core.user_credentials c ON c.user_id=v.created_by_user_id \
@@ -203,7 +203,7 @@ impl V2Repository {
         paper_id: Uuid,
         version_id: Uuid,
     ) -> Result<V2PaperVersion, V2Error> {
-        let workspace_id = writer_workspace(self.database.pool(), actor, paper_id).await?;
+        let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
         let row = sqlx::query(
             "SELECT v.*,v.created_at::text AS created_at_text,c.email AS author_email FROM latex_core.paper_versions v \
              JOIN latex_core.user_credentials c ON c.user_id=v.created_by_user_id \
@@ -229,7 +229,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
-        require_writer_access(
+        require_build_access(
             &mut tx,
             request.user_id,
             request.paper_id,
@@ -333,7 +333,7 @@ impl V2Repository {
         actor: UserId,
         paper_id: Uuid,
     ) -> Result<V2BuildView, V2Error> {
-        let workspace_id = writer_workspace(self.database.pool(), actor, paper_id).await?;
+        let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
         let row = sqlx::query(
             "SELECT s.desired_state_hash,s.desired_source_sequence,s.active_build_id,aj.state AS active_status, \
                     s.current_build_id,cb.source_sequence AS current_source_sequence,cb.compile_job_id AS current_job_id, \
@@ -387,7 +387,7 @@ impl V2Repository {
         if !matches!(kind, "pdf" | "log" | "synctex") {
             return Err(V2Error::NotFound { entity: "artifact" });
         }
-        let workspace_id = writer_workspace(self.database.pool(), actor, paper_id).await?;
+        let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
         let row = sqlx::query(
             "SELECT a.artifact_id,a.job_id,a.logical_name,a.blob_hash,a.size_bytes,a.content_type \
              FROM latex_core.v2_paper_build_state s \
@@ -405,7 +405,7 @@ impl V2Repository {
     }
 }
 
-async fn writer_workspace(
+async fn participant_workspace(
     pool: &sqlx::PgPool,
     actor: UserId,
     paper_id: Uuid,
@@ -417,7 +417,7 @@ async fn writer_workspace(
          UNION ALL \
          SELECT t.workspace_id FROM latex_core.paper_teams t \
          JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$2 \
-         JOIN latex_core.global_user_roles r ON r.user_id=$2 AND r.role='writer' WHERE t.id=$1",
+         JOIN latex_core.global_user_roles r ON r.user_id=$2 AND r.role IN ('writer','mentor') WHERE t.id=$1",
     )
     .bind(paper_id)
     .bind(actor.as_uuid())
@@ -443,6 +443,38 @@ async fn require_writer_access(
          SELECT t.status FROM latex_core.paper_teams t \
          JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$3 \
          JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role='writer' \
+         WHERE t.id=$1 AND t.workspace_id=$2",
+    )
+    .bind(paper_id)
+    .bind(workspace_id.as_uuid())
+    .bind(actor.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .ok_or(V2Error::NotFound { entity: "paper" })?;
+    if active && status != "active" {
+        return Err(V2Error::Conflict {
+            entity: "read-only paper",
+        });
+    }
+    Ok(())
+}
+
+async fn require_build_access(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: UserId,
+    paper_id: Uuid,
+    workspace_id: WorkspaceId,
+    active: bool,
+) -> Result<(), V2Error> {
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT p.status FROM latex_core.personal_papers p \
+         JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role='writer' \
+         WHERE p.id=$1 AND p.workspace_id=$2 AND p.owner_user_id=$3 \
+         UNION ALL \
+         SELECT t.status FROM latex_core.paper_teams t \
+         JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$3 \
+         JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role IN ('writer','mentor') \
          WHERE t.id=$1 AND t.workspace_id=$2",
     )
     .bind(paper_id)

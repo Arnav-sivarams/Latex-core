@@ -2,7 +2,7 @@
   "name": "latex-core-writer",
   "private": true,
   "scripts": {
-    "build": "esbuild services/server/frontend/writer.js --bundle --format=esm --minify --outfile=services/server/static/writer.js",
+    "build": "esbuild services/server/frontend/writer.js --bundle --format=esm --minify --outfile=services/server/static/writer.js && esbuild services/server/frontend/review.js --bundle --format=esm --minify --external:/static/pdf.min.mjs --outfile=services/server/static/review.js && cp node_modules/pdfjs-dist/build/pdf.min.mjs services/server/static/pdf.min.mjs && cp node_modules/pdfjs-dist/build/pdf.worker.min.mjs services/server/static/pdf.worker.min.mjs",
     "test": "node --test services/server/frontend/*.test.mjs"
   },
   "dependencies": {
@@ -11,6 +11,7 @@
     "@codemirror/state": "6.7.1",
     "@codemirror/view": "6.43.9",
     "codemirror": "6.0.2",
+    "pdfjs-dist": "6.3.289",
     "y-codemirror.next": "0.3.6",
     "y-indexeddb": "9.0.12",
     "yjs": "13.6.32"

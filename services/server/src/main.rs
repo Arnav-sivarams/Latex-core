@@ -11,6 +11,7 @@
 mod archive;
 mod auth;
 mod collaboration;
+mod review_api;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -625,6 +626,7 @@ fn router(state: AppState) -> Router {
         .route("/api/jobs/{id}/cancel", post(cancel))
         .route("/api/jobs/{id}/artifacts", get(artifacts))
         .route("/api/jobs/{id}/artifacts/{artifact}", get(artifact))
+        .merge(review_api::router())
         .layer(RequestBodyLimitLayer::new(archive::MAX_ARCHIVE_BYTES))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
@@ -1022,6 +1024,20 @@ async fn writer_session(
     let principal = principal_auth(state, headers).await?;
     if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Writer)) {
         return Err(error(StatusCode::FORBIDDEN, "V2 Writer required"));
+    }
+    Ok(principal)
+}
+
+async fn v2_paper_reader_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedPrincipal, Response> {
+    let principal = principal_auth(state, headers).await?;
+    if !matches!(
+        principal.kind,
+        PrincipalKind::V2(GlobalRole::Writer | GlobalRole::Mentor)
+    ) {
+        return Err(error(StatusCode::FORBIDDEN, "V2 Writer or Mentor required"));
     }
     Ok(principal)
 }
@@ -1501,7 +1517,7 @@ async fn v2_versions(
     headers: HeaderMap,
     Path(paper_id): Path<uuid::Uuid>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1516,7 +1532,7 @@ async fn v2_version(
     headers: HeaderMap,
     Path((paper_id, version_id)): Path<(uuid::Uuid, uuid::Uuid)>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1536,7 +1552,7 @@ async fn v2_compare_versions(
     Path(paper_id): Path<uuid::Uuid>,
     Query(query): Query<V2CompareQuery>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1676,13 +1692,31 @@ async fn v2_submit_build(
             "trigger_type must be auto or manual",
         );
     }
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
-        Ok(value) => value,
-        Err(error_value) => return v2_error(error_value),
+    if matches!(principal.kind, PrincipalKind::V2(GlobalRole::Mentor))
+        && input.trigger_type != "manual"
+    {
+        return error(StatusCode::FORBIDDEN, "Mentor builds must be manual");
+    }
+    let paper = match principal.kind {
+        PrincipalKind::V2(GlobalRole::Writer) => {
+            match state.v2.writer_paper(principal.user_id(), paper_id).await {
+                Ok(value) => value,
+                Err(error_value) => return v2_error(error_value),
+            }
+        }
+        PrincipalKind::V2(GlobalRole::Mentor) => {
+            match state.v2.review_paper(principal.user_id(), paper_id).await {
+                Ok((value, _)) => value,
+                Err(error_value) => return v2_error(error_value),
+            }
+        }
+        PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(_) => {
+            return error(StatusCode::FORBIDDEN, "Writer or assigned Mentor required");
+        }
     };
     let exact = match capture_exact_v2_state(&state, &paper).await {
         Ok(value) => value,
@@ -1732,7 +1766,7 @@ async fn v2_build_status(
     headers: HeaderMap,
     Path(paper_id): Path<uuid::Uuid>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1752,7 +1786,7 @@ async fn v2_current_artifact(
     headers: HeaderMap,
     Path((paper_id, kind)): Path<(uuid::Uuid, String)>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -5417,6 +5451,514 @@ mod database_tests {
                 .await
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn s5_review_authorization_lifecycle_suggestions_rounds_and_isolation() {
+        use core_types::WorkerId;
+
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let other_writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let other_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({"name":"S5 Review Team","writer_ids":[writer_id],"mentor_ids":[mentor_id]}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        let workspace_id =
+            uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap();
+        let file_id =
+            uuid::Uuid::parse_str(created["main_file"]["file_id"].as_str().unwrap()).unwrap();
+        let review_root = format!("/api/v2/reviews/papers/{paper_id}");
+
+        let listed =
+            test_json(get(&app, "/api/v2/mentor/papers", Some(&mentor.cookie)).await).await;
+        assert_eq!(listed["papers"][0]["id"], paper_id);
+        assert!(
+            listed["papers"][0]["pdf_available"]
+                .as_bool()
+                .is_some_and(|value| !value)
+        );
+        assert!(test_json(get(&app, "/api/v2/mentor/papers", Some(&other_mentor.cookie)).await).await["papers"].as_array().unwrap().is_empty());
+        assert_eq!(
+            get(&app, "/api/v2/mentor/papers", Some(&admin.cookie))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let build_path = format!("/api/v2/papers/{paper_id}/builds");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&mentor.cookie),
+                r#"{"trigger_type":"auto"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let build = request(
+            &app,
+            Method::POST,
+            &build_path,
+            Some(&mentor.cookie),
+            r#"{"trigger_type":"manual"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(build.status(), StatusCode::ACCEPTED);
+        let worker = WorkerId::new();
+        let claimed = state.queue.claim(worker).await.unwrap().unwrap();
+        state
+            .queue
+            .complete_success(
+                claimed.id,
+                worker,
+                &test_artifacts(&state, "s5").await,
+                core_types::BlobHash::digest(b"s5-manifest"),
+            )
+            .await
+            .unwrap();
+        let current = test_json(get(&app, &build_path, Some(&mentor.cookie)).await).await;
+        assert!(current["build"]["current_build_id"].is_string());
+
+        let round = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/rounds"),
+            Some(&mentor.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(round.status(), StatusCode::CREATED);
+        let round = test_json(round).await;
+        let round_id = round["id"].as_str().unwrap();
+        let source_anchor = serde_json::json!({
+            "file_id":file_id,"encoded_relative_start":[1],"encoded_relative_end":[2],
+            "quoted_text":"article","context_hash":"0".repeat(64),"source_sequence":1,
+            "source_version_id":null,"document_epoch":1
+        });
+        let comment = serde_json::json!({"thread_type":"COMMENT","message":"Clarify this paragraph","severity":"MINOR","category":"WRITING","assigned_writer_user_id":null,"due_at":null,"source_anchor":source_anchor,"pdf_anchor":null,"suggested_replacement":null,"section_label":null});
+        for denied in [&writer, &admin] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::POST,
+                    &format!("{review_root}/threads"),
+                    Some(&denied.cookie),
+                    &comment.to_string(),
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&other_mentor.cookie),
+                &comment.to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let created_thread = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/threads"),
+            Some(&mentor.cookie),
+            &comment.to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(created_thread.status(), StatusCode::CREATED);
+        let thread_id = test_json(created_thread).await["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/messages"),
+                Some(&writer.cookie),
+                r#"{"body":"Writer reply"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&writer.cookie),
+                r#"{"state":"ADDRESSED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&writer.cookie),
+                r#"{"state":"RESOLVED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&mentor.cookie),
+                r#"{"state":"RESOLVED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&mentor.cookie),
+                r#"{"state":"REOPENED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&mentor.cookie),
+                r#"{"state":"RESOLVED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        let before_source = test_json(
+            get(
+                &app,
+                &format!("{review_root}/files/{file_id}"),
+                Some(&mentor.cookie),
+            )
+            .await,
+        )
+        .await["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let suggestion = serde_json::json!({"thread_type":"SUGGESTED_REPLACEMENT","message":"Use a stronger phrase","severity":"MAJOR","category":"WRITING","assigned_writer_user_id":writer_id,"due_at":null,"source_anchor":source_anchor,"pdf_anchor":null,"suggested_replacement":"replacement","section_label":null});
+        let suggested = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &suggestion.to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let suggestion_id = suggested["thread_id"].as_str().unwrap();
+        let after_mentor = test_json(
+            get(
+                &app,
+                &format!("{review_root}/files/{file_id}"),
+                Some(&mentor.cookie),
+            )
+            .await,
+        )
+        .await["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            before_source, after_mentor,
+            "Mentor suggestion must not mutate source"
+        );
+        let durable_sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO latex_core.collaboration_updates (workspace_id,file_id,document_epoch,actor_user_id,update_bytes) VALUES ($1,$2,1,$3,$4) RETURNING id",
+        ).bind(workspace_id).bind(file_id).bind(writer_id.as_uuid()).bind(vec![1_u8]).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{suggestion_id}/suggestion/accept"),
+                Some(&writer.cookie),
+                &serde_json::json!({"durable_sequence":durable_sequence}).to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let accepted: (String, uuid::Uuid) = sqlx::query_as("SELECT status,accepted_by_writer_user_id FROM latex_core.review_suggestions WHERE thread_id=$1").bind(uuid::Uuid::parse_str(suggestion_id).unwrap()).fetch_one(&pool).await.unwrap();
+        assert_eq!(accepted.0, "ACCEPTED");
+        assert_eq!(accepted.1, *writer_id.as_uuid());
+
+        let rejected = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &suggestion.to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!(
+                    "{review_root}/threads/{}/suggestion/reject",
+                    rejected["thread_id"].as_str().unwrap()
+                ),
+                Some(&writer.cookie),
+                r#"{"rejection_reason":"Not appropriate"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let paper_approval = serde_json::json!({"thread_type":"PAPER_APPROVAL","message":"Approved for this exact version","severity":"NOTE","category":"SUBMISSION_REQUIREMENT","assigned_writer_user_id":null,"due_at":null,"source_anchor":null,"pdf_anchor":null,"suggested_replacement":null,"section_label":null});
+        let paper_approval_id = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &paper_approval.to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let approval_identity: (Option<uuid::Uuid>, Option<uuid::Uuid>, Option<String>) =
+            sqlx::query_as("SELECT approved_version_id,approved_build_id,approved_state_hash FROM latex_core.review_threads WHERE id=$1")
+                .bind(uuid::Uuid::parse_str(&paper_approval_id).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(approval_identity.0.is_some() && approval_identity.1.is_some());
+        let approved_state_hash = approval_identity.2.unwrap();
+
+        let blocking = serde_json::json!({"thread_type":"CHANGE_REQUEST","message":"Blocking request","severity":"BLOCKING","category":"METHODOLOGY","assigned_writer_user_id":writer_id,"due_at":null,"source_anchor":source_anchor,"pdf_anchor":null,"suggested_replacement":null,"section_label":null});
+        let blocking_id = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &blocking.to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds/{round_id}/approve"),
+                Some(&mentor.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{blocking_id}/state"),
+                Some(&writer.cookie),
+                r#"{"state":"ADDRESSED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{blocking_id}/state"),
+                Some(&mentor.cookie),
+                r#"{"state":"RESOLVED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds/{round_id}/approve"),
+                Some(&mentor.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let paper_detail = test_json(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &format!("/api/v2/papers/{paper_id}/files/{file_id}"),
+                Some(&writer.cookie),
+                &serde_json::json!({"content":"\\documentclass{article}\n\\begin{document}newer source\\end{document}","version":paper_detail["version"]}).to_string(),
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let newer = state
+            .workspaces
+            .force_snapshot(WorkspaceId::from_uuid(workspace_id))
+            .await
+            .unwrap();
+        assert_ne!(approved_state_hash, newer.snapshot_id().to_hex());
+
+        assert_eq!(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&other_writer.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&other_mentor.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("{review_root}/report.csv"),
+                Some(&mentor.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("{review_root}/report.html"),
+                Some(&writer.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        sqlx::query("UPDATE latex_core.paper_files SET tombstoned=true,tombstoned_at=statement_timestamp() WHERE file_id=$1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after_delete = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            after_delete["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| { thread["source_anchor"]["file_deleted"] == true })
+        );
+
+        pool.close().await;
+        database.close().await;
     }
 
     #[tokio::test]

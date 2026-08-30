@@ -1,0 +1,62 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import * as Y from 'yjs';
+import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange } from './review-helpers.mjs';
+
+function sync(from, to) {
+  Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)), 'remote');
+}
+
+test('Yjs relative source anchor survives concurrent insertion before range', () => {
+  const mentor = new Y.Doc();
+  const source = mentor.getText('source');
+  source.insert(0, 'alpha target omega');
+  const writer = new Y.Doc();
+  sync(mentor, writer);
+  const start = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(source, 6));
+  const end = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(source, 12));
+  writer.getText('source').insert(0, 'prefix ');
+  sync(writer, mentor);
+  const range = resolveSuggestionRange(mentor, source, start, end);
+  assert.deepEqual(range, { from: 13, to: 19 });
+  assert.equal(source.toString().slice(range.from, range.to), 'target');
+});
+
+test('PDF rectangle normalization survives zoom and rerender', () => {
+  const normalized = normalizeRectangle({ x1: 100, y1: 80, x2: 300, y2: 180 }, 600, 800);
+  assert.deepEqual(denormalizeRectangle(normalized, 1200, 1600), { x: 200, y: 160, width: 400, height: 200 });
+});
+
+test('suggestion helper refuses an anchor unresolved in the current document', () => {
+  const oldDoc = new Y.Doc();
+  const oldText = oldDoc.getText('source');
+  oldText.insert(0, 'replace me');
+  const start = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(oldText, 0));
+  const end = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(oldText, 7));
+  const current = new Y.Doc();
+  const currentText = current.getText('source');
+  currentText.insert(0, 'different document');
+  assert.equal(resolveSuggestionRange(current, currentText, start, end), null);
+});
+
+test('Mentor bundle is read-only and PDF.js assets are same-origin', () => {
+  const review = readFileSync(new URL('./review.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../src/review.html', import.meta.url), 'utf8');
+  const packageJson = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'));
+  assert.match(review, /EditorView\.editable\.of\(false\)/);
+  assert.doesNotMatch(review, /sendUpdate|0x01|contenteditable\s*=\s*["']?true/i);
+  assert.match(review, /\/static\/pdf\.min\.mjs/);
+  assert.match(review, /\/static\/pdf\.worker\.min\.mjs/);
+  assert.doesNotMatch(html, /iframe|cdn|Set Main|New File|Publish/i);
+  assert.equal(packageJson.dependencies['pdfjs-dist'], '6.3.289');
+});
+
+test('Writer suggestion acceptance orders Yjs edit, durable flush, then acceptance record', () => {
+  const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
+  const edit = writer.indexOf("}, 'writer-suggestion-accept')");
+  const flush = writer.indexOf('model.collaboration.flush()', edit);
+  const accepted = writer.indexOf('api.acceptSuggestion', flush);
+  assert.ok(edit > 0 && flush > edit && accepted > flush);
+  assert.match(writer, /if \(!range\) return notice\('Suggestion anchor is stale or unresolved; nothing was changed\.'/);
+});

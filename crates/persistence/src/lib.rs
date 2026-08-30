@@ -17,6 +17,13 @@ mod permissions;
 #[allow(
     clippy::missing_errors_doc,
     clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    reason = "S5 review transactions keep authorization and state transitions adjacent"
+)]
+mod reviews;
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
     reason = "V2 repository methods share a typed domain error and transaction inputs are values"
 )]
 mod v2;
@@ -48,6 +55,9 @@ pub use config::DatabaseConfig;
 pub use database::Database;
 pub use error::PersistenceError;
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
+pub use reviews::{
+    ReviewPaperSummary, ReviewPdfAnchorInput, ReviewSourceAnchorInput, ReviewThreadInput,
+};
 pub use v2::{
     CollaborationAccess, CollaborationAccessMode, CollaborationRecovery, CollaborationUpdateInput,
     GlobalRole, GlobalRoleAssignment, PaperFile, PaperKind, PaperStatus, PaperTeam,

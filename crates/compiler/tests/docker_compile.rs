@@ -2,7 +2,9 @@
 
 use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
 use bytes::Bytes;
-use compiler::{CompileLimits, CompileStatus, CompilerConfig, CompilerService, DockerCliRuntime};
+use compiler::{
+    CompileLimits, CompileStatus, CompilerConfig, CompilerService, DockerCliRuntime, SyncTexIndex,
+};
 use core_types::{
     ArtifactKind, FileEntryV1, LogicalPath, ShellPolicy, TexEngine, WorkspaceManifestV1,
 };
@@ -92,7 +94,7 @@ fn pdf(execution: &compiler::CompileExecution) {
 
 #[tokio::test]
 async fn representative_v2_pdf_log_and_nonempty_synctex() {
-    let source = br"\documentclass{article}\begin{document}S4 exact-state PDF\end{document}";
+    let source = b"\\documentclass{article}\n\\begin{document}\n\nS5 representative paragraph for linked review.\n\\end{document}\n";
     let (execution, _) = compile(
         &[("paper.tex", source)],
         "paper.tex",
@@ -109,6 +111,19 @@ async fn representative_v2_pdf_log_and_nonempty_synctex() {
         .expect("SyncTeX artifact");
     assert!(!synctex.bytes().is_empty());
     assert!(synctex.logical_name().as_str().ends_with(".synctex.gz"));
+    let index = SyncTexIndex::from_gzip(synctex.bytes()).expect("read representative SyncTeX");
+    let forward = index
+        .forward("paper.tex", 4, 0)
+        .expect("forward mapping for normal paragraph");
+    assert_eq!(forward.page, 1);
+    assert!(forward.x.is_finite() && forward.y.is_finite());
+    let inverse = index
+        .inverse(forward.page, forward.x, forward.y)
+        .expect("inverse mapping from projected position");
+    assert!(inverse.source_path.ends_with("paper.tex"));
+    assert!(inverse.line > 0);
+    assert!(index.forward("intentionally-missing.tex", 999, 0).is_none());
+    assert!(index.inverse(999, -1.0, -1.0).is_none());
 }
 
 #[tokio::test]
