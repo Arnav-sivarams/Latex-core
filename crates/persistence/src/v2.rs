@@ -130,6 +130,34 @@ pub struct PaperFile {
     pub tombstoned_at: Option<String>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationAccessMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollaborationAccess {
+    pub workspace_id: WorkspaceId,
+    pub file: PaperFile,
+    pub document_epoch: u64,
+    pub mode: CollaborationAccessMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollaborationRecovery {
+    pub document_epoch: u64,
+    pub snapshot: Option<(u64, Vec<u8>)>,
+    pub updates: Vec<(u64, Vec<u8>)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollaborationUpdateInput {
+    pub actor_user_id: UserId,
+    pub update_bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct V2User {
     pub user_id: UserId,
@@ -756,6 +784,305 @@ impl V2Repository {
         .await
         .map_err(V2Error::Database)?;
         rows.into_iter().map(decode_paper_file).collect()
+    }
+
+    pub async fn collaboration_access(
+        &self,
+        user_id: UserId,
+        paper_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<CollaborationAccess, V2Error> {
+        let role = self
+            .get_global_role(user_id)
+            .await?
+            .ok_or(V2Error::RoleMissing { user_id })?
+            .role;
+        if role == GlobalRole::Admin {
+            return Err(V2Error::RoleForbidden {
+                user_id,
+                required: "paper collaboration participant",
+                actual: role,
+            });
+        }
+        let rows = sqlx::query(
+            "SELECT workspace_id,status,'personal' AS kind,(owner_user_id=$2) AS assigned \
+             FROM latex_core.personal_papers WHERE id=$1 \
+             UNION ALL \
+             SELECT t.workspace_id,t.status,'team' AS kind,EXISTS( \
+                 SELECT 1 FROM latex_core.paper_team_members m \
+                 WHERE m.paper_team_id=t.id AND m.user_id=$2) AS assigned \
+             FROM latex_core.paper_teams t WHERE t.id=$1",
+        )
+        .bind(paper_id)
+        .bind(user_id.as_uuid())
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        if rows.len() != 1 {
+            return Err(V2Error::NotFound { entity: "paper" });
+        }
+        let row = &rows[0];
+        let workspace_id =
+            WorkspaceId::from_uuid(row.try_get("workspace_id").map_err(V2Error::Database)?);
+        let kind: String = row.try_get("kind").map_err(V2Error::Database)?;
+        let status: String = row.try_get("status").map_err(V2Error::Database)?;
+        let assigned: bool = row.try_get("assigned").map_err(V2Error::Database)?;
+        let permitted = assigned
+            && matches!(
+                (kind.as_str(), role),
+                ("personal", GlobalRole::Writer)
+                    | ("team", GlobalRole::Writer | GlobalRole::Mentor)
+            );
+        if !permitted {
+            return Err(V2Error::RoleForbidden {
+                user_id,
+                required: "assigned paper collaborator",
+                actual: role,
+            });
+        }
+        let file = self.paper_file(file_id).await?;
+        if file.workspace_id != workspace_id || file.tombstoned {
+            return Err(V2Error::NotFound {
+                entity: "live paper file",
+            });
+        }
+        let epoch = match sqlx::query_scalar::<_, i64>(
+            "SELECT document_epoch FROM latex_core.paper_collaboration_state WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?
+        {
+            Some(epoch) => epoch,
+            None => sqlx::query_scalar(
+                "INSERT INTO latex_core.paper_collaboration_state (workspace_id) VALUES ($1) \
+                 ON CONFLICT (workspace_id) DO UPDATE SET workspace_id=EXCLUDED.workspace_id \
+                 RETURNING document_epoch",
+            )
+            .bind(workspace_id.as_uuid())
+            .fetch_one(self.database.pool())
+            .await
+            .map_err(V2Error::Database)?,
+        };
+        let document_epoch = u64::try_from(epoch).map_err(|_| V2Error::Integrity {
+            message: "negative collaboration document epoch".to_owned(),
+        })?;
+        let mode = if role == GlobalRole::Writer && status == PaperStatus::Active.as_str() {
+            CollaborationAccessMode::ReadWrite
+        } else {
+            CollaborationAccessMode::ReadOnly
+        };
+        Ok(CollaborationAccess {
+            workspace_id,
+            file,
+            document_epoch,
+            mode,
+        })
+    }
+
+    pub async fn collaboration_recovery(
+        &self,
+        workspace_id: WorkspaceId,
+        file_id: Uuid,
+        document_epoch: u64,
+    ) -> Result<CollaborationRecovery, V2Error> {
+        let epoch = i64::try_from(document_epoch).map_err(|_| V2Error::Integrity {
+            message: "collaboration epoch exceeds PostgreSQL BIGINT".to_owned(),
+        })?;
+        let snapshot_row = sqlx::query(
+            "SELECT through_sequence,compressed_state FROM latex_core.collaboration_snapshots \
+             WHERE workspace_id=$1 AND file_id=$2 AND document_epoch=$3 \
+             ORDER BY through_sequence DESC LIMIT 1",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(file_id)
+        .bind(epoch)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        let snapshot = snapshot_row
+            .map(|row| {
+                let sequence: i64 = row.try_get("through_sequence").map_err(V2Error::Database)?;
+                Ok((
+                    u64::try_from(sequence).map_err(|_| V2Error::Integrity {
+                        message: "negative collaboration snapshot sequence".to_owned(),
+                    })?,
+                    row.try_get("compressed_state").map_err(V2Error::Database)?,
+                ))
+            })
+            .transpose()?;
+        let after = snapshot.as_ref().map_or(0, |(sequence, _)| *sequence);
+        let after = i64::try_from(after).map_err(|_| V2Error::Integrity {
+            message: "collaboration sequence exceeds PostgreSQL BIGINT".to_owned(),
+        })?;
+        let rows = sqlx::query(
+            "SELECT id,update_bytes FROM latex_core.collaboration_updates \
+             WHERE workspace_id=$1 AND file_id=$2 AND document_epoch=$3 AND id>$4 ORDER BY id",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(file_id)
+        .bind(epoch)
+        .bind(after)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        let updates = rows
+            .into_iter()
+            .map(|row| {
+                let sequence: i64 = row.try_get("id").map_err(V2Error::Database)?;
+                Ok((
+                    u64::try_from(sequence).map_err(|_| V2Error::Integrity {
+                        message: "negative collaboration update sequence".to_owned(),
+                    })?,
+                    row.try_get("update_bytes").map_err(V2Error::Database)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, V2Error>>()?;
+        Ok(CollaborationRecovery {
+            document_epoch,
+            snapshot,
+            updates,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_collaboration_batch(
+        &self,
+        workspace_id: WorkspaceId,
+        file_id: Uuid,
+        document_epoch: u64,
+        updates: &[CollaborationUpdateInput],
+        blob_hash: BlobHash,
+        size_bytes: u64,
+    ) -> Result<u64, V2Error> {
+        if updates.is_empty() {
+            return Err(V2Error::Integrity {
+                message: "empty collaboration durability batch".to_owned(),
+            });
+        }
+        let materialization_actor = updates
+            .last()
+            .map(|update| update.actor_user_id)
+            .ok_or_else(|| V2Error::Integrity {
+                message: "empty collaboration durability batch".to_owned(),
+            })?;
+        let epoch = i64::try_from(document_epoch).map_err(|_| V2Error::Integrity {
+            message: "collaboration epoch exceeds PostgreSQL BIGINT".to_owned(),
+        })?;
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        let current = lock_live_file(&mut tx, file_id).await?;
+        if current.workspace_id != workspace_id {
+            return Err(V2Error::NotFound {
+                entity: "live paper file",
+            });
+        }
+        let current_epoch: i64 = sqlx::query_scalar(
+            "SELECT document_epoch FROM latex_core.paper_collaboration_state \
+             WHERE workspace_id=$1 FOR UPDATE",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?
+        .ok_or(V2Error::NotFound {
+            entity: "collaboration state",
+        })?;
+        if current_epoch != epoch {
+            return Err(V2Error::Conflict {
+                entity: "collaboration document epoch",
+            });
+        }
+        let mut durable_sequence = 0_u64;
+        for update in updates {
+            let sequence: i64 = sqlx::query_scalar(
+                "INSERT INTO latex_core.collaboration_updates \
+                 (workspace_id,file_id,document_epoch,actor_user_id,update_bytes) \
+                 VALUES ($1,$2,$3,$4,$5) RETURNING id",
+            )
+            .bind(workspace_id.as_uuid())
+            .bind(file_id)
+            .bind(epoch)
+            .bind(update.actor_user_id.as_uuid())
+            .bind(&update.update_bytes)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(V2Error::Database)?;
+            durable_sequence = u64::try_from(sequence).map_err(|_| V2Error::Integrity {
+                message: "negative collaboration update sequence".to_owned(),
+            })?;
+        }
+        let version: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        let version = u64::try_from(version).map_err(|_| V2Error::Integrity {
+            message: "negative workspace version".to_owned(),
+        })?;
+        append_workspace_operation(
+            &mut tx,
+            workspace_id,
+            materialization_actor,
+            version,
+            json!({"op":"put_file","path":current.path,"blob_hash":blob_hash,"size_bytes":size_bytes}),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE latex_core.paper_files SET revision=revision+1,updated_at=statement_timestamp() \
+             WHERE file_id=$1",
+        )
+        .bind(file_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        sqlx::query(
+            "UPDATE latex_core.paper_collaboration_state SET updated_at=statement_timestamp() \
+             WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(durable_sequence)
+    }
+
+    pub async fn save_collaboration_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        file_id: Uuid,
+        document_epoch: u64,
+        through_sequence: u64,
+        compressed_state: &[u8],
+    ) -> Result<(), V2Error> {
+        let epoch = i64::try_from(document_epoch).map_err(|_| V2Error::Integrity {
+            message: "collaboration epoch exceeds PostgreSQL BIGINT".to_owned(),
+        })?;
+        let sequence = i64::try_from(through_sequence).map_err(|_| V2Error::Integrity {
+            message: "collaboration sequence exceeds PostgreSQL BIGINT".to_owned(),
+        })?;
+        sqlx::query(
+            "INSERT INTO latex_core.collaboration_snapshots \
+             (workspace_id,file_id,document_epoch,through_sequence,compressed_state) \
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(file_id)
+        .bind(epoch)
+        .bind(sequence)
+        .bind(compressed_state)
+        .execute(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

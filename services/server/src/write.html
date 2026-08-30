@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Writer — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=s2">
+  <link rel="stylesheet" href="/static/shells.css?v=s3">
 </head>
 <body>
   <header class="shell-topbar">
@@ -12,7 +12,7 @@
     <span class="role-badge">Writer</span>
     <span id="currentPaper" class="current-context">No paper selected</span>
     <span class="shell-spacer"></span>
-    <span id="saveStatus" class="save-status" data-state="saved">Saved</span>
+    <span id="saveStatus" class="save-status" data-state="local">Local</span>
     <form method="post" action="/logout"><button type="submit">Log out</button></form>
   </header>
   <div class="writer-layout">
@@ -38,7 +38,7 @@
             <button id="renameFile" type="button" disabled>Rename</button>
             <button id="deleteFile" type="button" disabled>Delete</button>
             <button id="setMain" type="button" disabled>Set Main</button>
-            <button id="saveFile" class="primary" type="button" disabled>Save</button>
+            <button id="saveFile" class="primary" type="button" disabled>Sync now</button>
           </div>
         </div>
         <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No paper selected</strong><p>Create a personal paper or open an assigned team paper.</p></div></div>
@@ -59,6 +59,6 @@
     </main>
   </div>
   <div id="writerNotice" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/writer.js?v=s2"></script>
+  <script type="module" src="/static/writer.js?v=s3"></script>
 </body>
 </html>

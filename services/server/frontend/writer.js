@@ -3,6 +3,15 @@ import { EditorState } from '@codemirror/state';
 import { EditorView, keymap } from '@codemirror/view';
 import { StreamLanguage } from '@codemirror/language';
 import { stex } from '@codemirror/legacy-modes/mode/stex';
+import * as Y from 'yjs';
+import { yCollab } from 'y-codemirror.next';
+import { IndexeddbPersistence } from 'y-indexeddb';
+
+const SOURCE_UPDATE = 0x01;
+const FLUSH = 0x02;
+const INITIAL_STATE = 0x10;
+const REMOTE_SOURCE_UPDATE = 0x11;
+const REMOTE_ORIGIN = Symbol('server-remote');
 
 class PaperApi {
   async request(path, options = {}) {
@@ -16,13 +25,13 @@ class PaperApi {
     return response.status === 204 ? null : response.json();
   }
 
+  me() { return this.request('/api/v2/me'); }
   papers() { return this.request('/api/v2/writer/papers'); }
   createPaper(name) { return this.json('/api/v2/writer/personal-papers', 'POST', { name }); }
   paper(id) { return this.request(`/api/v2/papers/${id}`); }
   files(id) { return this.request(`/api/v2/papers/${id}/files`); }
   file(paperId, fileId) { return this.request(`/api/v2/papers/${paperId}/files/${fileId}`); }
   createFile(paperId, body) { return this.json(`/api/v2/papers/${paperId}/files`, 'POST', body); }
-  saveFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}`, 'PUT', body); }
   renameFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}/path`, 'PATCH', body); }
   deleteFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}`, 'DELETE', body); }
   setMain(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/main/${fileId}`, 'POST', body); }
@@ -44,6 +53,7 @@ const ui = Object.fromEntries([
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
+  identity: null,
   papers: [],
   paper: null,
   paperDetail: null,
@@ -51,7 +61,7 @@ const model = {
   file: null,
   version: 0,
   view: null,
-  dirty: false,
+  collaboration: null,
   conflict: false,
 };
 
@@ -62,8 +72,12 @@ function notice(message, failed = false) {
 
 function saveState(state) {
   const labels = {
-    saved: 'Saved', saving: 'Saving…', unsaved: 'Unsaved',
-    conflict: 'Conflict — reload/resolve required', error: 'Error',
+    local: 'Local',
+    syncing: 'Syncing…',
+    synced: 'Synced',
+    offline: 'Offline — stored locally',
+    reconnecting: 'Reconnecting…',
+    conflict: 'Conflict/Error',
   };
   ui.saveStatus.textContent = labels[state];
   ui.saveStatus.dataset.state = state;
@@ -147,13 +161,195 @@ function renderTree(node) {
   return list;
 }
 
+class CollaborationSession {
+  constructor(paper, file, requestedEditable, latex) {
+    this.paper = paper;
+    this.file = file;
+    this.requestedEditable = requestedEditable;
+    this.latex = latex;
+    this.socket = null;
+    this.doc = null;
+    this.text = null;
+    this.persistence = null;
+    this.destroyed = false;
+    this.connected = false;
+    this.access = 'read_only';
+    this.clientSequence = 0;
+    this.pending = new Set();
+    this.flushWaiters = [];
+    this.reconnectTimer = null;
+    this.backoff = 250;
+    this.metadata = null;
+    this.initialState = null;
+    this.initializing = false;
+    this.bufferedRemote = [];
+  }
+
+  start() {
+    saveState('local');
+    this.connect();
+  }
+
+  connect() {
+    if (this.destroyed) return;
+    saveState(this.doc ? 'reconnecting' : 'local');
+    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const path = `/api/v2/collab/${this.paper.id}/files/${this.file.file_id}`;
+    const socket = new WebSocket(`${scheme}//${window.location.host}${path}`);
+    socket.binaryType = 'arraybuffer';
+    this.socket = socket;
+    this.metadata = null;
+    this.initialState = null;
+    socket.addEventListener('open', () => {
+      this.connected = true;
+      this.backoff = 250;
+      saveState('syncing');
+    });
+    socket.addEventListener('message', (event) => this.receive(event));
+    socket.addEventListener('close', () => {
+      if (socket !== this.socket) return;
+      this.connected = false;
+      this.pending.clear();
+      this.rejectFlushes(new Error('connection closed before durable flush'));
+      if (!this.destroyed) {
+        saveState('reconnecting');
+        this.reconnectTimer = window.setTimeout(() => this.connect(), this.backoff);
+        this.backoff = Math.min(this.backoff * 2, 5000);
+      }
+    });
+    socket.addEventListener('error', () => {
+      if (!this.connected && this.doc) saveState('offline');
+    });
+  }
+
+  receive(event) {
+    if (typeof event.data === 'string') {
+      const control = JSON.parse(event.data);
+      if (control.type === 'JOIN_ACCEPTED') {
+        this.metadata = control;
+        this.access = control.access;
+        this.initializeOrMerge();
+      } else if (control.type === 'DURABLE_ACK') {
+        this.pending.delete(control.client_seq);
+        if (this.pending.size === 0) saveState('synced');
+      } else if (control.type === 'FLUSHED') {
+        this.resolveFlushes(control.durable_seq);
+        if (this.pending.size === 0) saveState('synced');
+      } else if (control.type === 'REMOTE_DURABLE') {
+        if (this.pending.size === 0) saveState('synced');
+      } else if (control.type === 'RELOAD_REQUIRED') {
+        model.conflict = true;
+        saveState('conflict');
+        notice('The collaborative file was deleted. Reload the paper.', true);
+        this.destroy();
+      } else if (control.type === 'ERROR') {
+        model.conflict = true;
+        saveState('conflict');
+        notice(control.message || 'Collaboration failed.', true);
+      }
+      return;
+    }
+    const bytes = new Uint8Array(event.data);
+    if (!bytes.length) return;
+    if (bytes[0] === INITIAL_STATE) {
+      this.initialState = bytes.slice(1);
+      this.initializeOrMerge();
+    } else if (bytes[0] === REMOTE_SOURCE_UPDATE) {
+      saveState('syncing');
+      if (this.doc) Y.applyUpdate(this.doc, bytes.slice(1), REMOTE_ORIGIN);
+      else this.bufferedRemote.push(bytes.slice(1));
+    }
+  }
+
+  async initializeOrMerge() {
+    if (!this.metadata || !this.initialState || this.initializing) return;
+    this.initializing = true;
+    try {
+      if (!this.doc) {
+        this.doc = new Y.Doc();
+        this.text = this.doc.getText('source');
+        const key = `latex-core:${model.identity.user_id}:${this.paper.workspace_id}:${this.file.file_id}:${this.metadata.document_epoch}`;
+        this.persistence = new IndexeddbPersistence(key, this.doc);
+        await new Promise((resolve) => this.persistence.once('synced', resolve));
+        Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
+        this.bufferedRemote.forEach((update) => Y.applyUpdate(this.doc, update, REMOTE_ORIGIN));
+        this.bufferedRemote = [];
+        this.doc.on('update', (update, origin) => {
+          if (origin === REMOTE_ORIGIN) return;
+          if (this.connected && this.access === 'read_write') this.sendUpdate(update);
+          else saveState('offline');
+        });
+        mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
+      } else {
+        Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
+      }
+      if (this.access === 'read_write') this.sendUpdate(Y.encodeStateAsUpdate(this.doc));
+      else saveState('synced');
+    } finally {
+      this.initializing = false;
+    }
+  }
+
+  sendUpdate(update) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      saveState('offline');
+      return;
+    }
+    this.clientSequence += 1;
+    const sequence = this.clientSequence;
+    const frame = new Uint8Array(9 + update.length);
+    frame[0] = SOURCE_UPDATE;
+    new DataView(frame.buffer).setBigUint64(1, BigInt(sequence));
+    frame.set(update, 9);
+    this.pending.add(sequence);
+    saveState('syncing');
+    this.socket.send(frame);
+  }
+
+  flush() {
+    if (this.access !== 'read_write') return Promise.resolve(0);
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      saveState('offline');
+      return Promise.reject(new Error('Offline edits are safely stored locally; reconnect before this structural operation.'));
+    }
+    saveState('syncing');
+    this.socket.send(Uint8Array.of(FLUSH));
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => reject(new Error('Durable flush timed out.')), 10000);
+      this.flushWaiters.push({
+        resolve: (value) => { window.clearTimeout(timeout); resolve(value); },
+        reject: (error) => { window.clearTimeout(timeout); reject(error); },
+      });
+    });
+  }
+
+  resolveFlushes(sequence) {
+    this.flushWaiters.splice(0).forEach(({ resolve }) => resolve(sequence));
+  }
+
+  rejectFlushes(error) {
+    this.flushWaiters.splice(0).forEach(({ reject }) => reject(error));
+  }
+
+  destroy() {
+    this.destroyed = true;
+    window.clearTimeout(this.reconnectTimer);
+    this.rejectFlushes(new Error('collaboration session closed'));
+    if (this.socket) this.socket.close();
+    if (this.persistence) this.persistence.destroy();
+    if (this.doc) this.doc.destroy();
+    this.socket = null;
+    this.doc = null;
+  }
+}
+
 async function refreshPapers() {
   model.papers = await api.papers();
   renderPapers();
 }
 
 async function openPaper(paper) {
-  if (!canLeaveEditor()) return;
+  closeEditor();
   model.paper = paper;
   model.file = null;
   model.paperDetail = await api.paper(paper.id);
@@ -168,23 +364,28 @@ async function openPaper(paper) {
 }
 
 async function openFile(file, force = false) {
-  if (!force && !canLeaveEditor()) return;
+  if (!force) closeEditor();
   try {
     const payload = await api.file(model.paper.id, file.file_id);
     model.file = payload.file;
     model.version = payload.version;
-    model.dirty = false;
     model.conflict = false;
     ui.currentFile.textContent = payload.file.path;
     ui.mainBadge.hidden = !payload.main;
-    mountEditor(payload.content, payload.editable, payload.file.path.endsWith('.tex'));
+    ui.editorMount.innerHTML = '<div class="foundation-empty"><strong>Local</strong><p>Opening collaborative document…</p></div>';
+    model.collaboration = new CollaborationSession(
+      model.paperDetail.paper,
+      payload.file,
+      payload.editable,
+      payload.file.path.endsWith('.tex'),
+    );
+    model.collaboration.start();
     updateFileActions(payload.editable);
-    saveState('saved');
     renderFiles();
   } catch (error) {
     if (error.status === 415) {
-      destroyEditor();
-      ui.editorMount.innerHTML = '<div class="foundation-empty"><strong>Binary file</strong><p>This asset is visible in the tree but is not editable in S2.</p></div>';
+      closeEditor();
+      ui.editorMount.innerHTML = '<div class="foundation-empty"><strong>Binary file</strong><p>This asset is visible in the tree but is not editable in S3.</p></div>';
       model.file = file;
       updateFileActions(false);
     }
@@ -192,37 +393,34 @@ async function openFile(file, force = false) {
   }
 }
 
-function mountEditor(content, editable, latex) {
-  destroyEditor();
+function mountEditor(ytext, editable, latex) {
+  destroyEditorView();
   ui.editorMount.replaceChildren();
+  const undoManager = new Y.UndoManager(ytext, { captureTimeout: 500 });
   const extensions = [
     basicSetup,
-    keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => { saveCurrent(); return true; } }]),
+    keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => { syncCurrent(); return true; } }]),
     EditorState.readOnly.of(!editable),
     EditorView.editable.of(editable),
-    EditorView.updateListener.of((update) => {
-      if (update.docChanged) {
-        model.dirty = true;
-        model.conflict = false;
-        saveState('unsaved');
-      }
-    }),
+    yCollab(ytext, null, { undoManager }),
     EditorView.theme({ '&': { height: '100%' }, '.cm-scroller': { overflow: 'auto' } }),
   ];
   if (latex) extensions.push(StreamLanguage.define(stex));
   model.view = new EditorView({
-    state: EditorState.create({ doc: content, extensions }),
+    state: EditorState.create({ doc: ytext.toString(), extensions }),
     parent: ui.editorMount,
   });
 }
 
-function destroyEditor() {
+function destroyEditorView() {
   if (model.view) model.view.destroy();
   model.view = null;
 }
 
-function canLeaveEditor() {
-  return !model.dirty || window.confirm('Discard unsaved changes?');
+function closeEditor() {
+  destroyEditorView();
+  if (model.collaboration) model.collaboration.destroy();
+  model.collaboration = null;
 }
 
 function updateFileActions(editable) {
@@ -233,34 +431,33 @@ function updateFileActions(editable) {
   ui.saveFile.disabled = !selected || !editable;
 }
 
-async function saveCurrent() {
-  if (!model.view || !model.file || model.conflict || !model.paperDetail?.editable) return false;
-  saveState('saving');
+async function syncCurrent(showNotice = true) {
+  if (!model.collaboration || model.conflict) return false;
   try {
-    const result = await api.saveFile(model.paper.id, model.file.file_id, {
-      content: model.view.state.doc.toString(),
-      version: model.version,
-    });
-    model.file = result.file;
-    model.version = result.version;
-    model.dirty = false;
-    saveState('saved');
-    notice(`Saved ${model.file.path}`);
+    await model.collaboration.flush();
+    if (showNotice) notice(`Synced ${model.file.path}`);
     return true;
   } catch (error) {
-    if (error.status === 409) {
-      model.conflict = true;
-      saveState('conflict');
-      notice('A newer workspace version exists. Your local text is preserved; reopen the file to reload or copy it before resolving.', true);
-    } else {
-      saveState('error');
-      notice(error.message, true);
-    }
+    saveState('offline');
+    notice(error.message, true);
+    return false;
+  }
+}
+
+async function requireDurableFlush() {
+  if (!await syncCurrent(false)) return false;
+  try {
+    model.paperDetail = await api.paper(model.paper.id);
+    model.version = model.paperDetail.version;
+    return true;
+  } catch (error) {
+    notice(error.message, true);
     return false;
   }
 }
 
 async function reloadPaperAndFile(fileId) {
+  closeEditor();
   model.paperDetail = await api.paper(model.paper.id);
   model.version = model.paperDetail.version;
   model.files = await api.files(model.paper.id);
@@ -290,7 +487,7 @@ ui.newFile.addEventListener('click', async () => {
 });
 
 ui.renameFile.addEventListener('click', async () => {
-  if (!canLeaveEditor()) return;
+  if (!await requireDurableFlush()) return;
   const path = window.prompt('New file path', model.file.path);
   if (!path || path === model.file.path) return;
   try {
@@ -301,20 +498,20 @@ ui.renameFile.addEventListener('click', async () => {
 });
 
 ui.deleteFile.addEventListener('click', async () => {
-  if (!window.confirm(`Delete ${model.file.path}?`)) return;
+  if (!window.confirm(`Delete ${model.file.path}?`) || !await requireDurableFlush()) return;
   try {
     const deletedId = model.file.file_id;
     const result = await api.deleteFile(model.paper.id, deletedId, { version: model.version });
     model.version = result.version;
     model.file = null;
-    model.dirty = false;
     model.conflict = false;
-    destroyEditor();
+    closeEditor();
     await openPaper(model.paper);
   } catch (error) { notice(error.message, true); }
 });
 
 ui.setMain.addEventListener('click', async () => {
+  if (!await requireDurableFlush()) return;
   try {
     const result = await api.setMain(model.paper.id, model.file.file_id, { version: model.version });
     model.version = result.version;
@@ -322,6 +519,11 @@ ui.setMain.addEventListener('click', async () => {
   } catch (error) { notice(error.message, true); }
 });
 
-ui.saveFile.addEventListener('click', saveCurrent);
+ui.saveFile.addEventListener('click', syncCurrent);
 
-refreshPapers().catch((error) => notice(error.message, true));
+api.me()
+  .then((identity) => {
+    model.identity = identity;
+    return refreshPapers();
+  })
+  .catch((error) => notice(error.message, true));

@@ -2,14 +2,18 @@
   "name": "latex-core-writer",
   "private": true,
   "scripts": {
-    "build": "esbuild services/server/frontend/writer.js --bundle --format=esm --minify --outfile=services/server/static/writer.js"
+    "build": "esbuild services/server/frontend/writer.js --bundle --format=esm --minify --outfile=services/server/static/writer.js",
+    "test": "node --test services/server/frontend/*.test.mjs"
   },
   "dependencies": {
     "@codemirror/language": "6.12.4",
     "@codemirror/legacy-modes": "6.5.3",
     "@codemirror/state": "6.7.1",
     "@codemirror/view": "6.43.9",
-    "codemirror": "6.0.2"
+    "codemirror": "6.0.2",
+    "y-codemirror.next": "0.3.6",
+    "y-indexeddb": "9.0.12",
+    "yjs": "13.6.32"
   },
   "devDependencies": {
     "esbuild": "0.28.2"

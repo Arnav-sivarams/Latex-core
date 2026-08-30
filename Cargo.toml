@@ -51,13 +51,16 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 argon2 = "0.5"
-axum = { version = "0.8", features = ["json", "macros"] }
+axum = { version = "0.8", features = ["json", "macros", "ws"] }
+futures-util = "0.3"
 rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["limit", "set-header", "trace"] }
 tower = { version = "0.5", features = ["util"] }
 zip = { version = "7.3.0-pre1", default-features = false, features = ["deflate"] }
+yrs = "0.27.4"
+zstd = "0.13"
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

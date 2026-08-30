@@ -10,10 +10,11 @@
 
 mod archive;
 mod auth;
+mod collaboration;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Form, Path, Query, State},
+    extract::{Form, Path, Query, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -51,6 +52,7 @@ struct AppState {
     workspaces: WorkspaceService,
     queue: PostgresCompileQueue,
     blobs: Arc<FsBlobStore>,
+    collaboration: collaboration::CollaborationHub,
     environment: TexEnvironmentId,
     cookie_secure: bool,
     allow_registration: bool,
@@ -394,15 +396,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blobs =
         Arc::new(FsBlobStore::open(storage, FsBlobStoreConfig::development_default()).await?);
     let queue = PostgresCompileQueue::new(database.clone(), queue_limits()?);
+    let v2 = V2Repository::new(database.clone());
+    let workspaces = WorkspaceService::new(
+        persistence::PostgresWorkspaceRepository::new(database.clone()),
+        blobs.clone(),
+    );
+    let collaboration =
+        collaboration::CollaborationHub::new(v2.clone(), workspaces.clone(), blobs.clone());
     let state = AppState {
         repo: AppRepository::new(database.clone()),
-        v2: V2Repository::new(database.clone()),
-        workspaces: WorkspaceService::new(
-            persistence::PostgresWorkspaceRepository::new(database),
-            blobs.clone(),
-        ),
+        v2,
+        workspaces,
         queue,
         blobs,
+        collaboration,
         environment,
         cookie_secure: bool_env("SESSION_COOKIE_SECURE", false),
         allow_registration: bool_env("ALLOW_REGISTRATION", false),
@@ -477,6 +484,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v2/papers/{paper_id}/files/{file_id}",
             get(v2_file).put(v2_save_file).delete(v2_delete_file),
+        )
+        .route(
+            "/api/v2/collab/{paper_id}/files/{file_id}",
+            get(v2_collaboration_socket),
         )
         .route(
             "/api/v2/papers/{paper_id}/files/{file_id}/path",
@@ -1122,6 +1133,40 @@ async fn v2_file(
     .into_response()
 }
 
+async fn v2_collaboration_socket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !collaboration::websocket_principal_is_supported(&principal) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "paper collaboration participant required",
+        );
+    }
+    let token = match collaboration::session_token(&headers) {
+        Some(value) => value,
+        None => return error(StatusCode::UNAUTHORIZED, "authentication required"),
+    };
+    let access = match state
+        .v2
+        .collaboration_access(principal.user_id(), paper_id, file_id)
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let user_id = principal.user_id();
+    websocket.on_upgrade(move |socket| {
+        collaboration::serve_socket(state, socket, token, user_id, paper_id, access)
+    })
+}
+
 async fn v2_create_file(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1251,15 +1296,22 @@ async fn v2_delete_file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
-        return response;
-    }
+    let (paper, _) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match state
         .v2
         .delete_file_with_event(file_id, principal.user_id(), input.version)
         .await
     {
-        Ok(version) => Json(serde_json::json!({"version":version})).into_response(),
+        Ok(version) => {
+            state
+                .collaboration
+                .file_deleted(paper.workspace_id, file_id)
+                .await;
+            Json(serde_json::json!({"version":version})).into_response()
+        }
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -4377,6 +4429,7 @@ mod tests {
 #[cfg(all(test, feature = "database-tests"))]
 #[allow(
     clippy::expect_used,
+    clippy::similar_names,
     clippy::too_many_lines,
     clippy::unwrap_used,
     reason = "disposable PostgreSQL authorization fixtures"
@@ -4403,7 +4456,7 @@ mod database_tests {
     #[tokio::test]
     async fn v2_and_legacy_authorization_route_login_api_and_mutation_matrix() {
         let _guard = SERVER_TEST_LOCK.lock().await;
-        let (database, pool, app, _storage) = test_application().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
 
         let writer = fixture(&app, &database, "admin", Some(GlobalRole::Writer)).await;
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
@@ -4593,7 +4646,7 @@ mod database_tests {
     #[tokio::test]
     async fn s2_admin_team_writer_and_file_vertical_slice() {
         let _guard = SERVER_TEST_LOCK.lock().await;
-        let (database, pool, app, _storage) = test_application().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
         let legacy_admin = fixture(&app, &database, "admin", None).await;
         let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
         let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
@@ -4910,7 +4963,335 @@ mod database_tests {
         )
     }
 
-    async fn test_application() -> (Database, PgPool, Router, TempDir) {
+    #[tokio::test]
+    async fn realtime_collaboration_converges_persists_recovers_and_enforces_access() {
+        use futures_util::SinkExt;
+        use persistence::CollaborationAccessMode;
+        use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update, updates::decoder::Decode};
+
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let writer_a = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let writer_b = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer_a_id = test_user_id(&pool, &writer_a.email).await;
+        let writer_b_id = test_user_id(&pool, &writer_b.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let outsider_id = test_user_id(&pool, &outsider.email).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+
+        let created = request(
+            &app,
+            Method::POST,
+            "/api/admin/v2/paper-teams",
+            Some(&admin.cookie),
+            &serde_json::json!({
+                "name":"S3 realtime",
+                "writer_ids":[writer_a_id,writer_b_id],
+                "mentor_ids":[mentor_id]
+            })
+            .to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = test_json(created).await;
+        let paper_id = uuid::Uuid::parse_str(created["team"]["id"].as_str().unwrap()).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap(),
+        );
+        let file_id =
+            uuid::Uuid::parse_str(created["main_file"]["file_id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            state
+                .v2
+                .collaboration_access(writer_a_id, paper_id, file_id)
+                .await
+                .unwrap()
+                .mode,
+            CollaborationAccessMode::ReadWrite
+        );
+        assert_eq!(
+            state
+                .v2
+                .collaboration_access(writer_b_id, paper_id, file_id)
+                .await
+                .unwrap()
+                .mode,
+            CollaborationAccessMode::ReadWrite
+        );
+        assert_eq!(
+            state
+                .v2
+                .collaboration_access(mentor_id, paper_id, file_id)
+                .await
+                .unwrap()
+                .mode,
+            CollaborationAccessMode::ReadOnly
+        );
+        assert!(
+            state
+                .v2
+                .collaboration_access(outsider_id, paper_id, file_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .v2
+                .collaboration_access(admin_id, paper_id, file_id)
+                .await
+                .is_err()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let route = format!("ws://{address}/api/v2/collab/{paper_id}/files/{file_id}");
+        let (mut socket_a, initial_a, access_a) = ws_test_join(&route, &writer_a.cookie).await;
+        let (mut socket_b, initial_b, access_b) = ws_test_join(&route, &writer_b.cookie).await;
+        let (mut socket_m, initial_m, access_m) = ws_test_join(&route, &mentor.cookie).await;
+        assert_eq!(access_a, "read_write");
+        assert_eq!(access_b, "read_write");
+        assert_eq!(access_m, "read_only");
+
+        let doc_a = Doc::new();
+        let text_a = doc_a.get_or_insert_text("source");
+        doc_a
+            .transact_mut()
+            .apply_update(Update::decode_v1(&initial_a).unwrap())
+            .unwrap();
+        let doc_b = Doc::new();
+        let text_b = doc_b.get_or_insert_text("source");
+        doc_b
+            .transact_mut()
+            .apply_update(Update::decode_v1(&initial_b).unwrap())
+            .unwrap();
+        let doc_m = Doc::new();
+        let text_m = doc_m.get_or_insert_text("source");
+        doc_m
+            .transact_mut()
+            .apply_update(Update::decode_v1(&initial_m).unwrap())
+            .unwrap();
+
+        let before_a = doc_a.transact().state_vector();
+        let end_a = text_a.len(&doc_a.transact());
+        text_a.insert(&mut doc_a.transact_mut(), end_a, " Writer-A");
+        let update_a = doc_a.transact().encode_diff_v1(&before_a);
+        socket_a.send(ws_source_update(1, &update_a)).await.unwrap();
+        let remote_for_b = ws_remote_update(&mut socket_b).await;
+        doc_b
+            .transact_mut()
+            .apply_update(Update::decode_v1(&remote_for_b).unwrap())
+            .unwrap();
+        let remote_for_m = ws_remote_update(&mut socket_m).await;
+        doc_m
+            .transact_mut()
+            .apply_update(Update::decode_v1(&remote_for_m).unwrap())
+            .unwrap();
+        ws_durable_ack(&mut socket_a, 1).await;
+
+        let before_b = doc_b.transact().state_vector();
+        let end_b = text_b.len(&doc_b.transact());
+        text_b.insert(&mut doc_b.transact_mut(), end_b, " Writer-B");
+        let update_b = doc_b.transact().encode_diff_v1(&before_b);
+        socket_b.send(ws_source_update(2, &update_b)).await.unwrap();
+        let remote_for_a = ws_remote_update(&mut socket_a).await;
+        doc_a
+            .transact_mut()
+            .apply_update(Update::decode_v1(&remote_for_a).unwrap())
+            .unwrap();
+        let remote_for_m = ws_remote_update(&mut socket_m).await;
+        doc_m
+            .transact_mut()
+            .apply_update(Update::decode_v1(&remote_for_m).unwrap())
+            .unwrap();
+        ws_durable_ack(&mut socket_b, 2).await;
+        assert_eq!(
+            text_a.get_string(&doc_a.transact()),
+            text_b.get_string(&doc_b.transact())
+        );
+        assert_eq!(
+            text_a.get_string(&doc_a.transact()),
+            text_m.get_string(&doc_m.transact())
+        );
+
+        let durable_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.collaboration_updates \
+             WHERE workspace_id=$1 AND file_id=$2",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(file_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(durable_count, 2);
+
+        socket_m.send(ws_source_update(9, &update_b)).await.unwrap();
+        let mentor_error = ws_control(&mut socket_m, "ERROR").await;
+        assert_eq!(mentor_error["code"], "read_only");
+        let after_rejection: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.collaboration_updates \
+             WHERE workspace_id=$1 AND file_id=$2",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(file_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after_rejection, durable_count);
+
+        let recovery = state
+            .v2
+            .collaboration_recovery(workspace_id, file_id, 1)
+            .await
+            .unwrap();
+        let recovered = Doc::new();
+        let recovered_text = recovered.get_or_insert_text("source");
+        if let Some((_, compressed)) = recovery.snapshot {
+            let bytes = zstd::stream::decode_all(std::io::Cursor::new(compressed)).unwrap();
+            recovered
+                .transact_mut()
+                .apply_update(Update::decode_v1(&bytes).unwrap())
+                .unwrap();
+        }
+        for (_, update) in recovery.updates {
+            recovered
+                .transact_mut()
+                .apply_update(Update::decode_v1(&update).unwrap())
+                .unwrap();
+        }
+        let converged = text_a.get_string(&doc_a.transact());
+        assert_eq!(recovered_text.get_string(&recovered.transact()), converged);
+        let canonical = state
+            .workspaces
+            .read_file(workspace_id, &LogicalPath::parse("main.tex").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(canonical.to_vec()).unwrap(), converged);
+
+        let paper = state.v2.writer_paper(writer_a_id, paper_id).await.unwrap();
+        let current = state.workspaces.restore(workspace_id).await.unwrap();
+        let renamed = state
+            .v2
+            .rename_file_with_event(
+                file_id,
+                writer_a_id,
+                current.version().get(),
+                LogicalPath::parse("renamed.tex").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.0.file_id, file_id);
+        assert_eq!(paper.workspace_id, renamed.0.workspace_id);
+        assert_eq!(
+            state
+                .v2
+                .collaboration_access(writer_a_id, paper_id, file_id)
+                .await
+                .unwrap()
+                .file
+                .path
+                .as_str(),
+            "renamed.tex"
+        );
+
+        socket_a.close(None).await.unwrap();
+        socket_b.close(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snapshots: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.collaboration_snapshots \
+             WHERE workspace_id=$1 AND file_id=$2",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(file_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(snapshots >= 1);
+
+        server.abort();
+        pool.close().await;
+        database.close().await;
+    }
+
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn ws_test_join(route: &str, cookie: &str) -> (TestSocket, Vec<u8>, String) {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = route.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let control = match socket.next().await.unwrap().unwrap() {
+            tokio_tungstenite::tungstenite::Message::Text(value) => {
+                serde_json::from_str::<serde_json::Value>(&value).unwrap()
+            }
+            message => panic!("expected join control, got {message:?}"),
+        };
+        let initial = match socket.next().await.unwrap().unwrap() {
+            tokio_tungstenite::tungstenite::Message::Binary(value) => {
+                assert_eq!(value[0], collaboration::INITIAL_STATE);
+                value[1..].to_vec()
+            }
+            message => panic!("expected initial state, got {message:?}"),
+        };
+        (
+            socket,
+            initial,
+            control["access"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    fn ws_source_update(sequence: u64, update: &[u8]) -> tokio_tungstenite::tungstenite::Message {
+        let mut frame = Vec::with_capacity(update.len() + 9);
+        frame.push(collaboration::SOURCE_UPDATE);
+        frame.extend(sequence.to_be_bytes());
+        frame.extend(update);
+        tokio_tungstenite::tungstenite::Message::Binary(frame.into())
+    }
+
+    async fn ws_remote_update(socket: &mut TestSocket) -> Vec<u8> {
+        use futures_util::StreamExt;
+        loop {
+            if let tokio_tungstenite::tungstenite::Message::Binary(value) =
+                socket.next().await.unwrap().unwrap()
+            {
+                if value[0] == collaboration::REMOTE_SOURCE_UPDATE {
+                    return value[1..].to_vec();
+                }
+            }
+        }
+    }
+
+    async fn ws_control(socket: &mut TestSocket, expected: &str) -> serde_json::Value {
+        use futures_util::StreamExt;
+        loop {
+            if let tokio_tungstenite::tungstenite::Message::Text(value) =
+                socket.next().await.unwrap().unwrap()
+            {
+                let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+                if value["type"] == expected {
+                    return value;
+                }
+            }
+        }
+    }
+
+    async fn ws_durable_ack(socket: &mut TestSocket, client_sequence: u64) {
+        let value = ws_control(socket, "DURABLE_ACK").await;
+        assert_eq!(value["client_seq"], client_sequence);
+        assert!(value["durable_seq"].as_u64().unwrap() > 0);
+    }
+
+    async fn test_application() -> (Database, PgPool, Router, TempDir, AppState) {
         let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
         let database =
             Database::connect(DatabaseConfig::new(&url, 1, 5, Duration::from_secs(5)).unwrap())
@@ -4924,24 +5305,29 @@ mod database_tests {
                 .await
                 .unwrap(),
         );
+        let v2 = V2Repository::new(database.clone());
+        let workspaces = WorkspaceService::new(
+            persistence::PostgresWorkspaceRepository::new(database.clone()),
+            blobs.clone(),
+        );
+        let collaboration =
+            collaboration::CollaborationHub::new(v2.clone(), workspaces.clone(), blobs.clone());
         let state = AppState {
             repo: AppRepository::new(database.clone()),
-            v2: V2Repository::new(database.clone()),
-            workspaces: WorkspaceService::new(
-                persistence::PostgresWorkspaceRepository::new(database.clone()),
-                blobs.clone(),
-            ),
+            v2,
+            workspaces,
             queue: PostgresCompileQueue::new(
                 database.clone(),
                 QueueLimits::new(2, 1, 8, Duration::from_secs(120), 3).unwrap(),
             ),
             blobs,
+            collaboration,
             environment: TexEnvironmentId::parse("development-env").unwrap(),
             cookie_secure: false,
             allow_registration: false,
             session_seconds: 3600,
         };
-        (database, pool, router(state), storage)
+        (database, pool, router(state.clone()), storage, state)
     }
 
     async fn fixture(

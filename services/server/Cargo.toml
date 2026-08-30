@@ -28,6 +28,7 @@ blob-store.workspace = true
 bytes.workspace = true
 compiler.workspace = true
 core-types.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 persistence.workspace = true
 queue.workspace = true
@@ -43,6 +44,8 @@ thiserror.workspace = true
 workspace-model.workspace = true
 uuid.workspace = true
 zip.workspace = true
+yrs.workspace = true
+zstd.workspace = true
 
 [lints]
 workspace = true
@@ -55,3 +58,4 @@ database-tests = ["persistence/database-tests"]
 sqlx.workspace = true
 tempfile.workspace = true
 tower.workspace = true
+tokio-tungstenite = "0.29"
