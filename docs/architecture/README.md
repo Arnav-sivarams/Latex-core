@@ -1,0 +1,22 @@
+# V2 Architecture Index
+
+- [V2 Architecture](V2_ARCHITECTURE.md) is the concise master product and system contract.
+- [V2 Role Model](V2_ROLE_MODEL.md) freezes the global exclusive Writer, Mentor, and Admin capabilities.
+- [V2 Domain Model](V2_DOMAIN_MODEL.md) defines one Paper Team per paper workspace and the conceptual entities and ownership rules.
+- [V2 Client Shells](V2_CLIENT_SHELLS.md) defines role routing and separate Writer, Mentor, and Admin product shells.
+- [V2 WebSocket Protocol](V2_WEBSOCKET_PROTOCOL.md) freezes collaboration message categories, authorization, ordering, and durability semantics without selecting exact bytes.
+- [V2 Review State Machine](V2_REVIEW_STATE_MACHINE.md) defines review aggregates, anchors, feedback transitions, suggestions, and approvals.
+- [V2 Compile State Machine](V2_COMPILE_STATE_MACHINE.md) defines debounce, coalescing, exact-state compilation, undo interaction, and artifact promotion.
+- [V2 Migration Policy](V2_MIGRATION_POLICY.md) records C0 constraints and requires explicit, non-destructive future data decisions.
+- [V2 Component Migration Map](V2_COMPONENT_MIGRATION_MAP.md) classifies current components as kept, evolved, replaced, migrated, or eventually retired.
+- [V2 Nonfunctional Targets](V2_NONFUNCTIONAL_TARGETS.md) establishes measurable latency, reliability, recovery, and isolation targets.
+- [ADR-001: Real-Time Collaboration](adr/ADR-001-REALTIME-COLLABORATION.md) selects CodeMirror 6, Yjs/Yrs, binary WebSockets, and durable update persistence.
+- [ADR-002: Collaboration Performance](adr/ADR-002-COLLABORATION-PERFORMANCE.md) isolates the hot update path and defines batching, priority, and backpressure.
+- [ADR-003: Undo Versus Restore](adr/ADR-003-UNDO-VS-RESTORE.md) distinguishes Writer-scoped inverse operations from whole-paper historical restoration.
+- [ADR-004: Team Restoration](adr/ADR-004-TEAM-RESTORATION.md) defines the Writer-to-Mentor-to-Admin governance state machine and append-preserving apply algorithm.
+- [ADR-005: Versioned Compile](adr/ADR-005-VERSIONED-COMPILE.md) defines exact manifests, coalesced auto-builds, immutable outputs, and stale-artifact handling.
+- [ADR-006: Source/PDF Anchors](adr/ADR-006-SOURCE-PDF-ANCHORS.md) defines PDF.js, SyncTeX, CRDT-relative anchors, reprojection, and mapping limitations.
+- [ADR-007: Mentor Review](adr/ADR-007-MENTOR-REVIEW.md) defines feedback types, severity, categories, lifecycle, suggestions, and approvals.
+- [ADR-008: Templates and Policies](adr/ADR-008-TEMPLATES-AND-POLICIES.md) defines pinned template versions, controlled updates, and exact file-policy semantics.
+- [ADR-009: Version History](adr/ADR-009-VERSION-HISTORY.md) separates CRDT updates, snapshots, human-visible versions, and audit history.
+- [ADR-010: Security Boundaries](adr/ADR-010-SECURITY-BOUNDARIES.md) freezes the server-side authorization and process-isolation invariants.
