@@ -43,6 +43,8 @@ class ReviewApi {
   map(id, body) { return this.json(`/api/v2/reviews/papers/${id}/synctex`, 'POST', body); }
   build(id) { return this.json(`/api/v2/papers/${id}/builds`, 'POST', { trigger_type: 'manual' }); }
   buildStatus(id) { return this.request(`/api/v2/papers/${id}/builds`); }
+  restorations() { return this.request('/api/v2/restoration-requests'); }
+  restorationDecision(id, action, note) { return this.json(`/api/v2/restoration-requests/${id}/${action}`, 'POST', { note: note || null }); }
 }
 
 const api = new ReviewApi();
@@ -53,14 +55,15 @@ const ui = Object.fromEntries([
   'zoomLabel', 'zoomIn', 'pdfState', 'pdfViewport', 'pdfCanvas', 'pdfOverlay',
   'annotationComposer', 'anchorSummary', 'threadType', 'severity', 'category', 'assignedWriter',
   'dueDate', 'threadMessage', 'replacementField', 'replacementText', 'cancelAnnotation',
-  'createAnnotation', 'threadFilters', 'threadList', 'roundList', 'reviewChanges', 'activityList', 'reviewNotice',
+  'createAnnotation', 'threadFilters', 'threadList', 'roundList', 'reviewChanges', 'activityList',
+  'restorationRequests', 'reviewNotice',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
   papers: [], paper: null, detail: null, files: [], file: null, writers: [], rounds: [], threads: [],
   activity: [], filter: 'active', collaboration: null, view: null, pendingAnchor: null,
   pdf: null, pdfBuildId: null, page: 1, scale: 1, viewport: null, renderTask: null, dragStart: null,
-  suppressSelection: false,
+  suppressSelection: false, restorations: [],
 };
 
 function notice(message, failed = false) { ui.reviewNotice.textContent = message; ui.reviewNotice.classList.toggle('danger', failed); }
@@ -87,6 +90,8 @@ class ReadOnlySession {
       if (value.type === 'JOIN_ACCEPTED') { this.metadata = value; this.initialize(); }
       else if (value.type === 'REMOTE_DURABLE') { ui.liveStatus.textContent = 'Live · read only'; refreshPaperDetail(); }
       else if (value.type === 'RELOAD_REQUIRED') notice('The selected file was removed.', true);
+      else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('Paper restoration changed the document version; reloading.', true); openPaper(model.paper); }
+      else if (value.type === 'POLICY_CHANGED') { notice(value.message || 'File policy changed; reload.', true); openPaper(model.paper); }
       else if (value.type === 'ERROR') notice(value.message || 'Read-only collaboration failed.', true);
       return;
     }
@@ -154,7 +159,7 @@ async function openPaper(paper) {
   const [detail, files, writers] = await Promise.all([api.paper(paper.id), api.files(paper.id), api.writers(paper.id)]);
   model.detail = detail; model.files = files.files; model.writers = writers.writers; renderPapers(); renderFiles(); renderWriterOptions();
   const initial = model.files.find((file) => file.path === detail.main_file) || model.files[0]; if (initial) await openFile(initial);
-  await Promise.all([refreshThreads(), refreshRounds(), refreshActivity(), refreshChanges(), refreshBuild()]);
+  await Promise.all([refreshThreads(), refreshRounds(), refreshActivity(), refreshChanges(), refreshBuild(), refreshRestorations()]);
 }
 
 function renderPapers() { refreshPapers().catch((failure) => notice(failure.message, true)); }
@@ -270,6 +275,27 @@ function renderRounds() { ui.roundList.replaceChildren(); const open = model.rou
 async function approveRound(round) { await api.approveRound(model.paper.id, round.id); await Promise.all([refreshRounds(), refreshActivity(), refreshChanges()]); notice(`Round ${round.round_number} approved.`); }
 async function refreshActivity() { const payload = await api.activity(model.paper.id); model.activity = payload.events; ui.activityList.replaceChildren(); if (!model.activity.length) return clearNode(ui.activityList, 'No activity.'); model.activity.slice(0, 30).forEach((event) => { const row = document.createElement('p'); row.textContent = `${new Date(event.occurred_at).toLocaleString()} · ${event.summary}`; ui.activityList.append(row); }); }
 async function refreshChanges() { const payload = await api.changes(model.paper.id); if (!payload.available) { ui.reviewChanges.textContent = 'No current review baseline and exact build.'; return; } const changes = payload.changes; ui.reviewChanges.textContent = [`Added: ${changes.files_added.join(', ') || 'none'}`, `Removed: ${changes.files_removed.join(', ') || 'none'}`, `Changed: ${changes.files_changed.join(', ') || 'none'}`, '', ...Object.values(changes.text_diffs)].join('\n'); }
+
+async function refreshRestorations() {
+  model.restorations = (await api.restorations()).filter((request) => request.paper_id === model.paper.id);
+  ui.restorationRequests.replaceChildren();
+  if (!model.restorations.length) return clearNode(ui.restorationRequests, 'No restoration requests.');
+  model.restorations.forEach((request) => {
+    const row = document.createElement('div'); row.className = 'round-row';
+    const text = document.createElement('span');
+    text.textContent = `Version #${request.target_version_number} · ${request.writer_email} · ${request.state.replaceAll('_', ' ')}${request.reason ? ` · ${request.reason}` : ''}`;
+    row.append(text);
+    if (request.state === 'AWAITING_MENTOR_REVIEW') {
+      row.append(button('Endorse', () => decideRestoration(request, 'endorse')), button('Reject', () => decideRestoration(request, 'reject')));
+    }
+    ui.restorationRequests.append(row);
+  });
+}
+async function decideRestoration(request, action) {
+  const note = window.prompt(`Optional Mentor note for ${action}`, ''); if (note === null) return;
+  try { await api.restorationDecision(request.id, action, note); await refreshRestorations(); notice(`Restoration request ${action === 'endorse' ? 'endorsed for Admin review' : 'rejected'}.`); }
+  catch (failure) { notice(failure.message, true); }
+}
 
 ui.threadType.addEventListener('change', () => { ui.replacementField.hidden = ui.threadType.value !== 'SUGGESTED_REPLACEMENT'; ui.assignedWriter.disabled = !['CHANGE_REQUEST', 'SUGGESTED_REPLACEMENT'].includes(ui.threadType.value); });
 ui.cancelAnnotation.addEventListener('click', hideComposer); ui.createAnnotation.addEventListener('click', () => createAnnotation().catch((failure) => notice(failure.message, true)));

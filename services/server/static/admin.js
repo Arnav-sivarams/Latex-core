@@ -6,11 +6,10 @@ const status = document.querySelector('#adminStatus');
 
 const endpoints = {
   Overview: '/api/admin/overview',
-  'Legacy Users': '/api/admin/users',
-  'Legacy Teams': '/api/admin/teams',
-  'Legacy Research Groups': '/api/admin/research-groups',
-  'Legacy Projects': '/api/admin/projects',
   Templates: '/api/admin/templates',
+  Versions: '/api/admin/v2/versions',
+  'Restoration Requests': '/api/admin/v2/restoration-requests',
+  Reviews: '/api/admin/v2/reviews',
   'Build Queue': '/api/admin/jobs',
   Audit: '/api/admin/audit',
   System: '/api/admin/system',
@@ -219,11 +218,16 @@ function memberSelect(users, role, label) {
   return field;
 }
 
-async function renderPaperTeams(teams, users) {
+async function renderPaperTeams(teams, users, templates) {
   const form = element('form', 'admin-team-form');
   const name = element('label', '', 'Paper Team name');
   name.innerHTML = 'Paper Team name<input name="name" required maxlength="200">';
-  form.append(name, memberSelect(users, 'writer', 'Writers'), memberSelect(users, 'mentor', 'Mentors'));
+  const templateField = element('label', '', 'Initial template');
+  const templateSelect = document.createElement('select'); templateSelect.name = 'template_id';
+  templateSelect.append(new Option('Default main.tex', ''));
+  templates.forEach((template) => templateSelect.append(new Option(`${template.name} · immutable pin`, template.id)));
+  templateField.append(templateSelect);
+  form.append(name, memberSelect(users, 'writer', 'Writers'), memberSelect(users, 'mentor', 'Mentors'), templateField);
   const create = element('button', 'primary', 'Create Paper Team');
   create.type = 'submit';
   form.append(create);
@@ -234,7 +238,7 @@ async function renderPaperTeams(teams, users) {
       await api('/api/admin/v2/paper-teams', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: data.get('name'), writer_ids: data.getAll('writer_ids'), mentor_ids: data.getAll('mentor_ids') }),
+        body: JSON.stringify({ name: data.get('name'), writer_ids: data.getAll('writer_ids'), mentor_ids: data.getAll('mentor_ids'), template_id: data.get('template_id') || null }),
       });
       announce('Paper Team and initialized main.tex workspace created.');
       await showSection('Paper Teams');
@@ -246,9 +250,19 @@ async function renderPaperTeams(teams, users) {
     return;
   }
   const details = await Promise.all(teams.map((team) => api(`/api/admin/v2/paper-teams/${team.id}`)));
-  details.forEach(({ team, members }) => {
+  details.forEach(({ team, members, template_pin: templatePin }) => {
     const card = element('section', 'team-card');
     card.append(element('h2', '', team.name), element('p', 'empty-copy', `${team.status} · workspace ${team.workspace_id}`));
+    card.append(element('p', 'empty-copy', templatePin ? `Pinned template: ${templatePin.template_name} · ${templatePin.source_identity} · ${templatePin.update_status}` : 'Template: default bootstrap (no pin)'));
+    const lifecycle = element('div', 'admin-actions');
+    const transitions = team.status === 'active' ? [['Freeze', 'frozen'], ['Submit', 'submitted'], ['Archive', 'archived']]
+      : team.status === 'frozen' ? [['Activate', 'active'], ['Archive', 'archived']]
+        : team.status === 'submitted' ? [['Archive', 'archived']] : [];
+    transitions.forEach(([label, value]) => lifecycle.append(buttonAction(label, async () => {
+      await api(`/api/admin/v2/paper-teams/${team.id}/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: value }) });
+      announce(`${team.name} is now ${value}.`); await showSection('Paper Teams');
+    })));
+    card.append(lifecycle);
     const list = element('div', 'members-list');
     members.forEach((member) => {
       const row = element('div', 'member-row');
@@ -292,6 +306,46 @@ async function renderPaperTeams(teams, users) {
   });
 }
 
+function buttonAction(label, handler, className = '') {
+  const action = element('button', className, label); action.type = 'button';
+  action.addEventListener('click', () => handler().catch(showError)); return action;
+}
+
+async function renderFilePolicies(teams) {
+  if (!teams.length) return content.append(element('p', 'empty-copy', 'No Paper Teams yet.'));
+  const selector = document.createElement('select'); selector.setAttribute('aria-label', 'Paper Team');
+  teams.forEach((team) => selector.append(new Option(team.name, team.id)));
+  const tableHost = element('div', 'admin-table-wrap'); content.append(selector, tableHost);
+  const load = async () => {
+    const files = await api(`/api/admin/v2/paper-teams/${selector.value}/file-policies`);
+    const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Path / stable file ID</th><th>Policy</th></tr></thead>';
+    const body = document.createElement('tbody');
+    files.forEach((file) => {
+      const row = document.createElement('tr'); const identity = element('td', '', file.path); identity.append(element('small', '', ` ${file.file_id}`));
+      const select = document.createElement('select');
+      ['EDITABLE', 'CONTENT_READ_ONLY', 'STRUCTURE_LOCKED', 'TEMPLATE_MANAGED', 'HIDDEN_SYSTEM'].forEach((policy) => { const option = new Option(policy.replaceAll('_', ' '), policy); option.selected = file.policy === policy; select.append(option); });
+      select.addEventListener('change', async () => { try { await api(`/api/admin/v2/paper-teams/${selector.value}/file-policies/${file.file_id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: select.value }) }); announce(`Policy updated for ${file.path}. Active rooms were revalidated.`); } catch (error) { showError(error); } });
+      const policyCell = document.createElement('td'); policyCell.append(select); row.append(identity, policyCell); body.append(row);
+    }); table.append(body); tableHost.replaceChildren(table);
+  };
+  selector.addEventListener('change', () => load().catch(showError)); await load();
+}
+
+function renderRestorationRequests(requests) {
+  if (!requests.length) return content.append(element('p', 'empty-copy', 'No restoration requests.'));
+  requests.forEach((request) => {
+    const card = element('section', 'team-card');
+    card.append(element('h2', '', request.paper_name), element('p', '', `Version #${request.target_version_number} · ${request.writer_email} · ${request.state.replaceAll('_', ' ')}`), element('p', 'empty-copy', request.reason || 'No reason supplied.'));
+    if (request.state === 'AWAITING_ADMIN_REVIEW') {
+      const actions = element('div', 'admin-actions');
+      actions.append(buttonAction('Apply governed restoration', async () => { if (!confirm('Apply this endorsed restoration? The current exact state will be retained as PRE_RESTORE_SAFETY.')) return; const note = prompt('Optional Admin note', ''); if (note === null) return; await api(`/api/admin/v2/restoration-requests/${request.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note || null }) }); announce('Restoration applied as a new workspace head.'); await showSection('Restoration Requests'); }, 'primary'));
+      actions.append(buttonAction('Reject', async () => { const note = prompt('Optional rejection note', ''); if (note === null) return; await api(`/api/admin/v2/restoration-requests/${request.id}/reject`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note || null }) }); await showSection('Restoration Requests'); }, 'danger'));
+      card.append(actions);
+    }
+    content.append(card);
+  });
+}
+
 async function showSection(section) {
   setActive(section);
   content.replaceChildren(element('h1', '', section.toUpperCase()), element('p', 'empty-copy', 'Loading operational data…'));
@@ -304,15 +358,20 @@ async function showSection(section) {
       return;
     }
     if (section === 'Paper Teams') {
-      const [teams, users] = await Promise.all([api('/api/admin/v2/paper-teams'), api('/api/admin/v2/users')]);
+      const [teams, users, templates] = await Promise.all([api('/api/admin/v2/paper-teams'), api('/api/admin/v2/users'), api('/api/admin/templates')]);
       content.replaceChildren(element('h1', '', 'PAPER TEAMS'));
-      await renderPaperTeams(teams, users);
+      await renderPaperTeams(teams, users, templates);
+      return;
+    }
+    if (section === 'File Policies') {
+      const teams = await api('/api/admin/v2/paper-teams'); content.replaceChildren(element('h1', '', 'FILE POLICIES')); await renderFilePolicies(teams);
       return;
     }
     const data = await api(endpoints[section]);
     content.replaceChildren(element('h1', '', section.toUpperCase()));
-    if (section === 'Legacy Users') renderLegacyUsers(data);
-    else if (section === 'Overview') renderOverview(data);
+    if (section === 'Overview') renderOverview(data);
+    else if (section === 'Restoration Requests') renderRestorationRequests(data);
+    else if (section === 'System') { content.append(element('p', 'empty-copy', 'Host-level operational actions remain CLI-only in this release candidate.')); content.append(renderJson(data)); }
     else if (Array.isArray(data) && data.length === 0) content.append(element('p', 'empty-copy', 'No records available.'));
     else content.append(renderJson(data));
   } catch (error) {

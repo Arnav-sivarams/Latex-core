@@ -1,6 +1,9 @@
 //! S5 Mentor review persistence and authorization boundaries.
 
-use crate::{GlobalRole, PaperKind, PaperStatus, V2Error, V2Repository, WriterPaper};
+use crate::{
+    GlobalRole, PaperKind, PaperStatus, V2Error, V2Repository, WriterPaper,
+    governance::assert_content_policy,
+};
 use core_types::{UserId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -562,6 +565,7 @@ impl V2Repository {
         .ok_or(V2Error::Conflict {
             entity: "resolvable suggestion source anchor",
         })?;
+        assert_content_policy(&mut tx, file_id).await?;
         let writer_edit: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM latex_core.collaboration_updates u \
              JOIN latex_core.review_threads rt ON rt.id=$1 \

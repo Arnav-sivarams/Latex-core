@@ -1,6 +1,11 @@
 //! Additive V2 domain persistence. No V1 call path uses this repository in C3.
 
-use crate::Database;
+use crate::{
+    Database,
+    governance::{
+        assert_content_policy, assert_main_policy, assert_structure_policy, workspace_mutation_lock,
+    },
+};
 use core_types::{BlobHash, LogicalPath, TenantId, UserId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -857,6 +862,12 @@ impl V2Repository {
                 entity: "live paper file",
             });
         }
+        let policy = self.file_policy(file_id).await?;
+        if !policy.visible_to_participants() {
+            return Err(V2Error::NotFound {
+                entity: "live paper file",
+            });
+        }
         let epoch = match sqlx::query_scalar::<_, i64>(
             "SELECT document_epoch FROM latex_core.paper_collaboration_state WHERE workspace_id=$1",
         )
@@ -879,7 +890,10 @@ impl V2Repository {
         let document_epoch = u64::try_from(epoch).map_err(|_| V2Error::Integrity {
             message: "negative collaboration document epoch".to_owned(),
         })?;
-        let mode = if role == GlobalRole::Writer && status == PaperStatus::Active.as_str() {
+        let mode = if role == GlobalRole::Writer
+            && status == PaperStatus::Active.as_str()
+            && policy.content_editable()
+        {
             CollaborationAccessMode::ReadWrite
         } else {
             CollaborationAccessMode::ReadOnly
@@ -957,7 +971,7 @@ impl V2Repository {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn persist_collaboration_batch(
         &self,
         workspace_id: WorkspaceId,
@@ -987,12 +1001,14 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         let current = lock_live_file(&mut tx, file_id).await?;
         if current.workspace_id != workspace_id {
             return Err(V2Error::NotFound {
                 entity: "live paper file",
             });
         }
+        assert_content_policy(&mut tx, file_id).await?;
         let current_epoch: i64 = sqlx::query_scalar(
             "SELECT document_epoch FROM latex_core.paper_collaboration_state \
              WHERE workspace_id=$1 FOR UPDATE",
@@ -1112,6 +1128,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         require_writer_workspace_access(&mut tx, actor, workspace_id, true).await?;
         let row = sqlx::query(
             "INSERT INTO latex_core.paper_files (file_id,workspace_id,path) VALUES ($1,$2,$3) \
@@ -1162,8 +1179,11 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        let workspace_id = file_workspace(&mut tx, file_id).await?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         let current = lock_live_file(&mut tx, file_id).await?;
         require_writer_workspace_access(&mut tx, actor, current.workspace_id, true).await?;
+        assert_content_policy(&mut tx, file_id).await?;
         let version = append_workspace_operation(
             &mut tx,
             current.workspace_id,
@@ -1198,8 +1218,11 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        let workspace_id = file_workspace(&mut tx, file_id).await?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         let current = lock_live_file(&mut tx, file_id).await?;
         require_writer_workspace_access(&mut tx, actor, current.workspace_id, true).await?;
+        assert_structure_policy(&mut tx, file_id).await?;
         let old_path = current.path.clone();
         let version = append_workspace_operation(
             &mut tx,
@@ -1261,8 +1284,11 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        let workspace_id = file_workspace(&mut tx, file_id).await?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         let current = lock_live_file(&mut tx, file_id).await?;
         require_writer_workspace_access(&mut tx, actor, current.workspace_id, true).await?;
+        assert_structure_policy(&mut tx, file_id).await?;
         let version = append_workspace_operation(
             &mut tx,
             current.workspace_id,
@@ -1307,8 +1333,11 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        let workspace_id = file_workspace(&mut tx, file_id).await?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         let current = lock_live_file(&mut tx, file_id).await?;
         require_writer_workspace_access(&mut tx, actor, current.workspace_id, true).await?;
+        assert_main_policy(&mut tx, file_id).await?;
         let version = append_workspace_operation(
             &mut tx,
             current.workspace_id,
@@ -1372,6 +1401,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         require_writer_workspace_access(&mut tx, actor, workspace_id, true).await?;
         let wanted_state = if redo { "UNDONE" } else { "APPLIED" };
         let history_order = if redo {
@@ -1410,6 +1440,13 @@ impl V2Repository {
                 "inverse_payload"
             })
             .map_err(V2Error::Database)?;
+        if let Some(file_id) = file_id {
+            if operation_type == "SET_MAIN" {
+                assert_main_policy(&mut tx, file_id).await?;
+            } else {
+                assert_structure_policy(&mut tx, file_id).await?;
+            }
+        }
         let latest_structural: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM latex_core.reversible_structural_operations \
              WHERE workspace_id=$1 AND state='APPLIED' ORDER BY workspace_version_before DESC,id DESC LIMIT 1 FOR UPDATE",
@@ -2373,7 +2410,7 @@ fn decode_personal_paper(row: PgRow) -> Result<PersonalPaper, V2Error> {
     })
 }
 
-fn decode_paper_team(row: PgRow) -> Result<PaperTeam, V2Error> {
+pub(crate) fn decode_paper_team(row: PgRow) -> Result<PaperTeam, V2Error> {
     let status: String = row.try_get("status").map_err(V2Error::Database)?;
     Ok(PaperTeam {
         id: row.try_get("id").map_err(V2Error::Database)?,
@@ -2403,7 +2440,7 @@ fn decode_paper_team_member(row: PgRow) -> Result<PaperTeamMember, V2Error> {
     })
 }
 
-fn decode_paper_file(row: PgRow) -> Result<PaperFile, V2Error> {
+pub(crate) fn decode_paper_file(row: PgRow) -> Result<PaperFile, V2Error> {
     let path: String = row.try_get("path").map_err(V2Error::Database)?;
     let revision: i64 = row.try_get("revision").map_err(V2Error::Database)?;
     Ok(PaperFile {

@@ -81,6 +81,7 @@ pub struct AppTemplateRecord {
     pub name: String,
     pub description: Option<String>,
     pub main_file: Option<String>,
+    pub policy_default: String,
     pub created_at: String,
 }
 #[derive(Clone, Debug)]
@@ -620,7 +621,7 @@ impl AppRepository {
         tx.commit().await.map_err(AppError::Database)
     }
     pub async fn list_templates(&self) -> Result<Vec<AppTemplateRecord>, AppError> {
-        let rows = sqlx::query("SELECT id,name,description,main_file,created_at::text FROM latex_core.templates ORDER BY name")
+        let rows = sqlx::query("SELECT id,name,description,main_file,policy_default,created_at::text FROM latex_core.templates ORDER BY name")
             .fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_template).collect()
     }
@@ -628,7 +629,7 @@ impl AppRepository {
         &self,
         user: UserId,
     ) -> Result<Vec<AppTemplateRecord>, AppError> {
-        let rows = sqlx::query("SELECT DISTINCT t.id,t.name,t.description,t.main_file,t.created_at::text FROM latex_core.templates t JOIN latex_core.user_credentials c ON c.user_id=$1 LEFT JOIN latex_core.template_account_types a ON a.template_id=t.id AND a.account_type=c.account_type LEFT JOIN latex_core.template_user_grants g ON g.template_id=t.id AND g.user_id=$1 WHERE a.template_id IS NOT NULL OR g.user_id IS NOT NULL ORDER BY t.name")
+        let rows = sqlx::query("SELECT DISTINCT t.id,t.name,t.description,t.main_file,t.policy_default,t.created_at::text FROM latex_core.templates t JOIN latex_core.user_credentials c ON c.user_id=$1 LEFT JOIN latex_core.template_account_types a ON a.template_id=t.id AND a.account_type=c.account_type LEFT JOIN latex_core.template_user_grants g ON g.template_id=t.id AND g.user_id=$1 WHERE a.template_id IS NOT NULL OR g.user_id IS NOT NULL ORDER BY t.name")
             .bind(user.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_template).collect()
     }
@@ -685,7 +686,7 @@ impl AppRepository {
         }
     }
     pub async fn template(&self, id: uuid::Uuid) -> Result<AppTemplateRecord, AppError> {
-        let row = sqlx::query("SELECT id,name,description,main_file,created_at::text FROM latex_core.templates WHERE id=$1")
+        let row = sqlx::query("SELECT id,name,description,main_file,policy_default,created_at::text FROM latex_core.templates WHERE id=$1")
             .bind(id).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
         decode_template(row)
     }
@@ -903,6 +904,7 @@ fn decode_template(r: sqlx::postgres::PgRow) -> Result<AppTemplateRecord, AppErr
         name: r.try_get("name").map_err(AppError::Database)?,
         description: r.try_get("description").map_err(AppError::Database)?,
         main_file: r.try_get("main_file").map_err(AppError::Database)?,
+        policy_default: r.try_get("policy_default").map_err(AppError::Database)?,
         created_at: r.try_get("created_at").map_err(AppError::Database)?,
     })
 }

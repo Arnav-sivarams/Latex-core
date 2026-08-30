@@ -139,6 +139,27 @@ impl CollaborationHub {
         }
     }
 
+    pub async fn policy_changed(&self, workspace_id: WorkspaceId, file_id: Uuid) {
+        let key = RoomKey::new(workspace_id, file_id);
+        if let Some(room) = self.rooms.lock().await.get(&key) {
+            let _ = room.events.send(RoomEvent::PolicyChanged);
+        }
+    }
+
+    pub async fn epoch_changed(&self, workspace_id: WorkspaceId, document_epoch: u64) {
+        let mut rooms = self.rooms.lock().await;
+        let keys = rooms
+            .keys()
+            .filter(|key| key.workspace_id == workspace_id)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(room) = rooms.remove(&key) {
+                let _ = room.events.send(RoomEvent::EpochChanged { document_epoch });
+            }
+        }
+    }
+
     /// Waits until every currently loaded room in a workspace has persisted and
     /// canonically materialized all updates observed before its flush command.
     /// Unloaded files are already represented by the canonical workspace state.
@@ -164,6 +185,8 @@ enum RoomEvent {
     Update { source: Uuid, bytes: Vec<u8> },
     Durable { sequence: u64 },
     ReloadRequired,
+    PolicyChanged,
+    EpochChanged { document_epoch: u64 },
 }
 
 #[derive(Debug)]
@@ -658,6 +681,16 @@ pub async fn serve_socket(
                     }
                     Ok(RoomEvent::ReloadRequired) => {
                         let value = serde_json::json!({"type":"RELOAD_REQUIRED","reason":"file_deleted"});
+                        let _ = sender.send(Message::Text(value.to_string().into())).await;
+                        break;
+                    }
+                    Ok(RoomEvent::PolicyChanged) => {
+                        let value = serde_json::json!({"type":"POLICY_CHANGED","message":"File policy changed; reload before continuing."});
+                        let _ = sender.send(Message::Text(value.to_string().into())).await;
+                        break;
+                    }
+                    Ok(RoomEvent::EpochChanged { document_epoch }) => {
+                        let value = serde_json::json!({"type":"PAPER_EPOCH_CHANGED","document_epoch":document_epoch});
                         let _ = sender.send(Message::Text(value.to_string().into())).await;
                         break;
                     }

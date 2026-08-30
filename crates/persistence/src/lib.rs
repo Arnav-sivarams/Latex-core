@@ -13,6 +13,13 @@ mod compile_queue;
 mod config;
 mod database;
 mod error;
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    reason = "governed restoration keeps its authorization and append-only cutover transaction auditable"
+)]
+mod governance;
 mod permissions;
 #[allow(
     clippy::missing_errors_doc,
@@ -54,6 +61,10 @@ pub use compile_queue::{
 pub use config::DatabaseConfig;
 pub use database::Database;
 pub use error::PersistenceError;
+pub use governance::{
+    ExactRestoreState, RestorationApplied, RestorationRequest, TemplateSeedFile, V2FilePolicy,
+    V2FilePolicyRecord,
+};
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{
     ReviewPaperSummary, ReviewPdfAnchorInput, ReviewSourceAnchorInput, ReviewThreadInput,

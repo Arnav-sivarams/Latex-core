@@ -5,8 +5,9 @@ import test from 'node:test';
 const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/write.html', import.meta.url), 'utf8');
 
-test('Writer exposes exact-state PDF and History with manual compilation only', () => {
-  assert.doesNotMatch(writer, /requestBuild\('auto'\)/);
+test('Writer exposes exact-state PDF and History with idle auto-build and manual compilation', () => {
+  assert.match(writer, /autoBuild\.durableUpdate\(\)/);
+  assert.match(writer, /requestBuild\(triggerType\)/);
   assert.match(writer, /requestBuild\('manual'\)/);
   assert.match(writer, /key: 'Mod-Enter'/);
   assert.match(writer, /key: 'Mod-s'/);

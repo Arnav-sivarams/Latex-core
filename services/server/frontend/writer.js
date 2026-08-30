@@ -8,6 +8,7 @@ import * as Y from 'yjs';
 import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { resolveSuggestionRange } from './review-helpers.mjs';
+import { createIdleBuildScheduler } from './auto-build.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
   buildOutlineTree, buildPlot, buildTable, buildTheorem, commonSnippets,
@@ -51,6 +52,10 @@ class PaperApi {
   versions(paperId) { return this.request(`/api/v2/papers/${paperId}/versions`); }
   checkpoint(paperId, name) { return this.json(`/api/v2/papers/${paperId}/versions`, 'POST', { name }); }
   compare(paperId, from, to) { return this.request(`/api/v2/papers/${paperId}/versions/compare?from=${from}&to=${to}`); }
+  restorationRequests(paperId) { return this.request(`/api/v2/papers/${paperId}/restoration-requests`); }
+  requestRestoration(paperId, targetVersionId, reason) { return this.json(`/api/v2/papers/${paperId}/restoration-requests`, 'POST', { target_version_id: targetVersionId, reason: reason || null }); }
+  submitRestoration(requestId) { return this.json(`/api/v2/restoration-requests/${requestId}/submit`, 'POST', {}); }
+  restorePersonal(paperId, versionId) { return this.json(`/api/v2/papers/${paperId}/versions/${versionId}/restore`, 'POST', {}); }
   build(paperId, triggerType) { return this.json(`/api/v2/papers/${paperId}/builds`, 'POST', { trigger_type: triggerType }); }
   buildStatus(paperId) { return this.request(`/api/v2/papers/${paperId}/builds`); }
   reviews(paperId) { return this.request(`/api/v2/reviews/papers/${paperId}/threads`); }
@@ -79,6 +84,7 @@ const ui = Object.fromEntries([
   'projectSearch', 'caseSensitive', 'searchResults', 'insertMenu', 'symbolPalette', 'showInPdf',
   'structuralUndo', 'structuralRedo', 'problemsCount', 'problemsList', 'productivityDialog',
   'dialogTitle', 'dialogSearch', 'dialogBody', 'dialogPreview', 'dialogActions',
+  'copyRecoveryText',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -94,13 +100,21 @@ const model = {
   conflict: false,
   currentBuildId: null,
   versions: [],
+  restorationRequests: [],
   reviews: [],
   reviewFilter: 'active',
   intelligence: { outline: [], labels: [], bibliography: [], diagnostics: [], environments: [], packages: [] },
   intelligenceTimer: null,
   searchTimer: null,
   compileDiagnostic: null,
+  recoveryText: null,
 };
+
+const autoBuild = createIdleBuildScheduler({
+  requestBuild: (triggerType) => requestBuild(triggerType),
+  setTimer: window.setTimeout.bind(window),
+  clearTimer: window.clearTimeout.bind(window),
+});
 
 function notice(message, failed = false) {
   ui.writerNotice.textContent = message;
@@ -284,6 +298,7 @@ class CollaborationSession {
     this.reconnectTimer = null;
     this.backoff = 250;
     this.metadata = null;
+    this.documentEpoch = null;
     this.initialState = null;
     this.initializing = false;
     this.bufferedRemote = [];
@@ -331,6 +346,11 @@ class CollaborationSession {
     if (typeof event.data === 'string') {
       const control = JSON.parse(event.data);
       if (control.type === 'JOIN_ACCEPTED') {
+        if (this.documentEpoch !== null && this.documentEpoch !== control.document_epoch) {
+          this.preserveOldEpoch(control.document_epoch);
+          return;
+        }
+        this.documentEpoch = control.document_epoch;
         this.metadata = control;
         this.access = control.access;
         this.initializeOrMerge();
@@ -339,6 +359,7 @@ class CollaborationSession {
         if (this.pending.size === 0) {
           saveState('synced');
           scheduleIntelligence();
+          if (model.paperDetail?.editable) autoBuild.durableUpdate();
         }
       } else if (control.type === 'FLUSHED') {
         this.resolveFlushes(control.durable_seq);
@@ -346,10 +367,18 @@ class CollaborationSession {
       } else if (control.type === 'REMOTE_DURABLE') {
         if (this.pending.size === 0) saveState('synced');
         scheduleIntelligence();
+        if (model.paperDetail?.editable) autoBuild.durableUpdate();
       } else if (control.type === 'RELOAD_REQUIRED') {
         model.conflict = true;
         saveState('conflict');
         notice('The collaborative file was deleted. Reload the paper.', true);
+        this.destroy();
+      } else if (control.type === 'PAPER_EPOCH_CHANGED') {
+        this.preserveOldEpoch(control.document_epoch);
+      } else if (control.type === 'POLICY_CHANGED') {
+        model.conflict = true;
+        saveState('conflict');
+        notice(control.message || 'File policy changed; reload the paper.', true);
         this.destroy();
       } else if (control.type === 'ERROR') {
         model.conflict = true;
@@ -368,6 +397,16 @@ class CollaborationSession {
       if (this.doc) Y.applyUpdate(this.doc, bytes.slice(1), REMOTE_ORIGIN);
       else this.bufferedRemote.push(bytes.slice(1));
     }
+  }
+
+  preserveOldEpoch(newEpoch) {
+    model.recoveryText = this.text?.toString() || '';
+    ui.copyRecoveryText.hidden = !model.recoveryText;
+    model.conflict = true;
+    saveState('conflict');
+    notice('Offline changes from the previous paper version were preserved locally and were not merged after restoration.', true);
+    this.destroy();
+    if (model.paper && Number.isInteger(newEpoch)) window.setTimeout(() => openPaper(model.paper), 0);
   }
 
   async initializeOrMerge() {
@@ -459,6 +498,7 @@ async function refreshPapers() {
 }
 
 async function openPaper(paper) {
+  autoBuild.cancel();
   closeEditor();
   model.paper = paper;
   model.file = null;
@@ -654,6 +694,7 @@ async function requestBuild(triggerType) {
 
 async function manualCompile() {
   if (!model.paper || !model.paperDetail?.editable) return;
+  autoBuild.cancel();
   if (!await syncCurrent(false)) return;
   await requestBuild('manual');
 }
@@ -694,7 +735,9 @@ async function refreshBuildStatus() {
 async function refreshHistory() {
   if (!model.paper) return;
   try {
-    model.versions = await api.versions(model.paper.id);
+    [model.versions, model.restorationRequests] = await Promise.all([
+      api.versions(model.paper.id), api.restorationRequests(model.paper.id),
+    ]);
     renderHistory();
   } catch (error) {
     notice(error.message, true);
@@ -721,6 +764,35 @@ function renderHistory() {
     metadata.textContent = `${version.author_email} · ${new Date(version.created_at).toLocaleString()}`;
     detail.append(title, metadata);
     label.append(checkbox, detail);
+    const request = model.restorationRequests.find((item) => item.target_version_id === version.id);
+    if (request) {
+      const status = document.createElement('small');
+      status.textContent = `Restoration: ${request.state.replaceAll('_', ' ')}`;
+      detail.append(status);
+    }
+    if (model.paper.kind === 'team') {
+      const action = button('Request restoration', async () => {
+        const reason = window.prompt('Optional reason for restoring this version', '') ?? null;
+        if (reason === null) return;
+        try {
+          const draft = await api.requestRestoration(model.paper.id, version.id, reason);
+          await api.submitRestoration(draft.id);
+          await refreshHistory();
+          notice('Restoration request submitted for Mentor review.');
+        } catch (error) { notice(error.message, true); }
+      });
+      label.append(action);
+    } else {
+      const action = button('Restore this personal version', async () => {
+        if (!window.confirm('Restore this personal paper as a new current head? The current state will be saved permanently as a safety version.')) return;
+        try {
+          await api.restorePersonal(model.paper.id, version.id);
+          await openPaper(model.paper);
+          notice('Personal paper restored as a new current version.');
+        } catch (error) { notice(error.message, true); }
+      });
+      label.append(action);
+    }
     ui.versionHistory.append(label);
   });
 }
@@ -1212,6 +1284,15 @@ ui.createCheckpoint.addEventListener('click', async () => {
     await refreshHistory();
     notice(`Checkpoint “${name}” created`);
   } catch (error) { notice(error.message, true); }
+});
+ui.copyRecoveryText.addEventListener('click', async () => {
+  if (!model.recoveryText) return;
+  try {
+    await navigator.clipboard.writeText(model.recoveryText);
+    notice('Previous-version recovery text copied.');
+  } catch {
+    window.prompt('Copy previous-version recovery text', model.recoveryText);
+  }
 });
 ui.writerReviewFilters.addEventListener('click', (event) => {
   const filter = event.target.dataset.filter;

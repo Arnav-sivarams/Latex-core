@@ -237,7 +237,7 @@ async fn review_files(
         Ok(value) => value,
         Err(value) => return v2_error(value),
     };
-    match state.v2.list_live_paper_files(paper.workspace_id).await {
+    match state.v2.visible_paper_files(paper.workspace_id).await {
         Ok(files) => Json(json!({"schema_version":1,"files":files})).into_response(),
         Err(value) => v2_error(value),
     }
@@ -261,6 +261,11 @@ async fn review_file(
         Ok(_) => return error(StatusCode::NOT_FOUND, "file not found"),
         Err(value) => return v2_error(value),
     };
+    match state.v2.file_policy(file_id).await {
+        Ok(policy) if policy.visible_to_participants() => {}
+        Ok(_) => return error(StatusCode::NOT_FOUND, "file not found"),
+        Err(value) => return v2_error(value),
+    }
     match state
         .workspaces
         .read_file(paper.workspace_id, &file.path)
@@ -641,7 +646,7 @@ async fn synctex_mapping(
         Ok(value) => value,
         Err(_) => return Json(mapping_fallback("PDF_ONLY", None, None)).into_response(),
     };
-    let files = match state.v2.list_live_paper_files(paper.workspace_id).await {
+    let files = match state.v2.visible_paper_files(paper.workspace_id).await {
         Ok(value) => value,
         Err(value) => return v2_error(value),
     };

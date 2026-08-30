@@ -29,15 +29,16 @@ use core_types::{
 use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLevel};
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, ChangeSetPublishResult, Database,
-    DatabaseConfig, EnqueueCompileJobV1, FilePolicy, GlobalRole, GroupType, PostgresCompileQueue,
-    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord, V2BuildRequest,
-    V2Error, V2Repository,
+    DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState, FilePolicy, GlobalRole, GroupType,
+    PostgresCompileQueue, ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord,
+    TemplateSeedFile, V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    fmt::Write as _,
     net::SocketAddr,
     str::FromStr,
     sync::Arc,
@@ -123,6 +124,7 @@ struct V2RoleInput {
 #[derive(Deserialize)]
 struct V2PaperTeamInput {
     name: String,
+    template_id: Option<uuid::Uuid>,
     #[serde(default)]
     writer_ids: Vec<String>,
     #[serde(default)]
@@ -180,6 +182,19 @@ struct V2BuildInput {
 struct V2CompareQuery {
     from: uuid::Uuid,
     to: uuid::Uuid,
+}
+#[derive(Deserialize)]
+struct RestorationRequestInput {
+    target_version_id: uuid::Uuid,
+    reason: Option<String>,
+}
+#[derive(Deserialize)]
+struct GovernanceDecisionInput {
+    note: Option<String>,
+}
+#[derive(Deserialize)]
+struct V2StatusInput {
+    status: String,
 }
 #[derive(Deserialize)]
 struct TeamMemberInput {
@@ -508,6 +523,32 @@ fn router(state: AppState) -> Router {
             "/api/admin/v2/paper-teams/{id}/members/{user_id}",
             axum::routing::delete(admin_v2_remove_paper_team_member),
         )
+        .route(
+            "/api/admin/v2/paper-teams/{id}/status",
+            axum::routing::patch(admin_v2_paper_team_status),
+        )
+        .route(
+            "/api/admin/v2/paper-teams/{id}/file-policies",
+            get(admin_v2_file_policies),
+        )
+        .route(
+            "/api/admin/v2/paper-teams/{id}/file-policies/{file_id}",
+            axum::routing::patch(admin_v2_set_file_policy),
+        )
+        .route(
+            "/api/admin/v2/restoration-requests",
+            get(admin_v2_restoration_requests),
+        )
+        .route(
+            "/api/admin/v2/restoration-requests/{request_id}/reject",
+            post(admin_v2_reject_restoration),
+        )
+        .route(
+            "/api/admin/v2/restoration-requests/{request_id}/apply",
+            post(admin_v2_apply_restoration),
+        )
+        .route("/api/admin/v2/versions", get(admin_v2_versions))
+        .route("/api/admin/v2/reviews", get(admin_v2_reviews))
         .route("/api/v2/writer/papers", get(v2_writer_papers))
         .route(
             "/api/v2/writer/personal-papers",
@@ -563,6 +604,30 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v2/papers/{paper_id}/versions/{version_id}",
             get(v2_version),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/versions/{version_id}/restore",
+            post(v2_restore_personal_version),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/restoration-requests",
+            get(v2_restoration_requests).post(v2_create_restoration_request),
+        )
+        .route(
+            "/api/v2/restoration-requests/{request_id}/submit",
+            post(v2_submit_restoration_request),
+        )
+        .route(
+            "/api/v2/restoration-requests/{request_id}/endorse",
+            post(v2_mentor_endorse_restoration),
+        )
+        .route(
+            "/api/v2/restoration-requests/{request_id}/reject",
+            post(v2_mentor_reject_restoration),
+        )
+        .route(
+            "/api/v2/restoration-requests",
+            get(v2_assigned_restoration_requests),
         )
         .route(
             "/api/v2/papers/{paper_id}/builds",
@@ -932,20 +997,26 @@ async fn admin_v2_paper_team(
     headers: HeaderMap,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(response) = admin_session(&state, &headers).await {
-        return response;
-    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match (
         state.v2.paper_team(id).await,
         state.v2.list_paper_team_member_views(id).await,
+        state.v2.paper_template_pin(principal.user_id(), id).await,
     ) {
-        (Ok(team), Ok(members)) => {
-            Json(serde_json::json!({"team":team,"members":members})).into_response()
+        (Ok(team), Ok(members), Ok(template_pin)) => {
+            Json(serde_json::json!({"team":team,"members":members,"template_pin":template_pin}))
+                .into_response()
         }
-        (Err(error_value), _) | (_, Err(error_value)) => v2_error(error_value),
+        (Err(error_value), _, _) | (_, Err(error_value), _) | (_, _, Err(error_value)) => {
+            v2_error(error_value)
+        }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn admin_v2_create_paper_team(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -969,6 +1040,71 @@ async fn admin_v2_create_paper_team(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(template_id) = input.template_id {
+        let template = match state.repo.template(template_id).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::NOT_FOUND, "template not found"),
+        };
+        let records = match state.repo.template_files(template_id).await {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) => return error(StatusCode::CONFLICT, "template has no files"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "template lookup failed"),
+        };
+        let main_path = match template
+            .main_file
+            .as_deref()
+            .map(LogicalPath::parse)
+            .transpose()
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => return error(StatusCode::CONFLICT, "template has no main file"),
+            Err(_) => return error(StatusCode::CONFLICT, "template main file is invalid"),
+        };
+        let policy = match template.policy_default.as_str() {
+            "editable" => V2FilePolicy::Editable,
+            "read_only" => V2FilePolicy::ContentReadOnly,
+            "managed" => V2FilePolicy::TemplateManaged,
+            _ => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template policy is invalid",
+                );
+            }
+        };
+        let mut identity_material = format!(
+            "{template_id}:{}:{}",
+            template.main_file.as_deref().unwrap_or(""),
+            template.policy_default
+        );
+        let mut seeds = Vec::with_capacity(records.len());
+        for record in records {
+            let path = match LogicalPath::parse(&record.path) {
+                Ok(value) => value,
+                Err(_) => return error(StatusCode::CONFLICT, "template contains an invalid path"),
+            };
+            let _ = write!(
+                identity_material,
+                "|{}:{}:{}",
+                path.as_str(),
+                record.blob_hash,
+                record.size_bytes
+            );
+            seeds.push(TemplateSeedFile {
+                path,
+                blob_hash: record.blob_hash,
+                size_bytes: record.size_bytes,
+                policy,
+            });
+        }
+        let source_identity = digest(&identity_material);
+        return match state.v2.create_template_paper_team(
+            principal.user_id(), principal.session.tenant_id, WorkspaceId::new(), &input.name,
+            &writer_ids, &mentor_ids, template_id, &source_identity, &main_path, &seeds,
+        ).await {
+            Ok((team, files)) => (StatusCode::CREATED, Json(serde_json::json!({"team":team,"files":files,"template_pin":{"template_id":template_id,"source_identity":source_identity}}))).into_response(),
+            Err(value) => v2_error(value),
+        };
+    }
     let main_path = LogicalPath::parse("main.tex").expect("static main path is valid");
     let stored = match state
         .blobs
@@ -1052,6 +1188,254 @@ async fn admin_v2_remove_paper_team_member(
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_paper_team_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<V2StatusInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Admin)) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "V2 Admin required for Paper Team governance",
+        );
+    }
+    let current = match state.v2.paper_team(id).await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    let wanted = match persistence::PaperStatus::from_str(&input.status) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid Paper Team status"),
+    };
+    let legal = matches!(
+        (current.status, wanted),
+        (
+            persistence::PaperStatus::Active,
+            persistence::PaperStatus::Frozen
+                | persistence::PaperStatus::Submitted
+                | persistence::PaperStatus::Archived
+        ) | (
+            persistence::PaperStatus::Frozen,
+            persistence::PaperStatus::Active | persistence::PaperStatus::Archived
+        ) | (
+            persistence::PaperStatus::Submitted,
+            persistence::PaperStatus::Archived
+        )
+    );
+    if !legal {
+        return error(
+            StatusCode::CONFLICT,
+            "invalid Paper Team lifecycle transition",
+        );
+    }
+    match state.v2.set_paper_team_status(id, wanted).await {
+        Ok(team) => Json(team).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_file_policies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.admin_file_policies(principal.user_id(), id).await {
+        Ok(files) => Json(files).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_set_file_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(input): Json<FilePolicyInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let policy = match V2FilePolicy::parse(&input.policy) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid V2 file policy"),
+    };
+    match state
+        .v2
+        .set_file_policy(principal.user_id(), id, file_id, policy)
+        .await
+    {
+        Ok(record) => {
+            state
+                .collaboration
+                .policy_changed(record.workspace_id, record.file_id)
+                .await;
+            Json(record).into_response()
+        }
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_restoration_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .restoration_requests_for_actor(principal.user_id(), None)
+        .await
+    {
+        Ok(requests) => Json(requests).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_reject_restoration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<uuid::Uuid>,
+    Json(input): Json<GovernanceDecisionInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .admin_reject_restoration(principal.user_id(), request_id, input.note.as_deref())
+        .await
+    {
+        Ok(request) => Json(request).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_apply_restoration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<uuid::Uuid>,
+    Json(input): Json<GovernanceDecisionInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Admin)) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "V2 Admin required for governed restoration",
+        );
+    }
+    let request = match state
+        .v2
+        .restoration_requests_for_actor(principal.user_id(), None)
+        .await
+    {
+        Ok(requests) => match requests
+            .into_iter()
+            .find(|request| request.id == request_id)
+        {
+            Some(value) => value,
+            None => return error(StatusCode::NOT_FOUND, "restoration request not found"),
+        },
+        Err(value) => return v2_error(value),
+    };
+    if request.state != "AWAITING_ADMIN_REVIEW" {
+        return error(
+            StatusCode::CONFLICT,
+            "restoration request is not awaiting Admin review",
+        );
+    }
+    let team = match state.v2.paper_team(request.paper_id).await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    let paper = persistence::WriterPaper {
+        id: team.id,
+        workspace_id: team.workspace_id,
+        name: team.name,
+        kind: persistence::PaperKind::Team,
+        status: team.status,
+        updated_at: team.updated_at,
+    };
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let safety = ExactRestoreState {
+        document_epoch: exact.document_epoch,
+        workspace_version: exact.source_sequence,
+        snapshot_id: exact.snapshot_id,
+        manifest: exact.manifest,
+        state_hash: exact.state_hash,
+    };
+    match state
+        .v2
+        .apply_team_restoration(
+            principal.user_id(),
+            request_id,
+            safety,
+            input.note.as_deref(),
+        )
+        .await
+    {
+        Ok(applied) => {
+            state
+                .collaboration
+                .epoch_changed(request.workspace_id, applied.document_epoch)
+                .await;
+            Json(applied).into_response()
+        }
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_versions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.admin_versions(principal.user_id()).await {
+        Ok(versions) => Json(versions).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_reviews(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.admin_reviews(principal.user_id()).await {
+        Ok(reviews) => Json(reviews).into_response(),
+        Err(value) => v2_error(value),
     }
 }
 
@@ -1172,8 +1556,22 @@ async fn v2_paper_files(
         Ok(value) => value,
         Err(error_value) => return v2_error(error_value),
     };
-    match state.v2.list_live_paper_files(paper.workspace_id).await {
-        Ok(files) => Json(files).into_response(),
+    match state.v2.visible_paper_files(paper.workspace_id).await {
+        Ok(files) => {
+            let mut result = Vec::with_capacity(files.len());
+            for file in files {
+                let policy = match state.v2.file_policy(file.file_id).await {
+                    Ok(value) => value,
+                    Err(error_value) => return v2_error(error_value),
+                };
+                result.push(serde_json::json!({
+                    "file_id":file.file_id,"workspace_id":file.workspace_id,"path":file.path,
+                    "revision":file.revision,"tombstoned":file.tombstoned,"created_at":file.created_at,
+                    "updated_at":file.updated_at,"tombstoned_at":file.tombstoned_at,"policy":policy
+                }));
+            }
+            Json(result).into_response()
+        }
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -1213,12 +1611,17 @@ async fn v2_file(
             );
         }
     };
+    let policy = match state.v2.file_policy(file_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
     Json(serde_json::json!({
         "file":file,
         "content":content,
         "version":workspace.version().get(),
         "main":workspace.main_file() == Some(&file.path),
-        "editable":paper.status == persistence::PaperStatus::Active
+        "editable":paper.status == persistence::PaperStatus::Active && policy.content_editable(),
+        "policy":policy
     }))
     .into_response()
 }
@@ -1579,7 +1982,7 @@ async fn canonical_paper_sources(
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"))?;
     let files = state
         .v2
-        .list_live_paper_files(paper.workspace_id)
+        .visible_paper_files(paper.workspace_id)
         .await
         .map_err(v2_error)?;
     let mut sources = BTreeMap::new();
@@ -1988,6 +2391,18 @@ async fn capture_exact_v2_state(
         .collaboration_cutoffs(paper.workspace_id, document_epoch)
         .await
         .map_err(v2_error)?;
+    let files = state
+        .v2
+        .list_live_paper_files(paper.workspace_id)
+        .await
+        .map_err(v2_error)?;
+    let mut file_identities = Vec::with_capacity(files.len());
+    let mut file_policies = Vec::with_capacity(files.len());
+    for file in files {
+        let policy = state.v2.file_policy(file.file_id).await.map_err(v2_error)?;
+        file_identities.push(serde_json::json!({"file_id":file.file_id,"path":file.path}));
+        file_policies.push(serde_json::json!({"file_id":file.file_id,"policy":policy}));
+    }
     let manifest = serde_json::json!({
         "schema_version": 1,
         "paper_id": paper.id,
@@ -1998,8 +2413,9 @@ async fn capture_exact_v2_state(
         "collaboration_cutoffs": cutoffs.into_iter().map(|(file_id, sequence)| {
             serde_json::json!({"file_id":file_id,"durable_sequence":sequence})
         }).collect::<Vec<_>>(),
+        "file_identities": file_identities,
         "workspace": workspace_manifest,
-        "template_policy_provenance": null,
+        "template_policy_provenance": {"file_policies":file_policies},
     });
     let state_hash = checkpoint.snapshot_id().to_hex();
     Ok(ExactV2State {
@@ -2083,6 +2499,195 @@ async fn v2_version(
     {
         Ok(version) => Json(version).into_response(),
         Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_restoration_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .restoration_requests_for_actor(principal.user_id(), Some(paper_id))
+        .await
+    {
+        Ok(requests) => Json(requests).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_create_restoration_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Json(input): Json<RestorationRequestInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .create_restoration_request(
+            principal.user_id(),
+            paper_id,
+            input.target_version_id,
+            input.reason.as_deref(),
+        )
+        .await
+    {
+        Ok(request) => (StatusCode::CREATED, Json(request)).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_submit_restoration_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .submit_restoration_request(principal.user_id(), request_id)
+        .await
+    {
+        Ok(request) => Json(request).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_assigned_restoration_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Mentor)) {
+        return error(StatusCode::FORBIDDEN, "V2 Mentor required");
+    }
+    match state
+        .v2
+        .restoration_requests_for_actor(principal.user_id(), None)
+        .await
+    {
+        Ok(requests) => Json(requests).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_mentor_endorse_restoration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<uuid::Uuid>,
+    Json(input): Json<GovernanceDecisionInput>,
+) -> Response {
+    v2_mentor_restoration_decision(state, headers, request_id, input, true).await
+}
+
+async fn v2_mentor_reject_restoration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<uuid::Uuid>,
+    Json(input): Json<GovernanceDecisionInput>,
+) -> Response {
+    v2_mentor_restoration_decision(state, headers, request_id, input, false).await
+}
+
+async fn v2_mentor_restoration_decision(
+    state: AppState,
+    headers: HeaderMap,
+    request_id: uuid::Uuid,
+    input: GovernanceDecisionInput,
+    endorse: bool,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Mentor)) {
+        return error(StatusCode::FORBIDDEN, "V2 Mentor required");
+    }
+    match state
+        .v2
+        .mentor_decide_restoration(
+            principal.user_id(),
+            request_id,
+            endorse,
+            input.note.as_deref(),
+        )
+        .await
+    {
+        Ok(request) => Json(request).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_restore_personal_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, version_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    if paper.kind != persistence::PaperKind::Personal {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Team Paper restoration requires Mentor and Admin governance",
+        );
+    }
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let safety = ExactRestoreState {
+        document_epoch: exact.document_epoch,
+        workspace_version: exact.source_sequence,
+        snapshot_id: exact.snapshot_id,
+        manifest: exact.manifest,
+        state_hash: exact.state_hash,
+    };
+    match state
+        .v2
+        .apply_personal_restoration(principal.user_id(), paper_id, version_id, safety)
+        .await
+    {
+        Ok(applied) => {
+            state
+                .collaboration
+                .epoch_changed(paper.workspace_id, applied.document_epoch)
+                .await;
+            Json(applied).into_response()
+        }
+        Err(value) => v2_error(value),
     }
 }
 
@@ -2387,6 +2992,10 @@ async fn authorized_file(
     if file.workspace_id != paper.workspace_id || file.tombstoned {
         return Err(error(StatusCode::NOT_FOUND, "file not found"));
     }
+    let policy = state.v2.file_policy(file_id).await.map_err(v2_error)?;
+    if !policy.visible_to_participants() {
+        return Err(error(StatusCode::NOT_FOUND, "file not found"));
+    }
     Ok((paper, file))
 }
 
@@ -2652,7 +3261,7 @@ async fn admin_templates(State(state): State<AppState>, headers: HeaderMap) -> R
     if let Err(response) = admin_session(&state, &headers).await {
         return response;
     }
-    match state.repo.list_templates().await { Ok(templates) => Json(templates.into_iter().map(|template| serde_json::json!({"id":template.id.to_string(),"name":template.name,"description":template.description,"main_file":template.main_file,"created_at":template.created_at})).collect::<Vec<_>>()).into_response(), Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure") }
+    match state.repo.list_templates().await { Ok(templates) => Json(templates.into_iter().map(|template| serde_json::json!({"id":template.id.to_string(),"name":template.name,"description":template.description,"main_file":template.main_file,"policy_default":template.policy_default,"created_at":template.created_at,"update_status":"Template update unavailable in this RC"})).collect::<Vec<_>>()).into_response(), Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure") }
 }
 async fn admin_system(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = admin_session(&state, &headers).await {
@@ -5441,7 +6050,22 @@ mod tests {
         assert!(!admin.contains("/review"));
         assert!(!admin.contains("<textarea"));
         assert!(!admin.contains(">Workspace<"));
-        assert!(admin.contains("LEGACY RESEARCH GROUPS"));
+        for required in [
+            "OVERVIEW",
+            "V2 USERS",
+            "PAPER TEAMS",
+            "TEMPLATES",
+            "FILE POLICIES",
+            "VERSIONS",
+            "RESTORATION REQUESTS",
+            "REVIEWS",
+            "BUILD QUEUE",
+            "AUDIT",
+            "SYSTEM",
+        ] {
+            assert!(admin.contains(required), "missing Admin section {required}");
+        }
+        assert!(!admin.contains("LEGACY RESEARCH GROUPS"));
     }
 }
 
@@ -5657,10 +6281,20 @@ mod database_tests {
         }
 
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM latex_core.global_user_roles")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM latex_core.global_user_roles r \
+                 JOIN latex_core.user_credentials c ON c.user_id=r.user_id \
+                 WHERE c.email IN ($1,$2,$3,$4,$5,$6)",
+            )
+            .bind(&writer.email)
+            .bind(&mentor.email)
+            .bind(&admin.email)
+            .bind(&legacy_student.email)
+            .bind(&legacy_professor.email)
+            .bind(&legacy_admin.email)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             3
         );
         let users = test_json(get(&app, "/api/admin/v2/users", Some(&admin.cookie)).await).await;
@@ -7076,17 +7710,27 @@ mod database_tests {
                 .status(),
                 StatusCode::FORBIDDEN
             );
-            assert_eq!(
-                get(
-                    &app,
-                    &format!("/api/v2/papers/{paper_id}/artifacts/pdf"),
-                    Some(&denied.cookie),
-                )
-                .await
-                .status(),
-                StatusCode::FORBIDDEN
-            );
         }
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/artifacts/pdf"),
+                Some(&mentor.cookie),
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/artifacts/pdf"),
+                Some(&admin.cookie),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
 
         pool.close().await;
         database.close().await;
@@ -7525,6 +8169,1021 @@ mod database_tests {
             StatusCode::CONFLICT
         );
 
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn s7_governed_team_and_personal_restoration_is_append_only_and_epoch_safe() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let wrong_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+
+        let created = test_json(request(
+            &app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie),
+            &serde_json::json!({"name":"S7 governed restore","writer_ids":[writer_id],"mentor_ids":[mentor_id]}).to_string(), Some("application/json"),
+        ).await).await;
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        let workspace_id =
+            uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap();
+        let file_id = created["main_file"]["file_id"].as_str().unwrap();
+        let root = format!("/api/v2/papers/{paper_id}");
+        let h1 = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/versions"),
+                Some(&writer.cookie),
+                r#"{"name":"H1"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let h1_id = h1["id"].as_str().unwrap();
+        let h1_content = test_json(
+            get(
+                &app,
+                &format!("{root}/files/{file_id}"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &format!("{root}/files/{file_id}"),
+                Some(&writer.cookie),
+                r#"{"content":"H2 durable source","version":1}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let request_path = format!("{root}/restoration-requests");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &request_path,
+                Some(&outsider.cookie),
+                &serde_json::json!({"target_version_id":h1_id}).to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/versions/{h1_id}/restore"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let rejected = test_json(
+            request(
+                &app,
+                Method::POST,
+                &request_path,
+                Some(&writer.cookie),
+                &serde_json::json!({"target_version_id":h1_id,"reason":"Return to H1"}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let rejected_id = rejected["id"].as_str().unwrap();
+        assert_eq!(rejected["state"], "DRAFT");
+        let submitted = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{rejected_id}/submit"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(submitted["state"], "AWAITING_MENTOR_REVIEW");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{rejected_id}/reject"),
+                Some(&wrong_mentor.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mentor_rejected = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{rejected_id}/reject"),
+                Some(&mentor.cookie),
+                r#"{"note":"not yet"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(mentor_rejected["state"], "MENTOR_REJECTED");
+
+        let admin_reject = test_json(
+            request(
+                &app,
+                Method::POST,
+                &request_path,
+                Some(&writer.cookie),
+                &serde_json::json!({"target_version_id":h1_id}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let admin_reject_id = admin_reject["id"].as_str().unwrap();
+        request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/restoration-requests/{admin_reject_id}/submit"),
+            Some(&writer.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        let endorsed = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{admin_reject_id}/endorse"),
+                Some(&mentor.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(endorsed["state"], "AWAITING_ADMIN_REVIEW");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/restoration-requests/{admin_reject_id}/apply"),
+                Some(&mentor.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/restoration-requests/{admin_reject_id}/apply"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let admin_rejected = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/restoration-requests/{admin_reject_id}/reject"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(admin_rejected["state"], "ADMIN_REJECTED");
+
+        let applied_request = test_json(
+            request(
+                &app,
+                Method::POST,
+                &request_path,
+                Some(&writer.cookie),
+                &serde_json::json!({"target_version_id":h1_id}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let applied_request_id = applied_request["id"].as_str().unwrap();
+        request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/restoration-requests/{applied_request_id}/submit"),
+            Some(&writer.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/restoration-requests/{applied_request_id}/endorse"),
+            Some(&mentor.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let app = app.clone();
+            async move {
+                axum::serve(listener, app).await.unwrap();
+            }
+        });
+        let route = format!("ws://{address}/api/v2/collab/{paper_id}/files/{file_id}");
+        let (mut socket, _, access) = ws_test_join(&route, &writer.cookie).await;
+        assert_eq!(access, "read_write");
+        let before_epoch: i64 = sqlx::query_scalar(
+            "SELECT document_epoch FROM latex_core.paper_collaboration_state WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let applied_response = request(
+            &app,
+            Method::POST,
+            &format!("/api/admin/v2/restoration-requests/{applied_request_id}/apply"),
+            Some(&admin.cookie),
+            r#"{"note":"approved"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(applied_response.status(), StatusCode::OK);
+        let applied = test_json(applied_response).await;
+        assert_eq!(applied["document_epoch"], before_epoch + 1);
+        let epoch_signal = tokio::time::timeout(
+            Duration::from_secs(2),
+            ws_control(&mut socket, "PAPER_EPOCH_CHANGED"),
+        )
+        .await
+        .expect("epoch signal timed out");
+        assert_eq!(epoch_signal["document_epoch"], before_epoch + 1);
+        let current = test_json(
+            get(
+                &app,
+                &format!("{root}/files/{file_id}"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(current["content"], h1_content);
+        assert_eq!(current["version"], 3);
+        let request_state: (String, Option<uuid::Uuid>) = sqlx::query_as(
+            "SELECT state,applied_version_id FROM latex_core.restoration_requests WHERE id=$1",
+        )
+        .bind(uuid::Uuid::parse_str(applied_request_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(request_state.0, "APPLIED");
+        assert!(request_state.1.is_some());
+        let safety: (String, i64) = sqlx::query_as("SELECT version_type,workspace_version FROM latex_core.paper_versions WHERE workspace_id=$1 AND version_type='pre_restore_safety' ORDER BY version_number DESC LIMIT 1")
+            .bind(workspace_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(safety, ("pre_restore_safety".to_owned(), 2));
+        let latest: (String, i64) = sqlx::query_as("SELECT version_type,workspace_version FROM latex_core.paper_versions WHERE workspace_id=$1 ORDER BY version_number DESC LIMIT 1")
+            .bind(workspace_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(latest, ("admin_restoration".to_owned(), 3));
+        let stored = state.blobs.put(Bytes::from_static(b"stale")).await.unwrap();
+        assert!(
+            state
+                .v2
+                .persist_collaboration_batch(
+                    WorkspaceId::from_uuid(workspace_id),
+                    uuid::Uuid::parse_str(file_id).unwrap(),
+                    u64::try_from(before_epoch).unwrap(),
+                    &[persistence::CollaborationUpdateInput {
+                        actor_user_id: writer_id,
+                        update_bytes: vec![1]
+                    }],
+                    stored.hash(),
+                    stored.size_bytes()
+                )
+                .await
+                .is_err()
+        );
+
+        let personal = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                r#"{"name":"Personal restore"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let personal_id = personal["paper"]["id"].as_str().unwrap();
+        let personal_file = personal["main_file"]["file_id"].as_str().unwrap();
+        let personal_h1 = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{personal_id}/versions"),
+                Some(&writer.cookie),
+                r#"{"name":"P1"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            &format!("/api/v2/papers/{personal_id}/files/{personal_file}"),
+            Some(&writer.cookie),
+            r#"{"content":"P2","version":1}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!(
+                    "/api/v2/papers/{personal_id}/versions/{}/restore",
+                    personal_h1["id"].as_str().unwrap()
+                ),
+                Some(&outsider.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!(
+                    "/api/v2/papers/{personal_id}/versions/{}/restore",
+                    personal_h1["id"].as_str().unwrap()
+                ),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        server.abort();
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn s7_file_policies_cover_http_websocket_hidden_and_structural_paths() {
+        use futures_util::SinkExt;
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({"name":"Policies","writer_ids":[writer_id],"mentor_ids":[mentor_id]})
+                    .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        let file_id = created["main_file"]["file_id"].as_str().unwrap();
+        let root = format!("/api/v2/papers/{paper_id}");
+        let file_path = format!("{root}/files/{file_id}");
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&writer.cookie),
+                r#"{"content":"editable","version":1}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let policy_path = format!("/api/admin/v2/paper-teams/{paper_id}/file-policies/{file_id}");
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &policy_path,
+                Some(&writer.cookie),
+                r#"{"policy":"CONTENT_READ_ONLY"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &policy_path,
+                Some(&mentor.cookie),
+                r#"{"policy":"CONTENT_READ_ONLY"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &policy_path,
+                Some(&admin.cookie),
+                r#"{"policy":"CONTENT_READ_ONLY"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&writer.cookie),
+                r#"{"content":"denied","version":2}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("{file_path}/path"),
+                Some(&writer.cookie),
+                r#"{"path":"readonly.tex","version":2}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        request(
+            &app,
+            Method::PATCH,
+            &policy_path,
+            Some(&admin.cookie),
+            r#"{"policy":"STRUCTURE_LOCKED"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&writer.cookie),
+                r#"{"content":"structure locked edit","version":2}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::DELETE,
+                &file_path,
+                Some(&writer.cookie),
+                r#"{"version":3}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("{file_path}/path"),
+                Some(&writer.cookie),
+                r#"{"path":"locked.tex","version":3}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        request(
+            &app,
+            Method::PATCH,
+            &policy_path,
+            Some(&admin.cookie),
+            r#"{"policy":"TEMPLATE_MANAGED"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&writer.cookie),
+                r#"{"content":"denied","version":3}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&mentor.cookie),
+                r#"{"content":"denied","version":3}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&admin.cookie),
+                r#"{"content":"denied","version":3}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        request(
+            &app,
+            Method::PATCH,
+            &policy_path,
+            Some(&admin.cookie),
+            r#"{"policy":"CONTENT_READ_ONLY"}"#,
+            Some("application/json"),
+        )
+        .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let app = app.clone();
+            async move {
+                axum::serve(listener, app).await.unwrap();
+            }
+        });
+        let (mut socket, _, access) = ws_test_join(
+            &format!("ws://{address}/api/v2/collab/{paper_id}/files/{file_id}"),
+            &writer.cookie,
+        )
+        .await;
+        assert_eq!(access, "read_only");
+        socket.send(ws_source_update(1, &[0])).await.unwrap();
+        assert_eq!(ws_control(&mut socket, "ERROR").await["code"], "read_only");
+
+        request(
+            &app,
+            Method::PATCH,
+            &policy_path,
+            Some(&admin.cookie),
+            r#"{"policy":"HIDDEN_SYSTEM"}"#,
+            Some("application/json"),
+        )
+        .await;
+        let files =
+            test_json(get(&app, &format!("{root}/files"), Some(&writer.cookie)).await).await;
+        assert!(
+            files
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["file_id"] != file_id)
+        );
+        assert_eq!(
+            get(&app, &file_path, Some(&writer.cookie)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/reviews/papers/{paper_id}/files/{file_id}"),
+                Some(&mentor.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let created_file = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/files"),
+                Some(&writer.cookie),
+                r#"{"path":"undo.tex","content":"x","version":3}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let undo_id = created_file["file"]["file_id"].as_str().unwrap();
+        request(
+            &app,
+            Method::PATCH,
+            &format!("/api/admin/v2/paper-teams/{paper_id}/file-policies/{undo_id}"),
+            Some(&admin.cookie),
+            r#"{"policy":"STRUCTURE_LOCKED"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/structural-undo"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            state
+                .v2
+                .collaboration_access(
+                    writer_id,
+                    uuid::Uuid::parse_str(paper_id).unwrap(),
+                    uuid::Uuid::parse_str(undo_id).unwrap()
+                )
+                .await
+                .unwrap()
+                .mode,
+            persistence::CollaborationAccessMode::ReadWrite
+        );
+
+        server.abort();
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn s7_template_pinning_and_team_lifecycle_are_enforced() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let template_id = uuid::Uuid::new_v4();
+        let template_name = format!("Governed template {template_id}");
+        let main = state
+            .blobs
+            .put(Bytes::from_static(
+                b"\\documentclass{article}\n\\begin{document}\nPinned template\n\\end{document}\n",
+            ))
+            .await
+            .unwrap();
+        let bibliography = state
+            .blobs
+            .put(Bytes::from_static(b"@book{core,title={LaTeX Core}}\n"))
+            .await
+            .unwrap();
+        state
+            .repo
+            .create_template(
+                template_id,
+                &template_name,
+                Some("Immutable fixture"),
+                Some("main.tex"),
+                &[
+                    persistence::AppTemplateFileRecord {
+                        path: "main.tex".to_owned(),
+                        blob_hash: main.hash(),
+                        size_bytes: main.size_bytes(),
+                    },
+                    persistence::AppTemplateFileRecord {
+                        path: "references.bib".to_owned(),
+                        blob_hash: bibliography.hash(),
+                        size_bytes: bibliography.size_bytes(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE latex_core.templates SET policy_default='managed' WHERE id=$1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({
+                    "name":"Pinned Team",
+                    "writer_ids":[writer_id],
+                    "mentor_ids":[mentor_id],
+                    "template_id":template_id
+                })
+                .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        assert_eq!(created["files"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            created["template_pin"]["template_id"],
+            template_id.to_string()
+        );
+        let pin: (uuid::Uuid, String) = sqlx::query_as(
+            "SELECT template_id,source_identity FROM latex_core.paper_template_pins WHERE paper_id=$1",
+        )
+        .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pin.0, template_id);
+        assert_eq!(pin.1.len(), 64);
+        let policies: Vec<String> = sqlx::query_scalar(
+            "SELECT policy FROM latex_core.paper_file_policies WHERE workspace_id=$1 ORDER BY file_id",
+        )
+        .bind(uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(policies, vec!["TEMPLATE_MANAGED", "TEMPLATE_MANAGED"]);
+        let main_file_id = created["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "main.tex")
+            .unwrap()["file_id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &format!("/api/v2/papers/{paper_id}/files/{main_file_id}"),
+                Some(&writer.cookie),
+                r#"{"content":"overwrite","version":1}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        let status_path = format!("/api/admin/v2/paper-teams/{paper_id}/status");
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &status_path,
+                Some(&admin.cookie),
+                r#"{"status":"frozen"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+                r#"{"path":"frozen.tex","content":"x","version":1}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &status_path,
+                Some(&admin.cookie),
+                r#"{"status":"active"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &status_path,
+                Some(&admin.cookie),
+                r#"{"status":"archived"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+                r#"{"path":"archived.tex","content":"x","version":1}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn s7_bounded_concurrency_smoke_12_websocket_clients() {
+        use futures_util::{SinkExt, StreamExt};
+        use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update, updates::decoder::Decode};
+
+        const CLIENTS: usize = 12;
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({"name":"12-client smoke","writer_ids":[writer_id],"mentor_ids":[]}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        let workspace_id = WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap(),
+        );
+        let file_id = created["main_file"]["file_id"].as_str().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let app = app.clone();
+            async move {
+                axum::serve(listener, app).await.unwrap();
+            }
+        });
+        let route = format!("ws://{address}/api/v2/collab/{paper_id}/files/{file_id}");
+        let started = std::time::Instant::now();
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            let (socket, initial, access) = ws_test_join(&route, &writer.cookie).await;
+            assert_eq!(access, "read_write");
+            let doc = Doc::new();
+            let text = doc.get_or_insert_text("source");
+            doc.transact_mut()
+                .apply_update(Update::decode_v1(&initial).unwrap())
+                .unwrap();
+            clients.push((socket, doc, text));
+        }
+        for (index, (socket, doc, text)) in clients.iter_mut().enumerate() {
+            let before = doc.transact().state_vector();
+            let end = text.len(&doc.transact());
+            text.insert(&mut doc.transact_mut(), end, &format!(" [{index:02}]"));
+            let update = doc.transact().encode_diff_v1(&before);
+            socket
+                .send(ws_source_update(u64::try_from(index + 1).unwrap(), &update))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            for (index, (socket, doc, _)) in clients.iter_mut().enumerate() {
+                let mut remotes = 0;
+                let mut acknowledged = false;
+                while remotes < CLIENTS - 1 || !acknowledged {
+                    match socket.next().await.unwrap().unwrap() {
+                        tokio_tungstenite::tungstenite::Message::Binary(value)
+                            if value[0] == collaboration::REMOTE_SOURCE_UPDATE =>
+                        {
+                            doc.transact_mut()
+                                .apply_update(Update::decode_v1(&value[1..]).unwrap())
+                                .unwrap();
+                            remotes += 1;
+                        }
+                        tokio_tungstenite::tungstenite::Message::Text(value) => {
+                            let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+                            if value["type"] == "DURABLE_ACK"
+                                && value["client_seq"] == u64::try_from(index + 1).unwrap()
+                            {
+                                acknowledged = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("12-client convergence timed out");
+        let exact = clients[0].2.get_string(&clients[0].1.transact());
+        assert!(
+            clients
+                .iter()
+                .all(|(_, doc, text)| text.get_string(&doc.transact()) == exact)
+        );
+        let canonical = state
+            .workspaces
+            .read_file(workspace_id, &LogicalPath::parse("main.tex").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(canonical.to_vec()).unwrap(), exact);
+        assert!(started.elapsed() < Duration::from_secs(8));
+        for (socket, _, _) in &mut clients {
+            let _ = socket.close(None).await;
+        }
+        server.abort();
         pool.close().await;
         database.close().await;
     }
