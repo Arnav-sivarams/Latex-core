@@ -42,8 +42,9 @@ pub use database::Database;
 pub use error::PersistenceError;
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use v2::{
-    GlobalRole, GlobalRoleAssignment, PaperFile, PaperStatus, PaperTeam, PaperTeamMember,
-    PersonalPaper, V2Error, V2Repository,
+    GlobalRole, GlobalRoleAssignment, PaperFile, PaperKind, PaperStatus, PaperTeam,
+    PaperTeamMember, PaperTeamMemberView, PersonalPaper, V2Error, V2Repository, V2User,
+    WriterPaper,
 };
 pub use workspace::{
     PostgresWorkspaceRepository, WorkspaceEventRecord, WorkspaceHeadRecord, WorkspaceSnapshotRecord,

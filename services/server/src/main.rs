@@ -26,7 +26,7 @@ use core_types::{
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, ChangeSetPublishResult, Database,
     DatabaseConfig, EnqueueCompileJobV1, FilePolicy, GlobalRole, GroupType, PostgresCompileQueue,
-    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord, V2Repository,
+    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord, V2Error, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,52 @@ struct AdminUserPatch {
 #[derive(Deserialize)]
 struct AdminPasswordInput {
     password: Option<String>,
+}
+#[derive(Deserialize)]
+struct V2AdminUserInput {
+    email: String,
+    password: String,
+    role: String,
+}
+#[derive(Deserialize)]
+struct V2RoleInput {
+    role: String,
+}
+#[derive(Deserialize)]
+struct V2PaperTeamInput {
+    name: String,
+    #[serde(default)]
+    writer_ids: Vec<String>,
+    #[serde(default)]
+    mentor_ids: Vec<String>,
+}
+#[derive(Deserialize)]
+struct V2PaperTeamMemberInput {
+    user_id: String,
+}
+#[derive(Deserialize)]
+struct V2PaperInput {
+    name: String,
+}
+#[derive(Deserialize)]
+struct V2CreateFileInput {
+    path: String,
+    content: String,
+    version: u64,
+}
+#[derive(Deserialize)]
+struct V2SaveFileInput {
+    content: String,
+    version: u64,
+}
+#[derive(Deserialize)]
+struct V2RenameFileInput {
+    path: String,
+    version: u64,
+}
+#[derive(Deserialize)]
+struct V2VersionInput {
+    version: u64,
 }
 #[derive(Deserialize)]
 struct TeamMemberInput {
@@ -270,7 +316,7 @@ struct VersionWire {
 }
 #[derive(Serialize)]
 struct ErrorWire {
-    error: &'static str,
+    error: String,
 }
 #[derive(Serialize)]
 struct TemplateWire {
@@ -388,6 +434,7 @@ fn router(state: AppState) -> Router {
         .route("/static/styles.css", get(styles))
         .route("/static/shells.css", get(shells_css))
         .route("/static/admin.js", get(admin_js))
+        .route("/static/writer.js", get(writer_js))
         .route("/static/app.js", get(app_js))
         .route("/static/api.js", get(api_js))
         .route("/static/state.js", get(state_js))
@@ -396,6 +443,49 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
         .route("/api/v2/me", get(v2_me))
+        .route(
+            "/api/admin/v2/users",
+            get(admin_v2_users).post(admin_v2_create_user),
+        )
+        .route(
+            "/api/admin/v2/users/{user_id}/role",
+            axum::routing::patch(admin_v2_change_role),
+        )
+        .route(
+            "/api/admin/v2/paper-teams",
+            get(admin_v2_paper_teams).post(admin_v2_create_paper_team),
+        )
+        .route("/api/admin/v2/paper-teams/{id}", get(admin_v2_paper_team))
+        .route(
+            "/api/admin/v2/paper-teams/{id}/members",
+            post(admin_v2_add_paper_team_member),
+        )
+        .route(
+            "/api/admin/v2/paper-teams/{id}/members/{user_id}",
+            axum::routing::delete(admin_v2_remove_paper_team_member),
+        )
+        .route("/api/v2/writer/papers", get(v2_writer_papers))
+        .route(
+            "/api/v2/writer/personal-papers",
+            post(v2_create_personal_paper),
+        )
+        .route("/api/v2/papers/{paper_id}", get(v2_paper))
+        .route(
+            "/api/v2/papers/{paper_id}/files",
+            get(v2_paper_files).post(v2_create_file),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/files/{file_id}",
+            get(v2_file).put(v2_save_file).delete(v2_delete_file),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/files/{file_id}/path",
+            axum::routing::patch(v2_rename_file),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/main/{file_id}",
+            post(v2_set_main),
+        )
         .route("/api/admin/overview", get(admin_overview))
         .route("/api/admin/users", get(admin_users).post(admin_create_user))
         .route(
@@ -652,6 +742,606 @@ async fn v2_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         role: role.as_str().to_owned(),
     })
     .into_response()
+}
+
+const INITIAL_TEX: &str = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}\n";
+
+async fn admin_v2_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.v2.list_v2_users().await {
+        Ok(users) => Json(users).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<V2AdminUserInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let email = match auth::normalized_email(&input.email) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
+    };
+    let role = match input.role.parse::<GlobalRole>() {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid V2 role"),
+    };
+    let password_hash = match auth::hash_password(&input.password) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "password must be 12-256 characters",
+            );
+        }
+    };
+    match state
+        .repo
+        .create_v2_account(&email, &password_hash, role)
+        .await
+    {
+        Ok(user) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "user_id": user.user_id,
+                "email": user.email,
+                "enabled": user.enabled,
+                "role": role
+            })),
+        )
+            .into_response(),
+        Err(AppError::Conflict) => error(StatusCode::CONFLICT, "email already exists"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "account creation failed"),
+    }
+}
+
+async fn admin_v2_change_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(input): Json<V2RoleInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let user_id = match parse_user_id(&user_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let role = match input.role.parse::<GlobalRole>() {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid V2 role"),
+    };
+    match state.v2.set_global_role(user_id, role).await {
+        Ok(assignment) => Json(assignment).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_paper_teams(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.v2.list_paper_teams().await {
+        Ok(teams) => Json(teams).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_paper_team(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match (
+        state.v2.paper_team(id).await,
+        state.v2.list_paper_team_member_views(id).await,
+    ) {
+        (Ok(team), Ok(members)) => {
+            Json(serde_json::json!({"team":team,"members":members})).into_response()
+        }
+        (Err(error_value), _) | (_, Err(error_value)) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_create_paper_team(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<V2PaperTeamInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Admin)) {
+        return error(StatusCode::FORBIDDEN, "V2 Admin required for Paper Teams");
+    }
+    let writer_ids = match parse_user_ids(&input.writer_ids) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let mentor_ids = match parse_user_ids(&input.mentor_ids) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let main_path = LogicalPath::parse("main.tex").expect("static main path is valid");
+    let stored = match state
+        .blobs
+        .put(Bytes::from_static(INITIAL_TEX.as_bytes()))
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    match state
+        .v2
+        .create_initialized_paper_team(
+            principal.user_id(),
+            principal.session.tenant_id,
+            WorkspaceId::new(),
+            &input.name,
+            &writer_ids,
+            &mentor_ids,
+            &main_path,
+            stored.hash(),
+            stored.size_bytes(),
+        )
+        .await
+    {
+        Ok((team, file)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"team":team,"main_file":file})),
+        )
+            .into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_add_paper_team_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<V2PaperTeamMemberInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let user_id = match parse_user_id(&input.user_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .add_paper_team_member(id, user_id, principal.user_id())
+        .await
+    {
+        Ok(member) => (StatusCode::CREATED, Json(member)).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_remove_paper_team_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, user_id)): Path<(uuid::Uuid, String)>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let user_id = match parse_user_id(&user_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .remove_paper_team_member(id, user_id, principal.user_id())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn writer_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedPrincipal, Response> {
+    let principal = principal_auth(state, headers).await?;
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Writer)) {
+        return Err(error(StatusCode::FORBIDDEN, "V2 Writer required"));
+    }
+    Ok(principal)
+}
+
+async fn v2_writer_papers(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.writer_papers(principal.user_id()).await {
+        Ok(papers) => Json(papers).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_create_personal_paper(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<V2PaperInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let main_path = LogicalPath::parse("main.tex").expect("static main path is valid");
+    let stored = match state
+        .blobs
+        .put(Bytes::from_static(INITIAL_TEX.as_bytes()))
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    match state
+        .v2
+        .create_initialized_personal_paper(
+            principal.user_id(),
+            principal.session.tenant_id,
+            WorkspaceId::new(),
+            &input.name,
+            &main_path,
+            stored.hash(),
+            stored.size_bytes(),
+        )
+        .await
+    {
+        Ok((paper, file)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"paper":paper,"main_file":file,"version":1})),
+        )
+            .into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_paper(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    match state.workspaces.restore(paper.workspace_id).await {
+        Ok(workspace) => Json(serde_json::json!({
+            "paper":paper,
+            "version":workspace.version().get(),
+            "main_file":workspace.main_file().map(LogicalPath::as_str),
+            "editable":paper.status == persistence::PaperStatus::Active
+        }))
+        .into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    }
+}
+
+async fn v2_paper_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    match state.v2.list_live_paper_files(paper.workspace_id).await {
+        Ok(files) => Json(files).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (paper, file) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let workspace = match state.workspaces.restore(paper.workspace_id).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    };
+    let bytes = match state
+        .workspaces
+        .read_file(paper.workspace_id, &file.path)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    };
+    let content = match String::from_utf8(bytes.to_vec()) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "binary file is not editable",
+            );
+        }
+    };
+    Json(serde_json::json!({
+        "file":file,
+        "content":content,
+        "version":workspace.version().get(),
+        "main":workspace.main_file() == Some(&file.path),
+        "editable":paper.status == persistence::PaperStatus::Active
+    }))
+    .into_response()
+}
+
+async fn v2_create_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Json(input): Json<V2CreateFileInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let path = match LogicalPath::parse(&input.path) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid file path"),
+    };
+    let stored = match state.blobs.put(Bytes::from(input.content)).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    match state
+        .v2
+        .create_file_with_event(
+            paper.workspace_id,
+            principal.user_id(),
+            input.version,
+            path,
+            stored.hash(),
+            stored.size_bytes(),
+        )
+        .await
+    {
+        Ok((file, version)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"file":file,"version":version})),
+        )
+            .into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_save_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(input): Json<V2SaveFileInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        return response;
+    }
+    let stored = match state.blobs.put(Bytes::from(input.content)).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    match state
+        .v2
+        .save_file_with_event(
+            file_id,
+            principal.user_id(),
+            input.version,
+            stored.hash(),
+            stored.size_bytes(),
+        )
+        .await
+    {
+        Ok((file, version)) => {
+            Json(serde_json::json!({"file":file,"version":version})).into_response()
+        }
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_rename_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(input): Json<V2RenameFileInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        return response;
+    }
+    let path = match LogicalPath::parse(&input.path) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid file path"),
+    };
+    match state
+        .v2
+        .rename_file_with_event(file_id, principal.user_id(), input.version, path)
+        .await
+    {
+        Ok((file, version)) => {
+            Json(serde_json::json!({"file":file,"version":version})).into_response()
+        }
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_delete_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(input): Json<V2VersionInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        return response;
+    }
+    match state
+        .v2
+        .delete_file_with_event(file_id, principal.user_id(), input.version)
+        .await
+    {
+        Ok(version) => Json(serde_json::json!({"version":version})).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_set_main(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(input): Json<V2VersionInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+        return response;
+    }
+    match state
+        .v2
+        .set_main_with_event(file_id, principal.user_id(), input.version)
+        .await
+    {
+        Ok(version) => Json(serde_json::json!({"version":version})).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn authorized_file(
+    state: &AppState,
+    writer: UserId,
+    paper_id: uuid::Uuid,
+    file_id: uuid::Uuid,
+) -> Result<(persistence::WriterPaper, persistence::PaperFile), Response> {
+    let paper = state
+        .v2
+        .writer_paper(writer, paper_id)
+        .await
+        .map_err(v2_error)?;
+    let file = state.v2.paper_file(file_id).await.map_err(v2_error)?;
+    if file.workspace_id != paper.workspace_id || file.tombstoned {
+        return Err(error(StatusCode::NOT_FOUND, "file not found"));
+    }
+    Ok((paper, file))
+}
+
+fn parse_user_id(value: &str) -> Result<UserId, Response> {
+    uuid::Uuid::parse_str(value)
+        .map(UserId::from_uuid)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid user id"))
+}
+
+fn parse_user_ids(values: &[String]) -> Result<Vec<UserId>, Response> {
+    values.iter().map(|value| parse_user_id(value)).collect()
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owned V2 errors compose directly with Result::map_err at HTTP boundaries"
+)]
+fn v2_error(error_value: V2Error) -> Response {
+    match error_value {
+        V2Error::RoleMissing { .. } | V2Error::RoleForbidden { .. } => {
+            error(StatusCode::FORBIDDEN, error_value.to_string())
+        }
+        V2Error::PersonalPaperOwnershipConflict { .. }
+        | V2Error::TeamMembershipConflict { .. }
+        | V2Error::WorkspaceConflict { .. }
+        | V2Error::DuplicateFilePath { .. }
+        | V2Error::Conflict { .. }
+        | V2Error::VersionConflict { .. } => error(StatusCode::CONFLICT, error_value.to_string()),
+        V2Error::NotFound { .. } => error(StatusCode::NOT_FOUND, error_value.to_string()),
+        V2Error::InvalidRole { .. }
+        | V2Error::InvalidStatus { .. }
+        | V2Error::InvalidPath { .. }
+        | V2Error::InvalidName => error(StatusCode::BAD_REQUEST, error_value.to_string()),
+        V2Error::Integrity { .. } | V2Error::Database(_) => {
+            error(StatusCode::INTERNAL_SERVER_ERROR, "V2 persistence failure")
+        }
+    }
 }
 
 async fn admin_session(
@@ -3256,8 +3946,14 @@ fn parsed<T: FromStr>(value: &str) -> Result<T, Response> {
         .parse()
         .map_err(|_| error(StatusCode::NOT_FOUND, "not found"))
 }
-fn error(status: StatusCode, message: &'static str) -> Response {
-    (status, Json(ErrorWire { error: message })).into_response()
+fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ErrorWire {
+            error: message.into(),
+        }),
+    )
+        .into_response()
 }
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
@@ -3442,6 +4138,14 @@ async fn admin_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../static/admin.js"),
+    )
+        .into_response()
+}
+
+async fn writer_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/writer.js"),
     )
         .into_response()
 }
@@ -3884,6 +4588,326 @@ mod database_tests {
 
         pool.close().await;
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn s2_admin_team_writer_and_file_vertical_slice() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage) = test_application().await;
+        let legacy_admin = fixture(&app, &database, "admin", None).await;
+        let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let other_writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "student", Some(GlobalRole::Mentor)).await;
+
+        let email = format!("{}@s2.example", uuid::Uuid::new_v4());
+        let create_user = request(
+            &app,
+            Method::POST,
+            "/api/admin/v2/users",
+            Some(&legacy_admin.cookie),
+            &serde_json::json!({"email":email,"password":PASSWORD,"role":"writer"}).to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(create_user.status(), StatusCode::CREATED);
+        let role: String = sqlx::query_scalar("SELECT g.role FROM latex_core.global_user_roles g JOIN latex_core.user_credentials c ON c.user_id=g.user_id WHERE c.email=$1")
+            .bind(&email).fetch_one(&pool).await.unwrap();
+        assert_eq!(role, "writer");
+        let compatibility: String = sqlx::query_scalar(
+            "SELECT account_type FROM latex_core.user_credentials WHERE email=$1",
+        )
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(compatibility, "student");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/users",
+                Some(&admin.cookie),
+                &serde_json::json!({"email":format!("{}@s2.example", uuid::Uuid::new_v4()),"password":PASSWORD,"role":"mentor"}).to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/users",
+                Some(&admin.cookie),
+                &serde_json::json!({"email":email,"password":PASSWORD,"role":"mentor"}).to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(&app, Method::POST, "/api/admin/v2/users", Some(&admin.cookie),
+                &serde_json::json!({"email":format!("{}@s2.example", uuid::Uuid::new_v4()),"password":PASSWORD,"role":"project_manager"}).to_string(), Some("application/json")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        for denied in [&writer, &mentor] {
+            assert_eq!(request(&app, Method::POST, "/api/admin/v2/users", Some(&denied.cookie),
+                &serde_json::json!({"email":format!("{}@s2.example", uuid::Uuid::new_v4()),"password":PASSWORD,"role":"writer"}).to_string(), Some("application/json")).await.status(), StatusCode::FORBIDDEN);
+        }
+
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+        let team_response = request(
+            &app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie),
+            &serde_json::json!({"name":"S2 Team","writer_ids":[writer_id],"mentor_ids":[mentor_id]}).to_string(),
+            Some("application/json"),
+        ).await;
+        assert_eq!(team_response.status(), StatusCode::CREATED);
+        let team = test_json(team_response).await;
+        let team_id = team["team"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(team["main_file"]["path"], "main.tex");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({"name":"Wrong role","writer_ids":[admin_id],"mentor_ids":[]})
+                    .to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        for denied in [&writer, &mentor] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::POST,
+                    "/api/admin/v2/paper-teams",
+                    Some(&denied.cookie),
+                    r#"{"name":"Denied","writer_ids":[],"mentor_ids":[]}"#,
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        for denied in [&mentor, &admin] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::POST,
+                    "/api/v2/writer/personal-papers",
+                    Some(&denied.cookie),
+                    r#"{"name":"Denied"}"#,
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let personal = request(
+            &app,
+            Method::POST,
+            "/api/v2/writer/personal-papers",
+            Some(&writer.cookie),
+            r#"{"name":"S2 Personal"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(personal.status(), StatusCode::CREATED);
+        let personal = test_json(personal).await;
+        let paper_id = personal["paper"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(personal["main_file"]["path"], "main.tex");
+        let visible =
+            test_json(get(&app, "/api/v2/writer/papers", Some(&writer.cookie)).await).await;
+        assert!(
+            visible
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|paper| paper["id"] == paper_id)
+        );
+        assert!(
+            visible
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|paper| paper["id"] == team_id)
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}"),
+                Some(&other_writer.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let files = test_json(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        let main_id = files[0]["file_id"].as_str().unwrap().to_owned();
+        let main_path = format!("/api/v2/papers/{paper_id}/files/{main_id}");
+        let saved = request(
+            &app,
+            Method::PUT,
+            &main_path,
+            Some(&writer.cookie),
+            r#"{"content":"newer source","version":1}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(test_json(saved).await["version"], 2);
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &main_path,
+                Some(&writer.cookie),
+                r#"{"content":"stale source","version":1}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            test_json(get(&app, &main_path, Some(&writer.cookie)).await).await["content"],
+            "newer source"
+        );
+
+        let created = request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/papers/{paper_id}/files"),
+            Some(&writer.cookie),
+            r#"{"path":"chapters/one.tex","content":"chapter","version":2}"#,
+            Some("application/json"),
+        )
+        .await;
+        let created = test_json(created).await;
+        let second_id = created["file"]["file_id"].as_str().unwrap().to_owned();
+        let renamed = request(
+            &app,
+            Method::PATCH,
+            &format!("/api/v2/papers/{paper_id}/files/{second_id}/path"),
+            Some(&writer.cookie),
+            r#"{"path":"sections/one.tex","version":3}"#,
+            Some("application/json"),
+        )
+        .await;
+        let renamed = test_json(renamed).await;
+        assert_eq!(renamed["file"]["file_id"], second_id);
+        assert_eq!(renamed["file"]["path"], "sections/one.tex");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/main/{second_id}"),
+                Some(&writer.cookie),
+                r#"{"version":4}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::DELETE,
+                &format!("/api/v2/papers/{paper_id}/files/{second_id}"),
+                Some(&writer.cookie),
+                r#"{"version":5}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT tombstoned FROM latex_core.paper_files WHERE file_id=$1"
+            )
+            .bind(uuid::Uuid::parse_str(&second_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        );
+        for denied in [&mentor, &admin] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::PUT,
+                    &main_path,
+                    Some(&denied.cookie),
+                    r#"{"content":"denied","version":6}"#,
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        let login = login_request(&app, &email, PASSWORD).await;
+        let old_cookie = response_cookie(&login);
+        let provisioned_id = test_user_id(&pool, &email).await;
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("/api/admin/v2/users/{provisioned_id}/role"),
+                Some(&admin.cookie),
+                r#"{"role":"mentor"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&app, "/api/v2/me", Some(&old_cookie)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    async fn test_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn test_user_id(pool: &PgPool, email: &str) -> UserId {
+        UserId::from_uuid(
+            sqlx::query_scalar("SELECT user_id FROM latex_core.user_credentials WHERE email=$1")
+                .bind(email)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+        )
     }
 
     async fn test_application() -> (Database, PgPool, Router, TempDir) {

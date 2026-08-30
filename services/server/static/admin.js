@@ -6,6 +6,7 @@ const status = document.querySelector('#adminStatus');
 
 const endpoints = {
   Overview: '/api/admin/overview',
+  'Legacy Users': '/api/admin/users',
   'Legacy Teams': '/api/admin/teams',
   'Research Groups': '/api/admin/research-groups',
   Projects: '/api/admin/projects',
@@ -101,7 +102,7 @@ function userActions(user) {
   return actions;
 }
 
-function renderUsers(users) {
+function renderLegacyUsers(users) {
   const form = element('form', 'admin-user-form');
   form.innerHTML = '<label>Email<input name="email" type="email" required></label><label>Institutional type<select name="account_type"><option>student</option><option>professor</option><option>admin</option></select></label><label>Temporary password (optional)<input name="password" type="password" minlength="12"></label><button class="primary" type="submit">Create user</button>';
   form.addEventListener('submit', async (event) => {
@@ -141,14 +142,164 @@ function renderUsers(users) {
   content.append(form, wrap);
 }
 
+async function patchV2Role(user, role) {
+  await api(`/api/admin/v2/users/${encodeURIComponent(user.user_id)}/role`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role }),
+  });
+  announce(`${user.email} is now an exclusive V2 ${role}.`);
+  await showSection('V2 Users');
+}
+
+function renderV2Users(users) {
+  const intro = element('p', 'empty-copy', 'Writer, Mentor, and Admin are mutually exclusive global V2 roles. Institutional compatibility fields do not authorize V2 access.');
+  const form = element('form', 'admin-user-form');
+  form.innerHTML = '<label>Email<input name="email" type="email" required></label><label>Password<input name="password" type="password" minlength="12" maxlength="256" required></label><label>Exclusive V2 role<select name="role"><option value="writer">Writer</option><option value="mentor">Mentor</option><option value="admin">Admin</option></select></label><button class="primary" type="submit">Create V2 user</button>';
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      await api('/api/admin/v2/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+      });
+      announce('V2 user created.');
+      await showSection('V2 Users');
+    } catch (error) { showError(error); }
+  });
+  const wrap = element('div', 'admin-table-wrap');
+  const table = element('table', 'admin-table');
+  table.innerHTML = '<thead><tr><th>Email</th><th>Exclusive role</th><th>Status</th><th>Created</th></tr></thead>';
+  const body = document.createElement('tbody');
+  users.forEach((user) => {
+    const row = document.createElement('tr');
+    const select = document.createElement('select');
+    select.setAttribute('aria-label', `Exclusive V2 role for ${user.email}`);
+    ['writer', 'mentor', 'admin'].forEach((role) => {
+      const option = element('option', '', role[0].toUpperCase() + role.slice(1));
+      option.value = role;
+      option.selected = role === user.role;
+      select.append(option);
+    });
+    select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError));
+    const roleCell = document.createElement('td');
+    roleCell.append(select);
+    row.append(element('td', '', user.email), roleCell, element('td', '', user.enabled ? 'enabled' : 'disabled'), element('td', '', user.created_at));
+    body.append(row);
+  });
+  table.append(body);
+  wrap.append(table);
+  content.append(intro, form, wrap);
+}
+
+function memberSelect(users, role, label) {
+  const field = element('label', '', label);
+  const select = document.createElement('select');
+  select.name = `${role}_ids`;
+  select.multiple = true;
+  users.filter((user) => user.role === role).forEach((user) => {
+    const option = element('option', '', user.email);
+    option.value = user.user_id;
+    select.append(option);
+  });
+  field.append(select);
+  return field;
+}
+
+async function renderPaperTeams(teams, users) {
+  const form = element('form', 'admin-team-form');
+  const name = element('label', '', 'Paper Team name');
+  name.innerHTML = 'Paper Team name<input name="name" required maxlength="200">';
+  form.append(name, memberSelect(users, 'writer', 'Writers'), memberSelect(users, 'mentor', 'Mentors'));
+  const create = element('button', 'primary', 'Create Paper Team');
+  create.type = 'submit';
+  form.append(create);
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    try {
+      await api('/api/admin/v2/paper-teams', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: data.get('name'), writer_ids: data.getAll('writer_ids'), mentor_ids: data.getAll('mentor_ids') }),
+      });
+      announce('Paper Team and initialized main.tex workspace created.');
+      await showSection('Paper Teams');
+    } catch (error) { showError(error); }
+  });
+  content.append(element('p', 'empty-copy', 'One Paper Team maps to exactly one paper workspace. Membership grants access; capability comes from the exclusive global role.'), form);
+  if (!teams.length) {
+    content.append(element('p', 'empty-copy', 'No Paper Teams yet.'));
+    return;
+  }
+  const details = await Promise.all(teams.map((team) => api(`/api/admin/v2/paper-teams/${team.id}`)));
+  details.forEach(({ team, members }) => {
+    const card = element('section', 'team-card');
+    card.append(element('h2', '', team.name), element('p', 'empty-copy', `${team.status} · workspace ${team.workspace_id}`));
+    const list = element('div', 'members-list');
+    members.forEach((member) => {
+      const row = element('div', 'member-row');
+      row.append(element('span', '', `${member.email} — ${member.role}`));
+      const remove = element('button', 'danger', 'Remove');
+      remove.type = 'button';
+      remove.addEventListener('click', async () => {
+        try {
+          await api(`/api/admin/v2/paper-teams/${team.id}/members/${member.user_id}`, { method: 'DELETE' });
+          await showSection('Paper Teams');
+        } catch (error) { showError(error); }
+      });
+      row.append(remove);
+      list.append(row);
+    });
+    const assigned = new Set(members.map((member) => member.user_id));
+    const available = users.filter((user) => user.role !== 'admin' && !assigned.has(user.user_id));
+    const add = element('form', 'member-add-form');
+    const select = document.createElement('select');
+    select.required = true;
+    select.innerHTML = '<option value="">Assign Writer or Mentor…</option>';
+    available.forEach((user) => {
+      const option = element('option', '', `${user.email} — ${user.role}`);
+      option.value = user.user_id;
+      select.append(option);
+    });
+    const submit = element('button', '', 'Assign');
+    submit.type = 'submit';
+    add.append(select, submit);
+    add.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        await api(`/api/admin/v2/paper-teams/${team.id}/members`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: select.value }),
+        });
+        await showSection('Paper Teams');
+      } catch (error) { showError(error); }
+    });
+    card.append(list, add);
+    content.append(card);
+  });
+}
+
 async function showSection(section) {
   setActive(section);
   content.replaceChildren(element('h1', '', section.toUpperCase()), element('p', 'empty-copy', 'Loading operational data…'));
   content.focus();
   try {
-    const data = await api(section === 'Users' ? '/api/admin/users' : endpoints[section]);
+    if (section === 'V2 Users') {
+      const users = await api('/api/admin/v2/users');
+      content.replaceChildren(element('h1', '', 'V2 USERS'));
+      renderV2Users(users);
+      return;
+    }
+    if (section === 'Paper Teams') {
+      const [teams, users] = await Promise.all([api('/api/admin/v2/paper-teams'), api('/api/admin/v2/users')]);
+      content.replaceChildren(element('h1', '', 'PAPER TEAMS'));
+      await renderPaperTeams(teams, users);
+      return;
+    }
+    const data = await api(endpoints[section]);
     content.replaceChildren(element('h1', '', section.toUpperCase()));
-    if (section === 'Users') renderUsers(data);
+    if (section === 'Legacy Users') renderLegacyUsers(data);
     else if (section === 'Overview') renderOverview(data);
     else if (Array.isArray(data) && data.length === 0) content.append(element('p', 'empty-copy', 'No records available.'));
     else content.append(renderJson(data));

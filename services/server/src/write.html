@@ -4,38 +4,48 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Writer — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=c4">
+  <link rel="stylesheet" href="/static/shells.css?v=s2">
 </head>
 <body>
   <header class="shell-topbar">
     <a class="shell-brand" href="/write" aria-current="page">LaTeX Core</a>
     <span class="role-badge">Writer</span>
+    <span id="currentPaper" class="current-context">No paper selected</span>
     <span class="shell-spacer"></span>
+    <span id="saveStatus" class="save-status" data-state="saved">Saved</span>
     <form method="post" action="/logout"><button type="submit">Log out</button></form>
   </header>
   <div class="writer-layout">
     <nav class="paper-nav" aria-label="Writer papers and files">
       <section aria-labelledby="my-papers-heading">
-        <h2 id="my-papers-heading">MY PAPERS</h2>
-        <p class="empty-copy">Personal papers will appear here after the V2 paper workflow is available.</p>
+        <div class="section-heading"><h2 id="my-papers-heading">MY PAPERS</h2><button id="newPaper" type="button">New Personal Paper</button></div>
+        <div id="myPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="team-papers-heading">
         <h2 id="team-papers-heading">TEAM PAPERS</h2>
-        <p class="empty-copy">No assigned team papers yet.</p>
+        <div id="teamPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="files-heading">
-        <h2 id="files-heading">FILES</h2>
-        <p class="empty-copy">Choose a paper to view its files.</p>
+        <div class="section-heading"><h2 id="files-heading">FILES</h2><button id="newFile" type="button" disabled>New File</button></div>
+        <div id="fileTree"><p class="empty-copy">Choose a paper to view its files.</p></div>
       </section>
     </nav>
     <main class="writer-main">
       <section class="editor-foundation" aria-labelledby="editor-heading">
-        <div class="panel-heading"><h1 id="editor-heading">EDITOR</h1><span>Foundation only</span></div>
-        <div class="foundation-empty"><strong>No paper selected</strong><p>Source editing arrives with the V2 collaboration editor.</p></div>
+        <div class="panel-heading editor-heading">
+          <div><h1 id="editor-heading">EDITOR</h1><span id="currentFile">No file selected</span><span id="mainBadge" class="main-badge" hidden>Main</span></div>
+          <div class="editor-actions">
+            <button id="renameFile" type="button" disabled>Rename</button>
+            <button id="deleteFile" type="button" disabled>Delete</button>
+            <button id="setMain" type="button" disabled>Set Main</button>
+            <button id="saveFile" class="primary" type="button" disabled>Save</button>
+          </div>
+        </div>
+        <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No paper selected</strong><p>Create a personal paper or open an assigned team paper.</p></div></div>
       </section>
       <section class="pdf-foundation" aria-labelledby="pdf-heading">
-        <div class="panel-heading"><h2 id="pdf-heading">PDF</h2></div>
-        <div class="foundation-empty"><strong>No preview available</strong><p>Select a paper when V2 paper access is enabled.</p></div>
+        <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><span>Manual compilation foundation</span></div>
+        <div class="foundation-empty"><strong>No preview available</strong><p>Live rebuild is not part of S2.</p></div>
       </section>
       <nav class="detail-tabs" aria-label="Paper details">
         <a href="#problems" aria-current="page">PROBLEMS</a>
@@ -44,9 +54,11 @@
       </nav>
       <section id="problems" class="detail-panel" aria-labelledby="problems-heading">
         <h2 id="problems-heading">PROBLEMS</h2>
-        <p>No build diagnostics are available.</p>
+        <p>Build diagnostics, reviews, and history remain truthful empty foundations in S2.</p>
       </section>
     </main>
   </div>
+  <div id="writerNotice" class="status-region" aria-live="polite"></div>
+  <script type="module" src="/static/writer.js?v=s2"></script>
 </body>
 </html>

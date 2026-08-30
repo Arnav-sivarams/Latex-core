@@ -167,6 +167,68 @@ impl AppRepository {
             account_type: "student".to_owned(),
         })
     }
+
+    /// Creates a V2 identity and its authoritative exclusive role in one
+    /// transaction. The legacy account type remains the least-privilege
+    /// compatibility value and is never used to authorize this identity.
+    pub async fn create_v2_account(
+        &self,
+        email: &str,
+        password_hash: &str,
+        role: GlobalRole,
+    ) -> Result<AppUserRecord, AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let tenant = TenantId::new();
+        let user = UserId::new();
+        sqlx::query("INSERT INTO latex_core.tenants (id) VALUES ($1)")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        sqlx::query("INSERT INTO latex_core.users (id,tenant_id) VALUES ($1,$2)")
+            .bind(user.as_uuid())
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        let insert = sqlx::query(
+            "INSERT INTO latex_core.user_credentials (user_id,email,password_hash,account_type) \
+             VALUES ($1,$2,$3,'student')",
+        )
+        .bind(user.as_uuid())
+        .bind(email)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await;
+        match insert {
+            Ok(_) => {}
+            Err(error) if matches!(error.as_database_error().and_then(sqlx::error::DatabaseError::code), Some(code) if code == "23505") =>
+            {
+                return Err(AppError::Conflict);
+            }
+            Err(error) => return Err(AppError::Database(error)),
+        }
+        sqlx::query("INSERT INTO latex_core.global_user_roles (user_id,role) VALUES ($1,$2)")
+            .bind(user.as_uuid())
+            .bind(role.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::Database)?;
+        Ok(AppUserRecord {
+            user_id: user,
+            tenant_id: tenant,
+            email: email.to_owned(),
+            password_hash: password_hash.to_owned(),
+            enabled: true,
+            account_type: "student".to_owned(),
+        })
+    }
     pub async fn user_by_email(&self, email: &str) -> Result<Option<AppUserRecord>, AppError> {
         let row = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash,c.enabled,c.account_type FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id WHERE c.email=$1").bind(email).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
         row.map(decode_user).transpose()

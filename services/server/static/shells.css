@@ -45,6 +45,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .shell-brand { min-height: auto; border: 0; padding: 4px 0; color: var(--text); font-size: 16px; font-weight: 750; }
 .role-badge { border-radius: 999px; padding: 3px 9px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 700; }
 .shell-spacer { flex: 1; }
+.current-context { max-width: 42vw; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.save-status { padding: 3px 8px; border-radius: 999px; color: var(--muted); background: var(--surface-subtle); font-size: 12px; }
+.save-status[data-state="unsaved"], .save-status[data-state="saving"] { color: #805b09; background: #fff3cc; }
+.save-status[data-state="conflict"], .save-status[data-state="error"] { color: var(--danger); background: #fbeceb; }
 .empty-copy { color: var(--muted); }
 .paper-nav h2, .review-nav h2, .panel-heading h1, .panel-heading h2, .review-grid h2 {
   margin: 0;
@@ -57,10 +61,28 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .paper-nav, .review-nav, .admin-nav { padding: 22px 16px; border-right: 1px solid var(--border); background: var(--surface-subtle); }
 .paper-nav section { margin-bottom: 28px; }
 .paper-nav p { margin: 8px 0 0; font-size: 13px; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.section-heading button { min-height: 28px; padding: 3px 7px; font-size: 11px; }
+.paper-list { display: grid; gap: 3px; margin-top: 7px; }
+.paper-list button, .file-tree button { display: flex; align-items: center; justify-content: space-between; gap: 6px; width: 100%; min-height: 30px; border: 0; padding: 4px 6px; background: transparent; text-align: left; }
+.paper-list button[aria-current="page"], .file-tree button[aria-current="page"] { color: var(--accent); background: var(--accent-soft); }
+.paper-list small, .file-tree small { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.file-tree { margin: 5px 0 0; padding-left: 13px; list-style: none; }
+#fileTree > .file-tree { padding-left: 0; }
+.file-tree .directory { display: block; padding: 4px 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
 .writer-main { min-width: 0; display: grid; grid-template-columns: minmax(300px, 1fr) minmax(280px, 42%); grid-template-rows: minmax(430px, 1fr) auto auto; gap: 1px; background: var(--border); }
 .editor-foundation, .pdf-foundation, .detail-panel { min-width: 0; background: var(--surface); }
 .panel-heading { min-height: 43px; display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); }
 .panel-heading span { color: var(--muted); font-size: 12px; }
+.editor-heading { gap: 12px; }
+.editor-heading > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.editor-heading #currentFile { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.editor-actions { justify-content: flex-end; flex-wrap: wrap; }
+.editor-actions button { min-height: 30px; padding: 4px 8px; }
+.main-badge { padding: 2px 6px; border-radius: 999px; color: var(--accent) !important; background: var(--accent-soft); font-weight: 700; }
+.editor-mount { height: calc(100% - 52px); min-height: 370px; overflow: hidden; }
+.editor-mount .cm-editor { height: 100%; font-size: 14px; }
+.editor-mount .cm-focused { outline: none; }
 .foundation-empty { min-height: 330px; display: grid; place-content: center; padding: 28px; text-align: center; color: var(--muted); }
 .foundation-empty strong { color: var(--text); }
 .foundation-empty p { max-width: 340px; margin: 6px 0 0; }
@@ -104,6 +126,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .admin-user-form { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)) auto; gap: 10px; align-items: end; margin: 16px 0; }
 .admin-user-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .admin-user-form input, .admin-user-form select { width: 100%; min-height: 36px; border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; background: var(--surface); }
+.admin-team-form { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)) auto; gap: 10px; align-items: end; margin: 16px 0 24px; }
+.admin-team-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.admin-team-form input, .admin-team-form select, .member-add-form select, .admin-table select { width: 100%; min-height: 36px; border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; background: var(--surface); }
+.admin-team-form select[multiple] { min-height: 92px; }
+.team-card { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; }
+.team-card h2 { margin-top: 0; }
+.member-row, .member-add-form { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.member-add-form { margin-top: 8px; border-bottom: 0; }
 .primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 .danger { color: var(--danger); }
 .status-region { position: fixed; right: 18px; bottom: 18px; max-width: min(420px, calc(100vw - 36px)); padding: 10px 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: 0 12px 28px #20231d1c; }
@@ -114,6 +144,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .pdf-foundation { grid-column: 1; }
   .detail-tabs, .detail-panel { grid-column: 1; }
   .admin-user-form { grid-template-columns: 1fr; }
+  .admin-team-form { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 700px) {

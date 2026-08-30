@@ -1,5 +1,6 @@
 .git
 target
+node_modules
 .agents
 .codex
 *.log
