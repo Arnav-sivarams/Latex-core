@@ -487,15 +487,60 @@ impl<E: CompileExecutor> CompilationWorker<E> {
                 }
             }
             CompileStatus::Failed => {
-                self.compile_failure(job.id, false, compile_result_error(&execution))
+                self.compile_execution_failure(job.id, false, &execution)
                     .await
             }
             CompileStatus::TimedOut => {
-                self.compile_failure(job.id, true, compile_result_error(&execution))
+                self.compile_execution_failure(job.id, true, &execution)
                     .await
             }
         }
     }
+
+    async fn compile_execution_failure(
+        &self,
+        job: core_types::JobId,
+        timed_out: bool,
+        execution: &WorkerExecution,
+    ) -> Result<WorkerRunOutcome, WorkerError> {
+        let mut artifacts = Vec::new();
+        for artifact in execution
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == core_types::ArtifactKind::Log)
+        {
+            let stored = self.blobs.put(artifact.bytes.clone()).await?;
+            artifacts.push(PersistedArtifactV1 {
+                artifact_id: ArtifactId::new(),
+                kind: artifact.kind,
+                logical_name: artifact.logical_name.clone(),
+                blob_hash: stored.hash(),
+                size_bytes: stored.size_bytes(),
+                content_type: content_type(&artifact.logical_name).to_owned(),
+            });
+        }
+        let error =
+            serde_json::json!({"class":"compile", "message":compile_result_error(execution)});
+        match self
+            .queue
+            .complete_compile_failure_with_artifacts(
+                job,
+                self.worker_id,
+                timed_out,
+                error,
+                &artifacts,
+            )
+            .await?
+        {
+            CompletionOutcome::Succeeded => Ok(if timed_out {
+                WorkerRunOutcome::TimedOut
+            } else {
+                WorkerRunOutcome::CompileFailed
+            }),
+            CompletionOutcome::Cancelled => Ok(WorkerRunOutcome::Cancelled),
+        }
+    }
+
     async fn compile_failure(
         &self,
         job: core_types::JobId,

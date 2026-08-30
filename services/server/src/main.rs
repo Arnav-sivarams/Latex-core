@@ -22,12 +22,14 @@ use axum::{
 use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
 use core_types::{
     ArtifactId, CompileKeyMaterialV1, CostClass, IdempotencyKey, JobId, LatexmkProfileId,
-    LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId, WorkspaceVersion,
+    LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
+    WorkspaceManifestV1, WorkspaceVersion,
 };
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, ChangeSetPublishResult, Database,
     DatabaseConfig, EnqueueCompileJobV1, FilePolicy, GlobalRole, GroupType, PostgresCompileQueue,
-    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord, V2Error, V2Repository,
+    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord, V2BuildRequest,
+    V2Error, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -144,6 +146,20 @@ struct V2RenameFileInput {
 #[derive(Deserialize)]
 struct V2VersionInput {
     version: u64,
+}
+#[derive(Deserialize)]
+struct V2CheckpointInput {
+    name: String,
+}
+#[derive(Deserialize)]
+struct V2BuildInput {
+    #[serde(default = "default_manual_trigger")]
+    trigger_type: String,
+}
+#[derive(Deserialize)]
+struct V2CompareQuery {
+    from: uuid::Uuid,
+    to: uuid::Uuid,
 }
 #[derive(Deserialize)]
 struct TeamMemberInput {
@@ -496,6 +512,26 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v2/papers/{paper_id}/main/{file_id}",
             post(v2_set_main),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/versions",
+            get(v2_versions).post(v2_create_checkpoint),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/versions/compare",
+            get(v2_compare_versions),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/versions/{version_id}",
+            get(v2_version),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/builds",
+            get(v2_build_status).post(v2_submit_build),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/artifacts/{kind}",
+            get(v2_current_artifact),
         )
         .route("/api/admin/overview", get(admin_overview))
         .route("/api/admin/users", get(admin_users).post(admin_create_user))
@@ -1340,6 +1376,426 @@ async fn v2_set_main(
         Ok(version) => Json(serde_json::json!({"version":version})).into_response(),
         Err(error_value) => v2_error(error_value),
     }
+}
+
+#[derive(Clone)]
+struct ExactV2State {
+    document_epoch: u64,
+    source_sequence: u64,
+    snapshot_id: core_types::SnapshotId,
+    manifest: serde_json::Value,
+    state_hash: String,
+}
+
+async fn capture_exact_v2_state(
+    state: &AppState,
+    paper: &persistence::WriterPaper,
+) -> Result<ExactV2State, Response> {
+    state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "collaboration flush failed",
+            )
+        })?;
+    let document_epoch = state
+        .v2
+        .paper_document_epoch(paper.workspace_id)
+        .await
+        .map_err(v2_error)?;
+    let checkpoint = state
+        .workspaces
+        .force_snapshot(paper.workspace_id)
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "paper must have a main file"))?;
+    let bytes = state
+        .blobs
+        .get(checkpoint.manifest_blob_hash())
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot storage failure",
+            )
+        })?;
+    let workspace_manifest: WorkspaceManifestV1 = serde_json::from_slice(&bytes).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid snapshot manifest",
+        )
+    })?;
+    let cutoffs = state
+        .v2
+        .collaboration_cutoffs(paper.workspace_id, document_epoch)
+        .await
+        .map_err(v2_error)?;
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "paper_id": paper.id,
+        "workspace_id": paper.workspace_id,
+        "document_epoch": document_epoch,
+        "source_sequence": checkpoint.workspace_version().get(),
+        "workspace_snapshot_id": checkpoint.snapshot_id(),
+        "collaboration_cutoffs": cutoffs.into_iter().map(|(file_id, sequence)| {
+            serde_json::json!({"file_id":file_id,"durable_sequence":sequence})
+        }).collect::<Vec<_>>(),
+        "workspace": workspace_manifest,
+        "template_policy_provenance": null,
+    });
+    let state_hash = checkpoint.snapshot_id().to_hex();
+    Ok(ExactV2State {
+        document_epoch,
+        source_sequence: checkpoint.workspace_version().get(),
+        snapshot_id: checkpoint.snapshot_id(),
+        manifest,
+        state_hash,
+    })
+}
+
+async fn v2_create_checkpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Json(input): Json<V2CheckpointInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .create_manual_version(
+            paper_id,
+            paper.workspace_id,
+            exact.document_epoch,
+            exact.source_sequence,
+            exact.snapshot_id,
+            exact.manifest,
+            &exact.state_hash,
+            principal.user_id(),
+            &input.name,
+        )
+        .await
+    {
+        Ok(version) => (StatusCode::CREATED, Json(version)).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.paper_versions(principal.user_id(), paper_id).await {
+        Ok(versions) => Json(versions).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, version_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .paper_version(principal.user_id(), paper_id, version_id)
+        .await
+    {
+        Ok(version) => Json(version).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_compare_versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Query(query): Query<V2CompareQuery>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let from = match state
+        .v2
+        .paper_version(principal.user_id(), paper_id, query.from)
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let to = match state
+        .v2
+        .paper_version(principal.user_id(), paper_id, query.to)
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    match compare_version_manifests(&state, &from.manifest, &to.manifest).await {
+        Ok(value) => Json(value).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn compare_version_manifests(
+    state: &AppState,
+    from: &serde_json::Value,
+    to: &serde_json::Value,
+) -> Result<serde_json::Value, Response> {
+    let before: WorkspaceManifestV1 =
+        serde_json::from_value(from.get("workspace").cloned().ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "version manifest missing workspace",
+            )
+        })?)
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid version manifest",
+            )
+        })?;
+    let after: WorkspaceManifestV1 =
+        serde_json::from_value(to.get("workspace").cloned().ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "version manifest missing workspace",
+            )
+        })?)
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid version manifest",
+            )
+        })?;
+    let added = after
+        .files()
+        .keys()
+        .filter(|path| !before.files().contains_key(*path))
+        .map(LogicalPath::as_str)
+        .collect::<Vec<_>>();
+    let removed = before
+        .files()
+        .keys()
+        .filter(|path| !after.files().contains_key(*path))
+        .map(LogicalPath::as_str)
+        .collect::<Vec<_>>();
+    let changed = before
+        .files()
+        .iter()
+        .filter_map(|(path, old)| {
+            after
+                .files()
+                .get(path)
+                .filter(|new| *new != old)
+                .map(|_| path)
+        })
+        .collect::<Vec<_>>();
+    let mut diffs = BTreeMap::new();
+    for path in &changed {
+        let old = before
+            .files()
+            .get(*path)
+            .expect("changed path exists before");
+        let new = after.files().get(*path).expect("changed path exists after");
+        let old_bytes = state.blobs.get(old.blob_hash).await.map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "version blob unavailable",
+            )
+        })?;
+        let new_bytes = state.blobs.get(new.blob_hash).await.map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "version blob unavailable",
+            )
+        })?;
+        if let (Ok(old_text), Ok(new_text)) = (
+            std::str::from_utf8(&old_bytes),
+            std::str::from_utf8(&new_bytes),
+        ) {
+            let mut unified = format!("--- a/{}\n+++ b/{}\n", path.as_str(), path.as_str());
+            for line in old_text.lines() {
+                unified.push('-');
+                unified.push_str(line);
+                unified.push('\n');
+            }
+            for line in new_text.lines() {
+                unified.push('+');
+                unified.push_str(line);
+                unified.push('\n');
+            }
+            diffs.insert(path.as_str(), unified);
+        }
+    }
+    Ok(serde_json::json!({
+        "files_added": added,
+        "files_removed": removed,
+        "files_changed": changed.iter().map(|path| path.as_str()).collect::<Vec<_>>(),
+        "text_diffs": diffs,
+    }))
+}
+
+async fn v2_submit_build(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Json(input): Json<V2BuildInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if !matches!(input.trigger_type.as_str(), "auto" | "manual") {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "trigger_type must be auto or manual",
+        );
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = TexEngine::PdfLatex;
+    let profile = LatexmkProfileId::parse("safe-v1").expect("static profile is valid");
+    let compile_key = match CompileKeyMaterialV1::new(
+        exact.snapshot_id,
+        engine,
+        state.environment.clone(),
+        profile.clone(),
+        ShellPolicy::Safe,
+        true,
+    )
+    .compile_key()
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "compile key failure"),
+    };
+    let request = V2BuildRequest {
+        paper_id,
+        workspace_id: paper.workspace_id,
+        document_epoch: exact.document_epoch,
+        source_sequence: exact.source_sequence,
+        snapshot_id: exact.snapshot_id,
+        manifest: exact.manifest,
+        state_hash: exact.state_hash,
+        tenant_id: principal.session.tenant_id,
+        user_id: principal.user_id(),
+        trigger_type: input.trigger_type,
+        compile_key,
+        engine,
+        tex_environment_id: state.environment.clone(),
+        latexmk_profile: profile,
+        shell_policy: ShellPolicy::Safe,
+        synctex: true,
+    };
+    match state.v2.submit_v2_build(&request).await {
+        Ok(build) => (StatusCode::ACCEPTED, Json(build)).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_build_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.v2_build_view(principal.user_id(), paper_id).await {
+        Ok(view) => Json(serde_json::json!({
+            "build": view,
+            "pdf_url": view.current_build_id.map(|_| format!("/api/v2/papers/{paper_id}/artifacts/pdf")),
+            "log_url": view.current_build_id.map(|_| format!("/api/v2/papers/{paper_id}/artifacts/log")),
+            "synctex_url": view.current_build_id.map(|_| format!("/api/v2/papers/{paper_id}/artifacts/synctex")),
+        })).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_current_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, kind)): Path<(uuid::Uuid, String)>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .current_v2_artifact(principal.user_id(), paper_id, &kind)
+        .await
+    {
+        Ok(artifact) => match state.blobs.get(artifact.blob_hash).await {
+            Ok(bytes) => (
+                [
+                    (header::CONTENT_TYPE, artifact.content_type),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!(
+                            "{}; filename=\"{}\"",
+                            if kind == "pdf" {
+                                "inline"
+                            } else {
+                                "attachment"
+                            },
+                            artifact
+                                .logical_name
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("artifact")
+                        ),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact storage failure",
+            ),
+        },
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+fn default_manual_trigger() -> String {
+    "manual".to_owned()
 }
 
 async fn authorized_file(
@@ -5216,6 +5672,335 @@ mod database_tests {
         server.abort();
         pool.close().await;
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn s4_versions_coalesce_deduplicate_and_suppress_stale_promotion() {
+        use core_types::WorkerId;
+
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                r#"{"name":"S4 exact paper"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["paper"]["id"].as_str().unwrap();
+        let workspace_id =
+            uuid::Uuid::parse_str(created["paper"]["workspace_id"].as_str().unwrap()).unwrap();
+        let file_id = created["main_file"]["file_id"].as_str().unwrap();
+        let checkpoint_path = format!("/api/v2/papers/{paper_id}/versions");
+        let build_path = format!("/api/v2/papers/{paper_id}/builds");
+        let file_path = format!("/api/v2/papers/{paper_id}/files/{file_id}");
+
+        let first_checkpoint = request(
+            &app,
+            Method::POST,
+            &checkpoint_path,
+            Some(&writer.cookie),
+            r#"{"name":"Before edits"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(first_checkpoint.status(), StatusCode::CREATED);
+        let first_checkpoint = test_json(first_checkpoint).await;
+        assert_eq!(first_checkpoint["name"], "Before edits");
+
+        let h1 = test_json(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&writer.cookie),
+                r#"{"trigger_type":"auto"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let h1_id = uuid::Uuid::parse_str(h1["build_id"].as_str().unwrap()).unwrap();
+        let worker = WorkerId::new();
+        let claimed_h1 = state.queue.claim(worker).await.unwrap().unwrap();
+        assert_eq!(*claimed_h1.id.as_uuid(), h1_id);
+
+        let mut version = 1_u64;
+        let mut newest_hash = String::new();
+        for label in ["H2", "H3", "H4"] {
+            let saved = test_json(
+                request(
+                    &app,
+                    Method::PUT,
+                    &file_path,
+                    Some(&writer.cookie),
+                    &serde_json::json!({
+                        "content":format!("\\documentclass{{article}}\n\\begin{{document}}{label}\\end{{document}}"),
+                        "version":version
+                    })
+                    .to_string(),
+                    Some("application/json"),
+                )
+                .await,
+            )
+            .await;
+            version = saved["version"].as_u64().unwrap();
+            let invalidated_pending: Option<String> = sqlx::query_scalar(
+                "SELECT pending_state_hash FROM latex_core.v2_paper_build_state WHERE workspace_id=$1",
+            )
+            .bind(workspace_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(invalidated_pending.is_none());
+            let submitted = test_json(
+                request(
+                    &app,
+                    Method::POST,
+                    &build_path,
+                    Some(&writer.cookie),
+                    r#"{"trigger_type":"auto"}"#,
+                    Some("application/json"),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(submitted["status"], "pending");
+            newest_hash = submitted["state_hash"].as_str().unwrap().to_owned();
+        }
+        let effective: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1 AND state IN ('queued','running')",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(effective, 1);
+        let pending: String = sqlx::query_scalar(
+            "SELECT pending_state_hash FROM latex_core.v2_paper_build_state WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, newest_hash);
+
+        let h1_artifacts = test_artifacts(&state, "h1").await;
+        state
+            .queue
+            .complete_success(
+                claimed_h1.id,
+                worker,
+                &h1_artifacts,
+                core_types::BlobHash::digest(b"h1-manifest"),
+            )
+            .await
+            .unwrap();
+        let after_stale = test_json(get(&app, &build_path, Some(&writer.cookie)).await).await;
+        assert!(after_stale["build"]["current_build_id"].is_null());
+        let h4_id = after_stale["build"]["active_build_id"].as_str().unwrap();
+        assert_ne!(h4_id, h1_id.to_string());
+
+        let worker_h4 = WorkerId::new();
+        let claimed_h4 = state.queue.claim(worker_h4).await.unwrap().unwrap();
+        assert_eq!(claimed_h4.id.to_string(), h4_id);
+        let h4_artifacts = test_artifacts(&state, "h4").await;
+        state
+            .queue
+            .complete_success(
+                claimed_h4.id,
+                worker_h4,
+                &h4_artifacts,
+                core_types::BlobHash::digest(b"h4-manifest"),
+            )
+            .await
+            .unwrap();
+        let current = test_json(get(&app, &build_path, Some(&writer.cookie)).await).await;
+        assert_eq!(current["build"]["current_build_id"], h4_id);
+        assert_eq!(current["build"]["current_source_sequence"], version);
+
+        let reused = test_json(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&writer.cookie),
+                r#"{"trigger_type":"manual"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["build_id"], h4_id);
+        let compile_versions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.paper_versions WHERE workspace_id=$1 AND version_type='compile_checkpoint'",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(compile_versions, 2);
+
+        let saved = test_json(
+            request(
+                &app,
+                Method::PUT,
+                &file_path,
+                Some(&writer.cookie),
+                &serde_json::json!({"content":"\\documentclass{article}\n\\badcommand", "version":version}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        version = saved["version"].as_u64().unwrap();
+        let failed_build = test_json(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&writer.cookie),
+                r#"{"trigger_type":"auto"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(failed_build["status"], "queued");
+        let failure_worker = WorkerId::new();
+        let claimed_failure = state.queue.claim(failure_worker).await.unwrap().unwrap();
+        state
+            .queue
+            .complete_compile_failure(
+                claimed_failure.id,
+                failure_worker,
+                false,
+                serde_json::json!({"class":"compile","message":"representative failure"}),
+            )
+            .await
+            .unwrap();
+        let after_failure = test_json(get(&app, &build_path, Some(&writer.cookie)).await).await;
+        assert_eq!(after_failure["build"]["current_build_id"], h4_id);
+        assert_eq!(after_failure["build"]["latest_status"], "failed");
+        assert_eq!(after_failure["build"]["source_sequence"], version);
+
+        let second_checkpoint = test_json(
+            request(
+                &app,
+                Method::POST,
+                &checkpoint_path,
+                Some(&writer.cookie),
+                r#"{"name":"After edits"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let comparison = test_json(
+            get(
+                &app,
+                &format!(
+                    "{checkpoint_path}/compare?from={}&to={}",
+                    first_checkpoint["id"].as_str().unwrap(),
+                    second_checkpoint["id"].as_str().unwrap()
+                ),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(comparison["files_changed"][0], "main.tex");
+        assert!(
+            comparison["text_diffs"]["main.tex"]
+                .as_str()
+                .unwrap()
+                .contains("badcommand")
+        );
+
+        assert_eq!(
+            get(&app, &checkpoint_path, Some(&outsider.cookie))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        for denied in [&mentor, &admin] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::POST,
+                    &checkpoint_path,
+                    Some(&denied.cookie),
+                    r#"{"name":"Denied"}"#,
+                    Some("application/json"),
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                get(
+                    &app,
+                    &format!("/api/v2/papers/{paper_id}/artifacts/pdf"),
+                    Some(&denied.cookie),
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    async fn test_artifacts(
+        state: &AppState,
+        label: &str,
+    ) -> Vec<persistence::PersistedArtifactV1> {
+        let values = [
+            (
+                core_types::ArtifactKind::Pdf,
+                "paper.pdf",
+                "application/pdf",
+                format!("pdf-{label}").into_bytes(),
+            ),
+            (
+                core_types::ArtifactKind::Log,
+                "paper.log",
+                "text/plain",
+                format!("log-{label}").into_bytes(),
+            ),
+            (
+                core_types::ArtifactKind::Synctex,
+                "paper.synctex.gz",
+                "application/gzip",
+                vec![0x1f, 0x8b, 1],
+            ),
+        ];
+        let mut artifacts = Vec::new();
+        for (kind, name, content_type, bytes) in values {
+            let stored = state.blobs.put(Bytes::from(bytes)).await.unwrap();
+            artifacts.push(persistence::PersistedArtifactV1 {
+                artifact_id: ArtifactId::new(),
+                kind,
+                logical_name: LogicalPath::parse(name).unwrap(),
+                blob_hash: stored.hash(),
+                size_bytes: stored.size_bytes(),
+                content_type: content_type.to_owned(),
+            });
+        }
+        artifacts
     }
 
     type TestSocket = tokio_tungstenite::WebSocketStream<

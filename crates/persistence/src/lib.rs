@@ -20,6 +20,13 @@ mod permissions;
     reason = "V2 repository methods share a typed domain error and transaction inputs are values"
 )]
 mod v2;
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    reason = "S4 repository methods share the typed V2 error contract and keep each scheduler transaction auditable"
+)]
+mod versions;
 mod workspace;
 
 pub use app::{
@@ -46,6 +53,9 @@ pub use v2::{
     GlobalRole, GlobalRoleAssignment, PaperFile, PaperKind, PaperStatus, PaperTeam,
     PaperTeamMember, PaperTeamMemberView, PersonalPaper, V2Error, V2Repository, V2User,
     WriterPaper,
+};
+pub use versions::{
+    V2ArtifactRecord, V2BuildRequest, V2BuildSubmission, V2BuildView, V2PaperVersion,
 };
 pub use workspace::{
     PostgresWorkspaceRepository, WorkspaceEventRecord, WorkspaceHeadRecord, WorkspaceSnapshotRecord,

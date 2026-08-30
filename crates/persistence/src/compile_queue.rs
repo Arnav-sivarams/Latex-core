@@ -253,6 +253,11 @@ impl PostgresCompileQueue {
         let row = sqlx::query("WITH candidate AS (SELECT j.id FROM latex_core.compile_jobs j WHERE j.state='queued' AND (SELECT count(*) FROM latex_core.compile_jobs active WHERE active.user_id=j.user_id AND active.state IN ('claimed','running')) < $1 ORDER BY j.priority DESC,j.created_at ASC,j.id ASC FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE latex_core.compile_jobs j SET state='running',worker_id=$2,lease_until=statement_timestamp() + ($3::bigint * interval '1 millisecond'),claimed_at=COALESCE(j.claimed_at,statement_timestamp()),started_at=COALESCE(j.started_at,statement_timestamp()),attempt_count=j.attempt_count+1,updated_at=statement_timestamp() FROM candidate WHERE j.id=candidate.id RETURNING j.id,j.tenant_id,j.user_id,j.workspace_id,j.snapshot_id,j.compile_key,j.engine,j.tex_environment_id,j.latexmk_profile,j.shell_policy,j.synctex,j.attempt_count")
             .bind(i64::from(self.limits.per_user_running)).bind(worker_id.as_uuid()).bind(self.limits.lease_millis()?)
             .fetch_optional(&mut *tx).await.map_err(QueueError::Database)?;
+        if let Some(ref claimed) = row {
+            let id: uuid::Uuid = claimed.try_get("id").map_err(QueueError::Database)?;
+            sqlx::query("UPDATE latex_core.v2_paper_builds SET status='running',updated_at=statement_timestamp() WHERE compile_job_id=$1")
+                .bind(id).execute(&mut *tx).await.map_err(QueueError::Database)?;
+        }
         tx.commit().await.map_err(QueueError::Database)?;
         row.map(decode_job).transpose()
     }
@@ -289,8 +294,24 @@ impl PostgresCompileQueue {
 
     /// Requeues expired infrastructure work, or fails it once retry budget is exhausted.
     pub async fn recover_expired_leases(&self) -> Result<u64, QueueError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(QueueError::Database)?;
         let result = sqlx::query("UPDATE latex_core.compile_jobs SET state=CASE WHEN cancellation_requested_at IS NOT NULL THEN 'cancelled' WHEN attempt_count >= $1 THEN 'failed' ELSE 'queued' END,worker_id=NULL,lease_until=NULL,finished_at=CASE WHEN cancellation_requested_at IS NOT NULL OR attempt_count >= $1 THEN statement_timestamp() ELSE NULL END,error_class=CASE WHEN cancellation_requested_at IS NOT NULL THEN 'cancelled' WHEN attempt_count >= $1 THEN 'infrastructure' ELSE error_class END,last_error=CASE WHEN cancellation_requested_at IS NOT NULL THEN last_error WHEN attempt_count >= $1 THEN jsonb_build_object('class','infrastructure','message','worker lease expired; retry budget exhausted') ELSE jsonb_build_object('class','infrastructure','message','worker lease expired; requeued') END,updated_at=statement_timestamp() WHERE state IN ('claimed','running') AND lease_until<=statement_timestamp()")
-            .bind(i32::try_from(self.limits.max_attempts).map_err(|_| QueueError::InvalidConfiguration { message: "max attempts too large".to_owned() })?).execute(self.database.pool()).await.map_err(QueueError::Database)?;
+            .bind(i32::try_from(self.limits.max_attempts).map_err(|_| QueueError::InvalidConfiguration { message: "max attempts too large".to_owned() })?).execute(&mut *tx).await.map_err(QueueError::Database)?;
+        let terminal_v2 = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT j.id FROM latex_core.compile_jobs j JOIN latex_core.v2_paper_builds b ON b.compile_job_id=j.id WHERE j.state='failed' AND b.status IN ('queued','running')",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(QueueError::Database)?;
+        for job in terminal_v2 {
+            finalize_v2_build(&mut tx, JobId::from_uuid(job), false).await?;
+        }
+        tx.commit().await.map_err(QueueError::Database)?;
         Ok(result.rows_affected())
     }
 
@@ -319,6 +340,7 @@ impl PostgresCompileQueue {
         sqlx::query("INSERT INTO latex_core.compile_cache (compile_key,source_job_id,artifact_manifest_blob_hash) VALUES ($1,$2,$3) ON CONFLICT (compile_key) DO UPDATE SET last_accessed_at=statement_timestamp()")
             .bind(key.to_hex()).bind(job_id.as_uuid()).bind(manifest_hash.to_hex()).execute(&mut *tx).await.map_err(QueueError::Database)?;
         finish(&mut tx, job_id, worker_id, "succeeded", None, None, None).await?;
+        finalize_v2_build(&mut tx, job_id, true).await?;
         tx.commit().await.map_err(QueueError::Database)?;
         Ok(CompletionOutcome::Succeeded)
     }
@@ -362,6 +384,7 @@ impl PostgresCompileQueue {
             Some(cache.source_job_id),
         )
         .await?;
+        finalize_v2_build(&mut tx, job_id, true).await?;
         tx.commit().await.map_err(QueueError::Database)?;
         Ok(CompletionOutcome::Succeeded)
     }
@@ -373,20 +396,36 @@ impl PostgresCompileQueue {
         timed_out: bool,
         error: Value,
     ) -> Result<CompletionOutcome, QueueError> {
+        self.complete_compile_failure_with_artifacts(job_id, worker_id, timed_out, error, &[])
+            .await
+    }
+
+    pub async fn complete_compile_failure_with_artifacts(
+        &self,
+        job_id: JobId,
+        worker_id: WorkerId,
+        timed_out: bool,
+        error: Value,
+        artifacts: &[PersistedArtifactV1],
+    ) -> Result<CompletionOutcome, QueueError> {
         let mut tx = self
             .database
             .pool()
             .begin()
             .await
             .map_err(QueueError::Database)?;
-        if self
-            .assert_live_lease(&mut tx, job_id, worker_id)
-            .await?
-            .is_none()
-        {
+        let key = self.assert_live_lease(&mut tx, job_id, worker_id).await?;
+        if key.is_none() {
             tx.commit().await.map_err(QueueError::Database)?;
             return Ok(CompletionOutcome::Cancelled);
         }
+        insert_artifacts(
+            &mut tx,
+            job_id,
+            key.ok_or_else(|| integrity("missing claimed compile key"))?,
+            artifacts,
+        )
+        .await?;
         finish(
             &mut tx,
             job_id,
@@ -397,6 +436,7 @@ impl PostgresCompileQueue {
             None,
         )
         .await?;
+        finalize_v2_build(&mut tx, job_id, false).await?;
         tx.commit().await.map_err(QueueError::Database)?;
         Ok(CompletionOutcome::Succeeded)
     }
@@ -439,6 +479,7 @@ impl PostgresCompileQueue {
                 None,
             )
             .await?;
+            finalize_v2_build(&mut tx, job_id, false).await?;
         } else {
             sqlx::query("UPDATE latex_core.compile_jobs SET state='queued',worker_id=NULL,lease_until=NULL,updated_at=statement_timestamp(),error_class='infrastructure',last_error=$2 WHERE id=$1 AND worker_id=$3 AND state='running'")
                 .bind(job_id.as_uuid()).bind(error).bind(worker_id.as_uuid()).execute(&mut *tx).await.map_err(QueueError::Database)?;
@@ -610,6 +651,181 @@ async fn insert_artifacts(
             .bind(artifact.artifact_id.as_uuid()).bind(job.as_uuid()).bind(key.to_hex()).bind(artifact_kind_text(artifact.kind)).bind(artifact.logical_name.as_str()).bind(artifact.blob_hash.to_hex()).bind(size).bind(&artifact.content_type).execute(&mut **tx).await.map_err(QueueError::Database)?;
     }
     Ok(())
+}
+
+/// Finalizes optional S4 metadata in the same transaction as the legacy queue
+/// transition, then promotes only an exact desired-state match and activates
+/// at most the single newest pending snapshot.
+#[allow(
+    clippy::too_many_lines,
+    reason = "promotion and newest-pending activation must remain one auditable PostgreSQL transaction"
+)]
+async fn finalize_v2_build(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: JobId,
+    succeeded: bool,
+) -> Result<(), QueueError> {
+    let build = sqlx::query(
+        "SELECT id,workspace_id,state_hash FROM latex_core.v2_paper_builds WHERE compile_job_id=$1",
+    )
+    .bind(job.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(QueueError::Database)?;
+    let Some(build) = build else {
+        return Ok(());
+    };
+    let build_id: uuid::Uuid = build.try_get("id").map_err(QueueError::Database)?;
+    let workspace_id: uuid::Uuid = build
+        .try_get("workspace_id")
+        .map_err(QueueError::Database)?;
+    let state_hash: String = build.try_get("state_hash").map_err(QueueError::Database)?;
+    let scheduler = sqlx::query(
+        "SELECT * FROM latex_core.v2_paper_build_state WHERE workspace_id=$1 FOR UPDATE",
+    )
+    .bind(workspace_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(QueueError::Database)?;
+    sqlx::query(
+        "UPDATE latex_core.v2_paper_builds SET status=$2,updated_at=statement_timestamp() WHERE id=$1",
+    )
+    .bind(build_id)
+    .bind(if succeeded { "succeeded" } else { "failed" })
+    .execute(&mut **tx)
+    .await
+    .map_err(QueueError::Database)?;
+    let desired: Option<String> = scheduler
+        .try_get("desired_state_hash")
+        .map_err(QueueError::Database)?;
+    if succeeded && desired.as_deref() == Some(state_hash.as_str()) {
+        sqlx::query(
+            "UPDATE latex_core.v2_paper_build_state SET current_build_id=$2,updated_at=statement_timestamp() WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .bind(build_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(QueueError::Database)?;
+        sqlx::query(
+            "UPDATE latex_core.v2_paper_builds SET promoted_at=statement_timestamp(),updated_at=statement_timestamp() WHERE id=$1",
+        )
+        .bind(build_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(QueueError::Database)?;
+    }
+
+    let pending_hash: Option<String> = scheduler
+        .try_get("pending_state_hash")
+        .map_err(QueueError::Database)?;
+    let next_build = if let Some(pending_hash) = pending_hash {
+        let next_build = uuid::Uuid::new_v4();
+        let next_version = uuid::Uuid::new_v4();
+        let paper_id: uuid::Uuid = scheduler
+            .try_get("paper_id")
+            .map_err(QueueError::Database)?;
+        let snapshot: String = required_pending(&scheduler, "pending_snapshot_id")?;
+        let manifest: Value = required_pending(&scheduler, "pending_manifest")?;
+        let sequence: i64 = required_pending(&scheduler, "pending_source_sequence")?;
+        let epoch: i64 = required_pending(&scheduler, "pending_document_epoch")?;
+        let tenant: uuid::Uuid = required_pending(&scheduler, "pending_tenant_id")?;
+        let user: uuid::Uuid = required_pending(&scheduler, "pending_user_id")?;
+        let trigger: String = required_pending(&scheduler, "pending_trigger_type")?;
+        let compile_key: String = required_pending(&scheduler, "pending_compile_key")?;
+        let engine: String = required_pending(&scheduler, "pending_engine")?;
+        let environment: String = required_pending(&scheduler, "pending_tex_environment_id")?;
+        let profile: String = required_pending(&scheduler, "pending_latexmk_profile")?;
+        let shell: String = required_pending(&scheduler, "pending_shell_policy")?;
+        let synctex: bool = required_pending(&scheduler, "pending_synctex")?;
+        let number: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(max(version_number),0)+1 FROM latex_core.paper_versions WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(QueueError::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.compile_jobs \
+             (id,tenant_id,user_id,workspace_id,snapshot_id,compile_key,idempotency_key,engine,tex_environment_id,latexmk_profile,shell_policy,synctex,cost_class,priority,state) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'normal',$13,'queued')",
+        )
+        .bind(next_build)
+        .bind(tenant)
+        .bind(user)
+        .bind(workspace_id)
+        .bind(&snapshot)
+        .bind(&compile_key)
+        .bind(format!("v2:{next_build}"))
+        .bind(&engine)
+        .bind(&environment)
+        .bind(&profile)
+        .bind(&shell)
+        .bind(synctex)
+        .bind(if trigger == "manual" { 10_i16 } else { 0_i16 })
+        .execute(&mut **tx)
+        .await
+        .map_err(QueueError::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.paper_versions \
+             (id,paper_id,workspace_id,document_epoch,version_number,version_type,created_by_user_id,workspace_version,snapshot_id,manifest,state_hash) \
+             VALUES ($1,$2,$3,$4,$5,'compile_checkpoint',$6,$7,$8,$9,$10)",
+        )
+        .bind(next_version)
+        .bind(paper_id)
+        .bind(workspace_id)
+        .bind(epoch)
+        .bind(number)
+        .bind(user)
+        .bind(sequence)
+        .bind(&snapshot)
+        .bind(manifest)
+        .bind(&pending_hash)
+        .execute(&mut **tx)
+        .await
+        .map_err(QueueError::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.v2_paper_builds \
+             (id,paper_id,workspace_id,compile_job_id,version_id,document_epoch,source_sequence,state_hash,trigger_type,status) \
+             VALUES ($1,$2,$3,$1,$4,$5,$6,$7,$8,'queued')",
+        )
+        .bind(next_build)
+        .bind(paper_id)
+        .bind(workspace_id)
+        .bind(next_version)
+        .bind(epoch)
+        .bind(sequence)
+        .bind(pending_hash)
+        .bind(trigger)
+        .execute(&mut **tx)
+        .await
+        .map_err(QueueError::Database)?;
+        Some(next_build)
+    } else {
+        None
+    };
+    sqlx::query(
+        "UPDATE latex_core.v2_paper_build_state SET active_build_id=$2, \
+         pending_snapshot_id=NULL,pending_manifest=NULL,pending_state_hash=NULL,pending_source_sequence=NULL, \
+         pending_document_epoch=NULL,pending_tenant_id=NULL,pending_user_id=NULL,pending_trigger_type=NULL, \
+         pending_compile_key=NULL,pending_engine=NULL,pending_tex_environment_id=NULL,pending_latexmk_profile=NULL, \
+         pending_shell_policy=NULL,pending_synctex=NULL,updated_at=statement_timestamp() WHERE workspace_id=$1",
+    )
+    .bind(workspace_id)
+    .bind(next_build)
+    .execute(&mut **tx)
+    .await
+    .map_err(QueueError::Database)?;
+    Ok(())
+}
+
+fn required_pending<T>(row: &sqlx::postgres::PgRow, column: &str) -> Result<T, QueueError>
+where
+    for<'r> T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    row.try_get::<Option<T>, _>(column)
+        .map_err(QueueError::Database)?
+        .ok_or_else(|| integrity(format!("incomplete pending V2 build: {column}")))
 }
 async fn finish(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

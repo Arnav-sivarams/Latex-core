@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Writer — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=s3">
+  <link rel="stylesheet" href="/static/shells.css?v=s4">
 </head>
 <body>
   <header class="shell-topbar">
@@ -44,21 +44,24 @@
         <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No paper selected</strong><p>Create a personal paper or open an assigned team paper.</p></div></div>
       </section>
       <section class="pdf-foundation" aria-labelledby="pdf-heading">
-        <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><span>Manual compilation foundation</span></div>
-        <div class="foundation-empty"><strong>No preview available</strong><p>Live rebuild is not part of S2.</p></div>
+        <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><div class="pdf-actions"><span id="buildStatus">No PDF yet</span><button id="compilePaper" class="primary" type="button" disabled>Compile</button></div></div>
+        <div id="pdfRelation" class="pdf-relation">No PDF yet</div>
+        <div id="pdfEmpty" class="foundation-empty"><strong>No PDF yet</strong><p>Compile, or pause after an edit for an automatic exact-state build.</p></div>
+        <iframe id="pdfFrame" class="pdf-frame" title="Current successful PDF" hidden></iframe>
       </section>
       <nav class="detail-tabs" aria-label="Paper details">
-        <a href="#problems" aria-current="page">PROBLEMS</a>
+        <a href="#problems">PROBLEMS</a>
         <a href="#reviews">REVIEWS</a>
-        <a href="#history">HISTORY</a>
+        <a href="#history" aria-current="page">HISTORY</a>
       </nav>
-      <section id="problems" class="detail-panel" aria-labelledby="problems-heading">
-        <h2 id="problems-heading">PROBLEMS</h2>
-        <p>Build diagnostics, reviews, and history remain truthful empty foundations in S2.</p>
+      <section id="history" class="detail-panel" aria-labelledby="history-heading">
+        <div class="history-heading"><div><h2 id="history-heading">HISTORY</h2><p>Immutable checkpoints and exact compile states.</p></div><button id="createCheckpoint" type="button" disabled>Create checkpoint</button></div>
+        <div id="versionHistory" class="version-history"><p class="empty-copy">Choose a paper to view history.</p></div>
+        <pre id="versionDiff" class="version-diff">Select two versions to compare.</pre>
       </section>
     </main>
   </div>
   <div id="writerNotice" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/writer.js?v=s3"></script>
+  <script type="module" src="/static/writer.js?v=s4"></script>
 </body>
 </html>

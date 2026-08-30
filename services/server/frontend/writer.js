@@ -35,6 +35,11 @@ class PaperApi {
   renameFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}/path`, 'PATCH', body); }
   deleteFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}`, 'DELETE', body); }
   setMain(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/main/${fileId}`, 'POST', body); }
+  versions(paperId) { return this.request(`/api/v2/papers/${paperId}/versions`); }
+  checkpoint(paperId, name) { return this.json(`/api/v2/papers/${paperId}/versions`, 'POST', { name }); }
+  compare(paperId, from, to) { return this.request(`/api/v2/papers/${paperId}/versions/compare?from=${from}&to=${to}`); }
+  build(paperId, triggerType) { return this.json(`/api/v2/papers/${paperId}/builds`, 'POST', { trigger_type: triggerType }); }
+  buildStatus(paperId) { return this.request(`/api/v2/papers/${paperId}/builds`); }
 
   json(path, method, body) {
     return this.request(path, {
@@ -49,7 +54,8 @@ const api = new PaperApi();
 const ui = Object.fromEntries([
   'myPapers', 'teamPapers', 'fileTree', 'newPaper', 'newFile', 'renameFile', 'deleteFile',
   'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
-  'editorMount', 'writerNotice',
+  'editorMount', 'writerNotice', 'compilePaper', 'buildStatus', 'pdfRelation', 'pdfEmpty',
+  'pdfFrame', 'createCheckpoint', 'versionHistory', 'versionDiff',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -63,6 +69,9 @@ const model = {
   view: null,
   collaboration: null,
   conflict: false,
+  autoBuildTimer: null,
+  currentBuildId: null,
+  versions: [],
 };
 
 function notice(message, failed = false) {
@@ -231,12 +240,16 @@ class CollaborationSession {
         this.initializeOrMerge();
       } else if (control.type === 'DURABLE_ACK') {
         this.pending.delete(control.client_seq);
-        if (this.pending.size === 0) saveState('synced');
+        if (this.pending.size === 0) {
+          saveState('synced');
+          scheduleAutoBuild();
+        }
       } else if (control.type === 'FLUSHED') {
         this.resolveFlushes(control.durable_seq);
         if (this.pending.size === 0) saveState('synced');
       } else if (control.type === 'REMOTE_DURABLE') {
         if (this.pending.size === 0) saveState('synced');
+        scheduleAutoBuild();
       } else if (control.type === 'RELOAD_REQUIRED') {
         model.conflict = true;
         saveState('conflict');
@@ -350,6 +363,7 @@ async function refreshPapers() {
 
 async function openPaper(paper) {
   closeEditor();
+  window.clearTimeout(model.autoBuildTimer);
   model.paper = paper;
   model.file = null;
   model.paperDetail = await api.paper(paper.id);
@@ -357,10 +371,13 @@ async function openPaper(paper) {
   model.files = await api.files(paper.id);
   ui.currentPaper.textContent = `${paper.name}${paper.status === 'active' ? '' : ` — ${paper.status} (read-only)`}`;
   ui.newFile.disabled = !model.paperDetail.editable;
+  ui.compilePaper.disabled = !model.paperDetail.editable;
+  ui.createCheckpoint.disabled = !model.paperDetail.editable;
   renderPapers();
   renderFiles();
   const initial = model.files.find((file) => file.path === model.paperDetail.main_file) || model.files[0];
   if (initial) await openFile(initial, true);
+  await Promise.all([refreshBuildStatus(), refreshHistory()]);
 }
 
 async function openFile(file, force = false) {
@@ -400,6 +417,7 @@ function mountEditor(ytext, editable, latex) {
   const extensions = [
     basicSetup,
     keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => { syncCurrent(); return true; } }]),
+    keymap.of([{ key: 'Mod-Enter', preventDefault: true, run: () => { manualCompile(); return true; } }]),
     EditorState.readOnly.of(!editable),
     EditorView.editable.of(editable),
     yCollab(ytext, null, { undoManager }),
@@ -466,6 +484,118 @@ async function reloadPaperAndFile(fileId) {
   if (file) await openFile(file, true);
 }
 
+function scheduleAutoBuild() {
+  if (!model.paper || !model.paperDetail?.editable) return;
+  window.clearTimeout(model.autoBuildTimer);
+  ui.buildStatus.textContent = 'Waiting for edits to settle…';
+  model.autoBuildTimer = window.setTimeout(() => requestBuild('auto'), 2000);
+}
+
+async function requestBuild(triggerType) {
+  if (!model.paper) return;
+  try {
+    ui.buildStatus.textContent = model.currentBuildId ? 'Rebuilding…' : 'Building…';
+    await api.build(model.paper.id, triggerType);
+    await Promise.all([refreshBuildStatus(), refreshHistory()]);
+  } catch (error) {
+    ui.buildStatus.textContent = model.currentBuildId ? 'Build failed — showing last successful PDF' : 'Build failed';
+    notice(error.message, true);
+  }
+}
+
+async function manualCompile() {
+  if (!model.paper || !model.paperDetail?.editable) return;
+  if (!await syncCurrent(false)) return;
+  await requestBuild('manual');
+}
+
+async function refreshBuildStatus() {
+  if (!model.paper) return;
+  try {
+    const payload = await api.buildStatus(model.paper.id);
+    const build = payload.build;
+    const source = build.source_sequence;
+    const pdf = build.current_source_sequence;
+    const rebuilding = Boolean(build.active_build_id) || (source != null && pdf != null && source !== pdf);
+    if (build.current_build_id && build.current_build_id !== model.currentBuildId) {
+      model.currentBuildId = build.current_build_id;
+      ui.pdfFrame.src = `${payload.pdf_url}?build=${build.current_build_id}`;
+    }
+    ui.pdfFrame.hidden = !build.current_build_id;
+    ui.pdfEmpty.hidden = Boolean(build.current_build_id);
+    if (source == null) ui.pdfRelation.textContent = 'No exact source state submitted yet';
+    else if (pdf == null) ui.pdfRelation.textContent = `Source version ${source} · No PDF yet`;
+    else ui.pdfRelation.textContent = `Source version ${source} · PDF version ${pdf}${rebuilding ? ' · Rebuilding…' : ''}`;
+    if (build.active_build_id) ui.buildStatus.textContent = build.current_build_id ? 'Rebuilding…' : 'Building…';
+    else if (build.latest_status === 'failed' && source !== pdf) {
+      ui.buildStatus.textContent = build.current_build_id ? 'Build failed — showing last successful PDF' : 'Build failed';
+      if (build.latest_error?.message) ui.pdfRelation.textContent += ` · ${build.latest_error.message}`;
+    } else if (build.current_build_id) ui.buildStatus.textContent = 'Current';
+    else ui.buildStatus.textContent = 'No PDF yet';
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+async function refreshHistory() {
+  if (!model.paper) return;
+  try {
+    model.versions = await api.versions(model.paper.id);
+    renderHistory();
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+function renderHistory() {
+  ui.versionHistory.replaceChildren();
+  if (!model.versions.length) {
+    ui.versionHistory.innerHTML = '<p class="empty-copy">No checkpoints yet.</p>';
+    return;
+  }
+  model.versions.forEach((version) => {
+    const label = document.createElement('label');
+    label.className = 'version-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = version.id;
+    checkbox.addEventListener('change', compareSelectedVersions);
+    const detail = document.createElement('span');
+    const title = document.createElement('strong');
+    title.textContent = `#${version.version_number} ${version.name || version.version_type.replaceAll('_', ' ')}`;
+    const metadata = document.createElement('small');
+    metadata.textContent = `${version.author_email} · ${new Date(version.created_at).toLocaleString()}`;
+    detail.append(title, metadata);
+    label.append(checkbox, detail);
+    ui.versionHistory.append(label);
+  });
+}
+
+async function compareSelectedVersions(event) {
+  const selected = [...ui.versionHistory.querySelectorAll('input:checked')];
+  if (selected.length > 2) {
+    event.target.checked = false;
+    return;
+  }
+  if (selected.length !== 2) {
+    ui.versionDiff.textContent = 'Select two versions to compare.';
+    return;
+  }
+  try {
+    const comparison = await api.compare(model.paper.id, selected[1].value, selected[0].value);
+    const lines = [
+      `Added: ${comparison.files_added.join(', ') || 'none'}`,
+      `Removed: ${comparison.files_removed.join(', ') || 'none'}`,
+      `Changed: ${comparison.files_changed.join(', ') || 'none'}`,
+      '',
+      ...Object.values(comparison.text_diffs),
+    ];
+    ui.versionDiff.textContent = lines.join('\n');
+  } catch (error) {
+    ui.versionDiff.textContent = error.message;
+  }
+}
+
 ui.newPaper.addEventListener('click', async () => {
   const name = window.prompt('Personal paper name');
   if (!name) return;
@@ -520,6 +650,21 @@ ui.setMain.addEventListener('click', async () => {
 });
 
 ui.saveFile.addEventListener('click', syncCurrent);
+ui.compilePaper.addEventListener('click', manualCompile);
+ui.createCheckpoint.addEventListener('click', async () => {
+  if (!model.paper || !await syncCurrent(false)) return;
+  const name = window.prompt('Checkpoint name');
+  if (!name) return;
+  try {
+    await api.checkpoint(model.paper.id, name);
+    await refreshHistory();
+    notice(`Checkpoint “${name}” created`);
+  } catch (error) { notice(error.message, true); }
+});
+
+window.setInterval(() => {
+  if (model.paper) refreshBuildStatus();
+}, 1500);
 
 api.me()
   .then((identity) => {

@@ -138,6 +138,25 @@ impl CollaborationHub {
             let _ = room.events.send(RoomEvent::ReloadRequired);
         }
     }
+
+    /// Waits until every currently loaded room in a workspace has persisted and
+    /// canonically materialized all updates observed before its flush command.
+    /// Unloaded files are already represented by the canonical workspace state.
+    pub async fn flush_workspace(&self, workspace_id: WorkspaceId) -> Result<(), String> {
+        let rooms = self
+            .rooms
+            .lock()
+            .await
+            .iter()
+            .filter(|(key, _)| key.workspace_id == workspace_id)
+            .map(|(_, room)| room.clone())
+            .collect::<Vec<_>>();
+        for room in rooms {
+            room.flush().await?;
+        }
+        tracing::info!(%workspace_id, "collaboration workspace flush barrier completed");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]

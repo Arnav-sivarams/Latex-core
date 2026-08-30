@@ -235,7 +235,7 @@ pub enum V2Error {
 
 #[derive(Clone, Debug)]
 pub struct V2Repository {
-    database: Database,
+    pub(crate) database: Database,
 }
 
 impl V2Repository {
@@ -1553,6 +1553,21 @@ async fn append_workspace_operation(
     .map_err(V2Error::Database)?;
     sqlx::query(
         "UPDATE latex_core.workspace_heads SET durable_version=$2,updated_at=statement_timestamp() WHERE workspace_id=$1",
+    )
+    .bind(workspace_id.as_uuid())
+    .bind(next)
+    .execute(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    // A durable canonical edit immediately invalidates any in-flight exact
+    // hash, even before the browser's two-second debounce submits the next
+    // snapshot. This closes the stale-promotion window during that debounce.
+    sqlx::query(
+        "UPDATE latex_core.v2_paper_build_state SET desired_state_hash=NULL,desired_source_sequence=$2, \
+         pending_snapshot_id=NULL,pending_manifest=NULL,pending_state_hash=NULL,pending_source_sequence=NULL, \
+         pending_document_epoch=NULL,pending_tenant_id=NULL,pending_user_id=NULL,pending_trigger_type=NULL, \
+         pending_compile_key=NULL,pending_engine=NULL,pending_tex_environment_id=NULL,pending_latexmk_profile=NULL, \
+         pending_shell_policy=NULL,pending_synctex=NULL,updated_at=statement_timestamp() WHERE workspace_id=$1",
     )
     .bind(workspace_id.as_uuid())
     .bind(next)

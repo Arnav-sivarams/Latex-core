@@ -91,6 +91,27 @@ fn pdf(execution: &compiler::CompileExecution) {
 }
 
 #[tokio::test]
+async fn representative_v2_pdf_log_and_nonempty_synctex() {
+    let source = br"\documentclass{article}\begin{document}S4 exact-state PDF\end{document}";
+    let (execution, _) = compile(
+        &[("paper.tex", source)],
+        "paper.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(execution.status(), CompileStatus::Succeeded);
+    pdf(&execution);
+    let synctex = execution
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::Synctex)
+        .expect("SyncTeX artifact");
+    assert!(!synctex.bytes().is_empty());
+    assert!(synctex.logical_name().as_str().ends_with(".synctex.gz"));
+}
+
+#[tokio::test]
 async fn basic_pdf_and_all_four_engines() {
     let source = br"\documentclass{article}\begin{document}Hello\end{document}";
     for engine in [
