@@ -196,7 +196,7 @@ impl V2Repository {
         .fetch_optional(&mut *tx)
         .await
         .map_err(V2Error::Database)?
-        .ok_or(V2Error::Conflict {
+        .ok_or(V2Error::NotFound {
             entity: "exact review baseline",
         })?;
         let number: i64 = sqlx::query_scalar(

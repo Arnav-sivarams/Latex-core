@@ -7,7 +7,9 @@ mod archive;
 mod auth;
 
 use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
-use persistence::{AppError, AppRepository, AppTemplateFileRecord, Database, DatabaseConfig};
+use persistence::{
+    AppError, AppRepository, AppTemplateFileRecord, Database, DatabaseConfig, V2Repository,
+};
 use std::env;
 use std::sync::Arc;
 
@@ -19,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database =
         Database::connect(DatabaseConfig::development(required("DATABASE_URL")?)?).await?;
     database.migrate().await?;
+    let v2 = V2Repository::new(database.clone());
     let repo = AppRepository::new(database);
     if group == "template" {
         return templates(repo, args, &command).await;
@@ -27,13 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return usage();
     }
     if command == "list" {
-        for user in repo.list_users().await? {
-            println!(
-                "{}\t{}\t{}",
-                user.email,
-                if user.enabled { "enabled" } else { "disabled" },
-                user.account_type,
-            );
+        for user in v2.list_v2_users().await? {
+            println!("{}", user_list_line(&user));
         }
         return Ok(());
     }
@@ -225,6 +223,43 @@ fn option(
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
 }
+fn user_list_line(user: &persistence::V2User) -> String {
+    format!(
+        "{}\t{}\tv2={}\tlegacy={}",
+        user.email,
+        if user.enabled { "enabled" } else { "disabled" },
+        user.v2_role.map_or("UNASSIGNED", |role| role.as_str()),
+        user.legacy_account_type,
+    )
+}
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
     Err("usage: latex-core-admin user <create|list|disable|enable|reset-password|set-type> EMAIL [--password PASSWORD] | template <add|list|remove|set-audience|grant-user>".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_list_reports_authoritative_v2_and_legacy_roles() {
+        let assigned = persistence::V2User {
+            user_id: core_types::UserId::new(),
+            email: "writer@example.test".into(),
+            enabled: true,
+            legacy_account_type: "student".into(),
+            v2_role: Some(persistence::GlobalRole::Writer),
+            migration_state: "ASSIGNED".into(),
+            created_at: "now".into(),
+        };
+        assert_eq!(
+            user_list_line(&assigned),
+            "writer@example.test\tenabled\tv2=writer\tlegacy=student"
+        );
+        let unassigned = persistence::V2User {
+            v2_role: None,
+            migration_state: "UNASSIGNED".into(),
+            ..assigned
+        };
+        assert!(user_list_line(&unassigned).contains("v2=UNASSIGNED\tlegacy=student"));
+    }
 }

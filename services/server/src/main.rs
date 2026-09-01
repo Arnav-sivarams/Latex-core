@@ -917,7 +917,8 @@ async fn v2_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
-const INITIAL_TEX: &str = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}\n";
+const INITIAL_TEX: &str =
+    "\\documentclass{article}\n\\begin{document}\nStart writing your paper.\n\\end{document}\n";
 
 async fn admin_v2_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = admin_session(&state, &headers).await {
@@ -6220,6 +6221,12 @@ mod tests {
     }
 
     #[test]
+    fn v2_bootstrap_document_produces_a_pdf_page() {
+        assert!(INITIAL_TEX.contains("\\begin{document}\nStart writing your paper."));
+        assert!(!INITIAL_TEX.contains("\\begin{document}\n\n\\end{document}"));
+    }
+
+    #[test]
     fn browser_login_redirect_has_a_canonical_session_cookie() {
         let response = redirect_with_cookies(
             "/",
@@ -7324,6 +7331,21 @@ mod database_tests {
             StatusCode::FORBIDDEN
         );
 
+        let missing_baseline = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/rounds"),
+            Some(&mentor.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(missing_baseline.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            test_json(missing_baseline).await["error"],
+            "exact review baseline was not found"
+        );
+
         let build_path = format!("/api/v2/papers/{paper_id}/builds");
         assert_eq!(
             request(
@@ -7986,7 +8008,7 @@ mod database_tests {
         let recovered = Doc::new();
         let recovered_text = recovered.get_or_insert_text("source");
         if let Some((_, compressed)) = recovery.snapshot {
-            let bytes = zstd::stream::decode_all(std::io::Cursor::new(compressed)).unwrap();
+            let bytes = zstd::stream::decode_all(Cursor::new(compressed)).unwrap();
             recovered
                 .transact_mut()
                 .apply_update(Update::decode_v1(&bytes).unwrap())
@@ -9541,12 +9563,12 @@ mod database_tests {
                 Some("Immutable fixture"),
                 Some("main.tex"),
                 &[
-                    persistence::AppTemplateFileRecord {
+                    AppTemplateFileRecord {
                         path: "main.tex".to_owned(),
                         blob_hash: main.hash(),
                         size_bytes: main.size_bytes(),
                     },
-                    persistence::AppTemplateFileRecord {
+                    AppTemplateFileRecord {
                         path: "references.bib".to_owned(),
                         blob_hash: bibliography.hash(),
                         size_bytes: bibliography.size_bytes(),
