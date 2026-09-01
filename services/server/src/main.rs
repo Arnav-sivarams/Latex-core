@@ -30,9 +30,10 @@ use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLe
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, AppTemplateFileRecord,
     ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState,
-    FilePolicy, GlobalRole, GroupType, PostgresCompileQueue, ProjectAccess, ProjectRoles,
-    PublishResult, QueueLimits, TeamFileRecord, TemplateSeedFile, V2BuildRequest, V2Error,
-    V2FilePolicy, V2Repository,
+    FilePolicy, GlobalRole, GroupType, ImportLimits, ImportMode, InstitutionError,
+    InstitutionRepository, PaperTeamPageFilter, PostgresCompileQueue, ProjectAccess, ProjectRoles,
+    PublishResult, QueueLimits, TeamFileRecord, TeamTemplateResolutionInput, TemplateSeedFile,
+    V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 struct AppState {
     repo: AppRepository,
     v2: V2Repository,
+    institution: InstitutionRepository,
     workspaces: WorkspaceService,
     queue: PostgresCompileQueue,
     blobs: Arc<FsBlobStore>,
@@ -135,6 +137,37 @@ struct V2PaperTeamInput {
 #[derive(Deserialize)]
 struct V2PaperTeamMemberInput {
     user_id: String,
+}
+
+#[derive(Deserialize)]
+struct ProgrammeTemplateInput {
+    template_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+struct TemplateResolvePreviewInput {
+    ordered_writer_user_ids: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ImportListQuery {
+    limit: Option<i64>,
+    before: Option<uuid::Uuid>,
+}
+
+#[derive(Deserialize, Default)]
+struct PaperTeamPageQuery {
+    limit: Option<i64>,
+    page: Option<i64>,
+    search: Option<String>,
+    status: Option<String>,
+    programme_code: Option<String>,
+    mentor_user_id: Option<uuid::Uuid>,
+    leader_user_id: Option<uuid::Uuid>,
+    template_id: Option<uuid::Uuid>,
+    review_state: Option<String>,
+    source: Option<String>,
+    unresolved: Option<bool>,
 }
 #[derive(Deserialize)]
 struct V2PaperInput {
@@ -468,6 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         collaboration::CollaborationHub::new(v2.clone(), workspaces.clone(), blobs.clone());
     let state = AppState {
         repo: AppRepository::new(database.clone()),
+        institution: InstitutionRepository::new(database.clone()),
         v2,
         workspaces,
         queue,
@@ -537,6 +571,47 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/paper-teams",
             get(admin_v2_paper_teams).post(admin_v2_create_paper_team),
+        )
+        .route(
+            "/api/admin/v2/paper-teams/query",
+            get(admin_v2_paper_teams_query),
+        )
+        .route(
+            "/api/admin/v2/institution/imports/validate",
+            post(admin_v2_institution_validate),
+        )
+        .route(
+            "/api/admin/v2/institution/imports/{job_id}/apply",
+            post(admin_v2_institution_apply),
+        )
+        .route(
+            "/api/admin/v2/institution/imports",
+            get(admin_v2_institution_imports),
+        )
+        .route(
+            "/api/admin/v2/institution/imports/{job_id}",
+            get(admin_v2_institution_import),
+        )
+        .route(
+            "/api/admin/v2/institution/imports/{job_id}/errors.csv",
+            get(admin_v2_institution_errors),
+        )
+        .route(
+            "/api/admin/v2/institution/template-defaults/programmes",
+            get(admin_v2_programme_template_defaults),
+        )
+        .route(
+            "/api/admin/v2/institution/template-defaults/programmes/{programme_code}",
+            axum::routing::put(admin_v2_set_programme_template_default)
+                .delete(admin_v2_delete_programme_template_default),
+        )
+        .route(
+            "/api/admin/v2/institution/template-defaults/resolve-preview",
+            post(admin_v2_template_resolve_preview),
+        )
+        .route(
+            "/api/admin/v2/institution/template-defaults/global-fallback",
+            get(admin_v2_global_fallback).put(admin_v2_set_global_fallback),
         )
         .route("/api/admin/v2/paper-teams/{id}", get(admin_v2_paper_team))
         .route(
@@ -1031,6 +1106,505 @@ async fn admin_v2_paper_teams(State(state): State<AppState>, headers: HeaderMap)
     }
 }
 
+async fn admin_v2_paper_teams_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PaperTeamPageQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    let filter = PaperTeamPageFilter {
+        limit: query.limit.unwrap_or(50),
+        page: query.page.unwrap_or(1),
+        search: query.search,
+        status: query.status,
+        programme_code: query.programme_code,
+        mentor_user_id: query.mentor_user_id,
+        leader_user_id: query.leader_user_id,
+        template_id: query.template_id,
+        review_state: query.review_state,
+        source: query.source,
+        unresolved: query.unresolved,
+    };
+    match state.institution.paginated_paper_teams(&filter).await {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+#[derive(Default)]
+struct InstitutionUpload {
+    filename: Option<String>,
+    target_table: Option<String>,
+    mode: Option<String>,
+    bytes: Bytes,
+}
+
+async fn institution_upload_fields(
+    mut multipart: Multipart,
+) -> Result<InstitutionUpload, Response> {
+    let mut upload = InstitutionUpload::default();
+    let mut has_file = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid institution upload"))?
+    {
+        match field.name() {
+            Some("file") if !has_file => {
+                upload.filename = field.file_name().map(str::to_owned);
+                upload.bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid institution upload"))?;
+                has_file = true;
+            }
+            Some("file") => {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "only one institution file may be uploaded",
+                ));
+            }
+            Some("mode") => {
+                upload.mode = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid import mode"))?,
+                );
+            }
+            Some("target_table") => {
+                upload.target_table = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid target table"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    if !has_file || upload.filename.is_none() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "multipart file with a filename is required",
+        ));
+    }
+    Ok(upload)
+}
+
+async fn admin_v2_institution_validate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let upload = match institution_upload_fields(multipart).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let mode = match upload
+        .mode
+        .as_deref()
+        .unwrap_or("VALIDATE_ONLY")
+        .parse::<ImportMode>()
+    {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    match state
+        .institution
+        .validate_upload(
+            principal.user_id(),
+            upload.filename.as_deref().unwrap_or_default(),
+            upload
+                .target_table
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            mode,
+            &upload.bytes,
+            ImportLimits::default(),
+        )
+        .await
+    {
+        Ok(job) => (StatusCode::CREATED, Json(job)).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "per-Team isolation keeps resolution, template cloning, and unresolved provenance adjacent"
+)]
+async fn admin_v2_institution_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let applied_job = match state
+        .institution
+        .apply_import(job_id, principal.user_id())
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    let plans = match state.institution.pending_team_plans(job_id).await {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    let mut materialized = 0_u64;
+    let mut merged = 0_u64;
+    let mut unresolved = 0_u64;
+    for plan in plans {
+        if plan.existing_paper_team_id.is_some() {
+            if applied_job.mode == "ADD_ONLY" {
+                continue;
+            }
+            if !plan.unresolved.is_empty() {
+                unresolved += 1;
+                if let Err(error_value) = state
+                    .institution
+                    .mark_team_unresolved(job_id, &plan.external_team_key, &plan.unresolved)
+                    .await
+                {
+                    return institution_error(error_value);
+                }
+                continue;
+            }
+            match state
+                .institution
+                .merge_existing_team(principal.user_id(), &plan)
+                .await
+            {
+                Ok(()) => merged += 1,
+                Err(error_value) => {
+                    unresolved += 1;
+                    let reasons = vec![error_value.to_string()];
+                    if let Err(mark_error) = state
+                        .institution
+                        .mark_team_unresolved(job_id, &plan.external_team_key, &reasons)
+                        .await
+                    {
+                        return institution_error(mark_error);
+                    }
+                }
+            }
+            continue;
+        }
+        if !plan.unresolved.is_empty() {
+            unresolved += 1;
+            if let Err(error_value) = state
+                .institution
+                .mark_team_unresolved(job_id, &plan.external_team_key, &plan.unresolved)
+                .await
+            {
+                return institution_error(error_value);
+            }
+            continue;
+        }
+        let writers = plan
+            .writer_user_ids
+            .iter()
+            .copied()
+            .map(UserId::from_uuid)
+            .collect::<Vec<_>>();
+        let mentors = plan
+            .mentor_user_ids
+            .iter()
+            .copied()
+            .map(UserId::from_uuid)
+            .collect::<Vec<_>>();
+        let Some(leader) = plan.leader_user_id.map(UserId::from_uuid) else {
+            unresolved += 1;
+            let reasons = vec!["MISSING_LEADER".to_owned()];
+            let _ = state
+                .institution
+                .mark_team_unresolved(job_id, &plan.external_team_key, &reasons)
+                .await;
+            continue;
+        };
+        let resolution = match state
+            .institution
+            .resolve_default_template_for_writers(&writers)
+            .await
+        {
+            Ok(value) => value,
+            Err(error_value) => {
+                unresolved += 1;
+                let reasons = vec![error_value.to_string()];
+                let _ = state
+                    .institution
+                    .mark_team_unresolved(job_id, &plan.external_team_key, &reasons)
+                    .await;
+                continue;
+            }
+        };
+        let (main_path, seeds, source_identity) =
+            match template_seeds(&state, resolution.selected_template_id).await {
+                Ok(value) => value,
+                Err(response) => {
+                    unresolved += 1;
+                    let reasons = vec!["selected template is not materializable".to_owned()];
+                    let _ = state
+                        .institution
+                        .mark_team_unresolved(job_id, &plan.external_team_key, &reasons)
+                        .await;
+                    tracing::warn!(external_team_key=%plan.external_team_key, "{response:?}");
+                    continue;
+                }
+            };
+        let imported = TeamTemplateResolutionInput {
+            dominant_programme_code: resolution.dominant_programme_code.clone(),
+            resolution_method: resolution.resolution_method.clone(),
+            external_team_key: Some(plan.external_team_key.clone()),
+            source_import_job_id: Some(job_id),
+        };
+        match state
+            .v2
+            .create_template_paper_team(
+                principal.user_id(),
+                principal.session.tenant_id,
+                WorkspaceId::new(),
+                &plan.team_name,
+                leader,
+                &writers,
+                &mentors,
+                resolution.selected_template_id,
+                &source_identity,
+                &main_path,
+                &seeds,
+                Some(&imported),
+            )
+            .await
+        {
+            Ok((_team, _)) => {
+                materialized += 1;
+            }
+            Err(error_value) => {
+                unresolved += 1;
+                let reasons = vec![error_value.to_string()];
+                if let Err(mark_error) = state
+                    .institution
+                    .mark_team_unresolved(job_id, &plan.external_team_key, &reasons)
+                    .await
+                {
+                    return institution_error(mark_error);
+                }
+            }
+        }
+    }
+    match state.institution.job(job_id).await {
+        Ok(job) => Json(serde_json::json!({
+            "job": job,
+            "materialized_teams": materialized,
+            "merged_teams": merged,
+            "unresolved_teams": unresolved,
+        }))
+        .into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_imports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ImportListQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .list_jobs(query.limit.unwrap_or(50), query.before)
+        .await
+    {
+        Ok(jobs) => Json(jobs).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match (
+        state.institution.job(job_id).await,
+        state.institution.job_rows(job_id, false).await,
+    ) {
+        (Ok(job), Ok(rows)) => Json(serde_json::json!({"job":job,"rows":rows})).into_response(),
+        (Err(error_value), _) | (_, Err(error_value)) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_errors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    let rows = match state.institution.job_rows(job_id, true).await {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    let mut body =
+        String::from("source_table_or_sheet,row_number,natural_key,error_code,error_message\n");
+    for row in rows {
+        let _ = writeln!(
+            body,
+            "{},{},{},{},{}",
+            csv_escape(&row.source_table_or_sheet),
+            row.row_number,
+            csv_escape(&row.natural_key.to_string()),
+            csv_escape(row.error_code.as_deref().unwrap_or("")),
+            csv_escape(row.error_message.as_deref().unwrap_or("")),
+        );
+    }
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=errors.csv"),
+    );
+    response
+}
+
+async fn admin_v2_programme_template_defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state.institution.list_programme_template_defaults().await {
+        Ok(value) => Json(value).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_set_programme_template_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(programme_code): Path<String>,
+    Json(input): Json<ProgrammeTemplateInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .set_programme_template_default(principal.user_id(), &programme_code, input.template_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_delete_programme_template_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(programme_code): Path<String>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .delete_programme_template_default(principal.user_id(), &programme_code)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_template_resolve_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TemplateResolvePreviewInput>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    let writers = match parse_user_ids(&input.ordered_writer_user_ids) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .resolve_default_template_for_writers(&writers)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_global_fallback(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state.institution.global_fallback().await {
+        Ok(template_id) => Json(serde_json::json!({"template_id":template_id})).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_set_global_fallback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ProgrammeTemplateInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .set_global_fallback(principal.user_id(), input.template_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
 async fn admin_v2_paper_team(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1083,83 +1657,45 @@ async fn admin_v2_create_paper_team(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if let Some(template_id) = input.template_id {
-        let template = match state.repo.template(template_id).await {
-            Ok(value) => value,
-            Err(_) => return error(StatusCode::NOT_FOUND, "template not found"),
-        };
-        let records = match state.repo.template_files(template_id).await {
-            Ok(value) if !value.is_empty() => value,
-            Ok(_) => return error(StatusCode::CONFLICT, "template has no files"),
-            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "template lookup failed"),
-        };
-        let main_path = match template
-            .main_file
-            .as_deref()
-            .map(LogicalPath::parse)
-            .transpose()
+    let automatic_resolution = if input.template_id.is_none() {
+        match state
+            .institution
+            .resolve_default_template_for_writers(&writer_ids)
+            .await
         {
-            Ok(Some(value)) => value,
-            Ok(None) => return error(StatusCode::CONFLICT, "template has no main file"),
-            Err(_) => return error(StatusCode::CONFLICT, "template main file is invalid"),
-        };
-        let policy = match template.policy_default.as_str() {
-            "editable" => V2FilePolicy::Editable,
-            "read_only" => V2FilePolicy::ContentReadOnly,
-            "managed" => V2FilePolicy::TemplateManaged,
-            _ => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "template policy is invalid",
-                );
-            }
-        };
-        let mut identity_material = format!(
-            "{template_id}:{}:{}",
-            template.main_file.as_deref().unwrap_or(""),
-            template.policy_default
-        );
-        let mut seeds = Vec::with_capacity(records.len());
-        for record in records {
-            let path = match LogicalPath::parse(&record.path) {
-                Ok(value) => value,
-                Err(_) => return error(StatusCode::CONFLICT, "template contains an invalid path"),
-            };
-            let _ = write!(
-                identity_material,
-                "|{}:{}:{}",
-                path.as_str(),
-                record.blob_hash,
-                record.size_bytes
-            );
-            seeds.push(TemplateSeedFile {
-                path,
-                blob_hash: record.blob_hash,
-                size_bytes: record.size_bytes,
-                policy,
-            });
+            Ok(value) => Some(value),
+            Err(error_value) => return institution_error(error_value),
         }
-        let source_identity = digest(&identity_material);
-        return match state.v2.create_template_paper_team(
-            principal.user_id(), principal.session.tenant_id, WorkspaceId::new(), &input.name,
-            leader_writer_id, &writer_ids, &mentor_ids, template_id, &source_identity, &main_path, &seeds,
-        ).await {
-            Ok((team, files)) => (StatusCode::CREATED, Json(serde_json::json!({"team":team,"files":files,"template_pin":{"template_id":template_id,"source_identity":source_identity}}))).into_response(),
-            Err(value) => v2_error(value),
-        };
-    }
-    let main_path = LogicalPath::parse("main.tex").expect("static main path is valid");
-    let stored = match state
-        .blobs
-        .put(Bytes::from_static(INITIAL_TEX.as_bytes()))
-        .await
-    {
-        Ok(value) => value,
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    } else {
+        None
     };
+    let template_id = input.template_id.unwrap_or_else(|| {
+        automatic_resolution
+            .as_ref()
+            .expect("automatic resolution is present")
+            .selected_template_id
+    });
+    let (main_path, seeds, source_identity) = match template_seeds(&state, template_id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let resolution_input = automatic_resolution.as_ref().map_or_else(
+        || TeamTemplateResolutionInput {
+            dominant_programme_code: None,
+            resolution_method: "MANUAL_OVERRIDE".to_owned(),
+            external_team_key: None,
+            source_import_job_id: None,
+        },
+        |resolution| TeamTemplateResolutionInput {
+            dominant_programme_code: resolution.dominant_programme_code.clone(),
+            resolution_method: resolution.resolution_method.clone(),
+            external_team_key: None,
+            source_import_job_id: None,
+        },
+    );
     match state
         .v2
-        .create_initialized_paper_team(
+        .create_template_paper_team(
             principal.user_id(),
             principal.session.tenant_id,
             WorkspaceId::new(),
@@ -1167,18 +1703,25 @@ async fn admin_v2_create_paper_team(
             leader_writer_id,
             &writer_ids,
             &mentor_ids,
+            template_id,
+            &source_identity,
             &main_path,
-            stored.hash(),
-            stored.size_bytes(),
+            &seeds,
+            Some(&resolution_input),
         )
         .await
     {
-        Ok((team, file)) => (
+        Ok((team, files)) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({"team":team,"main_file":file})),
+            Json(serde_json::json!({
+                "team":team,"files":files,
+                "template_pin":{"template_id":template_id,"source_identity":source_identity},
+                "template_resolution":automatic_resolution,
+                "manual_override":input.template_id.is_some(),
+            })),
         )
             .into_response(),
-        Err(error_value) => v2_error(error_value),
+        Err(value) => v2_error(value),
     }
 }
 
@@ -3065,6 +3608,108 @@ fn parse_user_id(value: &str) -> Result<UserId, Response> {
 
 fn parse_user_ids(values: &[String]) -> Result<Vec<UserId>, Response> {
     values.iter().map(|value| parse_user_id(value)).collect()
+}
+
+async fn template_seeds(
+    state: &AppState,
+    template_id: uuid::Uuid,
+) -> Result<(LogicalPath, Vec<TemplateSeedFile>, String), Response> {
+    let template = state
+        .repo
+        .template(template_id)
+        .await
+        .map_err(|_| error(StatusCode::NOT_FOUND, "template not found"))?;
+    let records = match state.repo.template_files(template_id).await {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => return Err(error(StatusCode::CONFLICT, "template has no files")),
+        Err(_) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template lookup failed",
+            ));
+        }
+    };
+    let main_path = match template
+        .main_file
+        .as_deref()
+        .map(LogicalPath::parse)
+        .transpose()
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => return Err(error(StatusCode::CONFLICT, "template has no main file")),
+        Err(_) => {
+            return Err(error(StatusCode::CONFLICT, "template main file is invalid"));
+        }
+    };
+    let policy = match template.policy_default.as_str() {
+        "editable" => V2FilePolicy::Editable,
+        "read_only" => V2FilePolicy::ContentReadOnly,
+        "managed" => V2FilePolicy::TemplateManaged,
+        _ => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template policy is invalid",
+            ));
+        }
+    };
+    let mut identity_material = format!(
+        "{template_id}:{}:{}",
+        template.main_file.as_deref().unwrap_or(""),
+        template.policy_default
+    );
+    let mut seeds = Vec::with_capacity(records.len());
+    for record in records {
+        let path = LogicalPath::parse(&record.path)
+            .map_err(|_| error(StatusCode::CONFLICT, "template contains an invalid path"))?;
+        let _ = write!(
+            identity_material,
+            "|{}:{}:{}",
+            path.as_str(),
+            record.blob_hash,
+            record.size_bytes
+        );
+        seeds.push(TemplateSeedFile {
+            path,
+            blob_hash: record.blob_hash,
+            size_bytes: record.size_bytes,
+            policy,
+        });
+    }
+    Ok((main_path, seeds, digest(&identity_material)))
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+async fn institution_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedPrincipal, Response> {
+    let principal = admin_session(state, headers).await?;
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Admin)) {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "V2 Admin required for institution administration",
+        ));
+    }
+    Ok(principal)
+}
+
+fn institution_error(error_value: InstitutionError) -> Response {
+    match error_value {
+        InstitutionError::InvalidInput(message) => error(StatusCode::BAD_REQUEST, message),
+        InstitutionError::NotFound => error(StatusCode::NOT_FOUND, "institution record not found"),
+        InstitutionError::Conflict(message) => error(StatusCode::CONFLICT, message),
+        InstitutionError::Database(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "institution persistence failure",
+        ),
+    }
 }
 
 #[allow(

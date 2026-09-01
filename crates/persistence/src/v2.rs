@@ -121,6 +121,7 @@ pub struct PaperTeamMember {
     pub user_id: UserId,
     pub assigned_by_user_id: UserId,
     pub is_leader: bool,
+    pub writer_order: Option<i32>,
     pub created_at: String,
 }
 
@@ -208,6 +209,7 @@ pub struct PaperTeamMemberView {
     pub email: String,
     pub role: GlobalRole,
     pub is_leader: bool,
+    pub writer_order: Option<i32>,
     pub created_at: String,
 }
 
@@ -482,14 +484,19 @@ impl V2Repository {
         .map_err(|error| map_conflict(error, "Paper Team"))?;
         let team = decode_paper_team(team_row)?;
         for member in writer_ids.iter().chain(mentor_ids) {
+            let writer_order = writer_ids
+                .iter()
+                .position(|writer| writer == member)
+                .and_then(|position| i32::try_from(position + 1).ok());
             sqlx::query(
                 "INSERT INTO latex_core.paper_team_members \
-                 (paper_team_id,user_id,assigned_by_user_id,is_leader) VALUES ($1,$2,$3,$4)",
+                 (paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order) VALUES ($1,$2,$3,$4,$5)",
             )
             .bind(team.id)
             .bind(member.as_uuid())
             .bind(creator.as_uuid())
             .bind(*member == leader_writer_id)
+            .bind(writer_order)
             .execute(&mut *tx)
             .await
             .map_err(|error| map_conflict(error, "Paper Team membership"))?;
@@ -624,7 +631,7 @@ impl V2Repository {
         let team = decode_paper_team(row)?;
         sqlx::query(
             "INSERT INTO latex_core.paper_team_members \
-             (paper_team_id,user_id,assigned_by_user_id,is_leader) VALUES ($1,$2,$3,TRUE)",
+             (paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order) VALUES ($1,$2,$3,TRUE,1)",
         )
         .bind(team.id)
         .bind(leader_writer_id.as_uuid())
@@ -699,7 +706,7 @@ impl V2Repository {
             .map_err(V2Error::Database)?;
         lock_users(&mut tx, user_id, assigned_by_user_id).await?;
         require_role(&mut tx, assigned_by_user_id, &[GlobalRole::Admin], "admin").await?;
-        require_role(
+        let member_role = require_role(
             &mut tx,
             user_id,
             &[GlobalRole::Writer, GlobalRole::Mentor],
@@ -707,14 +714,28 @@ impl V2Repository {
         )
         .await?;
         lock_paper_team(&mut tx, paper_team_id).await?;
+        let writer_order = if member_role == GlobalRole::Writer {
+            Some(
+                sqlx::query_scalar::<_, i32>(
+                    "SELECT COALESCE(max(writer_order),0)+1 FROM latex_core.paper_team_members WHERE paper_team_id=$1",
+                )
+                .bind(paper_team_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(V2Error::Database)?,
+            )
+        } else {
+            None
+        };
         let row = sqlx::query(
-            "INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id) \
-             VALUES ($1,$2,$3) \
-             RETURNING paper_team_id,user_id,assigned_by_user_id,is_leader,created_at::text AS created_at",
+            "INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id,writer_order) \
+             VALUES ($1,$2,$3,$4) \
+             RETURNING paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order,created_at::text AS created_at",
         )
         .bind(paper_team_id)
         .bind(user_id.as_uuid())
         .bind(assigned_by_user_id.as_uuid())
+        .bind(writer_order)
         .fetch_one(&mut *tx)
         .await
         .map_err(|error| map_conflict(error, "Paper Team membership"))?;
@@ -776,8 +797,8 @@ impl V2Repository {
         paper_team_id: Uuid,
     ) -> Result<Vec<PaperTeamMember>, V2Error> {
         let rows = sqlx::query(
-            "SELECT paper_team_id,user_id,assigned_by_user_id,is_leader,created_at::text AS created_at \
-             FROM latex_core.paper_team_members WHERE paper_team_id=$1 ORDER BY created_at,user_id",
+            "SELECT paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order,created_at::text AS created_at \
+             FROM latex_core.paper_team_members WHERE paper_team_id=$1 ORDER BY writer_order NULLS LAST,created_at,user_id",
         )
         .bind(paper_team_id)
         .fetch_all(self.database.pool())
@@ -835,7 +856,7 @@ impl V2Repository {
         let row = sqlx::query(
             "UPDATE latex_core.paper_team_members SET is_leader=TRUE \
              WHERE paper_team_id=$1 AND user_id=$2 \
-             RETURNING paper_team_id,user_id,assigned_by_user_id,is_leader,created_at::text AS created_at",
+             RETURNING paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order,created_at::text AS created_at",
         )
         .bind(paper_team_id)
         .bind(leader_writer_id.as_uuid())
@@ -869,11 +890,11 @@ impl V2Repository {
         paper_team_id: Uuid,
     ) -> Result<Vec<PaperTeamMemberView>, V2Error> {
         let rows = sqlx::query(
-            "SELECT m.user_id,c.email,g.role,m.is_leader,m.created_at::text AS created_at \
+            "SELECT m.user_id,c.email,g.role,m.is_leader,m.writer_order,m.created_at::text AS created_at \
              FROM latex_core.paper_team_members m \
              JOIN latex_core.user_credentials c ON c.user_id=m.user_id \
              JOIN latex_core.global_user_roles g ON g.user_id=m.user_id \
-             WHERE m.paper_team_id=$1 ORDER BY g.role,c.email",
+             WHERE m.paper_team_id=$1 ORDER BY m.writer_order NULLS LAST,g.role,c.email",
         )
         .bind(paper_team_id)
         .fetch_all(self.database.pool())
@@ -2562,6 +2583,7 @@ fn decode_team_member_view(row: PgRow) -> Result<PaperTeamMemberView, V2Error> {
         email: row.try_get("email").map_err(V2Error::Database)?,
         role: GlobalRole::from_str(&role)?,
         is_leader: row.try_get("is_leader").map_err(V2Error::Database)?,
+        writer_order: row.try_get("writer_order").map_err(V2Error::Database)?,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
     })
 }
@@ -2608,6 +2630,7 @@ fn decode_paper_team_member(row: PgRow) -> Result<PaperTeamMember, V2Error> {
                 .map_err(V2Error::Database)?,
         ),
         is_leader: row.try_get("is_leader").map_err(V2Error::Database)?,
+        writer_order: row.try_get("writer_order").map_err(V2Error::Database)?,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
     })
 }

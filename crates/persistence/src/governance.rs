@@ -10,6 +10,14 @@ use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 use std::{collections::BTreeMap, str::FromStr};
 use uuid::Uuid;
 
+#[derive(Clone, Debug)]
+pub struct TeamTemplateResolutionInput {
+    pub dominant_programme_code: Option<String>,
+    pub resolution_method: String,
+    pub external_team_key: Option<String>,
+    pub source_import_job_id: Option<Uuid>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum V2FilePolicy {
@@ -201,6 +209,7 @@ impl V2Repository {
         source_identity: &str,
         main_path: &LogicalPath,
         files: &[TemplateSeedFile],
+        resolution: Option<&TeamTemplateResolutionInput>,
     ) -> Result<(crate::PaperTeam, Vec<crate::PaperFile>), V2Error> {
         if name.trim().is_empty()
             || name.chars().count() > 200
@@ -279,8 +288,12 @@ impl V2Repository {
             .fetch_one(&mut *tx).await.map_err(V2Error::Database)?;
         let team = crate::v2::decode_paper_team(team_row)?;
         for member in writer_ids.iter().chain(mentor_ids) {
-            sqlx::query("INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id,is_leader) VALUES ($1,$2,$3,$4)")
-                .bind(team.id).bind(member.as_uuid()).bind(admin.as_uuid()).bind(*member == leader_writer_id)
+            let writer_order = writer_ids
+                .iter()
+                .position(|writer| writer == member)
+                .and_then(|position| i32::try_from(position + 1).ok());
+            sqlx::query("INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order) VALUES ($1,$2,$3,$4,$5)")
+                .bind(team.id).bind(member.as_uuid()).bind(admin.as_uuid()).bind(*member == leader_writer_id).bind(writer_order)
                 .execute(&mut *tx).await.map_err(V2Error::Database)?;
         }
         let mut paper_files = Vec::with_capacity(files.len());
@@ -297,6 +310,24 @@ impl V2Repository {
         sqlx::query("INSERT INTO latex_core.paper_template_pins (paper_id,workspace_id,template_id,source_identity,pinned_by_admin_user_id) VALUES ($1,$2,$3,$4,$5)")
             .bind(team.id).bind(workspace_id.as_uuid()).bind(template_id).bind(source_identity).bind(admin.as_uuid())
             .execute(&mut *tx).await.map_err(V2Error::Database)?;
+        if let Some(resolution) = resolution {
+            sqlx::query("INSERT INTO latex_core.paper_template_resolutions (paper_team_id,selected_template_id,dominant_programme_code,resolution_method,manual_override) VALUES ($1,$2,$3,$4,$5)")
+                .bind(team.id).bind(template_id).bind(&resolution.dominant_programme_code).bind(&resolution.resolution_method).bind(resolution.resolution_method == "MANUAL_OVERRIDE")
+                .execute(&mut *tx).await.map_err(V2Error::Database)?;
+        }
+        if let Some((external_team_key, source_import_job_id)) = resolution.and_then(|value| {
+            value
+                .external_team_key
+                .as_deref()
+                .zip(value.source_import_job_id)
+        }) {
+            sqlx::query("INSERT INTO latex_core.external_paper_team_links (external_team_key,paper_team_id,source_import_job_id) VALUES ($1,$2,$3)")
+                .bind(external_team_key).bind(team.id).bind(source_import_job_id)
+                .execute(&mut *tx).await.map_err(V2Error::Database)?;
+            sqlx::query("INSERT INTO latex_core.audit_events (id,actor_user_id,event_type,resource_type,resource_id,metadata) VALUES ($1,$2,'institution.team.materialized','paper_team',$3,$4)")
+                .bind(Uuid::new_v4()).bind(admin.as_uuid()).bind(team.id).bind(json!({"external_team_key":external_team_key,"job_id":source_import_job_id,"template_id":template_id,"resolution_method":resolution.map(|value| value.resolution_method.as_str())}))
+                .execute(&mut *tx).await.map_err(V2Error::Database)?;
+        }
         tx.commit().await.map_err(V2Error::Database)?;
         Ok((team, paper_files))
     }

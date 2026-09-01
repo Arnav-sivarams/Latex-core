@@ -20,6 +20,13 @@ mod error;
     reason = "governed restoration keeps its authorization and append-only cutover transaction auditable"
 )]
 mod governance;
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    reason = "bounded import parsing and dependency-ordered application remain auditable in one service module"
+)]
+mod institution;
 mod permissions;
 #[allow(
     clippy::missing_errors_doc,
@@ -62,8 +69,13 @@ pub use config::DatabaseConfig;
 pub use database::Database;
 pub use error::PersistenceError;
 pub use governance::{
-    ExactRestoreState, RestorationApplied, RestorationRequest, TemplateSeedFile, V2FilePolicy,
-    V2FilePolicyRecord,
+    ExactRestoreState, RestorationApplied, RestorationRequest, TeamTemplateResolutionInput,
+    TemplateSeedFile, V2FilePolicy, V2FilePolicyRecord,
+};
+pub use institution::{
+    ImportFileType, ImportLimits, ImportMode, ImportedTeamPlan, InstitutionError,
+    InstitutionImportJob, InstitutionImportRow, InstitutionRepository, PaperTeamPage,
+    PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
 };
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{

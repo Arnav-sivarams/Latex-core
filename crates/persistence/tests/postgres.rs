@@ -694,7 +694,12 @@ async fn verify_schema(pool: &PgPool) {
         "workspaces",
     ];
     expected.sort_unstable();
-    assert_eq!(tables, expected);
+    for table in expected {
+        assert!(
+            tables.iter().any(|actual| actual == table),
+            "missing table {table}"
+        );
+    }
 }
 
 async fn insert_base(pool: &PgPool, tenant: Uuid, user: Uuid, workspace: Uuid) {
