@@ -120,6 +120,7 @@ pub struct PaperTeamMember {
     pub paper_team_id: Uuid,
     pub user_id: UserId,
     pub assigned_by_user_id: UserId,
+    pub is_leader: bool,
     pub created_at: String,
 }
 
@@ -197,6 +198,7 @@ pub struct WriterPaper {
     pub name: String,
     pub kind: PaperKind,
     pub status: PaperStatus,
+    pub is_team_leader: bool,
     pub updated_at: String,
 }
 
@@ -205,6 +207,7 @@ pub struct PaperTeamMemberView {
     pub user_id: UserId,
     pub email: String,
     pub role: GlobalRole,
+    pub is_leader: bool,
     pub created_at: String,
 }
 
@@ -400,6 +403,7 @@ impl V2Repository {
         tenant_id: TenantId,
         workspace_id: WorkspaceId,
         name: &str,
+        leader_writer_id: UserId,
         writer_ids: &[UserId],
         mentor_ids: &[UserId],
         main_path: &LogicalPath,
@@ -407,6 +411,27 @@ impl V2Repository {
         main_size_bytes: u64,
     ) -> Result<(PaperTeam, PaperFile), V2Error> {
         validate_name(name)?;
+        let leader_role = self
+            .get_global_role(leader_writer_id)
+            .await?
+            .ok_or(V2Error::RoleMissing {
+                user_id: leader_writer_id,
+            })?
+            .role;
+        if leader_role != GlobalRole::Writer {
+            return Err(V2Error::RoleForbidden {
+                user_id: leader_writer_id,
+                required: "writer",
+                actual: leader_role,
+            });
+        }
+        if writer_ids.is_empty() || !writer_ids.contains(&leader_writer_id) {
+            return Err(V2Error::RoleForbidden {
+                user_id: leader_writer_id,
+                required: "assigned Paper Team Writer Leader",
+                actual: leader_role,
+            });
+        }
         let mut unique = HashSet::new();
         if writer_ids
             .iter()
@@ -459,11 +484,12 @@ impl V2Repository {
         for member in writer_ids.iter().chain(mentor_ids) {
             sqlx::query(
                 "INSERT INTO latex_core.paper_team_members \
-                 (paper_team_id,user_id,assigned_by_user_id) VALUES ($1,$2,$3)",
+                 (paper_team_id,user_id,assigned_by_user_id,is_leader) VALUES ($1,$2,$3,$4)",
             )
             .bind(team.id)
             .bind(member.as_uuid())
             .bind(creator.as_uuid())
+            .bind(*member == leader_writer_id)
             .execute(&mut *tx)
             .await
             .map_err(|error| map_conflict(error, "Paper Team membership"))?;
@@ -567,6 +593,7 @@ impl V2Repository {
         created_by_user_id: UserId,
         workspace_id: WorkspaceId,
         name: &str,
+        leader_writer_id: UserId,
     ) -> Result<PaperTeam, V2Error> {
         validate_name(name)?;
         let mut tx = self
@@ -575,8 +602,9 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
-        lock_user(&mut tx, created_by_user_id).await?;
+        lock_users(&mut tx, created_by_user_id, leader_writer_id).await?;
         require_role(&mut tx, created_by_user_id, &[GlobalRole::Admin], "admin").await?;
+        require_role(&mut tx, leader_writer_id, &[GlobalRole::Writer], "writer").await?;
         lock_workspace(&mut tx, workspace_id).await?;
         if workspace_is_v2_paper(&mut tx, workspace_id).await? {
             return Err(V2Error::WorkspaceConflict { workspace_id });
@@ -594,6 +622,16 @@ impl V2Repository {
         .await
         .map_err(|error| map_conflict(error, "Paper Team"))?;
         let team = decode_paper_team(row)?;
+        sqlx::query(
+            "INSERT INTO latex_core.paper_team_members \
+             (paper_team_id,user_id,assigned_by_user_id,is_leader) VALUES ($1,$2,$3,TRUE)",
+        )
+        .bind(team.id)
+        .bind(leader_writer_id.as_uuid())
+        .bind(created_by_user_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| map_conflict(error, "Paper Team Leader membership"))?;
         tx.commit().await.map_err(V2Error::Database)?;
         Ok(team)
     }
@@ -618,19 +656,33 @@ impl V2Repository {
         id: Uuid,
         status: PaperStatus,
     ) -> Result<PaperTeam, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        lock_paper_team(&mut tx, id).await?;
+        if status == PaperStatus::Active && !active_team_has_one_writer_leader(&mut tx, id).await? {
+            return Err(V2Error::Conflict {
+                entity: "active Paper Team without exactly one Writer Leader",
+            });
+        }
         let row = sqlx::query(
             "UPDATE latex_core.paper_teams SET status=$2,updated_at=statement_timestamp() WHERE id=$1 \
              RETURNING id,workspace_id,name,status,created_by_user_id,created_at::text AS created_at,updated_at::text AS updated_at",
         )
         .bind(id)
         .bind(status.as_str())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(V2Error::Database)?
         .ok_or(V2Error::NotFound {
             entity: "Paper Team",
         })?;
-        decode_paper_team(row)
+        let team = decode_paper_team(row)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(team)
     }
 
     pub async fn add_paper_team_member(
@@ -658,7 +710,7 @@ impl V2Repository {
         let row = sqlx::query(
             "INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id) \
              VALUES ($1,$2,$3) \
-             RETURNING paper_team_id,user_id,assigned_by_user_id,created_at::text AS created_at",
+             RETURNING paper_team_id,user_id,assigned_by_user_id,is_leader,created_at::text AS created_at",
         )
         .bind(paper_team_id)
         .bind(user_id.as_uuid())
@@ -686,6 +738,23 @@ impl V2Repository {
         lock_users(&mut tx, user_id, removed_by_user_id).await?;
         require_role(&mut tx, removed_by_user_id, &[GlobalRole::Admin], "admin").await?;
         lock_paper_team(&mut tx, paper_team_id).await?;
+        let leader_of_active_team: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM latex_core.paper_team_members m \
+                 JOIN latex_core.paper_teams t ON t.id=m.paper_team_id \
+                 WHERE m.paper_team_id=$1 AND m.user_id=$2 AND m.is_leader AND t.status='active'\
+             )",
+        )
+        .bind(paper_team_id)
+        .bind(user_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if leader_of_active_team {
+            return Err(V2Error::Conflict {
+                entity: "active Paper Team Leader membership cannot be removed",
+            });
+        }
         let result = sqlx::query(
             "DELETE FROM latex_core.paper_team_members WHERE paper_team_id=$1 AND user_id=$2",
         )
@@ -707,7 +776,7 @@ impl V2Repository {
         paper_team_id: Uuid,
     ) -> Result<Vec<PaperTeamMember>, V2Error> {
         let rows = sqlx::query(
-            "SELECT paper_team_id,user_id,assigned_by_user_id,created_at::text AS created_at \
+            "SELECT paper_team_id,user_id,assigned_by_user_id,is_leader,created_at::text AS created_at \
              FROM latex_core.paper_team_members WHERE paper_team_id=$1 ORDER BY created_at,user_id",
         )
         .bind(paper_team_id)
@@ -715,6 +784,73 @@ impl V2Repository {
         .await
         .map_err(V2Error::Database)?;
         rows.into_iter().map(decode_paper_team_member).collect()
+    }
+
+    pub async fn change_paper_team_leader(
+        &self,
+        paper_team_id: Uuid,
+        leader_writer_id: UserId,
+        changed_by_admin_user_id: UserId,
+    ) -> Result<PaperTeamMember, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        lock_users(&mut tx, leader_writer_id, changed_by_admin_user_id).await?;
+        require_role(
+            &mut tx,
+            changed_by_admin_user_id,
+            &[GlobalRole::Admin],
+            "admin",
+        )
+        .await?;
+        require_role(&mut tx, leader_writer_id, &[GlobalRole::Writer], "writer").await?;
+        lock_paper_team(&mut tx, paper_team_id).await?;
+        let member_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.paper_team_members \
+             WHERE paper_team_id=$1 AND user_id=$2)",
+        )
+        .bind(paper_team_id)
+        .bind(leader_writer_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if !member_exists {
+            return Err(V2Error::RoleForbidden {
+                user_id: leader_writer_id,
+                required: "assigned Paper Team Writer Leader",
+                actual: GlobalRole::Writer,
+            });
+        }
+        sqlx::query(
+            "UPDATE latex_core.paper_team_members SET is_leader=FALSE \
+             WHERE paper_team_id=$1 AND is_leader",
+        )
+        .bind(paper_team_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        let row = sqlx::query(
+            "UPDATE latex_core.paper_team_members SET is_leader=TRUE \
+             WHERE paper_team_id=$1 AND user_id=$2 \
+             RETURNING paper_team_id,user_id,assigned_by_user_id,is_leader,created_at::text AS created_at",
+        )
+        .bind(paper_team_id)
+        .bind(leader_writer_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        let leader = decode_paper_team_member(row)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        tracing::info!(
+            %paper_team_id,
+            %leader_writer_id,
+            %changed_by_admin_user_id,
+            "Paper Team Writer Leader reassigned"
+        );
+        Ok(leader)
     }
 
     pub async fn list_paper_teams(&self) -> Result<Vec<PaperTeam>, V2Error> {
@@ -733,7 +869,7 @@ impl V2Repository {
         paper_team_id: Uuid,
     ) -> Result<Vec<PaperTeamMemberView>, V2Error> {
         let rows = sqlx::query(
-            "SELECT m.user_id,c.email,g.role,m.created_at::text AS created_at \
+            "SELECT m.user_id,c.email,g.role,m.is_leader,m.created_at::text AS created_at \
              FROM latex_core.paper_team_members m \
              JOIN latex_core.user_credentials c ON c.user_id=m.user_id \
              JOIN latex_core.global_user_roles g ON g.user_id=m.user_id \
@@ -760,10 +896,10 @@ impl V2Repository {
             });
         }
         let rows = sqlx::query(
-            "SELECT id,workspace_id,name,'personal' AS kind,status,updated_at::text AS updated_at \
+            "SELECT id,workspace_id,name,'personal' AS kind,status,FALSE AS is_team_leader,updated_at::text AS updated_at \
              FROM latex_core.personal_papers WHERE owner_user_id=$1 \
              UNION ALL \
-             SELECT t.id,t.workspace_id,t.name,'team' AS kind,t.status,t.updated_at::text AS updated_at \
+             SELECT t.id,t.workspace_id,t.name,'team' AS kind,t.status,m.is_leader AS is_team_leader,t.updated_at::text AS updated_at \
              FROM latex_core.paper_teams t \
              JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id \
              WHERE m.user_id=$1 ORDER BY updated_at DESC,id",
@@ -2234,6 +2370,9 @@ async fn validate_role_change(
     if role == GlobalRole::Admin && has_team_membership(tx, user_id).await? {
         return Err(V2Error::TeamMembershipConflict { user_id });
     }
+    if role != GlobalRole::Writer && is_team_leader(tx, user_id).await? {
+        return Err(V2Error::TeamMembershipConflict { user_id });
+    }
     Ok(())
 }
 
@@ -2261,6 +2400,36 @@ async fn has_team_membership(
     .fetch_one(&mut **tx)
     .await
     .map_err(V2Error::Database)
+}
+
+async fn is_team_leader(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: UserId,
+) -> Result<bool, V2Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM latex_core.paper_team_members \
+         WHERE user_id=$1 AND is_leader)",
+    )
+    .bind(user_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(V2Error::Database)
+}
+
+async fn active_team_has_one_writer_leader(
+    tx: &mut Transaction<'_, Postgres>,
+    paper_team_id: Uuid,
+) -> Result<bool, V2Error> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.paper_team_members m \
+         JOIN latex_core.global_user_roles r ON r.user_id=m.user_id \
+         WHERE m.paper_team_id=$1 AND m.is_leader AND r.role='writer'",
+    )
+    .bind(paper_team_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    Ok(count == 1)
 }
 
 async fn revoke_user_sessions(
@@ -2381,6 +2550,7 @@ fn decode_writer_paper(row: PgRow) -> Result<WriterPaper, V2Error> {
             }
         },
         status: PaperStatus::from_str(&status)?,
+        is_team_leader: row.try_get("is_team_leader").map_err(V2Error::Database)?,
         updated_at: row.try_get("updated_at").map_err(V2Error::Database)?,
     })
 }
@@ -2391,6 +2561,7 @@ fn decode_team_member_view(row: PgRow) -> Result<PaperTeamMemberView, V2Error> {
         user_id: UserId::from_uuid(row.try_get("user_id").map_err(V2Error::Database)?),
         email: row.try_get("email").map_err(V2Error::Database)?,
         role: GlobalRole::from_str(&role)?,
+        is_leader: row.try_get("is_leader").map_err(V2Error::Database)?,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
     })
 }
@@ -2436,6 +2607,7 @@ fn decode_paper_team_member(row: PgRow) -> Result<PaperTeamMember, V2Error> {
             row.try_get("assigned_by_user_id")
                 .map_err(V2Error::Database)?,
         ),
+        is_leader: row.try_get("is_leader").map_err(V2Error::Database)?,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
     })
 }

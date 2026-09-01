@@ -8,7 +8,6 @@ const endpoints = {
   Overview: '/api/admin/overview',
   Templates: '/api/admin/templates',
   Versions: '/api/admin/v2/versions',
-  'Restoration Requests': '/api/admin/v2/restoration-requests',
   Reviews: '/api/admin/v2/reviews',
   'Build Queue': '/api/admin/jobs',
   Audit: '/api/admin/audit',
@@ -325,7 +324,20 @@ async function renderPaperTeams(teams, users, templates) {
   templateSelect.append(new Option('Default blank paper', ''));
   templates.forEach((template) => templateSelect.append(new Option(`${template.name} · immutable pin`, template.id)));
   templateField.append(templateSelect);
-  form.append(name, memberSelect(users, 'writer', 'Writers'), memberSelect(users, 'mentor', 'Mentors'), templateField);
+  const writersField = memberSelect(users, 'writer', 'Writers');
+  const writersSelect = writersField.querySelector('select');
+  const leaderField = element('label', '', 'Team Leader');
+  const leaderSelect = document.createElement('select'); leaderSelect.name = 'leader_writer_id'; leaderSelect.required = true;
+  const refreshLeaderChoices = () => {
+    const selected = new Set([...writersSelect.selectedOptions].map((option) => option.value));
+    const previous = leaderSelect.value;
+    leaderSelect.replaceChildren(new Option('Choose an assigned Writer…', ''));
+    [...writersSelect.options].filter((option) => selected.has(option.value)).forEach((option) => leaderSelect.append(new Option(option.textContent, option.value)));
+    if (selected.has(previous)) leaderSelect.value = previous;
+  };
+  writersSelect.addEventListener('change', refreshLeaderChoices);
+  leaderField.append(leaderSelect);
+  form.append(name, writersField, leaderField, memberSelect(users, 'mentor', 'Mentors'), templateField);
   const create = element('button', 'primary', 'Create Paper Team');
   create.type = 'submit';
   form.append(create);
@@ -336,7 +348,7 @@ async function renderPaperTeams(teams, users, templates) {
       await api('/api/admin/v2/paper-teams', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: data.get('name'), writer_ids: data.getAll('writer_ids'), mentor_ids: data.getAll('mentor_ids'), template_id: data.get('template_id') || null }),
+        body: JSON.stringify({ name: data.get('name'), writer_ids: data.getAll('writer_ids'), leader_writer_id: data.get('leader_writer_id'), mentor_ids: data.getAll('mentor_ids'), template_id: data.get('template_id') || null }),
       });
       announce('Paper Team and initialized main.tex workspace created.');
       await showSection('Paper Teams');
@@ -350,7 +362,9 @@ async function renderPaperTeams(teams, users, templates) {
   const details = await Promise.all(teams.map((team) => api(`/api/admin/v2/paper-teams/${team.id}`)));
   details.forEach(({ team, members, template_pin: templatePin }) => {
     const card = element('section', 'team-card');
+    const leader = members.find((member) => member.is_leader);
     card.append(element('h2', '', team.name), element('p', 'empty-copy', `${team.status} · workspace ${team.workspace_id}`));
+    card.append(element('p', '', `Leader: ${leader?.email || 'Not assigned'}`));
     card.append(element('p', 'empty-copy', templatePin ? `Template: ${templatePin.template_name} · pinned ${templatePin.source_identity}` : 'Template: Default blank paper'));
     const lifecycle = element('div', 'admin-actions');
     const transitions = team.status === 'active' ? [['Freeze', 'frozen'], ['Submit', 'submitted'], ['Archive', 'archived']]
@@ -364,7 +378,7 @@ async function renderPaperTeams(teams, users, templates) {
     const list = element('div', 'members-list');
     members.forEach((member) => {
       const row = element('div', 'member-row');
-      row.append(element('span', '', `${member.email} — ${member.role}`));
+      row.append(element('span', '', `${member.email} — ${member.role}${member.is_leader ? ' · Team Leader' : ''}`));
       const remove = element('button', 'danger', 'Remove');
       remove.type = 'button';
       remove.addEventListener('click', async () => {
@@ -375,6 +389,21 @@ async function renderPaperTeams(teams, users, templates) {
       });
       row.append(remove);
       list.append(row);
+    });
+    const assignedWriters = members.filter((member) => member.role === 'writer');
+    const leaderForm = element('form', 'member-add-form');
+    const leaderChoice = document.createElement('select'); leaderChoice.required = true;
+    assignedWriters.forEach((member) => leaderChoice.append(new Option(member.email, member.user_id, false, member.is_leader)));
+    const changeLeader = element('button', '', 'Change Leader'); changeLeader.type = 'submit';
+    leaderForm.append(leaderChoice, changeLeader);
+    leaderForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        await api(`/api/admin/v2/paper-teams/${team.id}/leader`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: leaderChoice.value }),
+        });
+        announce(`Leader changed for ${team.name}.`); await showSection('Paper Teams');
+      } catch (error) { showError(error); }
     });
     const assigned = new Set(members.map((member) => member.user_id));
     const available = users.filter((user) => user.v2_role && user.v2_role !== 'admin' && !assigned.has(user.user_id));
@@ -399,7 +428,7 @@ async function renderPaperTeams(teams, users, templates) {
         await showSection('Paper Teams');
       } catch (error) { showError(error); }
     });
-    card.append(list, add);
+    card.append(list, leaderForm, add);
     content.append(card);
   });
 }
@@ -427,21 +456,6 @@ async function renderFilePolicies(teams) {
     }); table.append(body); tableHost.replaceChildren(table);
   };
   selector.addEventListener('change', () => load().catch(showError)); await load();
-}
-
-function renderRestorationRequests(requests) {
-  if (!requests.length) return content.append(element('p', 'empty-copy', 'No restoration requests.'));
-  requests.forEach((request) => {
-    const card = element('section', 'team-card');
-    card.append(element('h2', '', request.paper_name), element('p', '', `Version #${request.target_version_number} · ${request.writer_email} · ${request.state.replaceAll('_', ' ')}`), element('p', 'empty-copy', request.reason || 'No reason supplied.'));
-    if (request.state === 'AWAITING_ADMIN_REVIEW') {
-      const actions = element('div', 'admin-actions');
-      actions.append(buttonAction('Apply governed restoration', async () => { if (!confirm('Apply this endorsed restoration? The current exact state will be retained as PRE_RESTORE_SAFETY.')) return; const note = prompt('Optional Admin note', ''); if (note === null) return; await api(`/api/admin/v2/restoration-requests/${request.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note || null }) }); announce('Restoration applied as a new workspace head.'); await showSection('Restoration Requests'); }, 'primary'));
-      actions.append(buttonAction('Reject', async () => { const note = prompt('Optional rejection note', ''); if (note === null) return; await api(`/api/admin/v2/restoration-requests/${request.id}/reject`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note || null }) }); await showSection('Restoration Requests'); }, 'danger'));
-      card.append(actions);
-    }
-    content.append(card);
-  });
 }
 
 async function showSection(section) {
@@ -474,7 +488,6 @@ async function showSection(section) {
     const data = await api(endpoints[section]);
     content.replaceChildren(element('h1', '', section.toUpperCase()));
     if (section === 'Overview') renderOverview(data);
-    else if (section === 'Restoration Requests') renderRestorationRequests(data);
     else if (section === 'Reviews') renderAdminReviews(data);
     else if (section === 'System') { content.append(element('p', 'empty-copy', 'Host-level operational actions remain CLI-only in this release candidate.')); content.append(renderJson(data)); }
     else if (Array.isArray(data) && data.length === 0) content.append(element('p', 'empty-copy', 'No records available.'));

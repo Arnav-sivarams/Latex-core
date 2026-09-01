@@ -2,29 +2,23 @@
 
 ## Status
 
-Accepted for V2.
+Superseded by the V2.1 Team Leader workflow.
 
 ## State machine
 
 ```text
-DRAFT
-  |
-  | Writer submits
-  v
-AWAITING_MENTOR_REVIEW
-  |-- Mentor rejects -----------------> MENTOR_REJECTED
-  `-- Mentor endorses ----------------> AWAITING_ADMIN_REVIEW
-                                          |-- Admin rejects --> ADMIN_REJECTED
-                                          `-- Admin applies --> APPLIED
+REQUESTED
+  |-- Team Leader rejects ------------> LEADER_REJECTED
+  `-- Team Leader safely applies -----> APPLIED
 ```
 
 Terminal rejection records remain auditable. Resubmission, if supported, creates a new request or explicit append-preserving transition rather than rewriting the decision.
 
-The Writer selects a target version, provides a reason, submits the request, and views its diff and status. The Mentor compares current and target state, comments, rejects, or endorses to Admin. The Admin cannot apply before Mentor endorsement; after endorsement the Admin independently compares and either rejects or applies.
+A regular Team Writer selects a target version, optionally provides a reason, and creates a request. The Team Leader compares current and target state and rejects or applies it. A Leader may also apply a direct revert after explicit confirmation. Mentor and Admin ordinary endpoints are deprecated and cannot authorize or apply Team reverts. Historical requests and their legacy statuses remain auditable.
 
 ## Apply algorithm
 
-Applying an endorsed request performs one controlled transition:
+Applying an authorized request performs one controlled transition:
 
 1. acquire a short restoration lock;
 2. notify active clients;

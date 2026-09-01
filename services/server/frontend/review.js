@@ -6,7 +6,7 @@ import { stex } from '@codemirror/legacy-modes/mode/stex';
 import { yCollab } from 'y-codemirror.next';
 import * as Y from 'yjs';
 import * as pdfjsLib from '/static/pdf.min.mjs';
-import { canOpenReviewRound, denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
+import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
 const INITIAL_STATE = 0x10;
@@ -31,39 +31,31 @@ class ReviewApi {
   file(id, fileId) { return this.request(`/api/v2/reviews/papers/${id}/files/${fileId}`); }
   writers(id) { return this.request(`/api/v2/reviews/papers/${id}/writers`); }
   rounds(id) { return this.request(`/api/v2/reviews/papers/${id}/rounds`); }
-  openRound(id) { return this.json(`/api/v2/reviews/papers/${id}/rounds`, 'POST'); }
-  approveRound(id, roundId) { return this.json(`/api/v2/reviews/papers/${id}/rounds/${roundId}/approve`, 'POST'); }
   threads(id) { return this.request(`/api/v2/reviews/papers/${id}/threads`); }
   createThread(id, body) { return this.json(`/api/v2/reviews/papers/${id}/threads`, 'POST', body); }
   message(id, threadId, body) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}/messages`, 'POST', { body }); }
   transition(id, threadId, state) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}/state`, 'POST', { state }); }
-  controls(id, threadId, body) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}/controls`, 'PATCH', body); }
-  activity(id) { return this.request(`/api/v2/reviews/papers/${id}/activity`); }
-  changes(id) { return this.request(`/api/v2/reviews/papers/${id}/changes`); }
   map(id, body) { return this.json(`/api/v2/reviews/papers/${id}/synctex`, 'POST', body); }
   build(id) { return this.json(`/api/v2/papers/${id}/builds`, 'POST', { trigger_type: 'manual' }); }
   buildStatus(id) { return this.request(`/api/v2/papers/${id}/builds`); }
-  restorations() { return this.request('/api/v2/restoration-requests'); }
-  restorationDecision(id, action, note) { return this.json(`/api/v2/restoration-requests/${id}/${action}`, 'POST', { note: note || null }); }
 }
 
 const api = new ReviewApi();
 const ui = Object.fromEntries([
   'reviewContext', 'liveStatus', 'assignedPapers', 'reviewFiles', 'csvExport', 'printExport',
-  'reviewTitle', 'reviewSummary', 'buildStatus', 'compileReview', 'openRound', 'approvePaper',
+  'reviewTitle', 'reviewSummary', 'buildStatus', 'compileReview',
   'reviewEditor', 'sourceSelection', 'reviewSelection', 'previousPage', 'pageLabel', 'nextPage', 'zoomOut',
   'zoomLabel', 'zoomIn', 'pdfState', 'pdfViewport', 'pdfCanvas', 'pdfOverlay',
-  'annotationComposer', 'anchorSummary', 'threadType', 'severity', 'category', 'assignedWriter',
-  'dueDate', 'threadMessage', 'replacementField', 'replacementText', 'cancelAnnotation',
-  'createAnnotation', 'threadFilters', 'threadList', 'roundList', 'reviewChanges', 'activityList',
-  'restorationRequests', 'reviewNotice',
+  'annotationComposer', 'anchorSummary', 'threadType', 'threadMessage', 'cancelAnnotation',
+  'createAnnotation', 'threadFilters', 'threadList',
+  'roundList', 'reviewNotice',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
-  papers: [], paper: null, detail: null, files: [], file: null, writers: [], rounds: [], threads: [],
-  activity: [], filter: 'active', collaboration: null, view: null, pendingAnchor: null, pendingAnchorSummary: null,
+  papers: [], paper: null, detail: null, files: [], file: null, rounds: [], threads: [],
+  filter: 'active', collaboration: null, view: null, pendingAnchor: null, pendingAnchorSummary: null,
   pdf: null, pdfBuildId: null, page: 1, scale: 1, viewport: null, renderTask: null, dragStart: null,
-  suppressSelection: false, restorations: [],
+  suppressSelection: false,
 };
 
 function notice(message, failed = false) { ui.reviewNotice.textContent = message; ui.reviewNotice.classList.toggle('danger', failed); }
@@ -90,7 +82,7 @@ class ReadOnlySession {
       if (value.type === 'JOIN_ACCEPTED') { this.metadata = value; this.initialize(); }
       else if (value.type === 'REMOTE_DURABLE') { ui.liveStatus.textContent = 'Live · read only'; refreshPaperDetail(); }
       else if (value.type === 'RELOAD_REQUIRED') notice('The selected file was removed.', true);
-      else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('Paper restoration changed the document version; reloading.', true); openPaper(model.paper); }
+      else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('The Team Leader changed the paper version; reloading.', true); openPaper(model.paper); }
       else if (value.type === 'POLICY_CHANGED') { notice(value.message || 'File policy changed; reload.', true); openPaper(model.paper); }
       else if (value.type === 'ERROR') notice(value.message || 'Read-only collaboration failed.', true);
       return;
@@ -122,6 +114,7 @@ function mountReadOnlyEditor(session) {
 async function sourceSelected(state) {
   const range = state.selection.main;
   if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text to annotate'; ui.reviewSelection.disabled = true; return; }
+  if (!reviewOpen()) { ui.sourceSelection.textContent = 'This paper has not been sent for review.'; ui.reviewSelection.disabled = true; return; }
   const quoted = state.sliceDoc(range.from, range.to);
   const relativeStart = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.from));
   const relativeEnd = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.to));
@@ -157,10 +150,10 @@ async function openPaper(paper) {
   disposeSource(); disposePdf(); model.paper = paper; model.file = null; model.pendingAnchor = null;
   ui.reviewContext.textContent = paper.name; ui.reviewTitle.textContent = paper.name; ui.reviewSummary.textContent = `${paper.status} · ${paper.open_review_count} open · ${paper.blocking_review_count} blocking`;
   ui.compileReview.disabled = paper.status !== 'active'; ui.csvExport.href = `/api/v2/reviews/papers/${paper.id}/report.csv`; ui.printExport.href = `/api/v2/reviews/papers/${paper.id}/report.html`; ui.csvExport.removeAttribute('aria-disabled'); ui.printExport.removeAttribute('aria-disabled');
-  const [detail, files, writers] = await Promise.all([api.paper(paper.id), api.files(paper.id), api.writers(paper.id)]);
-  model.detail = detail; model.files = files.files; model.writers = writers.writers; renderPapers(); renderFiles(); renderWriterOptions();
+  const [detail, files] = await Promise.all([api.paper(paper.id), api.files(paper.id)]);
+  model.detail = detail; model.files = files.files; renderPapers(); renderFiles();
   const initial = model.files.find((file) => file.path === detail.main_file) || model.files[0]; if (initial) await openFile(initial);
-  await Promise.all([refreshThreads(), refreshRounds(), refreshActivity(), refreshChanges(), refreshBuild(), refreshRestorations()]);
+  await Promise.all([refreshThreads(), refreshRounds(), refreshBuild()]);
 }
 
 function renderPapers() { refreshPapers().catch((failure) => notice(failure.message, true)); }
@@ -168,8 +161,6 @@ function renderFiles() {
   ui.reviewFiles.replaceChildren(); if (!model.files.length) return clearNode(ui.reviewFiles, 'No live files.');
   const list = document.createElement('ul'); list.className = 'file-tree'; model.files.forEach((file) => { const item = document.createElement('li'); item.append(button(file.path, () => openFile(file), model.file?.file_id === file.file_id)); list.append(item); }); ui.reviewFiles.append(list);
 }
-function renderWriterOptions() { ui.assignedWriter.replaceChildren(new Option('Unassigned', '')); model.writers.forEach((writer) => ui.assignedWriter.add(new Option(writer.email, writer.user_id))); }
-
 async function openFile(file) {
   disposeSource(); const payload = await api.file(model.paper.id, file.file_id); model.file = payload.file; renderFiles();
   ui.reviewEditor.innerHTML = '<div class="foundation-empty"><strong>Opening live read-only source…</strong></div>';
@@ -218,6 +209,7 @@ async function pdfAnchorFromMapping(mapping) {
 ui.pdfOverlay.addEventListener('pointerdown', (event) => { if (!model.viewport || event.target !== ui.pdfOverlay) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); model.dragStart = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; ui.pdfOverlay.setPointerCapture(event.pointerId); });
 ui.pdfOverlay.addEventListener('pointerup', async (event) => {
   if (!model.dragStart || !model.viewport) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); const end = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; const rectangle = normalizeRectangle({ x1: model.dragStart.x, y1: model.dragStart.y, x2: end.x, y2: end.y }, model.viewport.width, model.viewport.height); model.dragStart = null; if (rectangle.width < 0.005 || rectangle.height < 0.005) return;
+  if (!reviewOpen()) return notice('This paper has not been sent for review.', true);
   const point = { x: (rectangle.x + rectangle.width / 2) * model.viewport.width / model.scale, y: (rectangle.y + rectangle.height / 2) * model.viewport.height / model.scale };
   let mapping = { mapping_status: 'PDF_ONLY' }; try { mapping = await api.map(model.paper.id, { direction: 'INVERSE', page: model.page, ...point }); } catch { /* PDF-only is truthful. */ }
   let sourceAnchor = null; if (mapping.mapped_file_id) sourceAnchor = await anchorMappedLine(mapping);
@@ -232,20 +224,22 @@ async function anchorMappedLine(mapping) {
   return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.detail.version, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch };
 }
 
-function showComposer(summary) { ui.annotationComposer.hidden = false; ui.anchorSummary.textContent = summary; ui.annotationComposer.scrollIntoView({ block: 'nearest' }); }
+function reviewOpen() { return model.rounds.some((round) => round.status === 'OPEN_FOR_REVIEW'); }
+function showComposer(summary) { if (!reviewOpen()) return notice('This paper has not been sent for review.', true); ui.annotationComposer.hidden = false; ui.anchorSummary.textContent = summary; ui.annotationComposer.scrollIntoView({ block: 'nearest' }); }
 function hideComposer() { ui.annotationComposer.hidden = true; model.pendingAnchor = null; model.pendingAnchorSummary = null; ui.reviewSelection.disabled = true; renderOverlays(); }
 
 async function createAnnotation(body = null) {
-  if (!body && ui.threadType.value === 'SUGGESTED_REPLACEMENT' && !ui.replacementText.value.trim()) throw new Error('Suggested replacement requires non-empty replacement text.');
-  const request = body || { thread_type: ui.threadType.value, message: ui.threadMessage.value, severity: ui.severity.value, category: ui.category.value, assigned_writer_user_id: ui.assignedWriter.value || null, due_at: ui.dueDate.value ? `${ui.dueDate.value}T23:59:59Z` : null, source_anchor: model.pendingAnchor?.source_anchor || null, pdf_anchor: model.pendingAnchor?.pdf_anchor || null, suggested_replacement: ui.threadType.value === 'SUGGESTED_REPLACEMENT' ? ui.replacementText.value : null, section_label: ui.threadType.value === 'SECTION_APPROVAL' ? model.file?.path : null };
-  await api.createThread(model.paper.id, request); hideComposer(); ui.threadMessage.value = ''; ui.replacementText.value = ''; await Promise.all([refreshThreads(), refreshRounds(), refreshActivity()]); notice('Review annotation created.');
+  if (!reviewOpen()) throw new Error('This paper has not been sent for review.');
+  if (!body && !ui.threadMessage.value.trim()) throw new Error('Comment text is required.');
+  const request = body || { thread_type: ui.threadType.value, message: ui.threadMessage.value, severity: 'NOTE', category: 'WRITING', assigned_writer_user_id: null, due_at: null, source_anchor: model.pendingAnchor?.source_anchor || null, pdf_anchor: model.pendingAnchor?.pdf_anchor || null, suggested_replacement: ui.threadType.value === 'SUGGESTION' ? ui.threadMessage.value : null, section_label: null };
+  await api.createThread(model.paper.id, request); hideComposer(); ui.threadMessage.value = ''; await Promise.all([refreshThreads(), refreshRounds()]); notice('Review annotation created.');
 }
 
 async function refreshThreads() { const payload = await api.threads(model.paper.id); model.threads = payload.threads; renderThreads(); renderOverlays(); }
 function renderThreads() {
-  ui.threadList.replaceChildren(); const selected = model.threads.filter((thread) => model.filter === 'all' || (model.filter === 'active' && ['OPEN', 'REOPENED'].includes(thread.state)) || (model.filter === 'blocking' && thread.severity === 'BLOCKING' && thread.state !== 'RESOLVED') || thread.state === model.filter);
-  if (!selected.length) return clearNode(ui.threadList, 'No matching review threads.');
-  selected.forEach((thread) => { const card = document.createElement('article'); card.className = `thread-card severity-${thread.severity.toLowerCase()}`; const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'thread-title'; heading.textContent = `${thread.thread_type.replaceAll('_', ' ')} · ${thread.severity} · ${thread.state}`; heading.addEventListener('click', () => focusThread(thread)); const meta = document.createElement('p'); meta.textContent = `${thread.category} · ${thread.assigned_writer_email || 'Unassigned'}${thread.due_at ? ` · due ${new Date(thread.due_at).toLocaleDateString()}` : ''} · ${mappingStatus(thread)}`; const discussion = document.createElement('div'); discussion.className = 'discussion'; thread.messages.forEach((message) => { const row = document.createElement('p'); const author = document.createElement('strong'); author.textContent = `${message.author_email}: `; row.append(author, document.createTextNode(message.body)); discussion.append(row); }); const actions = document.createElement('div'); actions.className = 'thread-actions'; actions.append(button('Reply', () => reply(thread)), button('Edit controls', () => editControls(thread))); if (thread.state === 'ADDRESSED') actions.append(button('Resolve', () => transition(thread, 'RESOLVED')), button('Reopen', () => transition(thread, 'REOPENED'))); else if (thread.state === 'RESOLVED') actions.append(button('Reopen', () => transition(thread, 'REOPENED'))); card.append(heading, meta, discussion, actions); ui.threadList.append(card); });
+  ui.threadList.replaceChildren(); const selected = model.threads.filter((thread) => model.filter === 'all' || (model.filter === 'active' && ['OPEN', 'REOPENED', 'ADDRESSED'].includes(thread.state)) || thread.state === model.filter);
+  if (!selected.length) return clearNode(ui.threadList, 'No matching comments.');
+  selected.forEach((thread) => { const card = document.createElement('article'); card.className = 'thread-card'; const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'thread-title'; heading.textContent = `${thread.thread_type.replaceAll('_', ' ')} · ${thread.state}`; heading.addEventListener('click', () => focusThread(thread)); const meta = document.createElement('p'); meta.textContent = mappingStatus(thread); const discussion = document.createElement('div'); discussion.className = 'discussion'; thread.messages.forEach((message) => { const row = document.createElement('p'); const author = document.createElement('strong'); author.textContent = `${message.author_email}: `; row.append(author, document.createTextNode(message.body)); discussion.append(row); }); const actions = document.createElement('div'); actions.className = 'thread-actions'; if (reviewOpen()) actions.append(button('Reply', () => reply(thread))); if (thread.state === 'ADDRESSED') actions.append(button('Done', () => transition(thread, 'RESOLVED')), button('Reopen', () => transition(thread, 'REOPENED'))); else if (thread.state === 'RESOLVED' && reviewOpen()) actions.append(button('Reopen', () => transition(thread, 'REOPENED'))); card.append(heading, meta, discussion, actions); ui.threadList.append(card); });
 }
 function mappingStatus(thread) {
   if (thread.thread_type === 'PAPER_APPROVAL') return thread.approved_workspace_version === model.detail?.version ? 'EXACT · current version' : 'SOURCE_CHANGED · historical approval';
@@ -257,9 +251,8 @@ function mappingStatus(thread) {
   if (thread.pdf_anchor) return thread.pdf_anchor.mapping_status;
   return thread.source_anchor ? 'Source linked' : 'PDF_ONLY';
 }
-async function reply(thread) { const body = prompt('Reply'); if (!body) return; await api.message(model.paper.id, thread.id, body); await Promise.all([refreshThreads(), refreshActivity()]); }
-async function transition(thread, state) { await api.transition(model.paper.id, thread.id, state); await Promise.all([refreshThreads(), refreshRounds(), refreshActivity()]); }
-async function editControls(thread) { const severity = prompt('Severity: NOTE, MINOR, MAJOR, BLOCKING', thread.severity); if (!severity) return; const category = prompt('Category', thread.category); if (!category) return; const assigned = prompt('Assigned Writer user id (blank for unassigned)', thread.assigned_writer_user_id || ''); const due = prompt('Due timestamp (blank for none)', thread.due_at || ''); await api.controls(model.paper.id, thread.id, { severity, category, assigned_writer_user_id: assigned || null, due_at: due || null }); await refreshThreads(); }
+async function reply(thread) { const body = prompt('Reply'); if (!body) return; await api.message(model.paper.id, thread.id, body); await refreshThreads(); }
+async function transition(thread, state) { await api.transition(model.paper.id, thread.id, state); await Promise.all([refreshThreads(), refreshRounds()]); }
 
 async function focusThread(thread) {
   if (thread.pdf_anchor?.page) { model.page = thread.pdf_anchor.page; await renderPage(); }
@@ -273,38 +266,12 @@ async function focusThread(thread) {
 function base64(value) { if (!value) return null; const binary = atob(value.replaceAll('\n', '')); return Uint8Array.from(binary, (character) => character.charCodeAt(0)); }
 
 async function refreshRounds() { const payload = await api.rounds(model.paper.id); model.rounds = payload.rounds; renderRounds(); }
-function renderRounds() { ui.roundList.replaceChildren(); const open = model.rounds.find((round) => round.status === 'OPEN'); ui.openRound.disabled = !canOpenReviewRound(model.paper?.current_build_id, Boolean(open)); ui.approvePaper.disabled = !open; if (!model.rounds.length) return clearNode(ui.roundList, model.paper?.current_build_id ? 'No review round.' : 'Compile an exact PDF before opening a review round.'); model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status} · ${round.open_threads} open · ${round.blocking_threads} blocking`; row.append(text); if (round.status === 'OPEN') row.append(button('Approve Round', () => approveRound(round))); ui.roundList.append(row); }); }
-async function approveRound(round) { await api.approveRound(model.paper.id, round.id); await Promise.all([refreshRounds(), refreshActivity(), refreshChanges()]); notice(`Round ${round.round_number} approved.`); }
-async function refreshActivity() { const payload = await api.activity(model.paper.id); model.activity = payload.events; ui.activityList.replaceChildren(); if (!model.activity.length) return clearNode(ui.activityList, 'No activity.'); model.activity.slice(0, 30).forEach((event) => { const row = document.createElement('p'); row.textContent = `${new Date(event.occurred_at).toLocaleString()} · ${event.summary}`; ui.activityList.append(row); }); }
-async function refreshChanges() { const payload = await api.changes(model.paper.id); if (!payload.available) { ui.reviewChanges.textContent = 'No current review baseline and exact build.'; return; } const changes = payload.changes; ui.reviewChanges.textContent = [`Added: ${changes.files_added.join(', ') || 'none'}`, `Removed: ${changes.files_removed.join(', ') || 'none'}`, `Changed: ${changes.files_changed.join(', ') || 'none'}`, '', ...Object.values(changes.text_diffs)].join('\n'); }
+function renderRounds() { ui.roundList.replaceChildren(); if (!model.rounds.length) return clearNode(ui.roundList, 'This paper has not been sent for review.'); model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status.replaceAll('_', ' ')}`; row.append(text); ui.roundList.append(row); }); if (!reviewOpen()) hideComposer(); }
 
-async function refreshRestorations() {
-  model.restorations = (await api.restorations()).filter((request) => request.paper_id === model.paper.id);
-  ui.restorationRequests.replaceChildren();
-  if (!model.restorations.length) return clearNode(ui.restorationRequests, 'No restoration requests.');
-  model.restorations.forEach((request) => {
-    const row = document.createElement('div'); row.className = 'round-row';
-    const text = document.createElement('span');
-    text.textContent = `Version #${request.target_version_number} · ${request.writer_email} · ${request.state.replaceAll('_', ' ')}${request.reason ? ` · ${request.reason}` : ''}`;
-    row.append(text);
-    if (request.state === 'AWAITING_MENTOR_REVIEW') {
-      row.append(button('Endorse', () => decideRestoration(request, 'endorse')), button('Reject', () => decideRestoration(request, 'reject')));
-    }
-    ui.restorationRequests.append(row);
-  });
-}
-async function decideRestoration(request, action) {
-  const note = window.prompt(`Optional Mentor note for ${action}`, ''); if (note === null) return;
-  try { await api.restorationDecision(request.id, action, note); await refreshRestorations(); notice(`Restoration request ${action === 'endorse' ? 'endorsed for Admin review' : 'rejected'}.`); }
-  catch (failure) { notice(failure.message, true); }
-}
-
-ui.threadType.addEventListener('change', () => { const replacement = showsReplacementInput(ui.threadType.value); ui.replacementField.hidden = !replacement; ui.replacementText.required = replacement; ui.assignedWriter.disabled = !['CHANGE_REQUEST', 'SUGGESTED_REPLACEMENT'].includes(ui.threadType.value); });
+ui.threadType.addEventListener('change', () => { const suggestion = showsReplacementInput(ui.threadType.value); ui.threadMessage.placeholder = suggestion ? 'Suggested replacement text' : 'Review comment'; });
 ui.reviewSelection.addEventListener('click', () => { if (model.pendingAnchor && model.pendingAnchorSummary) showComposer(model.pendingAnchorSummary); });
 ui.cancelAnnotation.addEventListener('click', hideComposer); ui.createAnnotation.addEventListener('click', () => createAnnotation().catch((failure) => notice(failure.message, true)));
 ui.compileReview.addEventListener('click', async () => { try { ui.buildStatus.textContent = 'Building…'; await api.build(model.paper.id); await refreshBuild(); } catch (failure) { notice(failure.message, true); } });
-ui.openRound.addEventListener('click', async () => { try { await api.openRound(model.paper.id); await Promise.all([refreshRounds(), refreshActivity(), refreshChanges()]); } catch (failure) { notice(failure.message, true); } });
-ui.approvePaper.addEventListener('click', () => createAnnotation({ thread_type: 'PAPER_APPROVAL', message: 'Paper approved for the current exact version.', severity: 'NOTE', category: 'SUBMISSION_REQUIREMENT', assigned_writer_user_id: null, due_at: null, source_anchor: null, pdf_anchor: null, suggested_replacement: null, section_label: null }).catch((failure) => notice(failure.message, true)));
 ui.previousPage.addEventListener('click', async () => { if (model.page > 1) { model.page -= 1; await renderPage(); } }); ui.nextPage.addEventListener('click', async () => { if (model.page < model.pdf.numPages) { model.page += 1; await renderPage(); } }); ui.zoomOut.addEventListener('click', async () => { model.scale = Math.max(0.5, model.scale - 0.25); await renderPage(); }); ui.zoomIn.addEventListener('click', async () => { model.scale = Math.min(3, model.scale + 0.25); await renderPage(); });
 ui.threadFilters.addEventListener('click', (event) => { const filter = event.target.dataset.filter; if (!filter) return; model.filter = filter; [...ui.threadFilters.children].forEach((node) => node.toggleAttribute('aria-current', node === event.target)); renderThreads(); });
 window.setInterval(() => { if (model.paper) { refreshBuild().catch(() => {}); refreshPapers().catch(() => {}); } }, 2000);

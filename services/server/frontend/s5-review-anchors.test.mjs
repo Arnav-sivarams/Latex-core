@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import * as Y from 'yjs';
-import { canOpenReviewRound, denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
+import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
 
 function sync(from, to) {
   Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)), 'remote');
@@ -29,12 +29,10 @@ test('PDF rectangle normalization survives zoom and rerender', () => {
 });
 
 test('review round and replacement controls require their exact prerequisites', () => {
-  assert.equal(canOpenReviewRound(null, false), false);
-  assert.equal(canOpenReviewRound('build-id', false), true);
-  assert.equal(canOpenReviewRound('build-id', true), false);
   for (const type of ['COMMENT', 'QUESTION', 'CHANGE_REQUEST', 'SECTION_APPROVAL']) {
     assert.equal(showsReplacementInput(type), false);
   }
+  assert.equal(showsReplacementInput('SUGGESTION'), true);
   assert.equal(showsReplacementInput('SUGGESTED_REPLACEMENT'), true);
   const css = readFileSync(new URL('../static/shells.css', import.meta.url), 'utf8');
   assert.match(css, /\.annotation-composer \[hidden\] \{ display: none !important; \}/);
@@ -71,6 +69,39 @@ test('Mentor bundle is read-only and PDF.js assets are same-origin', () => {
   assert.match(review, /\/static\/pdf\.worker\.min\.mjs/);
   assert.doesNotMatch(html, /iframe|cdn|Set Main|New File|Publish/i);
   assert.equal(packageJson.dependencies['pdfjs-dist'], '6.3.289');
+});
+
+test('V2.1 review UI exposes only gated comments and suggestions', () => {
+  const review = readFileSync(new URL('./review.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../src/review.html', import.meta.url), 'utf8');
+  assert.match(html, /value="COMMENT">Comment/);
+  assert.match(html, /value="SUGGESTION">Suggestion/);
+  assert.doesNotMatch(html, /id="severity"|id="category"|id="assignedWriter"|id="dueDate"/);
+  assert.doesNotMatch(html, /RESTORATION REQUESTS|CHANGES SINCE LAST REVIEW|>ACTIVITY</);
+  assert.match(review, /This paper has not been sent for review\./);
+  assert.match(review, /status === 'OPEN_FOR_REVIEW'/);
+});
+
+test('Writer surface uses Save semantics and inline historical review highlights', () => {
+  const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../src/write.html', import.meta.url), 'utf8');
+  assert.match(html, /id="saveFile"[^>]*>Save</);
+  assert.doesNotMatch(html, /Sync now/);
+  assert.match(writer, /Saving…/);
+  assert.match(writer, /Saved\/Synced/);
+  assert.match(writer, /review-source-highlight/);
+  assert.match(writer, /button\('Done'/);
+  assert.match(writer, /button\('Apply'/);
+  assert.match(html, />Send for Review</);
+});
+
+test('Admin Team UI requires and can reassign an assigned Writer Leader', () => {
+  const admin = readFileSync(new URL('../static/admin.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../src/admin.html', import.meta.url), 'utf8');
+  assert.match(admin, /leader_writer_id/);
+  assert.match(admin, /\/paper-teams\/\$\{team\.id\}\/leader/);
+  assert.match(admin, /Leader: \$\{leader\?\.email/);
+  assert.doesNotMatch(html, /data-section="Restoration Requests"/);
 });
 
 test('Writer suggestion acceptance orders Yjs edit, durable flush, then acceptance record', () => {

@@ -209,11 +209,16 @@ async fn paper_teams_and_membership_separate_access_from_global_role() {
 
     let (admin, admin_tenant) = insert_user_with_tenant(&pool).await;
     let (writer, writer_tenant) = insert_user_with_tenant(&pool).await;
+    let second_writer = insert_user(&pool).await;
+    let unassigned_writer = insert_user(&pool).await;
     let (mentor, mentor_tenant) = insert_user_with_tenant(&pool).await;
     repo.set_global_role(admin, GlobalRole::Admin)
         .await
         .unwrap();
     repo.set_global_role(writer, GlobalRole::Writer)
+        .await
+        .unwrap();
+    repo.set_global_role(second_writer, GlobalRole::Writer)
         .await
         .unwrap();
     repo.set_global_role(mentor, GlobalRole::Mentor)
@@ -222,33 +227,39 @@ async fn paper_teams_and_membership_separate_access_from_global_role() {
 
     let team_workspace = insert_workspace(&pool, admin_tenant, admin).await;
     let team = repo
-        .create_paper_team(admin, team_workspace, "One paper team")
+        .create_paper_team(admin, team_workspace, "One paper team", writer)
         .await
         .unwrap();
     assert_eq!(team.workspace_id, team_workspace);
     assert_eq!(team.created_by_user_id, admin);
     assert_eq!(repo.paper_team(team.id).await.unwrap(), team);
+    assert!(
+        repo.writer_paper(writer, team.id)
+            .await
+            .unwrap()
+            .is_team_leader
+    );
     assert_team_statuses(&repo, team.id).await;
 
     let writer_workspace = insert_workspace(&pool, writer_tenant, writer).await;
     assert!(matches!(
-        repo.create_paper_team(writer, writer_workspace, "Writer team")
+        repo.create_paper_team(writer, writer_workspace, "Writer team", writer)
             .await,
         Err(V2Error::RoleForbidden { .. })
     ));
     let mentor_workspace = insert_workspace(&pool, mentor_tenant, mentor).await;
     assert!(matches!(
-        repo.create_paper_team(mentor, mentor_workspace, "Mentor team")
+        repo.create_paper_team(mentor, mentor_workspace, "Mentor team", writer)
             .await,
         Err(V2Error::RoleForbidden { .. })
     ));
     assert!(matches!(
-        repo.create_paper_team(admin, team_workspace, "Duplicate workspace")
+        repo.create_paper_team(admin, team_workspace, "Duplicate workspace", writer)
             .await,
         Err(V2Error::WorkspaceConflict { .. })
     ));
 
-    repo.add_paper_team_member(team.id, writer, admin)
+    repo.add_paper_team_member(team.id, second_writer, admin)
         .await
         .unwrap();
     repo.add_paper_team_member(team.id, mentor, admin)
@@ -263,11 +274,81 @@ async fn paper_teams_and_membership_separate_access_from_global_role() {
         Err(V2Error::Conflict { .. })
     ));
     let members = repo.list_paper_team_members(team.id).await.unwrap();
-    assert_eq!(members.len(), 2);
-    assert!(members.iter().any(|member| member.user_id == writer));
+    assert_eq!(members.len(), 3);
+    assert!(
+        members
+            .iter()
+            .any(|member| member.user_id == writer && member.is_leader)
+    );
+    assert!(
+        members
+            .iter()
+            .any(|member| member.user_id == second_writer && !member.is_leader)
+    );
     assert!(members.iter().any(|member| member.user_id == mentor));
 
-    assert_membership_has_no_local_role(&pool).await;
+    assert_membership_has_only_team_leader_capability(&pool).await;
+
+    assert!(matches!(
+        repo.change_paper_team_leader(team.id, mentor, admin).await,
+        Err(V2Error::RoleForbidden { .. })
+    ));
+    assert!(matches!(
+        repo.change_paper_team_leader(team.id, admin, admin).await,
+        Err(V2Error::RoleForbidden { .. })
+    ));
+    assert!(matches!(
+        repo.change_paper_team_leader(team.id, unassigned_writer, admin)
+            .await,
+        Err(V2Error::RoleMissing { .. })
+    ));
+    let outside_writer = insert_user(&pool).await;
+    repo.set_global_role(outside_writer, GlobalRole::Writer)
+        .await
+        .unwrap();
+    assert!(matches!(
+        repo.change_paper_team_leader(team.id, outside_writer, admin)
+            .await,
+        Err(V2Error::RoleForbidden { .. })
+    ));
+    assert_constraint(
+        sqlx::query(
+            "UPDATE latex_core.paper_team_members SET is_leader=TRUE \
+             WHERE paper_team_id=$1 AND user_id=$2",
+        )
+        .bind(team.id)
+        .bind(second_writer.as_uuid())
+        .execute(&pool)
+        .await,
+    );
+    let changed = repo
+        .change_paper_team_leader(team.id, second_writer, admin)
+        .await
+        .unwrap();
+    assert!(changed.is_leader);
+    assert!(
+        repo.writer_paper(second_writer, team.id)
+            .await
+            .unwrap()
+            .is_team_leader
+    );
+    assert!(
+        !repo
+            .writer_paper(writer, team.id)
+            .await
+            .unwrap()
+            .is_team_leader
+    );
+    assert!(matches!(
+        repo.remove_paper_team_member(team.id, second_writer, admin)
+            .await,
+        Err(V2Error::Conflict { .. })
+    ));
+    assert!(matches!(
+        repo.set_global_role(second_writer, GlobalRole::Mentor)
+            .await,
+        Err(V2Error::TeamMembershipConflict { .. })
+    ));
 
     assert!(matches!(
         repo.set_global_role(writer, GlobalRole::Admin).await,
@@ -558,7 +639,7 @@ async fn assert_team_statuses(repo: &V2Repository, team_id: Uuid) {
     }
 }
 
-async fn assert_membership_has_no_local_role(pool: &PgPool) {
+async fn assert_membership_has_only_team_leader_capability(pool: &PgPool) {
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \
          WHERE table_schema='latex_core' AND table_name='paper_team_members' ORDER BY ordinal_position",
@@ -572,7 +653,8 @@ async fn assert_membership_has_no_local_role(pool: &PgPool) {
             "paper_team_id",
             "user_id",
             "assigned_by_user_id",
-            "created_at"
+            "created_at",
+            "is_leader"
         ]
     );
 }

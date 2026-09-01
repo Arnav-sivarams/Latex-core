@@ -6,11 +6,10 @@ Admins use `/admin` as the V2 governance control plane. Admin inspection does no
 
 - **OVERVIEW** — product and queue summary.
 - **V2 USERS** — provision users and assign one exclusive Writer, Mentor, or Admin role.
-- **PAPER TEAMS** — create teams, assign Writers/Mentors, and apply legal lifecycle transitions.
+- **PAPER TEAMS** — create teams, assign Writers/Mentors, select or change the Writer Leader, and apply legal lifecycle transitions.
 - **TEMPLATES** — inspect the existing immutable library and select a template at Team creation.
 - **FILE POLICIES** — inspect stable file IDs and set server-enforced policies.
 - **VERSIONS** — inspect immutable Team Paper history.
-- **RESTORATION REQUESTS** — reject or apply Mentor-endorsed requests.
 - **REVIEWS**, **BUILD QUEUE**, **AUDIT**, and **SYSTEM** — operational inspection using existing bounded APIs.
 
 ## Templates and policies
@@ -21,11 +20,11 @@ Silent template updates are not supported. Applying or changing a template on an
 
 Policies are `EDITABLE`, `CONTENT_READ_ONLY`, `STRUCTURE_LOCKED`, `TEMPLATE_MANAGED`, and `HIDDEN_SYSTEM`. Changes take effect for open collaboration rooms; rejected edits return a policy/reload error rather than being silently discarded.
 
-## Lifecycle and restoration
+## Lifecycle and Team leadership
 
 An Active Team may be frozen, submitted, or archived. A Frozen Team can return to Active or be archived. Submitted may be archived. Archived is terminal and retained rather than deleted. Frozen and Archived papers deny source and structural mutation.
 
-An Admin may reject a request in `AWAITING_ADMIN_REVIEW` or apply it. Apply flushes collaboration, records `PRE_RESTORE_SAFETY`, materializes the selected immutable version as a new current head, increments the document epoch, creates `ADMIN_RESTORATION`, marks the request `APPLIED`, and tells clients to reload. It never deletes or rewinds history.
+Team creation requires exactly one Leader selected from the assigned Writers. Reassignment is transactional and cannot select a Mentor, Admin, or unassigned Writer or leave an active Team leaderless. Admin may inspect historical governance data under Audit, but ordinary Team revert decisions belong to the Team Leader.
 
 ## Operator boundary
 

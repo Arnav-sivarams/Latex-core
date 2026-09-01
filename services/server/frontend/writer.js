@@ -1,6 +1,6 @@
 import { basicSetup } from 'codemirror';
-import { EditorState } from '@codemirror/state';
-import { EditorView, keymap } from '@codemirror/view';
+import { EditorState, StateEffect, StateField } from '@codemirror/state';
+import { Decoration, EditorView, keymap } from '@codemirror/view';
 import { StreamLanguage } from '@codemirror/language';
 import { autocompletion, snippetCompletion } from '@codemirror/autocomplete';
 import { stex } from '@codemirror/legacy-modes/mode/stex';
@@ -21,6 +21,16 @@ const FLUSH = 0x02;
 const INITIAL_STATE = 0x10;
 const REMOTE_SOURCE_UPDATE = 0x11;
 const REMOTE_ORIGIN = Symbol('server-remote');
+const setReviewMarks = StateEffect.define();
+const reviewMarkField = StateField.define({
+  create: () => Decoration.none,
+  update(marks, transaction) {
+    let next = marks.map(transaction.changes);
+    transaction.effects.forEach((effect) => { if (effect.is(setReviewMarks)) next = Decoration.set(effect.value, true); });
+    return next;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
 
 class PaperApi {
   async request(path, options = {}) {
@@ -55,11 +65,16 @@ class PaperApi {
   compare(paperId, from, to) { return this.request(`/api/v2/papers/${paperId}/versions/compare?from=${from}&to=${to}`); }
   restorationRequests(paperId) { return this.request(`/api/v2/papers/${paperId}/restoration-requests`); }
   requestRestoration(paperId, targetVersionId, reason) { return this.json(`/api/v2/papers/${paperId}/restoration-requests`, 'POST', { target_version_id: targetVersionId, reason: reason || null }); }
-  submitRestoration(requestId) { return this.json(`/api/v2/restoration-requests/${requestId}/submit`, 'POST', {}); }
+  rejectRestoration(requestId, note) { return this.json(`/api/v2/restoration-requests/${requestId}/reject`, 'POST', { note: note || null }); }
+  applyRestoration(requestId, note) { return this.json(`/api/v2/restoration-requests/${requestId}/apply`, 'POST', { note: note || null }); }
+  revertTeam(paperId, versionId) { return this.json(`/api/v2/papers/${paperId}/versions/${versionId}/revert`, 'POST', { confirmed: true }); }
   restorePersonal(paperId, versionId) { return this.json(`/api/v2/papers/${paperId}/versions/${versionId}/restore`, 'POST', {}); }
   build(paperId, triggerType) { return this.json(`/api/v2/papers/${paperId}/builds`, 'POST', { trigger_type: triggerType }); }
   buildStatus(paperId) { return this.request(`/api/v2/papers/${paperId}/builds`); }
   reviews(paperId) { return this.request(`/api/v2/reviews/papers/${paperId}/threads`); }
+  reviewRounds(paperId) { return this.request(`/api/v2/reviews/papers/${paperId}/rounds`); }
+  sendForReview(paperId) { return this.json(`/api/v2/reviews/papers/${paperId}/rounds`, 'POST', {}); }
+  endReview(paperId, roundId) { return this.json(`/api/v2/reviews/papers/${paperId}/rounds/${roundId}/close`, 'POST', {}); }
   reviewMessage(paperId, threadId, body) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/messages`, 'POST', { body }); }
   reviewState(paperId, threadId, state) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/state`, 'POST', { state }); }
   acceptSuggestion(paperId, threadId, durableSequence) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/accept`, 'POST', { durable_sequence: durableSequence }); }
@@ -78,7 +93,7 @@ const api = new PaperApi();
 const ui = Object.fromEntries([
   'myPapers', 'teamPapers', 'fileTree', 'newPaper', 'newFile', 'renameFile', 'deleteFile',
   'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
-  'editorMount', 'writerNotice', 'compilePaper', 'buildStatus', 'pdfRelation', 'pdfEmpty',
+  'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'pdfRelation', 'pdfEmpty',
   'pdfFrame', 'createCheckpoint', 'versionHistory', 'versionDiff',
   'reviewCounts', 'writerReviewFilters', 'writerReviewList',
   'quickOpen', 'commandPalette', 'uploadImage', 'assetInput', 'outlineTree', 'refreshIntelligence',
@@ -102,6 +117,7 @@ const model = {
   currentBuildId: null,
   versions: [],
   restorationRequests: [],
+  reviewRounds: [],
   reviews: [],
   reviewFilter: 'active',
   intelligence: { outline: [], labels: [], bibliography: [], diagnostics: [], environments: [], packages: [] },
@@ -124,10 +140,10 @@ function notice(message, failed = false) {
 
 function saveState(state) {
   const labels = {
-    local: 'Local',
-    syncing: 'Syncing…',
-    synced: 'Synced',
-    offline: 'Offline — stored locally',
+    local: 'Saved/Synced',
+    syncing: 'Saving…',
+    synced: 'Saved/Synced',
+    offline: 'Offline',
     reconnecting: 'Reconnecting…',
     conflict: 'Conflict/Error',
   };
@@ -510,7 +526,7 @@ async function openPaper(paper) {
   model.paperDetail = await api.paper(paper.id);
   model.version = model.paperDetail.version;
   model.files = await api.files(paper.id);
-  ui.currentPaper.textContent = `${paper.name}${paper.status === 'active' ? '' : ` — ${paper.status} (read-only)`}`;
+  ui.currentPaper.textContent = `${paper.name}${paper.is_team_leader ? ' — Team Leader' : ''}${paper.status === 'active' ? '' : ` — ${paper.status} (read-only)`}`;
   ui.newFile.disabled = !model.paperDetail.editable;
   ui.uploadImage.disabled = !model.paperDetail.editable;
   ui.refreshIntelligence.disabled = false;
@@ -518,12 +534,14 @@ async function openPaper(paper) {
   ui.structuralUndo.disabled = !model.paperDetail.editable;
   ui.structuralRedo.disabled = !model.paperDetail.editable;
   ui.compilePaper.disabled = !model.paperDetail.editable;
-  ui.createCheckpoint.disabled = !model.paperDetail.editable;
+  ui.createCheckpoint.disabled = !model.paperDetail.editable || (paper.kind === 'team' && !paper.is_team_leader);
+  ui.sendReview.disabled = paper.kind !== 'team' || !paper.is_team_leader || !model.paperDetail.editable;
+  ui.endReview.disabled = true;
   renderPapers();
   renderFiles();
   const initial = model.files.find((file) => file.path === model.paperDetail.main_file) || model.files[0];
   if (initial) await openFile(initial, true);
-  await Promise.all([refreshBuildStatus(), refreshHistory(), refreshReviews(), refreshIntelligence()]);
+  await Promise.all([refreshBuildStatus(), refreshHistory(), refreshReviews(), refreshReviewRounds(), refreshIntelligence()]);
 }
 
 async function openFile(file, force = false) {
@@ -617,7 +635,7 @@ function mountEditor(ytext, editable, latex) {
     keymap.of([{ key: 'Mod-Enter', preventDefault: true, run: () => { manualCompile(); return true; } }]),
     EditorState.readOnly.of(!editable),
     EditorView.editable.of(editable),
-    yCollab(ytext, null, { undoManager }),
+    yCollab(ytext, null, { undoManager }), reviewMarkField,
     EditorView.theme({ '&': { height: '100%' }, '.cm-scroller': { overflow: 'auto' } }),
   ];
   if (latex) extensions.push(StreamLanguage.define(stex), autocompletion({ override: [latexCompletionSource] }));
@@ -625,6 +643,7 @@ function mountEditor(ytext, editable, latex) {
     state: EditorState.create({ doc: ytext.toString(), extensions }),
     parent: ui.editorMount,
   });
+  applyReviewHighlights();
 }
 
 function destroyEditorView() {
@@ -654,7 +673,7 @@ async function syncCurrent(showNotice = true) {
   try {
     await model.collaboration.flush();
     scheduleIntelligence();
-    if (showNotice) notice(`Synced ${model.file.path}`);
+    if (showNotice) notice(`Saved ${model.file.path}`);
     return true;
   } catch (error) {
     saveState('offline');
@@ -750,6 +769,25 @@ async function refreshHistory() {
   }
 }
 
+async function refreshReviewRounds() {
+  if (!model.paper || model.paper.kind !== 'team') {
+    model.reviewRounds = [];
+    ui.sendReview.disabled = true;
+    ui.endReview.disabled = true;
+    return;
+  }
+  try {
+    const payload = await api.reviewRounds(model.paper.id);
+    model.reviewRounds = payload.rounds;
+    const open = model.reviewRounds.find((round) => round.status === 'OPEN_FOR_REVIEW');
+    const leader = Boolean(model.paper.is_team_leader && model.paperDetail?.editable);
+    ui.sendReview.disabled = !leader || Boolean(open);
+    ui.endReview.disabled = !leader || !open;
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
 function renderHistory() {
   ui.versionHistory.replaceChildren();
   if (!model.versions.length) {
@@ -770,24 +808,46 @@ function renderHistory() {
     metadata.textContent = `${version.author_email} · ${new Date(version.created_at).toLocaleString()}`;
     detail.append(title, metadata);
     label.append(checkbox, detail);
-    const request = model.restorationRequests.find((item) => item.target_version_id === version.id);
-    if (request) {
+    const requests = model.restorationRequests.filter((item) => item.target_version_id === version.id);
+    if (requests.length) {
       const status = document.createElement('small');
-      status.textContent = `Restoration: ${request.state.replaceAll('_', ' ')}`;
+      status.textContent = `Revert: ${requests.map((request) => request.state.replaceAll('_', ' ')).join(', ')}`;
       detail.append(status);
     }
     if (model.paper.kind === 'team') {
-      const action = button('Request restoration', async () => {
-        const reason = window.prompt('Optional reason for restoring this version', '') ?? null;
-        if (reason === null) return;
-        try {
-          const draft = await api.requestRestoration(model.paper.id, version.id, reason);
-          await api.submitRestoration(draft.id);
-          await refreshHistory();
-          notice('Restoration request submitted for Mentor review.');
-        } catch (error) { notice(error.message, true); }
-      });
-      label.append(action);
+      if (model.paper.is_team_leader) {
+        requests.filter((request) => request.state === 'REQUESTED').forEach((request) => {
+          label.append(
+            button(`Reject request from ${request.writer_email}`, async () => {
+              const note = window.prompt('Optional rejection note', ''); if (note === null) return;
+              try { await api.rejectRestoration(request.id, note); await refreshHistory(); notice('Revert request rejected.'); }
+              catch (error) { notice(error.message, true); }
+            }),
+            button(`Revert for ${request.writer_email}`, async () => {
+              if (!window.confirm('Revert this Team Paper as a new head? The current state will be retained as PRE_RESTORE_SAFETY.')) return;
+              const note = window.prompt('Optional decision note', ''); if (note === null) return;
+              try { await api.applyRestoration(request.id, note); await openPaper(model.paper); notice('Team Paper reverted as a new current version.'); }
+              catch (error) { notice(error.message, true); }
+            }),
+          );
+        });
+        label.append(button('Revert', async () => {
+          if (!window.confirm('Revert this Team Paper directly as a new head? The current state will be retained as PRE_RESTORE_SAFETY.')) return;
+          try { await api.revertTeam(model.paper.id, version.id); await openPaper(model.paper); notice('Team Paper reverted as a new current version.'); }
+          catch (error) { notice(error.message, true); }
+        }));
+      } else {
+        const action = button('Request Revert', async () => {
+          const reason = window.prompt('Optional reason for reverting to this version', '') ?? null;
+          if (reason === null) return;
+          try {
+            await api.requestRestoration(model.paper.id, version.id, reason);
+            await refreshHistory();
+            notice('Revert request sent to the Team Leader.');
+          } catch (error) { notice(error.message, true); }
+        });
+        label.append(action);
+      }
     } else {
       const action = button('Restore this personal version', async () => {
         if (!window.confirm('Restore this personal paper as a new current head? The current state will be saved permanently as a safety version.')) return;
@@ -850,6 +910,7 @@ function renderReviews() {
   const resolved = model.reviews.filter((thread) => thread.state === 'RESOLVED').length;
   const blocking = model.reviews.filter((thread) => thread.severity === 'BLOCKING' && thread.state !== 'RESOLVED').length;
   ui.reviewCounts.textContent = `${active} open · ${addressed} addressed · ${resolved} resolved · ${blocking} blocking`;
+  applyReviewHighlights();
   const visible = model.reviews.filter((thread) => model.reviewFilter === 'all'
     || (model.reviewFilter === 'active' && ['OPEN', 'REOPENED'].includes(thread.state))
     || (model.reviewFilter === 'blocking' && thread.severity === 'BLOCKING' && thread.state !== 'RESOLVED')
@@ -884,6 +945,49 @@ function renderReviews() {
     ui.writerReviewList.append(card);
   });
 }
+
+function applyReviewHighlights() {
+  if (!model.view || !model.collaboration?.doc || !model.file) return;
+  const marks = [];
+  model.reviews.filter((thread) => ['OPEN', 'REOPENED', 'ADDRESSED'].includes(thread.state)
+    && thread.source_anchor?.file_id === model.file.file_id && !thread.source_anchor.file_deleted).forEach((thread) => {
+    const anchor = thread.source_anchor;
+    const range = resolveSuggestionRange(model.collaboration.doc, model.collaboration.text, decodeBase64(anchor.encoded_relative_start), decodeBase64(anchor.encoded_relative_end));
+    if (!range || range.to <= range.from) return;
+    const body = thread.messages?.[0]?.body || 'Review annotation';
+    marks.push(Decoration.mark({
+      class: 'review-source-highlight',
+      attributes: { 'data-review-thread': thread.id, title: `${thread.mentor_email}: ${body} · Done` },
+    }).range(range.from, range.to));
+  });
+  model.view.dispatch({ effects: setReviewMarks.of(marks) });
+}
+
+let reviewPopoverTimer = null;
+function hideReviewPopover() {
+  window.clearTimeout(reviewPopoverTimer);
+  reviewPopoverTimer = window.setTimeout(() => document.querySelector('#writerReviewPopover')?.remove(), 200);
+}
+ui.editorMount.addEventListener('mouseover', (event) => {
+  const mark = event.target.closest?.('[data-review-thread]');
+  if (!mark) return;
+  const thread = model.reviews.find((candidate) => candidate.id === mark.dataset.reviewThread);
+  if (!thread) return;
+  window.clearTimeout(reviewPopoverTimer);
+  document.querySelector('#writerReviewPopover')?.remove();
+  const popover = document.createElement('aside'); popover.id = 'writerReviewPopover'; popover.className = 'review-highlight-popover';
+  const body = thread.messages?.[0]?.body || 'Review annotation';
+  popover.append(Object.assign(document.createElement('strong'), { textContent: thread.mentor_email }), Object.assign(document.createElement('p'), { textContent: body }));
+  popover.append(button('Done', async () => {
+    try { await api.reviewState(model.paper.id, thread.id, 'RESOLVED'); popover.remove(); await refreshReviews(); }
+    catch (error) { notice(error.message, true); }
+  }));
+  if (thread.suggestion?.status === 'PENDING') popover.append(button('Apply', () => writerAcceptSuggestion(thread)));
+  const bounds = mark.getBoundingClientRect(); Object.assign(popover.style, { left: `${bounds.left}px`, top: `${bounds.bottom + 6}px` });
+  popover.addEventListener('mouseenter', () => window.clearTimeout(reviewPopoverTimer)); popover.addEventListener('mouseleave', hideReviewPopover);
+  document.body.append(popover);
+});
+ui.editorMount.addEventListener('mouseout', (event) => { if (event.target.closest?.('[data-review-thread]')) hideReviewPopover(); });
 
 function writerAnchorStatus(thread) {
   if (thread.source_anchor?.file_deleted) return 'SOURCE_DELETED';
@@ -1225,6 +1329,23 @@ ui.setMain.addEventListener('click', async () => {
 
 ui.saveFile.addEventListener('click', syncCurrent);
 ui.compilePaper.addEventListener('click', manualCompile);
+ui.sendReview.addEventListener('click', async () => {
+  if (!model.paper?.is_team_leader || !await syncCurrent(false)) return;
+  try {
+    await api.sendForReview(model.paper.id);
+    await refreshReviewRounds();
+    notice('Current paper sent for Mentor review.');
+  } catch (error) { notice(error.message, true); }
+});
+ui.endReview.addEventListener('click', async () => {
+  const open = model.reviewRounds.find((round) => round.status === 'OPEN_FOR_REVIEW');
+  if (!open || !window.confirm('End the current review? Mentor annotation controls will be disabled.')) return;
+  try {
+    await api.endReview(model.paper.id, open.id);
+    await refreshReviewRounds();
+    notice('Review ended.');
+  } catch (error) { notice(error.message, true); }
+});
 ui.quickOpen.addEventListener('click', quickOpen);
 ui.commandPalette.addEventListener('click', () => showPalette('Command Palette', commandItems()));
 ui.insertMenu.addEventListener('click', openInsertMenu);

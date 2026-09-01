@@ -19,7 +19,7 @@ These layers reference one another where useful but are not interchangeable. CRD
 - `COMPILE_CHECKPOINT`
 - `REVIEW_ROUND`
 - `PRE_RESTORE_SAFETY`
-- `ADMIN_RESTORATION`
+- `TEAM_REVERT` (new V2.1 heads; historical `ADMIN_RESTORATION` rows remain readable)
 - `TEMPLATE_UPDATE`
 - `SUBMISSION`
 

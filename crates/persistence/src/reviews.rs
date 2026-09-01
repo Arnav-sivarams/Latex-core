@@ -1,4 +1,4 @@
-//! S5 Mentor review persistence and authorization boundaries.
+//! V2.1 Team-Leader review submissions and Mentor annotation boundaries.
 
 use crate::{
     GlobalRole, PaperKind, PaperStatus, V2Error, V2Repository, WriterPaper,
@@ -53,7 +53,9 @@ pub struct ReviewPdfAnchorInput {
 pub struct ReviewThreadInput {
     pub thread_type: String,
     pub message: String,
+    #[serde(default = "default_review_severity")]
     pub severity: String,
+    #[serde(default = "default_review_category")]
     pub category: String,
     pub assigned_writer_user_id: Option<UserId>,
     pub due_at: Option<String>,
@@ -61,6 +63,14 @@ pub struct ReviewThreadInput {
     pub pdf_anchor: Option<ReviewPdfAnchorInput>,
     pub suggested_replacement: Option<String>,
     pub section_label: Option<String>,
+}
+
+fn default_review_severity() -> String {
+    "NOTE".to_owned()
+}
+
+fn default_review_category() -> String {
+    "WRITING".to_owned()
 }
 
 impl V2Repository {
@@ -110,6 +120,7 @@ impl V2Repository {
                 &row.try_get::<String, _>("status")
                     .map_err(V2Error::Database)?,
             )?,
+            is_team_leader: row.try_get("is_team_leader").map_err(V2Error::Database)?,
             updated_at: row.try_get("updated_at").map_err(V2Error::Database)?,
         };
         Ok((paper, role))
@@ -148,7 +159,8 @@ impl V2Repository {
     ) -> Result<Vec<Value>, V2Error> {
         let (paper, _) = self.review_paper(actor, paper_id).await?;
         let rows = sqlx::query(
-            "SELECT rr.id,rr.round_number,rr.baseline_version_id,rr.status,rr.opened_at::text AS opened_at,rr.closed_at::text AS closed_at, \
+            "SELECT rr.id,rr.round_number,rr.baseline_version_id,rr.baseline_build_id,rr.baseline_state_hash, \
+                    rr.submitted_by_leader_writer_id,rr.status,rr.opened_at::text AS opened_at,rr.closed_at::text AS closed_at, \
                     count(rt.id) FILTER (WHERE rt.state IN ('OPEN','ADDRESSED','REOPENED')) AS open_threads, \
                     count(rt.id) FILTER (WHERE rt.severity='BLOCKING' AND rt.state IN ('OPEN','ADDRESSED','REOPENED')) AS blocking_threads \
              FROM latex_core.review_rounds rr LEFT JOIN latex_core.review_threads rt ON rt.review_round_id=rr.id \
@@ -163,12 +175,13 @@ impl V2Repository {
 
     pub async fn open_review_round(
         &self,
-        mentor: UserId,
+        leader: UserId,
         paper_id: Uuid,
+        expected_state_hash: &str,
     ) -> Result<Value, V2Error> {
-        let (paper, role) = self.review_paper(mentor, paper_id).await?;
-        if role != GlobalRole::Mentor {
-            return Err(forbidden(mentor, role, "assigned mentor"));
+        let (paper, role) = self.review_paper(leader, paper_id).await?;
+        if role != GlobalRole::Writer {
+            return Err(forbidden(leader, role, "Paper Team Leader Writer"));
         }
         let mut tx = self
             .database
@@ -176,8 +189,14 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        if lock_paper_team(&mut tx, paper_id).await? != PaperStatus::Active {
+            return Err(V2Error::Conflict {
+                entity: "active Paper Team review submission",
+            });
+        }
+        require_team_leader(&mut tx, paper_id, leader).await?;
         let already_open: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM latex_core.review_rounds WHERE workspace_id=$1 AND status='OPEN')",
+            "SELECT EXISTS(SELECT 1 FROM latex_core.review_rounds WHERE workspace_id=$1 AND status IN ('OPEN','OPEN_FOR_REVIEW'))",
         )
         .bind(paper.workspace_id.as_uuid())
         .fetch_one(&mut *tx)
@@ -188,17 +207,27 @@ impl V2Repository {
                 entity: "open review round",
             });
         }
-        let baseline: Uuid = sqlx::query_scalar(
-            "SELECT b.version_id FROM latex_core.v2_paper_build_state s \
-             JOIN latex_core.v2_paper_builds b ON b.id=s.current_build_id WHERE s.workspace_id=$1",
+        let baseline = sqlx::query(
+            "SELECT b.version_id,b.id AS build_id,b.state_hash FROM latex_core.v2_paper_build_state s \
+             JOIN latex_core.v2_paper_builds b ON b.id=s.current_build_id \
+             WHERE s.workspace_id=$1 AND b.status='succeeded' AND b.state_hash=$2 \
+               AND s.desired_state_hash=$2 \
+               AND EXISTS (SELECT 1 FROM latex_core.compilation_artifacts a \
+                           WHERE a.job_id=b.compile_job_id AND a.kind='pdf')",
         )
         .bind(paper.workspace_id.as_uuid())
+        .bind(expected_state_hash)
         .fetch_optional(&mut *tx)
         .await
         .map_err(V2Error::Database)?
-        .ok_or(V2Error::NotFound {
-            entity: "exact review baseline",
+        .ok_or(V2Error::Conflict {
+            entity: "current review PDF",
         })?;
+        let baseline_version_id: Uuid =
+            baseline.try_get("version_id").map_err(V2Error::Database)?;
+        let baseline_build_id: Uuid = baseline.try_get("build_id").map_err(V2Error::Database)?;
+        let baseline_state_hash: String =
+            baseline.try_get("state_hash").map_err(V2Error::Database)?;
         let number: i64 = sqlx::query_scalar(
             "SELECT COALESCE(max(round_number),0)+1 FROM latex_core.review_rounds WHERE workspace_id=$1",
         )
@@ -209,33 +238,38 @@ impl V2Repository {
         let id = Uuid::new_v4();
         let row = sqlx::query(
             "INSERT INTO latex_core.review_rounds \
-             (id,paper_id,workspace_id,round_number,baseline_version_id,opened_by_mentor_user_id) \
-             VALUES ($1,$2,$3,$4,$5,$6) \
-             RETURNING id,round_number,baseline_version_id,status,opened_at::text AS opened_at,closed_at::text AS closed_at,0::bigint AS open_threads,0::bigint AS blocking_threads",
+             (id,paper_id,workspace_id,round_number,baseline_version_id,opened_by_mentor_user_id, \
+              submitted_by_leader_writer_id,baseline_build_id,baseline_state_hash,status) \
+             VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,'OPEN_FOR_REVIEW') \
+             RETURNING id,round_number,baseline_version_id,baseline_build_id,baseline_state_hash, \
+                       submitted_by_leader_writer_id,status,opened_at::text AS opened_at, \
+                       closed_at::text AS closed_at,0::bigint AS open_threads,0::bigint AS blocking_threads",
         )
         .bind(id)
         .bind(paper_id)
         .bind(paper.workspace_id.as_uuid())
         .bind(number)
-        .bind(baseline)
-        .bind(mentor.as_uuid())
+        .bind(baseline_version_id)
+        .bind(leader.as_uuid())
+        .bind(baseline_build_id)
+        .bind(&baseline_state_hash)
         .fetch_one(&mut *tx)
         .await
         .map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
-        tracing::info!(%paper_id, round_id=%id, mentor_user_id=%mentor, "review round opened");
+        tracing::info!(%paper_id, round_id=%id, leader_writer_user_id=%leader, %baseline_version_id, %baseline_build_id, state_hash=%baseline_state_hash, "paper sent for review");
         round_json(row)
     }
 
-    pub async fn approve_review_round(
+    pub async fn close_review_round(
         &self,
-        mentor: UserId,
+        leader: UserId,
         paper_id: Uuid,
         round_id: Uuid,
     ) -> Result<Value, V2Error> {
-        let (paper, role) = self.review_paper(mentor, paper_id).await?;
-        if role != GlobalRole::Mentor {
-            return Err(forbidden(mentor, role, "assigned mentor"));
+        let (paper, role) = self.review_paper(leader, paper_id).await?;
+        if role != GlobalRole::Writer {
+            return Err(forbidden(leader, role, "Paper Team Leader Writer"));
         }
         let mut tx = self
             .database
@@ -243,6 +277,8 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        let _status = lock_paper_team(&mut tx, paper_id).await?;
+        require_team_leader(&mut tx, paper_id, leader).await?;
         let status: String = sqlx::query_scalar(
             "SELECT status FROM latex_core.review_rounds WHERE id=$1 AND paper_id=$2 AND workspace_id=$3 FOR UPDATE",
         )
@@ -253,35 +289,23 @@ impl V2Repository {
         .await
         .map_err(V2Error::Database)?
         .ok_or(V2Error::NotFound { entity: "review round" })?;
-        if status != "OPEN" {
+        if status != "OPEN_FOR_REVIEW" {
             return Err(V2Error::Conflict {
                 entity: "review round transition",
             });
         }
-        let blocking: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM latex_core.review_threads WHERE review_round_id=$1 \
-             AND severity='BLOCKING' AND state IN ('OPEN','ADDRESSED','REOPENED')",
-        )
-        .bind(round_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(V2Error::Database)?;
-        if blocking != 0 {
-            return Err(V2Error::Conflict {
-                entity: "unresolved blocking review",
-            });
-        }
-        create_review_round_version(&mut tx, paper_id, paper.workspace_id, mentor).await?;
         let row = sqlx::query(
-            "UPDATE latex_core.review_rounds SET status='APPROVED',closed_at=statement_timestamp() WHERE id=$1 \
-             RETURNING id,round_number,baseline_version_id,status,opened_at::text AS opened_at,closed_at::text AS closed_at,0::bigint AS open_threads,0::bigint AS blocking_threads",
+            "UPDATE latex_core.review_rounds SET status='CLOSED',closed_at=statement_timestamp() WHERE id=$1 \
+             RETURNING id,round_number,baseline_version_id,baseline_build_id,baseline_state_hash, \
+                       submitted_by_leader_writer_id,status,opened_at::text AS opened_at, \
+                       closed_at::text AS closed_at,0::bigint AS open_threads,0::bigint AS blocking_threads",
         )
         .bind(round_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
-        tracing::info!(%paper_id, %round_id, mentor_user_id=%mentor, "review round approved");
+        tracing::info!(%paper_id, %round_id, leader_writer_user_id=%leader, "paper review closed");
         round_json(row)
     }
 
@@ -301,14 +325,18 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        let _status = lock_paper_team(&mut tx, paper_id).await?;
+        require_team_mentor(&mut tx, paper_id, mentor).await?;
         let round_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM latex_core.review_rounds WHERE workspace_id=$1 AND status='OPEN' ORDER BY round_number DESC LIMIT 1 FOR UPDATE",
+            "SELECT id FROM latex_core.review_rounds WHERE workspace_id=$1 AND status='OPEN_FOR_REVIEW' ORDER BY round_number DESC LIMIT 1 FOR UPDATE",
         )
         .bind(paper.workspace_id.as_uuid())
         .fetch_optional(&mut *tx)
         .await
         .map_err(V2Error::Database)?
-        .ok_or(V2Error::Conflict { entity: "open review round" })?;
+        .ok_or(V2Error::Conflict {
+            entity: "paper review gate",
+        })?;
         if let Some(writer) = input.assigned_writer_user_id {
             require_team_writer(&mut tx, paper_id, writer).await?;
         }
@@ -365,7 +393,18 @@ impl V2Repository {
         if let Some(anchor) = &input.pdf_anchor {
             insert_pdf_anchor(&mut tx, id, paper.workspace_id, anchor).await?;
         }
-        if let Some(replacement) = &input.suggested_replacement {
+        let replacement = if input.thread_type == "SUGGESTION" {
+            Some(
+                input
+                    .suggested_replacement
+                    .as_deref()
+                    .unwrap_or(input.message.as_str())
+                    .trim(),
+            )
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
             sqlx::query(
                 "INSERT INTO latex_core.review_suggestions (thread_id,replacement_text) VALUES ($1,$2)",
             )
@@ -464,11 +503,19 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
-        let current = lock_thread(&mut tx, paper.workspace_id, thread_id).await?;
+        let (current, thread_type) =
+            lock_thread_state_and_type(&mut tx, paper.workspace_id, thread_id).await?;
         let valid = match role {
-            GlobalRole::Writer => {
-                target == "ADDRESSED" && matches!(current.as_str(), "OPEN" | "REOPENED")
-            }
+            GlobalRole::Writer => match target {
+                "ADDRESSED" => matches!(current.as_str(), "OPEN" | "REOPENED"),
+                "RESOLVED" => {
+                    matches!(
+                        thread_type.as_str(),
+                        "COMMENT" | "SUGGESTION" | "SUGGESTED_REPLACEMENT"
+                    ) && matches!(current.as_str(), "OPEN" | "ADDRESSED" | "REOPENED")
+                }
+                _ => false,
+            },
             GlobalRole::Mentor => {
                 (target == "RESOLVED" && current == "ADDRESSED")
                     || (target == "REOPENED"
@@ -691,7 +738,7 @@ async fn participant_row(
     paper_id: Uuid,
 ) -> Result<PgRow, V2Error> {
     sqlx::query(
-        "SELECT t.id,t.workspace_id,t.name,t.status,t.updated_at::text AS updated_at,r.role \
+        "SELECT t.id,t.workspace_id,t.name,t.status,t.updated_at::text AS updated_at,r.role,m.is_leader AS is_team_leader \
          FROM latex_core.paper_teams t JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$2 \
          JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role IN ('writer','mentor') WHERE t.id=$1",
     )
@@ -746,6 +793,75 @@ async fn require_team_writer(
     Ok(())
 }
 
+async fn require_team_leader(
+    tx: &mut Transaction<'_, Postgres>,
+    paper_id: Uuid,
+    writer: UserId,
+) -> Result<(), V2Error> {
+    let is_leader = sqlx::query_scalar::<_, Uuid>(
+        "SELECT m.user_id FROM latex_core.paper_team_members m \
+         JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='writer' \
+         WHERE m.paper_team_id=$1 AND m.user_id=$2 AND m.is_leader FOR UPDATE OF m",
+    )
+    .bind(paper_id)
+    .bind(writer.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .is_some();
+    if !is_leader {
+        return Err(V2Error::RoleForbidden {
+            user_id: writer,
+            required: "Paper Team Leader Writer",
+            actual: GlobalRole::Writer,
+        });
+    }
+    Ok(())
+}
+
+async fn require_team_mentor(
+    tx: &mut Transaction<'_, Postgres>,
+    paper_id: Uuid,
+    mentor: UserId,
+) -> Result<(), V2Error> {
+    let is_assigned = sqlx::query_scalar::<_, Uuid>(
+        "SELECT m.user_id FROM latex_core.paper_team_members m \
+         JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='mentor' \
+         WHERE m.paper_team_id=$1 AND m.user_id=$2 FOR UPDATE OF m",
+    )
+    .bind(paper_id)
+    .bind(mentor.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .is_some();
+    if !is_assigned {
+        return Err(V2Error::RoleForbidden {
+            user_id: mentor,
+            required: "assigned Paper Team Mentor",
+            actual: GlobalRole::Mentor,
+        });
+    }
+    Ok(())
+}
+
+async fn lock_paper_team(
+    tx: &mut Transaction<'_, Postgres>,
+    paper_id: Uuid,
+) -> Result<PaperStatus, V2Error> {
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM latex_core.paper_teams WHERE id=$1 FOR UPDATE",
+    )
+    .bind(paper_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .ok_or(V2Error::NotFound {
+        entity: "Paper Team",
+    })?;
+    PaperStatus::from_str(&status)
+}
+
 async fn require_file(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: WorkspaceId,
@@ -779,6 +895,29 @@ async fn lock_thread(
     .ok_or(V2Error::NotFound {
         entity: "review thread",
     })
+}
+
+async fn lock_thread_state_and_type(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+    thread_id: Uuid,
+) -> Result<(String, String), V2Error> {
+    let row = sqlx::query(
+        "SELECT state,thread_type FROM latex_core.review_threads \
+         WHERE id=$1 AND workspace_id=$2 FOR UPDATE",
+    )
+    .bind(thread_id)
+    .bind(workspace_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?
+    .ok_or(V2Error::NotFound {
+        entity: "review thread",
+    })?;
+    Ok((
+        row.try_get("state").map_err(V2Error::Database)?,
+        row.try_get("thread_type").map_err(V2Error::Database)?,
+    ))
 }
 
 async fn insert_message(
@@ -829,33 +968,6 @@ async fn insert_pdf_anchor(
     Ok(())
 }
 
-async fn create_review_round_version(
-    tx: &mut Transaction<'_, Postgres>,
-    paper_id: Uuid,
-    workspace_id: WorkspaceId,
-    mentor: UserId,
-) -> Result<Uuid, V2Error> {
-    let current = sqlx::query(
-        "SELECT v.document_epoch,v.workspace_version,v.snapshot_id,v.manifest,v.state_hash FROM latex_core.v2_paper_build_state s \
-         JOIN latex_core.v2_paper_builds b ON b.id=s.current_build_id JOIN latex_core.paper_versions v ON v.id=b.version_id WHERE s.workspace_id=$1",
-    ).bind(workspace_id.as_uuid()).fetch_optional(&mut **tx).await.map_err(V2Error::Database)?
-        .ok_or(V2Error::Conflict { entity: "current exact review version" })?;
-    let number: i64 = sqlx::query_scalar("SELECT COALESCE(max(version_number),0)+1 FROM latex_core.paper_versions WHERE workspace_id=$1")
-        .bind(workspace_id.as_uuid()).fetch_one(&mut **tx).await.map_err(V2Error::Database)?;
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO latex_core.paper_versions (id,paper_id,workspace_id,document_epoch,version_number,version_type,name,created_by_user_id,workspace_version,snapshot_id,manifest,state_hash) \
-         VALUES ($1,$2,$3,$4,$5,'review_round',$6,$7,$8,$9,$10,$11)",
-    ).bind(id).bind(paper_id).bind(workspace_id.as_uuid()).bind(current.try_get::<i64,_>("document_epoch").map_err(V2Error::Database)?)
-      .bind(number).bind(format!("Approved review round {number}")).bind(mentor.as_uuid())
-      .bind(current.try_get::<i64,_>("workspace_version").map_err(V2Error::Database)?)
-      .bind(current.try_get::<String,_>("snapshot_id").map_err(V2Error::Database)?)
-      .bind(current.try_get::<Value,_>("manifest").map_err(V2Error::Database)?)
-      .bind(current.try_get::<String,_>("state_hash").map_err(V2Error::Database)?)
-      .execute(&mut **tx).await.map_err(V2Error::Database)?;
-    Ok(id)
-}
-
 fn decode_review_paper(row: PgRow) -> Result<ReviewPaperSummary, V2Error> {
     let open: i64 = row
         .try_get("open_review_count")
@@ -894,7 +1006,7 @@ fn decode_review_paper(row: PgRow) -> Result<ReviewPaperSummary, V2Error> {
 
 fn round_json(row: PgRow) -> Result<Value, V2Error> {
     Ok(
-        json!({"schema_version":1,"id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"round_number":row.try_get::<i64,_>("round_number").map_err(V2Error::Database)?,"baseline_version_id":row.try_get::<Uuid,_>("baseline_version_id").map_err(V2Error::Database)?,"status":row.try_get::<String,_>("status").map_err(V2Error::Database)?,"opened_at":row.try_get::<String,_>("opened_at").map_err(V2Error::Database)?,"closed_at":row.try_get::<Option<String>,_>("closed_at").map_err(V2Error::Database)?,"open_threads":row.try_get::<i64,_>("open_threads").map_err(V2Error::Database)?,"blocking_threads":row.try_get::<i64,_>("blocking_threads").map_err(V2Error::Database)?}),
+        json!({"schema_version":1,"id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"round_number":row.try_get::<i64,_>("round_number").map_err(V2Error::Database)?,"baseline_version_id":row.try_get::<Uuid,_>("baseline_version_id").map_err(V2Error::Database)?,"baseline_build_id":row.try_get::<Option<Uuid>,_>("baseline_build_id").map_err(V2Error::Database)?,"baseline_state_hash":row.try_get::<Option<String>,_>("baseline_state_hash").map_err(V2Error::Database)?,"submitted_by_leader_writer_id":row.try_get::<Option<Uuid>,_>("submitted_by_leader_writer_id").map_err(V2Error::Database)?,"status":row.try_get::<String,_>("status").map_err(V2Error::Database)?,"opened_at":row.try_get::<String,_>("opened_at").map_err(V2Error::Database)?,"closed_at":row.try_get::<Option<String>,_>("closed_at").map_err(V2Error::Database)?,"open_threads":row.try_get::<i64,_>("open_threads").map_err(V2Error::Database)?,"blocking_threads":row.try_get::<i64,_>("blocking_threads").map_err(V2Error::Database)?}),
     )
 }
 

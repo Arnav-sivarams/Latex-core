@@ -126,6 +126,7 @@ struct V2RoleInput {
 struct V2PaperTeamInput {
     name: String,
     template_id: Option<uuid::Uuid>,
+    leader_writer_id: String,
     #[serde(default)]
     writer_ids: Vec<String>,
     #[serde(default)]
@@ -192,6 +193,10 @@ struct RestorationRequestInput {
 #[derive(Deserialize)]
 struct GovernanceDecisionInput {
     note: Option<String>,
+}
+#[derive(Deserialize)]
+struct ConfirmedRevertInput {
+    confirmed: bool,
 }
 #[derive(Deserialize)]
 struct V2StatusInput {
@@ -543,6 +548,10 @@ fn router(state: AppState) -> Router {
             axum::routing::delete(admin_v2_remove_paper_team_member),
         )
         .route(
+            "/api/admin/v2/paper-teams/{id}/leader",
+            axum::routing::patch(admin_v2_change_paper_team_leader),
+        )
+        .route(
             "/api/admin/v2/paper-teams/{id}/status",
             axum::routing::patch(admin_v2_paper_team_status),
         )
@@ -560,11 +569,11 @@ fn router(state: AppState) -> Router {
         )
         .route(
             "/api/admin/v2/restoration-requests/{request_id}/reject",
-            post(admin_v2_reject_restoration),
+            post(gone_restoration_governance),
         )
         .route(
             "/api/admin/v2/restoration-requests/{request_id}/apply",
-            post(admin_v2_apply_restoration),
+            post(gone_restoration_governance),
         )
         .route("/api/admin/v2/versions", get(admin_v2_versions))
         .route("/api/admin/v2/reviews", get(admin_v2_reviews))
@@ -629,20 +638,28 @@ fn router(state: AppState) -> Router {
             post(v2_restore_personal_version),
         )
         .route(
+            "/api/v2/papers/{paper_id}/versions/{version_id}/revert",
+            post(v2_direct_team_revert),
+        )
+        .route(
             "/api/v2/papers/{paper_id}/restoration-requests",
             get(v2_restoration_requests).post(v2_create_restoration_request),
         )
         .route(
             "/api/v2/restoration-requests/{request_id}/submit",
-            post(v2_submit_restoration_request),
+            post(gone_restoration_governance),
         )
         .route(
             "/api/v2/restoration-requests/{request_id}/endorse",
-            post(v2_mentor_endorse_restoration),
+            post(gone_restoration_governance),
         )
         .route(
             "/api/v2/restoration-requests/{request_id}/reject",
-            post(v2_mentor_reject_restoration),
+            post(v2_leader_reject_restoration),
+        )
+        .route(
+            "/api/v2/restoration-requests/{request_id}/apply",
+            post(v2_leader_apply_restoration),
         )
         .route(
             "/api/v2/restoration-requests",
@@ -1062,6 +1079,10 @@ async fn admin_v2_create_paper_team(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let leader_writer_id = match parse_user_id(&input.leader_writer_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     if let Some(template_id) = input.template_id {
         let template = match state.repo.template(template_id).await {
             Ok(value) => value,
@@ -1121,7 +1142,7 @@ async fn admin_v2_create_paper_team(
         let source_identity = digest(&identity_material);
         return match state.v2.create_template_paper_team(
             principal.user_id(), principal.session.tenant_id, WorkspaceId::new(), &input.name,
-            &writer_ids, &mentor_ids, template_id, &source_identity, &main_path, &seeds,
+            leader_writer_id, &writer_ids, &mentor_ids, template_id, &source_identity, &main_path, &seeds,
         ).await {
             Ok((team, files)) => (StatusCode::CREATED, Json(serde_json::json!({"team":team,"files":files,"template_pin":{"template_id":template_id,"source_identity":source_identity}}))).into_response(),
             Err(value) => v2_error(value),
@@ -1143,6 +1164,7 @@ async fn admin_v2_create_paper_team(
             principal.session.tenant_id,
             WorkspaceId::new(),
             &input.name,
+            leader_writer_id,
             &writer_ids,
             &mentor_ids,
             &main_path,
@@ -1156,6 +1178,33 @@ async fn admin_v2_create_paper_team(
             Json(serde_json::json!({"team":team,"main_file":file})),
         )
             .into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn admin_v2_change_paper_team_leader(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<V2PaperTeamMemberInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let leader_writer_id = match parse_user_id(&input.user_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .change_paper_team_leader(id, leader_writer_id, principal.user_id())
+        .await
+    {
+        Ok(member) => Json(member).into_response(),
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -1333,110 +1382,11 @@ async fn admin_v2_restoration_requests(
     }
 }
 
-async fn admin_v2_reject_restoration(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(request_id): Path<uuid::Uuid>,
-    Json(input): Json<GovernanceDecisionInput>,
-) -> Response {
-    if let Err(response) = csrf(&headers) {
-        return response;
-    }
-    let principal = match admin_session(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    match state
-        .v2
-        .admin_reject_restoration(principal.user_id(), request_id, input.note.as_deref())
-        .await
-    {
-        Ok(request) => Json(request).into_response(),
-        Err(value) => v2_error(value),
-    }
-}
-
-async fn admin_v2_apply_restoration(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(request_id): Path<uuid::Uuid>,
-    Json(input): Json<GovernanceDecisionInput>,
-) -> Response {
-    if let Err(response) = csrf(&headers) {
-        return response;
-    }
-    let principal = match admin_session(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Admin)) {
-        return error(
-            StatusCode::FORBIDDEN,
-            "V2 Admin required for governed restoration",
-        );
-    }
-    let request = match state
-        .v2
-        .restoration_requests_for_actor(principal.user_id(), None)
-        .await
-    {
-        Ok(requests) => match requests
-            .into_iter()
-            .find(|request| request.id == request_id)
-        {
-            Some(value) => value,
-            None => return error(StatusCode::NOT_FOUND, "restoration request not found"),
-        },
-        Err(value) => return v2_error(value),
-    };
-    if request.state != "AWAITING_ADMIN_REVIEW" {
-        return error(
-            StatusCode::CONFLICT,
-            "restoration request is not awaiting Admin review",
-        );
-    }
-    let team = match state.v2.paper_team(request.paper_id).await {
-        Ok(value) => value,
-        Err(value) => return v2_error(value),
-    };
-    let paper = persistence::WriterPaper {
-        id: team.id,
-        workspace_id: team.workspace_id,
-        name: team.name,
-        kind: persistence::PaperKind::Team,
-        status: team.status,
-        updated_at: team.updated_at,
-    };
-    let exact = match capture_exact_v2_state(&state, &paper).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let safety = ExactRestoreState {
-        document_epoch: exact.document_epoch,
-        workspace_version: exact.source_sequence,
-        snapshot_id: exact.snapshot_id,
-        manifest: exact.manifest,
-        state_hash: exact.state_hash,
-    };
-    match state
-        .v2
-        .apply_team_restoration(
-            principal.user_id(),
-            request_id,
-            safety,
-            input.note.as_deref(),
-        )
-        .await
-    {
-        Ok(applied) => {
-            state
-                .collaboration
-                .epoch_changed(request.workspace_id, applied.document_epoch)
-                .await;
-            Json(applied).into_response()
-        }
-        Err(value) => v2_error(value),
-    }
+async fn gone_restoration_governance() -> Response {
+    error(
+        StatusCode::GONE,
+        "Mentor/Admin restoration governance is deprecated; Team reverts are controlled by the Team Leader.",
+    )
 }
 
 async fn admin_v2_versions(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -2466,6 +2416,12 @@ async fn v2_create_checkpoint(
         Ok(value) => value,
         Err(error_value) => return v2_error(error_value),
     };
+    if paper.kind == persistence::PaperKind::Team && !paper.is_team_leader {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Only the Team Leader can create authoritative Team checkpoints.",
+        );
+    }
     let exact = match capture_exact_v2_state(&state, &paper).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -2571,39 +2527,14 @@ async fn v2_create_restoration_request(
     }
 }
 
-async fn v2_submit_restoration_request(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(request_id): Path<uuid::Uuid>,
-) -> Response {
-    if let Err(response) = csrf(&headers) {
-        return response;
-    }
-    let principal = match writer_session(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    match state
-        .v2
-        .submit_restoration_request(principal.user_id(), request_id)
-        .await
-    {
-        Ok(request) => Json(request).into_response(),
-        Err(value) => v2_error(value),
-    }
-}
-
 async fn v2_assigned_restoration_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let principal = match principal_auth(&state, &headers).await {
+    let principal = match writer_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Mentor)) {
-        return error(StatusCode::FORBIDDEN, "V2 Mentor required");
-    }
     match state
         .v2
         .restoration_requests_for_actor(principal.user_id(), None)
@@ -2614,52 +2545,101 @@ async fn v2_assigned_restoration_requests(
     }
 }
 
-async fn v2_mentor_endorse_restoration(
+async fn v2_leader_reject_restoration(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(request_id): Path<uuid::Uuid>,
     Json(input): Json<GovernanceDecisionInput>,
-) -> Response {
-    v2_mentor_restoration_decision(state, headers, request_id, input, true).await
-}
-
-async fn v2_mentor_reject_restoration(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(request_id): Path<uuid::Uuid>,
-    Json(input): Json<GovernanceDecisionInput>,
-) -> Response {
-    v2_mentor_restoration_decision(state, headers, request_id, input, false).await
-}
-
-async fn v2_mentor_restoration_decision(
-    state: AppState,
-    headers: HeaderMap,
-    request_id: uuid::Uuid,
-    input: GovernanceDecisionInput,
-    endorse: bool,
 ) -> Response {
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    let principal = match principal_auth(&state, &headers).await {
+    let principal = match writer_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Mentor)) {
-        return error(StatusCode::FORBIDDEN, "V2 Mentor required");
-    }
     match state
         .v2
-        .mentor_decide_restoration(
+        .leader_reject_restoration(principal.user_id(), request_id, input.note.as_deref())
+        .await
+    {
+        Ok(request) => Json(request).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_leader_apply_restoration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<uuid::Uuid>,
+    Json(input): Json<GovernanceDecisionInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let request = match state
+        .v2
+        .restoration_requests_for_actor(principal.user_id(), None)
+        .await
+    {
+        Ok(requests) => match requests
+            .into_iter()
+            .find(|request| request.id == request_id)
+        {
+            Some(value) => value,
+            None => return error(StatusCode::NOT_FOUND, "revert request not found"),
+        },
+        Err(value) => return v2_error(value),
+    };
+    if request.state != "REQUESTED" {
+        return error(StatusCode::CONFLICT, "revert request is not pending");
+    }
+    let paper = match state
+        .v2
+        .writer_paper(principal.user_id(), request.paper_id)
+        .await
+    {
+        Ok(value) if value.kind == persistence::PaperKind::Team && value.is_team_leader => value,
+        Ok(_) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "Only the Team Leader can apply a Team revert.",
+            );
+        }
+        Err(value) => return v2_error(value),
+    };
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let safety = ExactRestoreState {
+        document_epoch: exact.document_epoch,
+        workspace_version: exact.source_sequence,
+        snapshot_id: exact.snapshot_id,
+        manifest: exact.manifest,
+        state_hash: exact.state_hash,
+    };
+    match state
+        .v2
+        .apply_team_restoration(
             principal.user_id(),
             request_id,
-            endorse,
+            safety,
             input.note.as_deref(),
         )
         .await
     {
-        Ok(request) => Json(request).into_response(),
+        Ok(applied) => {
+            state
+                .collaboration
+                .epoch_changed(request.workspace_id, applied.document_epoch)
+                .await;
+            Json(applied).into_response()
+        }
         Err(value) => v2_error(value),
     }
 }
@@ -2683,7 +2663,7 @@ async fn v2_restore_personal_version(
     if paper.kind != persistence::PaperKind::Personal {
         return error(
             StatusCode::FORBIDDEN,
-            "Team Paper restoration requires Mentor and Admin governance",
+            "Team Paper reverts are controlled by the Team Leader.",
         );
     }
     let exact = match capture_exact_v2_state(&state, &paper).await {
@@ -2700,6 +2680,62 @@ async fn v2_restore_personal_version(
     match state
         .v2
         .apply_personal_restoration(principal.user_id(), paper_id, version_id, safety)
+        .await
+    {
+        Ok(applied) => {
+            state
+                .collaboration
+                .epoch_changed(paper.workspace_id, applied.document_epoch)
+                .await;
+            Json(applied).into_response()
+        }
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_direct_team_revert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, version_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(input): Json<ConfirmedRevertInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if !input.confirmed {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Explicit confirmation is required to revert Team history.",
+        );
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) if value.kind == persistence::PaperKind::Team && value.is_team_leader => value,
+        Ok(_) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "Only the Team Leader can revert Team history.",
+            );
+        }
+        Err(value) => return v2_error(value),
+    };
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let safety = ExactRestoreState {
+        document_epoch: exact.document_epoch,
+        workspace_version: exact.source_sequence,
+        snapshot_id: exact.snapshot_id,
+        manifest: exact.manifest,
+        state_hash: exact.state_hash,
+    };
+    match state
+        .v2
+        .apply_direct_team_restoration(principal.user_id(), paper_id, version_id, safety)
         .await
     {
         Ok(applied) => {
@@ -6369,13 +6405,12 @@ mod tests {
         let mentor = mentor_html();
         for required in [
             "ASSIGNED REVIEWS",
-            "ACTIVITY",
-            "REVIEW ROUNDS",
+            "REVIEW STATUS",
             "READ-ONLY SOURCE",
-            "PDF",
-            "REVIEW THREADS",
-            "APPROVALS",
-            "VERSIONS",
+            "PDF.JS",
+            "COMMENTS",
+            "NEW ANNOTATION",
+            "Suggestion",
         ] {
             assert!(
                 mentor.contains(required),
@@ -6396,6 +6431,10 @@ mod tests {
             "Delete",
             "Publish",
             "<textarea",
+            "ACTIVITY",
+            "CHANGES SINCE",
+            "RESTORATION REQUESTS",
+            "APPROVALS",
         ] {
             assert!(
                 !mentor.contains(forbidden),
@@ -6416,7 +6455,6 @@ mod tests {
             "TEMPLATES",
             "FILE POLICIES",
             "VERSIONS",
-            "RESTORATION REQUESTS",
             "REVIEWS",
             "BUILD QUEUE",
             "AUDIT",
@@ -6782,24 +6820,73 @@ mod database_tests {
         }
 
         let writer_id = test_user_id(&pool, &writer.email).await;
+        let other_writer_id = test_user_id(&pool, &other_writer.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
         let admin_id = test_user_id(&pool, &admin.email).await;
+        let unassigned_writer_id = test_user_id(&pool, &email).await;
         let team_response = request(
             &app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie),
-            &serde_json::json!({"name":"S2 Team","writer_ids":[writer_id],"mentor_ids":[mentor_id]}).to_string(),
+            &serde_json::json!({"name":"S2 Team","writer_ids":[writer_id,other_writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id]}).to_string(),
             Some("application/json"),
         ).await;
         assert_eq!(team_response.status(), StatusCode::CREATED);
         let team = test_json(team_response).await;
         let team_id = team["team"]["id"].as_str().unwrap().to_owned();
         assert_eq!(team["main_file"]["path"], "main.tex");
+        for invalid_leader in [mentor_id, admin_id, unassigned_writer_id] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::PATCH,
+                    &format!("/api/admin/v2/paper-teams/{team_id}/leader"),
+                    Some(&admin.cookie),
+                    &serde_json::json!({"user_id":invalid_leader}).to_string(),
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let changed_leader = test_json(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("/api/admin/v2/paper-teams/{team_id}/leader"),
+                Some(&admin.cookie),
+                &serde_json::json!({"user_id":other_writer_id}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(changed_leader["user_id"], other_writer_id.to_string());
+        assert_eq!(changed_leader["is_leader"], true);
+        let team_detail = test_json(
+            get(
+                &app,
+                &format!("/api/admin/v2/paper-teams/{team_id}"),
+                Some(&admin.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            team_detail["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|member| member["is_leader"] == true)
+                .count(),
+            1
+        );
         assert_eq!(
             request(
                 &app,
                 Method::POST,
                 "/api/admin/v2/paper-teams",
                 Some(&admin.cookie),
-                &serde_json::json!({"name":"Wrong role","writer_ids":[admin_id],"mentor_ids":[]})
+                &serde_json::json!({"name":"Wrong role","writer_ids":[admin_id],"leader_writer_id":admin_id,"mentor_ids":[]})
                     .to_string(),
                 Some("application/json")
             )
@@ -6814,7 +6901,7 @@ mod database_tests {
                     Method::POST,
                     "/api/admin/v2/paper-teams",
                     Some(&denied.cookie),
-                    r#"{"name":"Denied","writer_ids":[],"mentor_ids":[]}"#,
+                    r#"{"name":"Denied","writer_ids":[],"leader_writer_id":"","mentor_ids":[]}"#,
                     Some("application/json")
                 )
                 .await
@@ -7116,7 +7203,7 @@ mod database_tests {
                 Method::POST,
                 "/api/admin/v2/paper-teams",
                 Some(&admin.cookie),
-                &serde_json::json!({"name":"Imported Template Team","writer_ids":[writer_id],"mentor_ids":[mentor_id],"template_id":template_id}).to_string(),
+                &serde_json::json!({"name":"Imported Template Team","writer_ids":[writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id],"template_id":template_id}).to_string(),
                 Some("application/json"),
             )
             .await,
@@ -7285,6 +7372,7 @@ mod database_tests {
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let other_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;
+        let other_writer_id = test_user_id(&pool, &other_writer.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
         let empty_admin_reviews = get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await;
         assert_eq!(empty_admin_reviews.status(), StatusCode::OK);
@@ -7302,7 +7390,7 @@ mod database_tests {
                 Method::POST,
                 "/api/admin/v2/paper-teams",
                 Some(&admin.cookie),
-                &serde_json::json!({"name":"S5 Review Team","writer_ids":[writer_id],"mentor_ids":[mentor_id]}).to_string(),
+                &serde_json::json!({"name":"S5 Review Team","writer_ids":[writer_id,other_writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id]}).to_string(),
                 Some("application/json"),
             )
             .await,
@@ -7314,6 +7402,15 @@ mod database_tests {
         let file_id =
             uuid::Uuid::parse_str(created["main_file"]["file_id"].as_str().unwrap()).unwrap();
         let review_root = format!("/api/v2/reviews/papers/{paper_id}");
+        let source_anchor = serde_json::json!({
+            "file_id":file_id,"encoded_relative_start":[1],"encoded_relative_end":[2],
+            "quoted_text":"article","context_hash":"0".repeat(64),"source_sequence":1,
+            "source_version_id":null,"document_epoch":1
+        });
+        let comment = serde_json::json!({
+            "thread_type":"COMMENT","message":"Clarify this paragraph",
+            "source_anchor":source_anchor,"pdf_anchor":null
+        });
 
         let listed =
             test_json(get(&app, "/api/v2/mentor/papers", Some(&mentor.cookie)).await).await;
@@ -7331,19 +7428,47 @@ mod database_tests {
             StatusCode::FORBIDDEN
         );
 
+        let before_review = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/threads"),
+            Some(&mentor.cookie),
+            &comment.to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(before_review.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            test_json(before_review).await["error"],
+            "This paper has not been sent for review."
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds"),
+                Some(&other_writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
         let missing_baseline = request(
             &app,
             Method::POST,
             &format!("{review_root}/rounds"),
-            Some(&mentor.cookie),
+            Some(&writer.cookie),
             "{}",
             Some("application/json"),
         )
         .await;
-        assert_eq!(missing_baseline.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing_baseline.status(), StatusCode::CONFLICT);
         assert_eq!(
             test_json(missing_baseline).await["error"],
-            "exact review baseline was not found"
+            "Compile the current paper before sending it for review."
         );
 
         let build_path = format!("/api/v2/papers/{paper_id}/builds");
@@ -7389,7 +7514,7 @@ mod database_tests {
             &app,
             Method::POST,
             &format!("{review_root}/rounds"),
-            Some(&mentor.cookie),
+            Some(&writer.cookie),
             "{}",
             Some("application/json"),
         )
@@ -7397,12 +7522,14 @@ mod database_tests {
         assert_eq!(round.status(), StatusCode::CREATED);
         let round = test_json(round).await;
         let round_id = round["id"].as_str().unwrap();
-        let source_anchor = serde_json::json!({
-            "file_id":file_id,"encoded_relative_start":[1],"encoded_relative_end":[2],
-            "quoted_text":"article","context_hash":"0".repeat(64),"source_sequence":1,
-            "source_version_id":null,"document_epoch":1
-        });
-        let comment = serde_json::json!({"thread_type":"COMMENT","message":"Clarify this paragraph","severity":"MINOR","category":"WRITING","assigned_writer_user_id":null,"due_at":null,"source_anchor":source_anchor,"pdf_anchor":null,"suggested_replacement":null,"section_label":null});
+        assert_eq!(round["status"], "OPEN_FOR_REVIEW");
+        assert_eq!(
+            round["submitted_by_leader_writer_id"],
+            writer_id.to_string()
+        );
+        assert!(round["baseline_version_id"].is_string());
+        assert!(round["baseline_build_id"].is_string());
+        let first_baseline_hash = round["baseline_state_hash"].as_str().unwrap().to_owned();
         for denied in [&writer, &admin] {
             assert_eq!(
                 request(
@@ -7450,6 +7577,8 @@ mod database_tests {
         assert_eq!(admin_reviews.as_array().unwrap().len(), 1);
         assert_eq!(admin_reviews[0]["paper_name"], "S5 Review Team");
         assert_eq!(admin_reviews[0]["thread_type"], "COMMENT");
+        assert_eq!(admin_reviews[0]["severity"], "NOTE");
+        assert_eq!(admin_reviews[0]["category"], "WRITING");
         assert_eq!(admin_reviews[0]["mentor"], mentor.email);
         assert!(admin_reviews[0]["assigned_writer"].is_null());
         assert_eq!(
@@ -7479,64 +7608,12 @@ mod database_tests {
                 Method::POST,
                 &format!("{review_root}/threads/{thread_id}/state"),
                 Some(&writer.cookie),
-                r#"{"state":"ADDRESSED"}"#,
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads/{thread_id}/state"),
-                Some(&writer.cookie),
-                r#"{"state":"RESOLVED"}"#,
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads/{thread_id}/state"),
-                Some(&mentor.cookie),
                 r#"{"state":"RESOLVED"}"#,
                 Some("application/json")
             )
             .await
             .status(),
             StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads/{thread_id}/state"),
-                Some(&mentor.cookie),
-                r#"{"state":"REOPENED"}"#,
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads/{thread_id}/state"),
-                Some(&mentor.cookie),
-                r#"{"state":"RESOLVED"}"#,
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::CONFLICT
         );
 
         let before_source = test_json(
@@ -7551,7 +7628,7 @@ mod database_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let suggestion = serde_json::json!({"thread_type":"SUGGESTED_REPLACEMENT","message":"Use a stronger phrase","severity":"MAJOR","category":"WRITING","assigned_writer_user_id":writer_id,"due_at":null,"source_anchor":source_anchor,"pdf_anchor":null,"suggested_replacement":"replacement","section_label":null});
+        let suggestion = serde_json::json!({"thread_type":"SUGGESTION","message":"replacement","source_anchor":source_anchor,"pdf_anchor":null});
         let suggested = test_json(
             request(
                 &app,
@@ -7630,47 +7707,6 @@ mod database_tests {
             StatusCode::NO_CONTENT
         );
 
-        let paper_approval = serde_json::json!({"thread_type":"PAPER_APPROVAL","message":"Approved for this exact version","severity":"NOTE","category":"SUBMISSION_REQUIREMENT","assigned_writer_user_id":null,"due_at":null,"source_anchor":null,"pdf_anchor":null,"suggested_replacement":null,"section_label":null});
-        let paper_approval_id = test_json(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads"),
-                Some(&mentor.cookie),
-                &paper_approval.to_string(),
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await["thread_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let approval_identity: (Option<uuid::Uuid>, Option<uuid::Uuid>, Option<String>) =
-            sqlx::query_as("SELECT approved_version_id,approved_build_id,approved_state_hash FROM latex_core.review_threads WHERE id=$1")
-                .bind(uuid::Uuid::parse_str(&paper_approval_id).unwrap())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(approval_identity.0.is_some() && approval_identity.1.is_some());
-        let approved_state_hash = approval_identity.2.unwrap();
-
-        let blocking = serde_json::json!({"thread_type":"CHANGE_REQUEST","message":"Blocking request","severity":"BLOCKING","category":"METHODOLOGY","assigned_writer_user_id":writer_id,"due_at":null,"source_anchor":source_anchor,"pdf_anchor":null,"suggested_replacement":null,"section_label":null});
-        let blocking_id = test_json(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads"),
-                Some(&mentor.cookie),
-                &blocking.to_string(),
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await["thread_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
         assert_eq!(
             request(
                 &app,
@@ -7682,46 +7718,32 @@ mod database_tests {
             )
             .await
             .status(),
-            StatusCode::CONFLICT
+            StatusCode::GONE
         );
+        let closed = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/rounds/{round_id}/close"),
+            Some(&writer.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(closed.status(), StatusCode::OK);
+        assert_eq!(test_json(closed).await["status"], "CLOSED");
+        let after_close = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/threads"),
+            Some(&mentor.cookie),
+            &comment.to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(after_close.status(), StatusCode::CONFLICT);
         assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads/{blocking_id}/state"),
-                Some(&writer.cookie),
-                r#"{"state":"ADDRESSED"}"#,
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads/{blocking_id}/state"),
-                Some(&mentor.cookie),
-                r#"{"state":"RESOLVED"}"#,
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/rounds/{round_id}/approve"),
-                Some(&mentor.cookie),
-                "{}",
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::OK
+            test_json(after_close).await["error"],
+            "This paper has not been sent for review."
         );
 
         let paper_detail = test_json(
@@ -7751,7 +7773,59 @@ mod database_tests {
             .force_snapshot(WorkspaceId::from_uuid(workspace_id))
             .await
             .unwrap();
-        assert_ne!(approved_state_hash, newer.snapshot_id().to_hex());
+        assert_ne!(first_baseline_hash, newer.snapshot_id().to_hex());
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&writer.cookie),
+                r#"{"trigger_type":"manual"}"#,
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        let second_worker = WorkerId::new();
+        let second_claimed = state.queue.claim(second_worker).await.unwrap().unwrap();
+        state
+            .queue
+            .complete_success(
+                second_claimed.id,
+                second_worker,
+                &test_artifacts(&state, "s5-second").await,
+                core_types::BlobHash::digest(b"s5-second-manifest"),
+            )
+            .await
+            .unwrap();
+        let second_round = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/rounds"),
+            Some(&writer.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(second_round.status(), StatusCode::CREATED);
+        let second_round = test_json(second_round).await;
+        assert_eq!(second_round["round_number"], 2);
+        assert_eq!(second_round["status"], "OPEN_FOR_REVIEW");
+        assert_ne!(second_round["baseline_state_hash"], first_baseline_hash);
 
         assert_eq!(
             get(
@@ -7761,7 +7835,7 @@ mod database_tests {
             )
             .await
             .status(),
-            StatusCode::NOT_FOUND
+            StatusCode::OK
         );
         assert_eq!(
             get(
@@ -7846,6 +7920,7 @@ mod database_tests {
             &serde_json::json!({
                 "name":"S3 realtime",
                 "writer_ids":[writer_a_id,writer_b_id],
+                "leader_writer_id":writer_a_id,
                 "mentor_ids":[mentor_id]
             })
             .to_string(),
@@ -7860,6 +7935,13 @@ mod database_tests {
         );
         let file_id =
             uuid::Uuid::parse_str(created["main_file"]["file_id"].as_str().unwrap()).unwrap();
+        let versions_before_save: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.paper_versions WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         assert_eq!(
             state
@@ -7985,6 +8067,14 @@ mod database_tests {
         .await
         .unwrap();
         assert_eq!(durable_count, 2);
+        let versions_after_save: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.paper_versions WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(versions_after_save, versions_before_save);
 
         socket_m.send(ws_source_update(9, &update_b)).await.unwrap();
         let mentor_error = ws_control(&mut socket_m, "ERROR").await;
@@ -8764,7 +8854,7 @@ mod database_tests {
             StatusCode::CONFLICT
         );
 
-        let team = test_json(request(&app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie), &serde_json::json!({"name":"S6 Team","writer_ids":[writer_id,other_id],"mentor_ids":[]}).to_string(), Some("application/json")).await).await;
+        let team = test_json(request(&app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie), &serde_json::json!({"name":"S6 Team","writer_ids":[writer_id,other_id],"leader_writer_id":writer_id,"mentor_ids":[]}).to_string(), Some("application/json")).await).await;
         let team_id = team["team"]["id"].as_str().unwrap();
         let team_root = format!("/api/v2/papers/{team_id}");
         let shared = test_json(
@@ -8817,15 +8907,17 @@ mod database_tests {
         let (database, pool, app, _storage, state) = test_application().await;
         let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
         let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let requester = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let wrong_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;
+        let requester_id = test_user_id(&pool, &requester.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
 
         let created = test_json(request(
             &app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie),
-            &serde_json::json!({"name":"S7 governed restore","writer_ids":[writer_id],"mentor_ids":[mentor_id]}).to_string(), Some("application/json"),
+            &serde_json::json!({"name":"S7 governed restore","writer_ids":[writer_id,requester_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id]}).to_string(), Some("application/json"),
         ).await).await;
         let paper_id = created["team"]["id"].as_str().unwrap();
         let workspace_id =
@@ -8845,6 +8937,19 @@ mod database_tests {
         )
         .await;
         let h1_id = h1["id"].as_str().unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/versions"),
+                Some(&requester.cookie),
+                r#"{"name":"unauthorized"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
         let h1_content = test_json(
             get(
                 &app,
@@ -8872,6 +8977,32 @@ mod database_tests {
         );
 
         let request_path = format!("{root}/restoration-requests");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/versions/{h1_id}/revert"),
+                Some(&requester.cookie),
+                r#"{"confirmed":true}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/versions/{h1_id}/revert"),
+                Some(&writer.cookie),
+                r#"{"confirmed":false}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             request(
                 &app,
@@ -8904,7 +9035,7 @@ mod database_tests {
                 &app,
                 Method::POST,
                 &request_path,
-                Some(&writer.cookie),
+                Some(&requester.cookie),
                 &serde_json::json!({"target_version_id":h1_id,"reason":"Return to H1"}).to_string(),
                 Some("application/json"),
             )
@@ -8912,20 +9043,7 @@ mod database_tests {
         )
         .await;
         let rejected_id = rejected["id"].as_str().unwrap();
-        assert_eq!(rejected["state"], "DRAFT");
-        let submitted = test_json(
-            request(
-                &app,
-                Method::POST,
-                &format!("/api/v2/restoration-requests/{rejected_id}/submit"),
-                Some(&writer.cookie),
-                "{}",
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(submitted["state"], "AWAITING_MENTOR_REVIEW");
+        assert_eq!(rejected["state"], "REQUESTED");
         assert_eq!(
             request(
                 &app,
@@ -8939,101 +9057,52 @@ mod database_tests {
             .status(),
             StatusCode::FORBIDDEN
         );
-        let mentor_rejected = test_json(
+        assert_eq!(
             request(
                 &app,
                 Method::POST,
                 &format!("/api/v2/restoration-requests/{rejected_id}/reject"),
                 Some(&mentor.cookie),
                 r#"{"note":"not yet"}"#,
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(mentor_rejected["state"], "MENTOR_REJECTED");
-
-        let admin_reject = test_json(
-            request(
-                &app,
-                Method::POST,
-                &request_path,
-                Some(&writer.cookie),
-                &serde_json::json!({"target_version_id":h1_id}).to_string(),
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await;
-        let admin_reject_id = admin_reject["id"].as_str().unwrap();
-        request(
-            &app,
-            Method::POST,
-            &format!("/api/v2/restoration-requests/{admin_reject_id}/submit"),
-            Some(&writer.cookie),
-            "{}",
-            Some("application/json"),
-        )
-        .await;
-        let endorsed = test_json(
-            request(
-                &app,
-                Method::POST,
-                &format!("/api/v2/restoration-requests/{admin_reject_id}/endorse"),
-                Some(&mentor.cookie),
-                "{}",
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(endorsed["state"], "AWAITING_ADMIN_REVIEW");
-        assert_eq!(
-            request(
-                &app,
-                Method::POST,
-                &format!("/api/admin/v2/restoration-requests/{admin_reject_id}/apply"),
-                Some(&mentor.cookie),
-                "{}",
                 Some("application/json")
             )
             .await
             .status(),
             StatusCode::FORBIDDEN
         );
+        let leader_rejected = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{rejected_id}/reject"),
+                Some(&writer.cookie),
+                r#"{"note":"not yet"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(leader_rejected["state"], "LEADER_REJECTED");
         assert_eq!(
             request(
                 &app,
                 Method::POST,
-                &format!("/api/admin/v2/restoration-requests/{admin_reject_id}/apply"),
-                Some(&writer.cookie),
-                "{}",
-                Some("application/json")
-            )
-            .await
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        let admin_rejected = test_json(
-            request(
-                &app,
-                Method::POST,
-                &format!("/api/admin/v2/restoration-requests/{admin_reject_id}/reject"),
+                &format!("/api/admin/v2/restoration-requests/{rejected_id}/apply"),
                 Some(&admin.cookie),
                 "{}",
-                Some("application/json"),
+                Some("application/json")
             )
-            .await,
-        )
-        .await;
-        assert_eq!(admin_rejected["state"], "ADMIN_REJECTED");
+            .await
+            .status(),
+            StatusCode::GONE
+        );
 
         let applied_request = test_json(
             request(
                 &app,
                 Method::POST,
                 &request_path,
-                Some(&writer.cookie),
+                Some(&requester.cookie),
                 &serde_json::json!({"target_version_id":h1_id}).to_string(),
                 Some("application/json"),
             )
@@ -9041,24 +9110,33 @@ mod database_tests {
         )
         .await;
         let applied_request_id = applied_request["id"].as_str().unwrap();
-        request(
-            &app,
-            Method::POST,
-            &format!("/api/v2/restoration-requests/{applied_request_id}/submit"),
-            Some(&writer.cookie),
-            "{}",
-            Some("application/json"),
-        )
-        .await;
-        request(
-            &app,
-            Method::POST,
-            &format!("/api/v2/restoration-requests/{applied_request_id}/endorse"),
-            Some(&mentor.cookie),
-            "{}",
-            Some("application/json"),
-        )
-        .await;
+        assert_eq!(applied_request["state"], "REQUESTED");
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{applied_request_id}/apply"),
+                Some(&mentor.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/restoration-requests/{applied_request_id}/apply"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -9081,8 +9159,8 @@ mod database_tests {
         let applied_response = request(
             &app,
             Method::POST,
-            &format!("/api/admin/v2/restoration-requests/{applied_request_id}/apply"),
-            Some(&admin.cookie),
+            &format!("/api/v2/restoration-requests/{applied_request_id}/apply"),
+            Some(&writer.cookie),
             r#"{"note":"approved"}"#,
             Some("application/json"),
         )
@@ -9120,9 +9198,9 @@ mod database_tests {
         let safety: (String, i64) = sqlx::query_as("SELECT version_type,workspace_version FROM latex_core.paper_versions WHERE workspace_id=$1 AND version_type='pre_restore_safety' ORDER BY version_number DESC LIMIT 1")
             .bind(workspace_id).fetch_one(&pool).await.unwrap();
         assert_eq!(safety, ("pre_restore_safety".to_owned(), 2));
-        let latest: (String, i64) = sqlx::query_as("SELECT version_type,workspace_version FROM latex_core.paper_versions WHERE workspace_id=$1 ORDER BY version_number DESC LIMIT 1")
+        let latest: (String, i64, uuid::Uuid) = sqlx::query_as("SELECT version_type,workspace_version,created_by_user_id FROM latex_core.paper_versions WHERE workspace_id=$1 ORDER BY version_number DESC LIMIT 1")
             .bind(workspace_id).fetch_one(&pool).await.unwrap();
-        assert_eq!(latest, ("admin_restoration".to_owned(), 3));
+        assert_eq!(latest, ("team_revert".to_owned(), 3, *writer_id.as_uuid()));
         let stored = state.blobs.put(Bytes::from_static(b"stale")).await.unwrap();
         assert!(
             state
@@ -9231,7 +9309,7 @@ mod database_tests {
                 Method::POST,
                 "/api/admin/v2/paper-teams",
                 Some(&admin.cookie),
-                &serde_json::json!({"name":"Policies","writer_ids":[writer_id],"mentor_ids":[mentor_id]})
+                &serde_json::json!({"name":"Policies","writer_ids":[writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id]})
                     .to_string(),
                 Some("application/json"),
             )
@@ -9592,6 +9670,7 @@ mod database_tests {
                 &serde_json::json!({
                     "name":"Pinned Team",
                     "writer_ids":[writer_id],
+                    "leader_writer_id":writer_id,
                     "mentor_ids":[mentor_id],
                     "template_id":template_id
                 })
@@ -9734,7 +9813,7 @@ mod database_tests {
                 Method::POST,
                 "/api/admin/v2/paper-teams",
                 Some(&admin.cookie),
-                &serde_json::json!({"name":"12-client smoke","writer_ids":[writer_id],"mentor_ids":[]}).to_string(),
+                &serde_json::json!({"name":"12-client smoke","writer_ids":[writer_id],"leader_writer_id":writer_id,"mentor_ids":[]}).to_string(),
                 Some("application/json"),
             )
             .await,

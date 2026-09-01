@@ -1,11 +1,7 @@
 import * as Y from 'yjs';
 
-export function canOpenReviewRound(currentBuildId, hasOpenRound) {
-  return Boolean(currentBuildId) && !hasOpenRound;
-}
-
 export function showsReplacementInput(threadType) {
-  return threadType === 'SUGGESTED_REPLACEMENT';
+  return threadType === 'SUGGESTION' || threadType === 'SUGGESTED_REPLACEMENT';
 }
 
 export function normalizeRectangle(rectangle, width, height) {

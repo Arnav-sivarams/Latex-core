@@ -6,13 +6,11 @@ Mentors use `/review`. Only Team Papers explicitly assigned to the signed-in Men
 
 - Source is read-only.
 - The PDF.js viewer shows the current or last-good PDF.
+- Source and the latest successful PDF remain readable whether or not a review is open.
+- Comment and Suggestion controls are enabled only while the Team Leader has sent an exact current build for review.
 - Linked source/PDF anchors, threads, suggestions, and review rounds preserve review context.
 - A Mentor cannot mutate source through HTTP, WebSocket, or suggestion bypasses.
 
-Submitted suggestions become source changes only when an authorized Writer accepts them. Archived papers remain available for historical reading but do not accept new review actions.
+Submitted suggestions become source changes only when an authorized Writer accepts them. New feedback uses a simple Comment or Suggestion body; severity, category, assignment, and due date are not requested. Archived papers remain available for historical reading but do not accept new review actions.
 
-## Restoration requests
-
-The **Restoration Requests** section lists requests for assigned Team Papers. Inspect the target immutable version and the Writer’s reason, then add an optional note and choose **Endorse** or **Reject**.
-
-Endorsement moves a request to Admin review. Rejection closes it as `MENTOR_REJECTED`. A Mentor cannot alter the selected version or apply a restoration.
+Mentors do not participate in Team revert authorization. Revert requests are handled within the Team by its Writer Leader.

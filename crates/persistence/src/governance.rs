@@ -1,4 +1,4 @@
-//! Final V2 governance: restoration approvals, file policies, and append-only restore cutovers.
+//! Final V2 governance: Team Leader reverts, file policies, and append-only restore cutovers.
 
 use crate::{GlobalRole, V2Error, V2Repository};
 use core_types::{
@@ -87,10 +87,13 @@ pub struct RestorationRequest {
     pub mentor_decision_note: Option<String>,
     pub admin_user_id: Option<UserId>,
     pub admin_decision_note: Option<String>,
+    pub leader_writer_user_id: Option<UserId>,
+    pub leader_decision_note: Option<String>,
     pub created_at: String,
     pub submitted_at: Option<String>,
     pub mentor_decided_at: Option<String>,
     pub admin_decided_at: Option<String>,
+    pub leader_decided_at: Option<String>,
     pub applied_version_id: Option<Uuid>,
 }
 
@@ -191,6 +194,7 @@ impl V2Repository {
         tenant_id: TenantId,
         workspace_id: WorkspaceId,
         name: &str,
+        leader_writer_id: UserId,
         writer_ids: &[UserId],
         mentor_ids: &[UserId],
         template_id: Uuid,
@@ -206,6 +210,11 @@ impl V2Repository {
         {
             return Err(V2Error::InvalidName);
         }
+        if !writer_ids.contains(&leader_writer_id) {
+            return Err(V2Error::Conflict {
+                entity: "Paper Team Leader must be an assigned Writer",
+            });
+        }
         let mut all = writer_ids
             .iter()
             .chain(mentor_ids)
@@ -218,12 +227,16 @@ impl V2Repository {
                 entity: "duplicate Paper Team assignment",
             });
         }
+        all.push(admin);
+        all.sort_unstable();
+        all.dedup();
         let mut tx = self
             .database
             .pool()
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        lock_governance_users_tx(&mut tx, &all).await?;
         require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
         for writer in writer_ids {
             require_role_tx(&mut tx, *writer, GlobalRole::Writer).await?;
@@ -266,8 +279,9 @@ impl V2Repository {
             .fetch_one(&mut *tx).await.map_err(V2Error::Database)?;
         let team = crate::v2::decode_paper_team(team_row)?;
         for member in writer_ids.iter().chain(mentor_ids) {
-            sqlx::query("INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id) VALUES ($1,$2,$3)")
-                .bind(team.id).bind(member.as_uuid()).bind(admin.as_uuid()).execute(&mut *tx).await.map_err(V2Error::Database)?;
+            sqlx::query("INSERT INTO latex_core.paper_team_members (paper_team_id,user_id,assigned_by_user_id,is_leader) VALUES ($1,$2,$3,$4)")
+                .bind(team.id).bind(member.as_uuid()).bind(admin.as_uuid()).bind(*member == leader_writer_id)
+                .execute(&mut *tx).await.map_err(V2Error::Database)?;
         }
         let mut paper_files = Vec::with_capacity(files.len());
         for file in files {
@@ -412,12 +426,21 @@ impl V2Repository {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO latex_core.restoration_requests \
-             (id,paper_id,workspace_id,requested_by_writer_user_id,target_version_id,reason) VALUES ($1,$2,$3,$4,$5,$6)",
+             (id,paper_id,workspace_id,requested_by_writer_user_id,target_version_id,state,reason,submitted_at) \
+             VALUES ($1,$2,$3,$4,$5,'REQUESTED',$6,statement_timestamp())",
         )
         .bind(id).bind(paper_id).bind(workspace_id).bind(writer.as_uuid()).bind(target_version_id)
         .bind(reason.map(str::trim).filter(|value| !value.is_empty()))
         .execute(&mut *tx).await.map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
+        tracing::info!(
+            request_id = %id,
+            %paper_id,
+            writer_user_id = %writer,
+            %target_version_id,
+            state = "REQUESTED",
+            "Team revert requested"
+        );
         self.restoration_request(id).await
     }
 
@@ -428,7 +451,7 @@ impl V2Repository {
     ) -> Result<RestorationRequest, V2Error> {
         require_role_pool(self.database.pool(), writer, GlobalRole::Writer).await?;
         let result = sqlx::query(
-            "UPDATE latex_core.restoration_requests SET state='AWAITING_MENTOR_REVIEW',submitted_at=statement_timestamp() \
+            "UPDATE latex_core.restoration_requests SET state='REQUESTED',submitted_at=statement_timestamp() \
              WHERE id=$1 AND requested_by_writer_user_id=$2 AND state='DRAFT'",
         )
         .bind(request_id).bind(writer.as_uuid()).execute(self.database.pool()).await.map_err(V2Error::Database)?;
@@ -443,53 +466,73 @@ impl V2Repository {
     pub async fn mentor_decide_restoration(
         &self,
         mentor: UserId,
-        request_id: Uuid,
-        endorse: bool,
-        note: Option<&str>,
+        _request_id: Uuid,
+        _endorse: bool,
+        _note: Option<&str>,
     ) -> Result<RestorationRequest, V2Error> {
-        validate_note(note)?;
         require_role_pool(self.database.pool(), mentor, GlobalRole::Mentor).await?;
-        let state = if endorse {
-            "AWAITING_ADMIN_REVIEW"
-        } else {
-            "MENTOR_REJECTED"
-        };
-        let result = sqlx::query(
-            "UPDATE latex_core.restoration_requests r SET state=$3,mentor_user_id=$2,mentor_decision_note=$4,mentor_decided_at=statement_timestamp() \
-             WHERE r.id=$1 AND r.state='AWAITING_MENTOR_REVIEW' AND EXISTS (SELECT 1 FROM latex_core.paper_team_members m WHERE m.paper_team_id=r.paper_id AND m.user_id=$2)",
-        )
-        .bind(request_id).bind(mentor.as_uuid()).bind(state)
-        .bind(note.map(str::trim).filter(|value| !value.is_empty()))
-        .execute(self.database.pool()).await.map_err(V2Error::Database)?;
-        if result.rows_affected() != 1 {
-            return Err(V2Error::RoleForbidden {
-                user_id: mentor,
-                required: "assigned Mentor with an awaiting request",
-                actual: GlobalRole::Mentor,
-            });
-        }
-        self.restoration_request(request_id).await
+        Err(V2Error::Conflict {
+            entity: "deprecated Mentor restoration workflow",
+        })
     }
 
     pub async fn admin_reject_restoration(
         &self,
         admin: UserId,
+        _request_id: Uuid,
+        _note: Option<&str>,
+    ) -> Result<RestorationRequest, V2Error> {
+        require_role_pool(self.database.pool(), admin, GlobalRole::Admin).await?;
+        Err(V2Error::Conflict {
+            entity: "deprecated Admin restoration workflow",
+        })
+    }
+
+    pub async fn leader_reject_restoration(
+        &self,
+        leader: UserId,
         request_id: Uuid,
         note: Option<&str>,
     ) -> Result<RestorationRequest, V2Error> {
         validate_note(note)?;
-        require_role_pool(self.database.pool(), admin, GlobalRole::Admin).await?;
-        let result = sqlx::query(
-            "UPDATE latex_core.restoration_requests SET state='ADMIN_REJECTED',admin_user_id=$2,admin_decision_note=$3,admin_decided_at=statement_timestamp() \
-             WHERE id=$1 AND state='AWAITING_ADMIN_REVIEW'",
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        require_role_tx(&mut tx, leader, GlobalRole::Writer).await?;
+        let paper_id: Uuid = sqlx::query_scalar(
+            "SELECT paper_id FROM latex_core.restoration_requests \
+             WHERE id=$1 AND state='REQUESTED' FOR UPDATE",
         )
-        .bind(request_id).bind(admin.as_uuid()).bind(note.map(str::trim).filter(|value| !value.is_empty()))
-        .execute(self.database.pool()).await.map_err(V2Error::Database)?;
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?
+        .ok_or(V2Error::Conflict {
+            entity: "requested Team revert",
+        })?;
+        require_team_leader_tx(&mut tx, leader, paper_id).await?;
+        let result = sqlx::query(
+            "UPDATE latex_core.restoration_requests \
+             SET state='LEADER_REJECTED',leader_writer_user_id=$2,leader_decision_note=$3,leader_decided_at=statement_timestamp() \
+             WHERE id=$1 AND state='REQUESTED'",
+        )
+        .bind(request_id).bind(leader.as_uuid()).bind(note.map(str::trim).filter(|value| !value.is_empty()))
+        .execute(&mut *tx).await.map_err(V2Error::Database)?;
         if result.rows_affected() != 1 {
             return Err(V2Error::Conflict {
-                entity: "restoration request transition",
+                entity: "requested Team revert",
             });
         }
+        tx.commit().await.map_err(V2Error::Database)?;
+        tracing::info!(
+            %request_id,
+            leader_writer_user_id = %leader,
+            state = "LEADER_REJECTED",
+            "Team revert request rejected"
+        );
         self.restoration_request(request_id).await
     }
 
@@ -504,8 +547,8 @@ impl V2Repository {
             restoration_select(),
             match role {
                 GlobalRole::Admin => "TRUE",
-                GlobalRole::Writer => "r.requested_by_writer_user_id=$1",
-                GlobalRole::Mentor => "EXISTS(SELECT 1 FROM latex_core.paper_team_members m WHERE m.paper_team_id=r.paper_id AND m.user_id=$1)",
+                GlobalRole::Writer => "r.requested_by_writer_user_id=$1 OR EXISTS(SELECT 1 FROM latex_core.paper_team_members m WHERE m.paper_team_id=r.paper_id AND m.user_id=$1 AND m.is_leader)",
+                GlobalRole::Mentor => "FALSE",
             }
         ))
         .bind(actor.as_uuid()).bind(paper_id)
@@ -515,7 +558,7 @@ impl V2Repository {
 
     pub async fn apply_team_restoration(
         &self,
-        admin: UserId,
+        leader: UserId,
         request_id: Uuid,
         safety: ExactRestoreState,
         note: Option<&str>,
@@ -527,13 +570,17 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
-        require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
+        require_role_tx(&mut tx, leader, GlobalRole::Writer).await?;
         let row = sqlx::query(
-            "SELECT paper_id,workspace_id,target_version_id FROM latex_core.restoration_requests WHERE id=$1 AND state='AWAITING_ADMIN_REVIEW' FOR UPDATE",
+            "SELECT r.paper_id,r.workspace_id,r.target_version_id FROM latex_core.restoration_requests r \
+             WHERE r.id=$1 AND r.state='REQUESTED' FOR UPDATE",
         )
         .bind(request_id).fetch_optional(&mut *tx).await.map_err(V2Error::Database)?
-        .ok_or(V2Error::Conflict { entity: "admin-applicable restoration request" })?;
+        .ok_or(V2Error::Conflict {
+            entity: "requested Team revert",
+        })?;
         let paper_id: Uuid = row.try_get("paper_id").map_err(V2Error::Database)?;
+        require_team_leader_tx(&mut tx, leader, paper_id).await?;
         let workspace_id =
             WorkspaceId::from_uuid(row.try_get("workspace_id").map_err(V2Error::Database)?);
         let target_version_id: Uuid = row
@@ -541,19 +588,64 @@ impl V2Repository {
             .map_err(V2Error::Database)?;
         let applied = apply_restore(
             &mut tx,
-            admin,
+            leader,
             paper_id,
             workspace_id,
             target_version_id,
             safety,
+            RestoreKind::Team,
         )
         .await?;
         sqlx::query(
-            "UPDATE latex_core.restoration_requests SET state='APPLIED',admin_user_id=$2,admin_decision_note=$3,\
-             admin_decided_at=statement_timestamp(),applied_version_id=$4 WHERE id=$1",
+            "UPDATE latex_core.restoration_requests SET state='APPLIED',leader_writer_user_id=$2,leader_decision_note=$3,\
+             leader_decided_at=statement_timestamp(),applied_version_id=$4 WHERE id=$1",
         )
-        .bind(request_id).bind(admin.as_uuid()).bind(note.map(str::trim).filter(|value| !value.is_empty()))
+        .bind(request_id).bind(leader.as_uuid()).bind(note.map(str::trim).filter(|value| !value.is_empty()))
         .bind(applied.applied_version_id).execute(&mut *tx).await.map_err(V2Error::Database)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(applied)
+    }
+
+    pub async fn apply_direct_team_restoration(
+        &self,
+        leader: UserId,
+        paper_id: Uuid,
+        target_version_id: Uuid,
+        safety: ExactRestoreState,
+    ) -> Result<RestorationApplied, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        require_role_tx(&mut tx, leader, GlobalRole::Writer).await?;
+        let workspace_id: Uuid = sqlx::query_scalar(
+            "SELECT t.workspace_id FROM latex_core.paper_teams t \
+             JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id \
+             WHERE t.id=$1 AND t.status<>'archived' AND m.user_id=$2 AND m.is_leader FOR UPDATE OF t",
+        )
+        .bind(paper_id)
+        .bind(leader.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?
+        .ok_or(V2Error::RoleForbidden {
+            user_id: leader,
+            required: "Team Leader",
+            actual: GlobalRole::Writer,
+        })?;
+        ensure_target_version(&mut tx, paper_id, workspace_id, target_version_id).await?;
+        let applied = apply_restore(
+            &mut tx,
+            leader,
+            paper_id,
+            WorkspaceId::from_uuid(workspace_id),
+            target_version_id,
+            safety,
+            RestoreKind::Team,
+        )
+        .await?;
         tx.commit().await.map_err(V2Error::Database)?;
         Ok(applied)
     }
@@ -584,6 +676,7 @@ impl V2Repository {
             WorkspaceId::from_uuid(workspace_id),
             target_version_id,
             safety,
+            RestoreKind::Personal,
         )
         .await?;
         tx.commit().await.map_err(V2Error::Database)?;
@@ -671,6 +764,28 @@ async fn policy_tx(
     V2FilePolicy::parse(value.as_deref().unwrap_or("EDITABLE"))
 }
 
+#[derive(Copy, Clone)]
+enum RestoreKind {
+    Team,
+    Personal,
+}
+
+impl RestoreKind {
+    const fn version_type(self) -> &'static str {
+        match self {
+            Self::Team => "team_revert",
+            Self::Personal => "admin_restoration",
+        }
+    }
+
+    const fn version_name(self) -> &'static str {
+        match self {
+            Self::Team => "Team revert",
+            Self::Personal => "Personal restoration",
+        }
+    }
+}
+
 async fn apply_restore(
     tx: &mut Transaction<'_, Postgres>,
     actor: UserId,
@@ -678,6 +793,7 @@ async fn apply_restore(
     workspace_id: WorkspaceId,
     target_version_id: Uuid,
     safety: ExactRestoreState,
+    kind: RestoreKind,
 ) -> Result<RestorationApplied, V2Error> {
     if safety.workspace_version == 0 || safety.state_hash.len() != 64 {
         return Err(V2Error::Integrity {
@@ -822,9 +938,10 @@ async fn apply_restore(
     sqlx::query(
         "INSERT INTO latex_core.paper_versions \
          (id,paper_id,workspace_id,document_epoch,version_number,version_type,name,created_by_user_id,workspace_version,snapshot_id,manifest,state_hash) \
-         VALUES ($1,$2,$3,$4,$5,'admin_restoration','Governed restoration',$6,$7,$8,$9,$10)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
     ).bind(applied_id).bind(paper_id).bind(workspace_id.as_uuid()).bind(epoch).bind(number + 1)
-        .bind(actor.as_uuid()).bind(next).bind(&target_snapshot).bind(&applied_manifest).bind(&target_hash)
+        .bind(kind.version_type()).bind(kind.version_name()).bind(actor.as_uuid()).bind(next).bind(&target_snapshot)
+        .bind(&applied_manifest).bind(&target_hash)
         .execute(&mut **tx).await.map_err(V2Error::Database)?;
     sqlx::query(
         "UPDATE latex_core.v2_paper_build_state SET desired_state_hash=$2,desired_source_sequence=$3,active_build_id=NULL,\
@@ -866,7 +983,8 @@ async fn ensure_target_version(
 fn restoration_select() -> &'static str {
     "SELECT r.*,t.name AS paper_name,c.email AS writer_email,v.version_number,r.created_at::text AS created_at_text,\
      r.submitted_at::text AS submitted_at_text,r.mentor_decided_at::text AS mentor_decided_at_text,\
-     r.admin_decided_at::text AS admin_decided_at_text FROM latex_core.restoration_requests r \
+     r.admin_decided_at::text AS admin_decided_at_text,r.leader_decided_at::text AS leader_decided_at_text \
+     FROM latex_core.restoration_requests r \
      JOIN latex_core.paper_teams t ON t.id=r.paper_id JOIN latex_core.user_credentials c ON c.user_id=r.requested_by_writer_user_id \
      JOIN latex_core.paper_versions v ON v.id=r.target_version_id"
 }
@@ -907,6 +1025,13 @@ fn decode_request(row: PgRow) -> Result<RestorationRequest, V2Error> {
         admin_decision_note: row
             .try_get("admin_decision_note")
             .map_err(V2Error::Database)?,
+        leader_writer_user_id: row
+            .try_get::<Option<Uuid>, _>("leader_writer_user_id")
+            .map_err(V2Error::Database)?
+            .map(UserId::from_uuid),
+        leader_decision_note: row
+            .try_get("leader_decision_note")
+            .map_err(V2Error::Database)?,
         created_at: row.try_get("created_at_text").map_err(V2Error::Database)?,
         submitted_at: row
             .try_get("submitted_at_text")
@@ -916,6 +1041,9 @@ fn decode_request(row: PgRow) -> Result<RestorationRequest, V2Error> {
             .map_err(V2Error::Database)?,
         admin_decided_at: row
             .try_get("admin_decided_at_text")
+            .map_err(V2Error::Database)?,
+        leader_decided_at: row
+            .try_get("leader_decided_at_text")
             .map_err(V2Error::Database)?,
         applied_version_id: row
             .try_get("applied_version_id")
@@ -996,6 +1124,47 @@ async fn require_role_tx(
             user_id: user,
             required: wanted.as_str(),
             actual,
+        })
+    }
+}
+
+async fn lock_governance_users_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    users: &[UserId],
+) -> Result<(), V2Error> {
+    for user in users {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM latex_core.users WHERE id=$1 FOR UPDATE")
+            .bind(user.as_uuid())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(V2Error::Database)?
+            .ok_or(V2Error::NotFound { entity: "user" })?;
+    }
+    Ok(())
+}
+
+async fn require_team_leader_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    writer: UserId,
+    paper_id: Uuid,
+) -> Result<(), V2Error> {
+    let authorized: Option<Uuid> = sqlx::query_scalar(
+        "SELECT t.id FROM latex_core.paper_teams t \
+         JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id \
+         WHERE t.id=$1 AND t.status<>'archived' AND m.user_id=$2 AND m.is_leader FOR UPDATE OF t",
+    )
+    .bind(paper_id)
+    .bind(writer.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    if authorized.is_some() {
+        Ok(())
+    } else {
+        Err(V2Error::RoleForbidden {
+            user_id: writer,
+            required: "Team Leader",
+            actual: GlobalRole::Writer,
         })
     }
 }

@@ -2,33 +2,26 @@
 
 ## Aggregate
 
-A review round scopes review threads to a paper state and records round status, reviewers, version comparisons, section approvals, and paper approval. A thread contains append-preserving messages and may reference one source anchor, one PDF anchor, or both. A suggested replacement is attached to a thread and records the Mentor proposal plus the Writer's decision and resulting Writer-attributed transaction when accepted.
+A review round scopes review threads to an immutable paper baseline. It records the exact version, successful build/PDF, source state hash, submitting Team Leader, and submission time. A thread contains append-preserving messages and may reference one source anchor, one PDF anchor, or both. A suggestion records the Mentor proposal plus the Writer's decision and resulting Writer-attributed transaction when accepted.
 
-Review types are Comment, Question, Change Request, Suggested Replacement, Section Approval, and Paper Approval. Severity is `note`, `minor`, `major`, or `blocking`. Categories are `writing`, `methodology`, `evidence`, `citation`, `formatting`, `figure`, `table`, `equation`, and `submission_requirement`.
+The primary V2.1 review types are `COMMENT` and `SUGGESTION`. New rows use compatibility defaults `NOTE`, `WRITING`, no assigned Writer, and no due date. Historical structured review rows remain readable.
 
 ## Review-round lifecycle
 
 ```text
-DRAFT -- Mentor opens --> OPEN -- Mentor approves round --> APPROVED
-                            |
-                            `-- superseded/administratively closed --> CLOSED
+no open review -- Team Leader sends exact current build --> OPEN_FOR_REVIEW
+OPEN_FOR_REVIEW -- Team Leader ends review -------------> CLOSED
 ```
 
-Opening a round binds its comparison baseline and creates the scope in which threads, messages, suggestions, section approvals, and paper approval are recorded. `APPROVED` is a review conclusion, not permission to mutate source or an automatic Paper Team status transition. Closing or superseding a round preserves its contents.
+Sending for review requires durable source and a successful PDF whose state hash exactly matches current desired source. Opening binds that immutable baseline and enables Mentor annotation. Closing disables new Mentor annotations and preserves all prior rounds, threads, anchors, and messages. A later submission creates a new baseline.
 
 ## Thread lifecycle
 
 ```text
-OPEN -- Writer marks addressed --> ADDRESSED -- Mentor resolves --> RESOLVED
-                                     |                              |
-                                     | Mentor reopens               | Mentor reopens
-                                     v                              |
-                                  REOPENED <-------------------------+
-                                     |
-                                     `-- Writer marks addressed --> ADDRESSED
+OPEN -- Writer chooses Done --> RESOLVED
 ```
 
-`REOPENED` behaves as actionable Mentor feedback: the Writer may mark it `ADDRESSED`, after which the Mentor may resolve or reopen it. Only a Mentor may resolve Mentor feedback. Messages remain available across lifecycle transitions.
+Done hides the active highlight but retains the review row historically. Legacy lifecycle states and messages remain readable.
 
 ## Suggested replacement
 

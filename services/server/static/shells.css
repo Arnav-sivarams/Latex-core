@@ -169,6 +169,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .annotation-composer p { margin: 3px 0 0; color: var(--muted); }
 .annotation-composer label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; font-weight: 700; }
 .annotation-composer [hidden] { display: none !important; }
+.review-source-highlight { background: color-mix(in srgb, var(--warning, #f5c451) 42%, transparent); border-bottom: 2px solid #b87900; cursor: pointer; }
+.review-highlight-popover { position: fixed; z-index: 50; max-width: 24rem; padding: .75rem; border: 1px solid #b87900; border-radius: .4rem; background: var(--surface, #fff); box-shadow: 0 .5rem 1.5rem #0002; }
+.review-highlight-popover p { margin: .35rem 0 .65rem; }
+.review-highlight-popover button { margin-right: .4rem; }
 .annotation-composer input, .annotation-composer select { min-height: 34px; border: 1px solid var(--border); border-radius: 5px; padding: 5px 7px; background: var(--surface); }
 .annotation-composer .composer-message { grid-column: span 2; }
 .review-details { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(280px, .7fr); gap: 12px; margin-top: 14px; }

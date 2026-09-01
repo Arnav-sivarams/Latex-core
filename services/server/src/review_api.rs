@@ -1,4 +1,4 @@
-//! S5 review HTTP surface. Every mutation rechecks exclusive V2 role and Team assignment.
+//! V2.1 review HTTP surface with Leader submission and Mentor annotation gates.
 
 use crate::{
     AppState, PrincipalKind, compare_version_manifests, csrf, error, principal_auth, v2_error,
@@ -14,21 +14,14 @@ use axum::{
 use blob_store::BlobStore;
 use compiler::SyncTexIndex;
 use core_types::{LogicalPath, UserId};
-use persistence::{GlobalRole, ReviewThreadInput};
+use persistence::{GlobalRole, PaperStatus, ReviewThreadInput, V2Error};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use uuid::Uuid;
 
-const THREAD_TYPES: [&str; 6] = [
-    "COMMENT",
-    "QUESTION",
-    "CHANGE_REQUEST",
-    "SUGGESTED_REPLACEMENT",
-    "SECTION_APPROVAL",
-    "PAPER_APPROVAL",
-];
+const THREAD_TYPES: [&str; 2] = ["COMMENT", "SUGGESTION"];
 const SEVERITIES: [&str; 4] = ["NOTE", "MINOR", "MAJOR", "BLOCKING"];
 const CATEGORIES: [&str; 9] = [
     "WRITING",
@@ -110,7 +103,11 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/v2/reviews/papers/{paper_id}/rounds/{round_id}/approve",
-            post(approve_round),
+            post(deprecated_approve_round),
+        )
+        .route(
+            "/api/v2/reviews/papers/{paper_id}/rounds/{round_id}/close",
+            post(close_round),
         )
         .route(
             "/api/v2/reviews/papers/{paper_id}/threads",
@@ -322,17 +319,65 @@ async fn open_round(
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
+    let leader = match role_session(&state, &headers, GlobalRole::Writer).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match state.v2.open_review_round(mentor, paper_id).await {
+    let (paper, _) = match state.v2.review_paper(leader, paper_id).await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    if !paper.is_team_leader {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Only the Paper Team Leader can send this paper for review.",
+        );
+    }
+    if paper.status != PaperStatus::Active {
+        return error(
+            StatusCode::CONFLICT,
+            "Only an active Paper Team can be sent for review.",
+        );
+    }
+    if state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "collaboration flush failed",
+        );
+    }
+    let checkpoint = match state.workspaces.force_snapshot(paper.workspace_id).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "paper must have a main file"),
+    };
+    let state_hash = checkpoint.snapshot_id().to_hex();
+    match state
+        .v2
+        .open_review_round(leader, paper_id, &state_hash)
+        .await
+    {
         Ok(round) => (StatusCode::CREATED, Json(round)).into_response(),
+        Err(V2Error::Conflict {
+            entity: "current review PDF",
+        }) => error(
+            StatusCode::CONFLICT,
+            "Compile the current paper before sending it for review.",
+        ),
+        Err(V2Error::Conflict {
+            entity: "active Paper Team review submission",
+        }) => error(
+            StatusCode::CONFLICT,
+            "Only an active Paper Team can be sent for review.",
+        ),
         Err(value) => v2_error(value),
     }
 }
 
-async fn approve_round(
+async fn close_round(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((paper_id, round_id)): Path<(Uuid, Uuid)>,
@@ -340,18 +385,28 @@ async fn approve_round(
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
+    let leader = match role_session(&state, &headers, GlobalRole::Writer).await {
         Ok(value) => value,
         Err(response) => return response,
     };
     match state
         .v2
-        .approve_review_round(mentor, paper_id, round_id)
+        .close_review_round(leader, paper_id, round_id)
         .await
     {
         Ok(round) => Json(round).into_response(),
         Err(value) => v2_error(value),
     }
+}
+
+async fn deprecated_approve_round(headers: HeaderMap) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    error(
+        StatusCode::GONE,
+        "Mentor review approval is deprecated; the Team Leader ends review.",
+    )
 }
 
 async fn review_threads(
@@ -395,6 +450,12 @@ async fn create_thread(
             Json(json!({"schema_version":1,"thread_id":id})),
         )
             .into_response(),
+        Err(V2Error::Conflict {
+            entity: "paper review gate",
+        }) => error(
+            StatusCode::CONFLICT,
+            "This paper has not been sent for review.",
+        ),
         Err(value) => v2_error(value),
     }
 }
@@ -832,42 +893,41 @@ async fn role_session(
 
 fn validate_thread(input: &ReviewThreadInput) -> Result<(), &'static str> {
     if !THREAD_TYPES.contains(&input.thread_type.as_str())
-        || !SEVERITIES.contains(&input.severity.as_str())
-        || !CATEGORIES.contains(&input.category.as_str())
+        || input.severity != "NOTE"
+        || input.category != "WRITING"
     {
-        return Err("invalid review type, severity, or category");
+        return Err("new reviews use COMMENT or SUGGESTION with default metadata");
     }
     if input.message.trim().is_empty() || input.message.chars().count() > 20_000 {
         return Err("message must contain between 1 and 20000 characters");
     }
-    if input.thread_type == "SUGGESTED_REPLACEMENT"
-        && (input
+    if input.thread_type == "SUGGESTION"
+        && (input.source_anchor.is_none() || input.pdf_anchor.is_some())
+    {
+        return Err("suggestion requires one source anchor");
+    }
+    if input.thread_type == "SUGGESTION"
+        && input
             .suggested_replacement
             .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-            || input.source_anchor.is_none())
+            .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 20_000)
     {
-        return Err("suggested replacement requires replacement text and a source anchor");
+        return Err("suggestion text must contain between 1 and 20000 characters");
     }
-    if input.thread_type != "SUGGESTED_REPLACEMENT" && input.suggested_replacement.is_some() {
-        return Err("replacement text is valid only for a suggested replacement");
+    if input.thread_type == "COMMENT" && input.suggested_replacement.is_some() {
+        return Err("suggestion text is valid only for a suggestion");
     }
-    if !matches!(
-        input.thread_type.as_str(),
-        "CHANGE_REQUEST" | "SUGGESTED_REPLACEMENT"
-    ) && input.assigned_writer_user_id.is_some()
-    {
-        return Err("only requests and suggestions may be assigned");
+    if input.assigned_writer_user_id.is_some() || input.due_at.is_some() {
+        return Err("new comments and suggestions do not accept assignment or due dates");
     }
-    if input.source_anchor.is_none()
-        && input.pdf_anchor.is_none()
-        && !matches!(input.thread_type.as_str(), "PAPER_APPROVAL")
-    {
-        return Err("review thread requires a source or PDF anchor");
+    if input.source_anchor.is_none() == input.pdf_anchor.is_none() {
+        return Err("review thread requires exactly one source or PDF anchor");
     }
     if let Some(anchor) = &input.source_anchor {
         if !valid_hash(&anchor.context_hash)
+            || anchor.encoded_relative_start.is_none()
             || anchor.encoded_relative_start.is_some() != anchor.encoded_relative_end.is_some()
+            || anchor.quoted_text.is_empty()
         {
             return Err("invalid source anchor");
         }
@@ -943,4 +1003,59 @@ fn html(value: &str) -> String {
 )]
 fn context_hash(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_comment_defaults_hidden_legacy_metadata() {
+        let input: ReviewThreadInput = serde_json::from_value(json!({
+            "thread_type": "COMMENT",
+            "message": "Clarify this sentence.",
+            "source_anchor": {
+                "file_id": Uuid::new_v4(),
+                "encoded_relative_start": [1],
+                "encoded_relative_end": [2],
+                "quoted_text": "sentence",
+                "context_hash": "0".repeat(64),
+                "source_sequence": 1,
+                "source_version_id": null,
+                "document_epoch": 1
+            }
+        }))
+        .expect("simple comment input should deserialize");
+
+        assert_eq!(input.severity, "NOTE");
+        assert_eq!(input.category, "WRITING");
+        assert!(input.assigned_writer_user_id.is_none());
+        assert!(input.due_at.is_none());
+        assert_eq!(validate_thread(&input), Ok(()));
+    }
+
+    #[test]
+    fn new_review_creation_rejects_legacy_types_and_controls() {
+        let legacy: ReviewThreadInput = serde_json::from_value(json!({
+            "thread_type": "QUESTION",
+            "message": "Why?",
+            "severity": "NOTE",
+            "category": "WRITING",
+            "pdf_anchor": {
+                "page": 1,
+                "normalized_rectangles": [{"x":0.1,"y":0.1,"width":0.2,"height":0.1}],
+                "mapping_status": "PDF_ONLY",
+                "mapped_file_id": null,
+                "mapped_line": null,
+                "mapped_column": null
+            }
+        }))
+        .expect("legacy review input should deserialize for rejection testing");
+        assert!(validate_thread(&legacy).is_err());
+
+        let mut controlled = legacy;
+        controlled.thread_type = "COMMENT".to_owned();
+        controlled.severity = "MAJOR".to_owned();
+        assert!(validate_thread(&controlled).is_err());
+    }
 }

@@ -13,7 +13,7 @@ The five policies are `EDITABLE`, `CONTENT_READ_ONLY`, `STRUCTURE_LOCKED`, `TEMP
 
 ## Realtime, offline, and saving
 
-Source changes synchronize through durable collaboration rooms. The sync indicator distinguishes pending and durable work. `Ctrl/Cmd+S` requests durable CRDT synchronization; it does not compile.
+Source changes synchronize through durable collaboration rooms. **Save** and `Ctrl/Cmd+S` request durable CRDT synchronization; they do not compile or create a checkpoint. The indicator distinguishes Saving, Saved/Synced, Offline, and Reconnecting states.
 
 Offline state is stored per paper epoch. After a governed restoration, changes from the previous epoch are preserved locally and are not merged into the restored paper. Use **Copy recovery text** to retrieve that buffer.
 
@@ -25,8 +25,8 @@ After a durable local or remote source change becomes idle for about two seconds
 
 History contains immutable versions. A Writer may directly restore an owned personal paper after confirmation; the old head is first retained as a safety version and restoration creates a new head.
 
-For a Team Paper, choose **Request restoration**, select a version, optionally enter a reason, and submit. A Team restoration requires the assigned Mentor’s endorsement and an Admin’s decision. Writers cannot directly restore Team Papers.
+For a Team Paper, a regular Writer chooses **Request Revert**, selects a version, optionally enters a reason, and submits it to the Team Leader. The Leader can reject or safely apply the request. A Leader may also directly choose **Revert** after explicit confirmation. Each applied revert first records `PRE_RESTORE_SAFETY`, advances the document epoch, and creates a new head without deleting later history.
 
 ## Reviews and productivity
 
-Use linked review threads and suggestions from the paper/review panels. Productivity tools include builders, shortcuts, text undo/redo for your own edits, and structural undo/redo subject to the current policy.
+The Team Leader can use **Send for Review** only when the exact current source has a successful matching PDF, and **End Review** to close the window. Writers see Mentor source annotations as inline highlights; Done resolves and hides a highlight without deleting history, and Apply uses the Writer-attributed suggestion flow.
