@@ -51,7 +51,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 argon2 = "0.5"
-axum = { version = "0.8", features = ["json", "macros", "ws"] }
+axum = { version = "0.8", features = ["json", "macros", "multipart", "ws"] }
 futures-util = "0.3"
 flate2 = "1"
 rand = "0.9"

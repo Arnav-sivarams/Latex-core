@@ -9,6 +9,7 @@ import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { resolveSuggestionRange } from './review-helpers.mjs';
 import { createIdleBuildScheduler } from './auto-build.mjs';
+import { pdfPreviewState } from './writer-pdf.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
   buildOutlineTree, buildPlot, buildTable, buildTheorem, commonSnippets,
@@ -500,6 +501,10 @@ async function refreshPapers() {
 async function openPaper(paper) {
   autoBuild.cancel();
   closeEditor();
+  model.currentBuildId = null;
+  ui.pdfFrame.removeAttribute('src');
+  ui.pdfFrame.hidden = true;
+  ui.pdfEmpty.hidden = false;
   model.paper = paper;
   model.file = null;
   model.paperDetail = await api.paper(paper.id);
@@ -706,6 +711,7 @@ async function refreshBuildStatus() {
     const build = payload.build;
     const source = build.source_sequence;
     const pdf = build.current_source_sequence;
+    const preview = pdfPreviewState(build);
     const rebuilding = Boolean(build.active_build_id) || (source != null && pdf != null && source !== pdf);
     model.compileDiagnostic = build.latest_status === 'failed' && build.latest_error?.message
       ? { severity: 'error', code: 'compile', message: build.latest_error.message, path: null, file_id: null }
@@ -714,8 +720,8 @@ async function refreshBuildStatus() {
       model.currentBuildId = build.current_build_id;
       ui.pdfFrame.src = `${payload.pdf_url}?build=${build.current_build_id}`;
     }
-    ui.pdfFrame.hidden = !build.current_build_id;
-    ui.pdfEmpty.hidden = Boolean(build.current_build_id);
+    ui.pdfFrame.hidden = !preview.viewer;
+    ui.pdfEmpty.hidden = !preview.empty;
     if (source == null) ui.pdfRelation.textContent = 'No exact source state submitted yet';
     else if (pdf == null) ui.pdfRelation.textContent = `Source version ${source} · No PDF yet`;
     else ui.pdfRelation.textContent = `Source version ${source} · PDF version ${pdf}${rebuilding ? ' · Rebuilding…' : ''}`;

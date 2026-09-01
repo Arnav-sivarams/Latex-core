@@ -841,7 +841,11 @@ fn validate_thread(input: &ReviewThreadInput) -> Result<(), &'static str> {
         return Err("message must contain between 1 and 20000 characters");
     }
     if input.thread_type == "SUGGESTED_REPLACEMENT"
-        && (input.suggested_replacement.is_none() || input.source_anchor.is_none())
+        && (input
+            .suggested_replacement
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+            || input.source_anchor.is_none())
     {
         return Err("suggested replacement requires replacement text and a source anchor");
     }

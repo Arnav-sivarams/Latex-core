@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import * as Y from 'yjs';
-import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange } from './review-helpers.mjs';
+import { canOpenReviewRound, denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
 
 function sync(from, to) {
   Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)), 'remote');
@@ -26,6 +26,27 @@ test('Yjs relative source anchor survives concurrent insertion before range', ()
 test('PDF rectangle normalization survives zoom and rerender', () => {
   const normalized = normalizeRectangle({ x1: 100, y1: 80, x2: 300, y2: 180 }, 600, 800);
   assert.deepEqual(denormalizeRectangle(normalized, 1200, 1600), { x: 200, y: 160, width: 400, height: 200 });
+});
+
+test('review round and replacement controls require their exact prerequisites', () => {
+  assert.equal(canOpenReviewRound(null, false), false);
+  assert.equal(canOpenReviewRound('build-id', false), true);
+  assert.equal(canOpenReviewRound('build-id', true), false);
+  for (const type of ['COMMENT', 'QUESTION', 'CHANGE_REQUEST', 'SECTION_APPROVAL']) {
+    assert.equal(showsReplacementInput(type), false);
+  }
+  assert.equal(showsReplacementInput('SUGGESTED_REPLACEMENT'), true);
+  const css = readFileSync(new URL('../static/shells.css', import.meta.url), 'utf8');
+  assert.match(css, /\.annotation-composer \[hidden\] \{ display: none !important; \}/);
+});
+
+test('source selection preserves viewport until Review selection is clicked', () => {
+  const review = readFileSync(new URL('./review.js', import.meta.url), 'utf8');
+  const handler = review.slice(review.indexOf('async function sourceSelected'), review.indexOf('async function sha256'));
+  assert.doesNotMatch(handler, /scrollIntoView|\.focus\(|showComposer/);
+  assert.match(review, /ui\.reviewSelection\.addEventListener\('click'/);
+  const html = readFileSync(new URL('../src/review.html', import.meta.url), 'utf8');
+  assert.match(html, /id="reviewSelection"[^>]*disabled>Review selection/);
 });
 
 test('suggestion helper refuses an anchor unresolved in the current document', () => {

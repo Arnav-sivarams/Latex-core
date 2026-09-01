@@ -6,7 +6,7 @@ import { stex } from '@codemirror/legacy-modes/mode/stex';
 import { yCollab } from 'y-codemirror.next';
 import * as Y from 'yjs';
 import * as pdfjsLib from '/static/pdf.min.mjs';
-import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange } from './review-helpers.mjs';
+import { canOpenReviewRound, denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
 const INITIAL_STATE = 0x10;
@@ -51,7 +51,7 @@ const api = new ReviewApi();
 const ui = Object.fromEntries([
   'reviewContext', 'liveStatus', 'assignedPapers', 'reviewFiles', 'csvExport', 'printExport',
   'reviewTitle', 'reviewSummary', 'buildStatus', 'compileReview', 'openRound', 'approvePaper',
-  'reviewEditor', 'sourceSelection', 'previousPage', 'pageLabel', 'nextPage', 'zoomOut',
+  'reviewEditor', 'sourceSelection', 'reviewSelection', 'previousPage', 'pageLabel', 'nextPage', 'zoomOut',
   'zoomLabel', 'zoomIn', 'pdfState', 'pdfViewport', 'pdfCanvas', 'pdfOverlay',
   'annotationComposer', 'anchorSummary', 'threadType', 'severity', 'category', 'assignedWriter',
   'dueDate', 'threadMessage', 'replacementField', 'replacementText', 'cancelAnnotation',
@@ -61,7 +61,7 @@ const ui = Object.fromEntries([
 
 const model = {
   papers: [], paper: null, detail: null, files: [], file: null, writers: [], rounds: [], threads: [],
-  activity: [], filter: 'active', collaboration: null, view: null, pendingAnchor: null,
+  activity: [], filter: 'active', collaboration: null, view: null, pendingAnchor: null, pendingAnchorSummary: null,
   pdf: null, pdfBuildId: null, page: 1, scale: 1, viewport: null, renderTask: null, dragStart: null,
   suppressSelection: false, restorations: [],
 };
@@ -121,7 +121,7 @@ function mountReadOnlyEditor(session) {
 
 async function sourceSelected(state) {
   const range = state.selection.main;
-  if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text to annotate'; return; }
+  if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text to annotate'; ui.reviewSelection.disabled = true; return; }
   const quoted = state.sliceDoc(range.from, range.to);
   const relativeStart = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.from));
   const relativeEnd = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.to));
@@ -139,7 +139,8 @@ async function sourceSelected(state) {
   } catch { /* Source annotation remains valid without a projection. */ }
   model.pendingAnchor = { source_anchor: sourceAnchor, pdf_anchor: pdfAnchor };
   ui.sourceSelection.textContent = `${quoted.length} characters selected`;
-  showComposer(`Source: ${model.file.path} · “${quoted.slice(0, 80)}”`);
+  model.pendingAnchorSummary = `Source: ${model.file.path} · “${quoted.slice(0, 80)}”`;
+  ui.reviewSelection.disabled = false;
 }
 
 async function sha256(value) { const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)); return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join(''); }
@@ -232,9 +233,10 @@ async function anchorMappedLine(mapping) {
 }
 
 function showComposer(summary) { ui.annotationComposer.hidden = false; ui.anchorSummary.textContent = summary; ui.annotationComposer.scrollIntoView({ block: 'nearest' }); }
-function hideComposer() { ui.annotationComposer.hidden = true; model.pendingAnchor = null; renderOverlays(); }
+function hideComposer() { ui.annotationComposer.hidden = true; model.pendingAnchor = null; model.pendingAnchorSummary = null; ui.reviewSelection.disabled = true; renderOverlays(); }
 
 async function createAnnotation(body = null) {
+  if (!body && ui.threadType.value === 'SUGGESTED_REPLACEMENT' && !ui.replacementText.value.trim()) throw new Error('Suggested replacement requires non-empty replacement text.');
   const request = body || { thread_type: ui.threadType.value, message: ui.threadMessage.value, severity: ui.severity.value, category: ui.category.value, assigned_writer_user_id: ui.assignedWriter.value || null, due_at: ui.dueDate.value ? `${ui.dueDate.value}T23:59:59Z` : null, source_anchor: model.pendingAnchor?.source_anchor || null, pdf_anchor: model.pendingAnchor?.pdf_anchor || null, suggested_replacement: ui.threadType.value === 'SUGGESTED_REPLACEMENT' ? ui.replacementText.value : null, section_label: ui.threadType.value === 'SECTION_APPROVAL' ? model.file?.path : null };
   await api.createThread(model.paper.id, request); hideComposer(); ui.threadMessage.value = ''; ui.replacementText.value = ''; await Promise.all([refreshThreads(), refreshRounds(), refreshActivity()]); notice('Review annotation created.');
 }
@@ -271,7 +273,7 @@ async function focusThread(thread) {
 function base64(value) { if (!value) return null; const binary = atob(value.replaceAll('\n', '')); return Uint8Array.from(binary, (character) => character.charCodeAt(0)); }
 
 async function refreshRounds() { const payload = await api.rounds(model.paper.id); model.rounds = payload.rounds; renderRounds(); }
-function renderRounds() { ui.roundList.replaceChildren(); const open = model.rounds.find((round) => round.status === 'OPEN'); ui.openRound.disabled = Boolean(open); ui.approvePaper.disabled = !open; if (!model.rounds.length) return clearNode(ui.roundList, 'Open a round after compiling an exact PDF.'); model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status} · ${round.open_threads} open · ${round.blocking_threads} blocking`; row.append(text); if (round.status === 'OPEN') row.append(button('Approve Round', () => approveRound(round))); ui.roundList.append(row); }); }
+function renderRounds() { ui.roundList.replaceChildren(); const open = model.rounds.find((round) => round.status === 'OPEN'); ui.openRound.disabled = !canOpenReviewRound(model.paper?.current_build_id, Boolean(open)); ui.approvePaper.disabled = !open; if (!model.rounds.length) return clearNode(ui.roundList, model.paper?.current_build_id ? 'No review round.' : 'Compile an exact PDF before opening a review round.'); model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status} · ${round.open_threads} open · ${round.blocking_threads} blocking`; row.append(text); if (round.status === 'OPEN') row.append(button('Approve Round', () => approveRound(round))); ui.roundList.append(row); }); }
 async function approveRound(round) { await api.approveRound(model.paper.id, round.id); await Promise.all([refreshRounds(), refreshActivity(), refreshChanges()]); notice(`Round ${round.round_number} approved.`); }
 async function refreshActivity() { const payload = await api.activity(model.paper.id); model.activity = payload.events; ui.activityList.replaceChildren(); if (!model.activity.length) return clearNode(ui.activityList, 'No activity.'); model.activity.slice(0, 30).forEach((event) => { const row = document.createElement('p'); row.textContent = `${new Date(event.occurred_at).toLocaleString()} · ${event.summary}`; ui.activityList.append(row); }); }
 async function refreshChanges() { const payload = await api.changes(model.paper.id); if (!payload.available) { ui.reviewChanges.textContent = 'No current review baseline and exact build.'; return; } const changes = payload.changes; ui.reviewChanges.textContent = [`Added: ${changes.files_added.join(', ') || 'none'}`, `Removed: ${changes.files_removed.join(', ') || 'none'}`, `Changed: ${changes.files_changed.join(', ') || 'none'}`, '', ...Object.values(changes.text_diffs)].join('\n'); }
@@ -297,7 +299,8 @@ async function decideRestoration(request, action) {
   catch (failure) { notice(failure.message, true); }
 }
 
-ui.threadType.addEventListener('change', () => { ui.replacementField.hidden = ui.threadType.value !== 'SUGGESTED_REPLACEMENT'; ui.assignedWriter.disabled = !['CHANGE_REQUEST', 'SUGGESTED_REPLACEMENT'].includes(ui.threadType.value); });
+ui.threadType.addEventListener('change', () => { const replacement = showsReplacementInput(ui.threadType.value); ui.replacementField.hidden = !replacement; ui.replacementText.required = replacement; ui.assignedWriter.disabled = !['CHANGE_REQUEST', 'SUGGESTED_REPLACEMENT'].includes(ui.threadType.value); });
+ui.reviewSelection.addEventListener('click', () => { if (model.pendingAnchor && model.pendingAnchorSummary) showComposer(model.pendingAnchorSummary); });
 ui.cancelAnnotation.addEventListener('click', hideComposer); ui.createAnnotation.addEventListener('click', () => createAnnotation().catch((failure) => notice(failure.message, true)));
 ui.compileReview.addEventListener('click', async () => { try { ui.buildStatus.textContent = 'Building…'; await api.build(model.paper.id); await refreshBuild(); } catch (failure) { notice(failure.message, true); } });
 ui.openRound.addEventListener('click', async () => { try { await api.openRound(model.paper.id); await Promise.all([refreshRounds(), refreshActivity(), refreshChanges()]); } catch (failure) { notice(failure.message, true); } });

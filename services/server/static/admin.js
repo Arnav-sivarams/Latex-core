@@ -54,6 +54,104 @@ function renderOverview(data) {
   content.append(grid);
 }
 
+function renderAdminReviews(reviews) {
+  if (!reviews.length) return content.append(element('p', 'empty-copy', 'No review activity yet.'));
+  const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table');
+  table.innerHTML = '<thead><tr><th>Paper Team</th><th>Type</th><th>State</th><th>Severity</th><th>Mentor</th><th>Assigned Writer</th><th>Updated</th></tr></thead>';
+  const body = document.createElement('tbody');
+  reviews.forEach((review) => {
+    const row = document.createElement('tr');
+    row.append(
+      element('td', '', review.paper_name), element('td', '', review.thread_type.replaceAll('_', ' ')),
+      element('td', '', review.state), element('td', '', review.severity), element('td', '', review.mentor),
+      element('td', '', review.assigned_writer || 'Unassigned'),
+      element('td', '', new Date(review.updated_at || review.created_at).toLocaleString()),
+    );
+    body.append(row);
+  });
+  table.append(body); wrap.append(table); content.append(wrap);
+}
+
+function renderTemplates(templates) {
+  const intro = element('p', 'empty-copy', 'Import a bounded local ZIP, inspect its safe file tree, select Main when detection is ambiguous, then save an immutable template. Existing-Team template update is unavailable in this RC.');
+  const form = element('form', 'admin-template-form');
+  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>Import Template</button>';
+  const archiveInput = form.elements.archive;
+  const mainSelect = form.elements.main;
+  const validate = form.querySelector('[data-action="validate-template"]');
+  const submit = form.querySelector('button[type="submit"]');
+  const previewHost = element('div', 'template-preview');
+  let preview = null;
+
+  const previewArchive = async () => {
+    const file = archiveInput.files[0];
+    if (!file) throw new Error('Choose a local template ZIP.');
+    const body = new FormData(); body.set('archive', file);
+    preview = await api('/api/admin/v2/templates/preview', {
+      method: 'POST', body,
+    });
+    const texFiles = preview.files.filter((entry) => entry.is_tex);
+    mainSelect.replaceChildren(new Option('Select Main…', ''));
+    texFiles.forEach((entry) => mainSelect.append(new Option(entry.path, entry.path)));
+    mainSelect.value = preview.detected_main || '';
+    mainSelect.disabled = false;
+    submit.disabled = !mainSelect.value;
+    const heading = element('strong', '', `${preview.files.length} safe files`);
+    const tree = element('ul', 'template-file-tree');
+    preview.files.forEach((entry) => tree.append(element('li', '', `${entry.path} · ${entry.size_bytes} bytes`)));
+    const hint = element('p', 'empty-copy', preview.detected_main ? `Detected Main: ${preview.detected_main}` : 'Main is ambiguous; choose one TeX file.');
+    previewHost.replaceChildren(heading, hint, tree);
+  };
+  archiveInput.addEventListener('change', () => { preview = null; mainSelect.disabled = true; submit.disabled = true; previewHost.replaceChildren(); });
+  validate.addEventListener('click', () => previewArchive().catch(showError));
+  mainSelect.addEventListener('change', () => { submit.disabled = !preview || !mainSelect.value; });
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      if (!preview) await previewArchive();
+      if (!mainSelect.value) throw new Error('Select the Main TeX file.');
+      const body = new FormData();
+      body.set('name', form.elements.name.value); body.set('description', form.elements.description.value);
+      body.set('main', mainSelect.value); body.set('archive', archiveInput.files[0]);
+      const imported = await api('/api/admin/v2/templates/import', {
+        method: 'POST', body,
+      });
+      announce(`Imported ${imported.name}: ${imported.files.length} immutable files · ${imported.source_identity}`);
+      await showSection('Templates');
+    } catch (error) { showError(error); }
+  });
+  content.append(intro, form, previewHost);
+  if (!templates.length) return content.append(element('p', 'empty-copy', 'No templates yet.'));
+  const wrap = element('div', 'admin-table-wrap');
+  const table = element('table', 'admin-table');
+  table.innerHTML = '<thead><tr><th>Name / description</th><th>Main file</th><th>Imported</th><th>Usage</th><th>Actions</th></tr></thead>';
+  const body = document.createElement('tbody');
+  templates.forEach((template) => {
+    const row = document.createElement('tr');
+    const metadata = element('td');
+    const name = document.createElement('input'); name.value = template.name; name.maxLength = 200; name.setAttribute('aria-label', `Name for ${template.name}`);
+    const description = document.createElement('input'); description.value = template.description || ''; description.maxLength = 2000; description.placeholder = 'Optional description'; description.setAttribute('aria-label', `Description for ${template.name}`);
+    metadata.append(name, description);
+    const mainCell = element('td'); const main = document.createElement('select'); main.setAttribute('aria-label', `Main file for ${template.name}`);
+    template.tex_files.forEach((path) => main.append(new Option(path, path, false, path === template.main_file))); mainCell.append(main);
+    const usage = template.pinned ? `${template.usage_count} Paper Team pin${template.usage_count === 1 ? '' : 's'}` : 'Unused';
+    const actions = element('td');
+    actions.append(
+      buttonAction('Edit', async () => {
+        await api(`/api/admin/v2/templates/${template.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.value, description: description.value || null, main_file: main.value }) });
+        announce(`Updated ${name.value}. Existing Paper Team sources were not changed.`); await showSection('Templates');
+      }),
+      buttonAction('Remove', async () => {
+        if (!confirm(`Remove template “${template.name}”?`)) return;
+        await api(`/api/admin/v2/templates/${template.id}`, { method: 'DELETE' }); announce(`Removed ${template.name}.`); await showSection('Templates');
+      }, 'danger'),
+    );
+    row.append(metadata, mainCell, element('td', '', new Date(template.created_at).toLocaleString()), element('td', '', usage), actions);
+    body.append(row);
+  });
+  table.append(body); wrap.append(table); content.append(wrap);
+}
+
 async function patchUser(email, values) {
   await api(`/api/admin/users/${encodeURIComponent(email)}`, {
     method: 'PATCH',
@@ -224,7 +322,7 @@ async function renderPaperTeams(teams, users, templates) {
   name.innerHTML = 'Paper Team name<input name="name" required maxlength="200">';
   const templateField = element('label', '', 'Initial template');
   const templateSelect = document.createElement('select'); templateSelect.name = 'template_id';
-  templateSelect.append(new Option('Default main.tex', ''));
+  templateSelect.append(new Option('Default blank paper', ''));
   templates.forEach((template) => templateSelect.append(new Option(`${template.name} · immutable pin`, template.id)));
   templateField.append(templateSelect);
   form.append(name, memberSelect(users, 'writer', 'Writers'), memberSelect(users, 'mentor', 'Mentors'), templateField);
@@ -253,7 +351,7 @@ async function renderPaperTeams(teams, users, templates) {
   details.forEach(({ team, members, template_pin: templatePin }) => {
     const card = element('section', 'team-card');
     card.append(element('h2', '', team.name), element('p', 'empty-copy', `${team.status} · workspace ${team.workspace_id}`));
-    card.append(element('p', 'empty-copy', templatePin ? `Pinned template: ${templatePin.template_name} · ${templatePin.source_identity} · ${templatePin.update_status}` : 'Template: default bootstrap (no pin)'));
+    card.append(element('p', 'empty-copy', templatePin ? `Template: ${templatePin.template_name} · pinned ${templatePin.source_identity}` : 'Template: Default blank paper'));
     const lifecycle = element('div', 'admin-actions');
     const transitions = team.status === 'active' ? [['Freeze', 'frozen'], ['Submit', 'submitted'], ['Archive', 'archived']]
       : team.status === 'frozen' ? [['Activate', 'active'], ['Archive', 'archived']]
@@ -363,6 +461,12 @@ async function showSection(section) {
       await renderPaperTeams(teams, users, templates);
       return;
     }
+    if (section === 'Templates') {
+      const templates = await api('/api/admin/templates');
+      content.replaceChildren(element('h1', '', 'TEMPLATES'));
+      renderTemplates(templates);
+      return;
+    }
     if (section === 'File Policies') {
       const teams = await api('/api/admin/v2/paper-teams'); content.replaceChildren(element('h1', '', 'FILE POLICIES')); await renderFilePolicies(teams);
       return;
@@ -371,6 +475,7 @@ async function showSection(section) {
     content.replaceChildren(element('h1', '', section.toUpperCase()));
     if (section === 'Overview') renderOverview(data);
     else if (section === 'Restoration Requests') renderRestorationRequests(data);
+    else if (section === 'Reviews') renderAdminReviews(data);
     else if (section === 'System') { content.append(element('p', 'empty-copy', 'Host-level operational actions remain CLI-only in this release candidate.')); content.append(renderJson(data)); }
     else if (Array.isArray(data) && data.length === 0) content.append(element('p', 'empty-copy', 'No records available.'));
     else content.append(renderJson(data));

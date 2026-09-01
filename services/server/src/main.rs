@@ -15,7 +15,7 @@ mod review_api;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Form, Path, Query, State, WebSocketUpgrade},
+    extract::{Form, Multipart, Path, Query, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -28,10 +28,11 @@ use core_types::{
 };
 use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLevel};
 use persistence::{
-    AccountType, AppError, AppRepository, AppSessionRecord, ChangeSetPublishResult, Database,
-    DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState, FilePolicy, GlobalRole, GroupType,
-    PostgresCompileQueue, ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord,
-    TemplateSeedFile, V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
+    AccountType, AppError, AppRepository, AppSessionRecord, AppTemplateFileRecord,
+    ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState,
+    FilePolicy, GlobalRole, GroupType, PostgresCompileQueue, ProjectAccess, ProjectRoles,
+    PublishResult, QueueLimits, TeamFileRecord, TemplateSeedFile, V2BuildRequest, V2Error,
+    V2FilePolicy, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -223,6 +224,12 @@ struct FilePolicyInput {
 #[derive(Deserialize)]
 struct ImportQuery {
     name: String,
+}
+#[derive(Deserialize)]
+struct V2TemplateEditInput {
+    name: String,
+    description: Option<String>,
+    main_file: String,
 }
 #[derive(Deserialize)]
 struct SetMain {
@@ -511,6 +518,18 @@ fn router(state: AppState) -> Router {
             axum::routing::patch(admin_v2_change_role),
         )
         .route(
+            "/api/admin/v2/templates/preview",
+            post(admin_v2_template_preview),
+        )
+        .route(
+            "/api/admin/v2/templates/import",
+            post(admin_v2_template_import),
+        )
+        .route(
+            "/api/admin/v2/templates/{id}",
+            axum::routing::patch(admin_v2_template_edit).delete(admin_v2_template_remove),
+        )
+        .route(
             "/api/admin/v2/paper-teams",
             get(admin_v2_paper_teams).post(admin_v2_create_paper_team),
         )
@@ -730,7 +749,9 @@ fn router(state: AppState) -> Router {
         .route("/api/jobs/{id}/artifacts", get(artifacts))
         .route("/api/jobs/{id}/artifacts/{artifact}", get(artifact))
         .merge(review_api::router())
-        .layer(RequestBodyLimitLayer::new(archive::MAX_ARCHIVE_BYTES))
+        .layer(RequestBodyLimitLayer::new(
+            archive::MAX_ARCHIVE_BYTES + 64 * 1024,
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -3261,7 +3282,338 @@ async fn admin_templates(State(state): State<AppState>, headers: HeaderMap) -> R
     if let Err(response) = admin_session(&state, &headers).await {
         return response;
     }
-    match state.repo.list_templates().await { Ok(templates) => Json(templates.into_iter().map(|template| serde_json::json!({"id":template.id.to_string(),"name":template.name,"description":template.description,"main_file":template.main_file,"policy_default":template.policy_default,"created_at":template.created_at,"update_status":"Template update unavailable in this RC"})).collect::<Vec<_>>()).into_response(), Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure") }
+    let templates = match state.repo.list_templates().await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+    };
+    let mut response = Vec::with_capacity(templates.len());
+    for template in templates {
+        let files = match state.repo.template_files(template.id).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+        };
+        let usage_count = match state.repo.template_paper_team_usage(template.id).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
+        };
+        response.push(serde_json::json!({
+            "id":template.id.to_string(),"name":template.name,"description":template.description,
+            "main_file":template.main_file,"policy_default":template.policy_default,
+            "created_at":template.created_at,"usage_count":usage_count,"pinned":usage_count > 0,
+            "tex_files":files.iter().filter(|file| std::path::Path::new(&file.path).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("tex"))).map(|file| &file.path).collect::<Vec<_>>(),
+            "update_status":"Template source is immutable; metadata and Main selection may be edited"
+        }));
+    }
+    Json(response).into_response()
+}
+async fn admin_v2_template_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let body = match template_archive_field(multipart).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let imported = match archive::read_archive(body.as_ref()) {
+        Ok(value) => value,
+        Err(error_value) => return import_error(error_value),
+    };
+    if !imported
+        .files
+        .iter()
+        .any(|file| file.path.extension() == Some("tex"))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "template archive contains no TeX file",
+        );
+    }
+    Json(serde_json::json!({
+        "schema_version": 1,
+        "detected_main": imported.detected_main.as_ref().map(LogicalPath::as_str),
+        "files": imported.files.iter().map(|file| serde_json::json!({
+            "path": file.path.as_str(),
+            "size_bytes": file.bytes.len(),
+            "is_tex": file.path.extension() == Some("tex"),
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "archive validation, blob persistence, and template metadata remain together at the import boundary"
+)]
+async fn admin_v2_template_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(principal.kind, PrincipalKind::V2(GlobalRole::Admin)) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "V2 Admin required for template import",
+        );
+    }
+    let upload = match template_import_fields(multipart).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = upload.name.trim();
+    if name.is_empty() || name.len() > 200 {
+        return error(StatusCode::BAD_REQUEST, "invalid template name");
+    }
+    let description = upload
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if description.is_some_and(|value| value.len() > 2_000) {
+        return error(StatusCode::BAD_REQUEST, "template description is too long");
+    }
+    let imported = match archive::read_archive(upload.archive.as_ref()) {
+        Ok(value) => value,
+        Err(error_value) => return import_error(error_value),
+    };
+    let main = match upload.main.as_deref().filter(|value| !value.is_empty()) {
+        Some(value) => match LogicalPath::parse(value) {
+            Ok(path) => path,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid template main path"),
+        },
+        None => {
+            if let Some(path) = imported.detected_main.clone() {
+                path
+            } else {
+                if !imported
+                    .files
+                    .iter()
+                    .any(|file| file.path.extension() == Some("tex"))
+                {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "template archive contains no TeX file",
+                    );
+                }
+                return error(
+                    StatusCode::CONFLICT,
+                    "select a main TeX file for this template",
+                );
+            }
+        }
+    };
+    if main.extension() != Some("tex") || !imported.files.iter().any(|file| file.path == main) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "template main must name an archived TeX file",
+        );
+    }
+    let mut records = Vec::with_capacity(imported.files.len());
+    for file in imported.files {
+        let stored = match state.blobs.put(file.bytes).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+        };
+        records.push(AppTemplateFileRecord {
+            path: file.path.to_string(),
+            blob_hash: stored.hash(),
+            size_bytes: stored.size_bytes(),
+        });
+    }
+    let id = uuid::Uuid::new_v4();
+    match state
+        .repo
+        .create_template(id, name, description, Some(main.as_str()), &records)
+        .await
+    {
+        Ok(()) => {
+            let mut identity_material = format!("{id}:{}", main.as_str());
+            for file in &records {
+                let _ = write!(
+                    identity_material,
+                    "|{}:{}:{}",
+                    file.path, file.blob_hash, file.size_bytes
+                );
+            }
+            tracing::info!(template_id=%id, admin_user_id=%principal.user_id(), file_count=records.len(), "V2 template imported");
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "schema_version": 1,
+                    "id": id,
+                    "name": name,
+                    "description": description,
+                    "main_file": main.as_str(),
+                    "source_identity": digest(&identity_material),
+                    "files": records.iter().map(|file| serde_json::json!({
+                        "path": file.path,
+                        "blob_hash": file.blob_hash,
+                        "size_bytes": file.size_bytes,
+                    })).collect::<Vec<_>>(),
+                })),
+            )
+                .into_response()
+        }
+        Err(AppError::Conflict) => error(StatusCode::CONFLICT, "template name already exists"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "template import failed"),
+    }
+}
+
+#[derive(Default)]
+struct TemplateImportFields {
+    name: String,
+    description: Option<String>,
+    main: Option<String>,
+    archive: Bytes,
+}
+
+async fn template_archive_field(mut multipart: Multipart) -> Result<Bytes, Response> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid template upload"))?
+    {
+        if field.name() == Some("archive") {
+            return field
+                .bytes()
+                .await
+                .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid template upload"));
+        }
+    }
+    Err(error(StatusCode::BAD_REQUEST, "Template ZIP is required"))
+}
+
+async fn template_import_fields(
+    mut multipart: Multipart,
+) -> Result<TemplateImportFields, Response> {
+    let mut upload = TemplateImportFields::default();
+    let mut has_archive = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid template upload"))?
+    {
+        match field.name() {
+            Some("name") => {
+                upload.name = field
+                    .text()
+                    .await
+                    .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid template name"))?;
+            }
+            Some("description") => {
+                upload.description =
+                    Some(field.text().await.map_err(|_| {
+                        error(StatusCode::BAD_REQUEST, "invalid template description")
+                    })?);
+            }
+            Some("main") => {
+                upload.main = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid template main"))?,
+                );
+            }
+            Some("archive") if !has_archive => {
+                upload.archive = field
+                    .bytes()
+                    .await
+                    .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid template upload"))?;
+                has_archive = true;
+            }
+            Some("archive") => {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "only one Template ZIP may be uploaded",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !has_archive {
+        return Err(error(StatusCode::BAD_REQUEST, "Template ZIP is required"));
+    }
+    Ok(upload)
+}
+
+async fn admin_v2_template_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<V2TemplateEditInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let name = input.name.trim();
+    let description = input
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let main = match LogicalPath::parse(&input.main_file) {
+        Ok(value) if value.extension() == Some("tex") => value,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Main must be an existing .tex file",
+            );
+        }
+    };
+    if name.is_empty() || name.len() > 200 || description.is_some_and(|value| value.len() > 2_000) {
+        return error(StatusCode::BAD_REQUEST, "invalid template metadata");
+    }
+    match state
+        .repo
+        .update_template_metadata(id, name, description, main.as_str())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::NotFound) => error(
+            StatusCode::BAD_REQUEST,
+            "Main must be an existing .tex file",
+        ),
+        Err(AppError::Conflict) => error(StatusCode::CONFLICT, "template name already exists"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "template update failed"),
+    }
+}
+
+async fn admin_v2_template_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.repo.delete_template_if_unused(id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AppError::Conflict) => error(
+            StatusCode::CONFLICT,
+            "Template is in use by a Paper Team and cannot be removed.",
+        ),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "template not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "template removal failed"),
+    }
 }
 async fn admin_system(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = admin_session(&state, &headers).await {
@@ -6085,6 +6437,7 @@ mod database_tests {
     };
     use persistence::{DatabaseConfig, GlobalRole};
     use sqlx::PgPool;
+    use std::io::{Cursor, Write};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -6656,6 +7009,246 @@ mod database_tests {
         database.close().await;
     }
 
+    #[tokio::test]
+    async fn admin_browser_template_zip_preview_import_and_validation() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
+        let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        let mentor = fixture(&app, &database, "student", Some(GlobalRole::Mentor)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let archive = test_zip(&[
+            (
+                "main.tex",
+                b"\\documentclass{article}\\begin{document}Imported\\end{document}",
+            ),
+            ("sections/intro.tex", b"Introduction"),
+            ("assets/data.csv", b"x,y\n1,2\n"),
+        ]);
+        let (preview_body, preview_type) = template_multipart(&[], &archive);
+        let preview = request_bytes(
+            &app,
+            Method::POST,
+            "/api/admin/v2/templates/preview",
+            Some(&admin.cookie),
+            preview_body.clone(),
+            Some(&preview_type),
+        )
+        .await;
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview = test_json(preview).await;
+        assert_eq!(preview["detected_main"], "main.tex");
+        assert_eq!(preview["files"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/preview",
+                Some(&mentor.cookie),
+                preview_body,
+                Some(&preview_type),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let (import_body, import_type) = template_multipart(
+            &[
+                ("name", "Browser Template"),
+                ("description", "Local ZIP"),
+                ("main", "main.tex"),
+            ],
+            &archive,
+        );
+        let imported = request_bytes(
+            &app,
+            Method::POST,
+            "/api/admin/v2/templates/import",
+            Some(&admin.cookie),
+            import_body,
+            Some(&import_type),
+        )
+        .await;
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let imported = test_json(imported).await;
+        assert_eq!(imported["main_file"], "main.tex");
+        assert_eq!(imported["files"].as_array().unwrap().len(), 3);
+        assert_eq!(imported["source_identity"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM latex_core.template_files WHERE template_id=$1",
+            )
+            .bind(uuid::Uuid::parse_str(imported["id"].as_str().unwrap()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            3
+        );
+        let template_id = imported["id"].as_str().unwrap();
+        let listed = test_json(get(&app, "/api/admin/templates", Some(&admin.cookie)).await).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["name"], "Browser Template");
+        assert_eq!(listed[0]["pinned"], false);
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("/api/admin/v2/templates/{template_id}"),
+                Some(&admin.cookie),
+                r#"{"name":"Edited Template","description":"Edited","main_file":"sections/intro.tex"}"#,
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({"name":"Imported Template Team","writer_ids":[writer_id],"mentor_ids":[mentor_id],"template_id":template_id}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created["template_pin"]["template_id"], template_id);
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        let detail = test_json(
+            get(
+                &app,
+                &format!("/api/admin/v2/paper-teams/{paper_id}"),
+                Some(&admin.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(detail["template_pin"]["template_name"], "Edited Template");
+        let pinned_remove = request(
+            &app,
+            Method::DELETE,
+            &format!("/api/admin/v2/templates/{template_id}"),
+            Some(&admin.cookie),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(pinned_remove.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            test_json(pinned_remove).await["error"],
+            "Template is in use by a Paper Team and cannot be removed."
+        );
+
+        let unused_archive = test_zip(&[("main.tex", b"unused")]);
+        let (unused_body, unused_type) = template_multipart(
+            &[("name", "Unused Template"), ("main", "main.tex")],
+            &unused_archive,
+        );
+        let unused = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/import",
+                Some(&admin.cookie),
+                unused_body,
+                Some(&unused_type),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::DELETE,
+                &format!("/api/admin/v2/templates/{}", unused["id"].as_str().unwrap()),
+                Some(&admin.cookie),
+                "",
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let ambiguous = test_zip(&[("a.tex", b"a"), ("b.tex", b"b")]);
+        let (ambiguous, ambiguous_type) = template_multipart(&[("name", "Ambiguous")], &ambiguous);
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/import",
+                Some(&admin.cookie),
+                ambiguous,
+                Some(&ambiguous_type),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let no_tex = test_zip(&[("README.md", b"not TeX")]);
+        let (no_tex, no_tex_type) = template_multipart(&[], &no_tex);
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/preview",
+                Some(&admin.cookie),
+                no_tex,
+                Some(&no_tex_type),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let traversal = test_zip(&[("../escape.tex", b"unsafe")]);
+        let (traversal, traversal_type) = template_multipart(&[], &traversal);
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/preview",
+                Some(&admin.cookie),
+                traversal,
+                Some(&traversal_type),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        pool.close().await;
+        database.close().await;
+    }
+
+    fn test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut output);
+            for (path, bytes) in entries {
+                writer
+                    .start_file(*path, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        output.into_inner()
+    }
+
+    fn template_multipart(fields: &[(&str, &str)], archive: &[u8]) -> (Vec<u8>, String) {
+        const BOUNDARY: &str = "latex-core-template-test-boundary";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"archive\"; filename=\"template.zip\"\r\nContent-Type: application/zip\r\n\r\n").as_bytes());
+        body.extend_from_slice(archive);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        (body, format!("multipart/form-data; boundary={BOUNDARY}"))
+    }
+
     async fn test_json(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -6686,6 +7279,15 @@ mod database_tests {
         let other_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let empty_admin_reviews = get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await;
+        assert_eq!(empty_admin_reviews.status(), StatusCode::OK);
+        assert!(
+            test_json(empty_admin_reviews)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         let created = test_json(
             request(
@@ -6821,6 +7423,20 @@ mod database_tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let admin_reviews =
+            test_json(get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await).await;
+        assert_eq!(admin_reviews.as_array().unwrap().len(), 1);
+        assert_eq!(admin_reviews[0]["paper_name"], "S5 Review Team");
+        assert_eq!(admin_reviews[0]["thread_type"], "COMMENT");
+        assert_eq!(admin_reviews[0]["mentor"], mentor.email);
+        assert!(admin_reviews[0]["assigned_writer"].is_null());
+        assert_eq!(
+            get(&app, &format!("{review_root}/threads"), Some(&admin.cookie),)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+            "Admin review access remains inspection-only",
+        );
 
         assert_eq!(
             request(
@@ -9308,6 +9924,25 @@ mod database_tests {
         body: &str,
         content_type: Option<&str>,
     ) -> Response {
+        request_bytes(
+            app,
+            method,
+            path,
+            cookie,
+            body.as_bytes().to_vec(),
+            content_type,
+        )
+        .await
+    }
+
+    async fn request_bytes(
+        app: &Router,
+        method: Method,
+        path: &str,
+        cookie: Option<&str>,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Response {
         let mut builder = Request::builder().method(method).uri(path);
         if let Some(cookie) = cookie {
             builder = builder.header(header::COOKIE, cookie);
@@ -9316,7 +9951,7 @@ mod database_tests {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
         app.clone()
-            .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+            .oneshot(builder.body(Body::from(body)).unwrap())
             .await
             .unwrap()
     }

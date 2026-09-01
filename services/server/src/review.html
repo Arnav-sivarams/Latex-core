@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Mentor Review — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=s5">
+  <link rel="stylesheet" href="/static/shells.css?v=v2-hotfix-1">
 </head>
 <body>
   <header class="shell-topbar">
@@ -29,7 +29,7 @@
       </header>
       <div class="review-split">
         <section class="review-source" aria-labelledby="source-heading">
-          <div class="panel-heading"><h2 id="source-heading">READ-ONLY SOURCE</h2><span id="sourceSelection">Select text to annotate</span></div>
+          <div class="panel-heading"><h2 id="source-heading">READ-ONLY SOURCE</h2><div class="source-selection-actions"><span id="sourceSelection">Select text to annotate</span><button id="reviewSelection" type="button" disabled>Review selection</button></div></div>
           <div id="reviewEditor" class="editor-mount"><div class="foundation-empty"><strong>No source selected</strong></div></div>
         </section>
         <section class="review-pdf" aria-labelledby="review-pdf-heading">
@@ -59,6 +59,6 @@
     </main>
   </div>
   <div id="reviewNotice" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/review.js?v=s5"></script>
+  <script type="module" src="/static/review.js?v=v2-hotfix-1"></script>
 </body>
 </html>

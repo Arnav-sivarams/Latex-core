@@ -1,5 +1,13 @@
 import * as Y from 'yjs';
 
+export function canOpenReviewRound(currentBuildId, hasOpenRound) {
+  return Boolean(currentBuildId) && !hasOpenRound;
+}
+
+export function showsReplacementInput(threadType) {
+  return threadType === 'SUGGESTED_REPLACEMENT';
+}
+
 export function normalizeRectangle(rectangle, width, height) {
   if (!(width > 0) || !(height > 0)) throw new Error('page dimensions must be positive');
   const x1 = Math.max(0, Math.min(rectangle.x1, rectangle.x2, width));

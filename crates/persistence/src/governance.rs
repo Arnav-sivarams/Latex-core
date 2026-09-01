@@ -164,16 +164,22 @@ impl V2Repository {
     pub async fn admin_reviews(&self, admin: UserId) -> Result<Vec<Value>, V2Error> {
         require_role_pool(self.database.pool(), admin, GlobalRole::Admin).await?;
         let rows = sqlx::query(
-            "SELECT rt.id,rt.paper_id,t.name AS paper_name,rt.thread_type,rt.severity,rt.category,rt.state,\
-                    c.email AS mentor,rt.created_at::text AS created_at,rt.updated_at::text AS updated_at \
-             FROM latex_core.review_threads rt JOIN latex_core.paper_teams t ON t.id=rt.paper_id \
-             JOIN latex_core.user_credentials c ON c.user_id=rt.mentor_user_id ORDER BY rt.updated_at DESC LIMIT 200",
+            "SELECT rt.id,rr.paper_id,t.name AS paper_name,rt.thread_type,rt.severity,rt.category,rt.state,\
+                    mentor.email AS mentor,assigned.email AS assigned_writer,\
+                    rt.created_at::text AS created_at,rt.updated_at::text AS updated_at \
+             FROM latex_core.review_threads rt \
+             JOIN latex_core.review_rounds rr ON rr.id=rt.review_round_id \
+             JOIN latex_core.paper_teams t ON t.id=rr.paper_id \
+             JOIN latex_core.user_credentials mentor ON mentor.user_id=rt.created_by_mentor_user_id \
+             LEFT JOIN latex_core.user_credentials assigned ON assigned.user_id=rt.assigned_writer_user_id \
+             ORDER BY rt.updated_at DESC LIMIT 200",
         ).fetch_all(self.database.pool()).await.map_err(V2Error::Database)?;
         rows.into_iter().map(|row| Ok(json!({
             "id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"paper_id":row.try_get::<Uuid,_>("paper_id").map_err(V2Error::Database)?,
             "paper_name":row.try_get::<String,_>("paper_name").map_err(V2Error::Database)?,"thread_type":row.try_get::<String,_>("thread_type").map_err(V2Error::Database)?,
             "severity":row.try_get::<String,_>("severity").map_err(V2Error::Database)?,"category":row.try_get::<String,_>("category").map_err(V2Error::Database)?,
             "state":row.try_get::<String,_>("state").map_err(V2Error::Database)?,"mentor":row.try_get::<String,_>("mentor").map_err(V2Error::Database)?,
+            "assigned_writer":row.try_get::<Option<String>,_>("assigned_writer").map_err(V2Error::Database)?,
             "created_at":row.try_get::<String,_>("created_at").map_err(V2Error::Database)?,"updated_at":row.try_get::<String,_>("updated_at").map_err(V2Error::Database)?
         }))).collect()
     }

@@ -698,6 +698,87 @@ impl AppRepository {
             .bind(id).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_template_file).collect()
     }
+    pub async fn template_paper_team_usage(&self, id: uuid::Uuid) -> Result<u64, AppError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.paper_template_pins WHERE template_id=$1",
+        )
+        .bind(id)
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(AppError::Database)?;
+        u64::try_from(count).map_err(|_| AppError::Integrity {
+            message: "negative template usage count".into(),
+        })
+    }
+    pub async fn update_template_metadata(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        description: Option<&str>,
+        main_file: &str,
+    ) -> Result<(), AppError> {
+        let valid_main: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.template_files WHERE template_id=$1 AND path=$2)",
+        )
+        .bind(id)
+        .bind(main_file)
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(AppError::Database)?;
+        if !valid_main {
+            return Err(AppError::NotFound);
+        }
+        let result = sqlx::query(
+            "UPDATE latex_core.templates SET name=$2,description=$3,main_file=$4 WHERE id=$1",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(description)
+        .bind(main_file)
+        .execute(self.database.pool())
+        .await
+        .map_err(map_conflict)?;
+        if result.rows_affected() == 0 {
+            Err(AppError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+    pub async fn delete_template_if_unused(&self, id: uuid::Uuid) -> Result<(), AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let in_use: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.paper_template_pins WHERE template_id=$1) \
+             OR EXISTS(SELECT 1 FROM latex_core.team_projects WHERE template_id=$1)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        if in_use {
+            return Err(AppError::Conflict);
+        }
+        let result = sqlx::query("DELETE FROM latex_core.templates WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                if matches!(error.as_database_error().and_then(sqlx::error::DatabaseError::code), Some(code) if code == "23503")
+                {
+                    AppError::Conflict
+                } else {
+                    AppError::Database(error)
+                }
+            })?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        tx.commit().await.map_err(AppError::Database)
+    }
     pub async fn delete_template_by_name(&self, name: &str) -> Result<(), AppError> {
         let result = sqlx::query("DELETE FROM latex_core.templates WHERE name=$1")
             .bind(name)
