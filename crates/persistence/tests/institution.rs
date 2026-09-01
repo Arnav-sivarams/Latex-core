@@ -7,8 +7,9 @@
 
 use core_types::{BlobHash, LogicalPath, TenantId, UserId, WorkspaceId};
 use persistence::{
-    Database, DatabaseConfig, ImportLimits, ImportMode, InstitutionRepository, PaperTeamPageFilter,
-    TeamTemplateResolutionInput, TemplateSeedFile, V2FilePolicy, V2Repository,
+    Database, DatabaseConfig, ImportLimits, ImportMode, InstitutionPageFilter,
+    InstitutionRepository, PaperTeamPageFilter, TeamTemplateResolutionInput, TemplateSeedFile,
+    V2FilePolicy, V2Repository,
 };
 use sqlx::PgPool;
 use std::{env, fmt::Write as _, time::Duration};
@@ -249,6 +250,48 @@ async fn identity_linking_is_safe(
     .await
     .unwrap();
     assert_eq!(manual_link, (*manual_user.as_uuid(), "MANUAL".into()));
+
+    let (api_writer, _) = insert_user(pool, "manual-api@example.edu", "writer").await;
+    sqlx::query("INSERT INTO vcap.students (reg_no,email,programme_code) VALUES ('MANUAL-API','external@example.edu','CSE')")
+        .execute(pool).await.unwrap();
+    repository
+        .manual_link_identity(actor, "STUDENT", "MANUAL-API", *api_writer.as_uuid())
+        .await
+        .unwrap();
+    let state: (String, String) = sqlx::query_as(
+        "SELECT status,match_method FROM vcap.student_user_links WHERE reg_no='MANUAL-API'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(state, ("LINKED".into(), "MANUAL".into()));
+    sqlx::query("INSERT INTO vcap.faculty (faculty_id,email) VALUES ('MANUAL-BAD','external-faculty@example.edu')").execute(pool).await.unwrap();
+    assert!(
+        repository
+            .manual_link_identity(actor, "FACULTY", "MANUAL-BAD", *api_writer.as_uuid())
+            .await
+            .is_err()
+    );
+
+    let (informational_admin, _) =
+        insert_user(pool, "informational-admin@example.edu", "writer").await;
+    sqlx::query("INSERT INTO vcap.admins (admin_id,email) VALUES ('MANUAL-ADMIN','institution-admin@example.edu')").execute(pool).await.unwrap();
+    repository
+        .manual_link_identity(
+            actor,
+            "ADMIN",
+            "MANUAL-ADMIN",
+            *informational_admin.as_uuid(),
+        )
+        .await
+        .unwrap();
+    let role: String =
+        sqlx::query_scalar("SELECT role FROM latex_core.global_user_roles WHERE user_id=$1")
+            .bind(informational_admin.as_uuid())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(role, "writer");
 }
 
 async fn resolver_is_deterministic_and_pins_are_immutable(
@@ -454,6 +497,12 @@ async fn imported_team_materialization_is_ordered_atomic_and_isolated(
     assert_eq!(before, after);
     let links: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.external_paper_team_links WHERE external_team_key='EXT-VALID'").fetch_one(pool).await.unwrap();
     assert_eq!(links, 1);
+    assert!(
+        repository
+            .unlink_identity(actor, "STUDENT", "TEAM-A")
+            .await
+            .is_err()
+    );
     let (writer_c, _) = insert_user(pool, "team-c@example.edu", "writer").await;
     sqlx::query("INSERT INTO vcap.students (reg_no,email,programme_code) VALUES ('TEAM-C','team-c@example.edu','CSE')")
         .execute(pool).await.unwrap();
@@ -585,6 +634,45 @@ async fn import_modes_and_ten_thousand_rows(
             .await
             .unwrap();
     assert_eq!(count, 10_000);
+    let student_page = repository
+        .paginated_students(&InstitutionPageFilter {
+            limit: 25,
+            page: 1,
+            programme_code: Some("SCALE".into()),
+            ..InstitutionPageFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(student_page.total, 10_000);
+    assert_eq!(student_page.items.len(), 25);
+    assert!(student_page.has_more);
+
+    sqlx::query(
+        r"WITH created AS (
+             INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id)
+             SELECT gen_random_uuid(),(SELECT tenant_id FROM latex_core.users WHERE id=$1),$1
+             FROM generate_series(1,1000) RETURNING id
+           ), numbered AS (
+             SELECT id,row_number() OVER (ORDER BY id) AS number FROM created
+           ) INSERT INTO latex_core.paper_teams (id,workspace_id,name,created_by_user_id)
+             SELECT gen_random_uuid(),id,'Scale Team ' || number,$1 FROM numbered",
+    )
+    .bind(actor.as_uuid())
+    .execute(pool)
+    .await
+    .unwrap();
+    let team_page = repository
+        .paginated_paper_teams(&PaperTeamPageFilter {
+            limit: 25,
+            page: 1,
+            search: Some("Scale Team".into()),
+            ..PaperTeamPageFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(team_page.total, 1_000);
+    assert_eq!(team_page.items.len(), 25);
+    assert!(team_page.has_more);
 
     let merge = b"reg_no,name,email,programme_code\nSCALE00000,Updated,scale0@example.edu,SCALE\n";
     let job = repository
@@ -667,5 +755,7 @@ async fn insert_template(pool: &PgPool, name: &str) -> Uuid {
         .execute(pool)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO latex_core.template_files (template_id,path,blob_hash,size_bytes) VALUES ($1,'main.tex',$2,8)")
+        .bind(id).bind("a".repeat(64)).execute(pool).await.unwrap();
     id
 }

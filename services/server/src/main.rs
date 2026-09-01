@@ -30,9 +30,10 @@ use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLe
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, AppTemplateFileRecord,
     ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState,
-    FilePolicy, GlobalRole, GroupType, ImportLimits, ImportMode, InstitutionError,
-    InstitutionRepository, PaperTeamPageFilter, PostgresCompileQueue, ProjectAccess, ProjectRoles,
-    PublishResult, QueueLimits, TeamFileRecord, TeamTemplateResolutionInput, TemplateSeedFile,
+    FilePolicy, GlobalRole, GroupType, ImportJobPageFilter, ImportLimits, ImportMode,
+    InstitutionError, InstitutionPageFilter, InstitutionRepository, PaperTeamPageFilter,
+    PostgresCompileQueue, ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord,
+    TeamTemplateResolutionInput, TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile,
     V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
 };
 use rand::RngCore;
@@ -153,6 +154,52 @@ struct TemplateResolvePreviewInput {
 struct ImportListQuery {
     limit: Option<i64>,
     before: Option<uuid::Uuid>,
+    page: Option<i64>,
+    search: Option<String>,
+    status: Option<String>,
+    mode: Option<String>,
+    file_type: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct InstitutionDirectoryQuery {
+    limit: Option<i64>,
+    page: Option<i64>,
+    search: Option<String>,
+    programme_code: Option<String>,
+    department_id: Option<uuid::Uuid>,
+    link_status: Option<String>,
+    external_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManualIdentityLinkInput {
+    external_type: String,
+    external_id: String,
+    user_id: uuid::Uuid,
+}
+
+#[derive(Deserialize, Default)]
+struct V2UserSearchQuery {
+    q: Option<String>,
+    role: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct BulkLifecycleInput {
+    team_ids: Vec<uuid::Uuid>,
+    status: String,
+    confirmed: bool,
+}
+
+#[derive(Deserialize)]
+struct TemplateChangeInput {
+    new_template_id: uuid::Uuid,
+    #[serde(default)]
+    preview_token: Option<String>,
+    #[serde(default)]
+    confirm_main_file_change: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -577,12 +624,20 @@ fn router(state: AppState) -> Router {
             get(admin_v2_paper_teams_query),
         )
         .route(
+            "/api/admin/v2/paper-teams/bulk-lifecycle",
+            post(admin_v2_bulk_paper_team_lifecycle),
+        )
+        .route(
             "/api/admin/v2/institution/imports/validate",
             post(admin_v2_institution_validate),
         )
         .route(
             "/api/admin/v2/institution/imports/{job_id}/apply",
             post(admin_v2_institution_apply),
+        )
+        .route(
+            "/api/admin/v2/institution/imports/{job_id}/retry-teams",
+            post(admin_v2_institution_retry_teams),
         )
         .route(
             "/api/admin/v2/institution/imports",
@@ -595,6 +650,30 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/institution/imports/{job_id}/errors.csv",
             get(admin_v2_institution_errors),
+        )
+        .route(
+            "/api/admin/v2/institution/students",
+            get(admin_v2_institution_students),
+        )
+        .route(
+            "/api/admin/v2/institution/faculty",
+            get(admin_v2_institution_faculty),
+        )
+        .route(
+            "/api/admin/v2/institution/programmes",
+            get(admin_v2_institution_programmes),
+        )
+        .route(
+            "/api/admin/v2/institution/identity-links",
+            get(admin_v2_identity_links).put(admin_v2_manual_identity_link),
+        )
+        .route(
+            "/api/admin/v2/institution/identity-links/{external_type}/{external_id}",
+            axum::routing::delete(admin_v2_unlink_identity),
+        )
+        .route(
+            "/api/admin/v2/institution/users/search",
+            get(admin_v2_institution_user_search),
         )
         .route(
             "/api/admin/v2/institution/template-defaults/programmes",
@@ -614,6 +693,14 @@ fn router(state: AppState) -> Router {
             get(admin_v2_global_fallback).put(admin_v2_set_global_fallback),
         )
         .route("/api/admin/v2/paper-teams/{id}", get(admin_v2_paper_team))
+        .route(
+            "/api/admin/v2/paper-teams/{id}/template-change/preview",
+            post(admin_v2_template_change_preview),
+        )
+        .route(
+            "/api/admin/v2/paper-teams/{id}/template-change/apply",
+            post(admin_v2_template_change_apply),
+        )
         .route(
             "/api/admin/v2/paper-teams/{id}/members",
             post(admin_v2_add_paper_team_member),
@@ -1133,6 +1220,62 @@ async fn admin_v2_paper_teams_query(
     }
 }
 
+async fn admin_v2_bulk_paper_team_lifecycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BulkLifecycleInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !input.confirmed || input.team_ids.is_empty() || input.team_ids.len() > 200 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "confirm between 1 and 200 Paper Teams",
+        );
+    }
+    let requested = match input.status.parse::<persistence::PaperStatus>() {
+        Ok(
+            value @ (persistence::PaperStatus::Active
+            | persistence::PaperStatus::Frozen
+            | persistence::PaperStatus::Archived),
+        ) => value,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "bulk status must be active, frozen, or archived",
+            );
+        }
+    };
+    let mut results = Vec::with_capacity(input.team_ids.len());
+    let mut succeeded = 0_usize;
+    for team_id in input.team_ids {
+        match state.v2.set_paper_team_status(team_id, requested).await {
+            Ok(team) => {
+                succeeded += 1;
+                results.push(serde_json::json!({"team_id":team_id,"ok":true,"status":team.status}));
+            }
+            Err(error_value) => results.push(serde_json::json!({
+                "team_id":team_id,"ok":false,"error":error_value.to_string()
+            })),
+        }
+    }
+    let failed = results.len().saturating_sub(succeeded);
+    if let Err(error_value) = state
+        .institution
+        .audit_bulk_lifecycle(principal.user_id(), requested.as_str(), succeeded, failed)
+        .await
+    {
+        return institution_error(error_value);
+    }
+    Json(serde_json::json!({"succeeded":succeeded,"failed":failed,"results":results}))
+        .into_response()
+}
+
 #[derive(Default)]
 struct InstitutionUpload {
     filename: Option<String>,
@@ -1421,6 +1564,116 @@ async fn admin_v2_institution_apply(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "retry keeps each idempotent imported-Team outcome explicit and independently reportable"
+)]
+async fn admin_v2_institution_retry_teams(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let job = match state.institution.job(job_id).await {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    if !matches!(job.status.as_str(), "PARTIAL" | "APPLIED") {
+        return error(
+            StatusCode::CONFLICT,
+            "only an applied import with unresolved Teams can be retried",
+        );
+    }
+    let plans = match state.institution.pending_team_plans(job_id).await {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    let mut results = Vec::new();
+    for plan in plans {
+        if !plan.unresolved.is_empty() {
+            results.push(serde_json::json!({"external_team_key":plan.external_team_key,"ok":false,"errors":plan.unresolved}));
+            continue;
+        }
+        let result: Result<(), String> = if plan.existing_paper_team_id.is_some() {
+            state
+                .institution
+                .merge_existing_team(principal.user_id(), &plan)
+                .await
+                .map_err(|error_value| error_value.to_string())
+        } else {
+            let writers = plan
+                .writer_user_ids
+                .iter()
+                .copied()
+                .map(UserId::from_uuid)
+                .collect::<Vec<_>>();
+            let mentors = plan
+                .mentor_user_ids
+                .iter()
+                .copied()
+                .map(UserId::from_uuid)
+                .collect::<Vec<_>>();
+            match plan.leader_user_id.map(UserId::from_uuid) {
+                None => Err("Missing Team Leader".into()),
+                Some(leader) => match state
+                    .institution
+                    .resolve_default_template_for_writers(&writers)
+                    .await
+                {
+                    Err(error_value) => Err(error_value.to_string()),
+                    Ok(resolution) => {
+                        match template_seeds(&state, resolution.selected_template_id).await {
+                            Err(_) => Err("selected template is not materializable".into()),
+                            Ok((main_path, seeds, source_identity)) => {
+                                let imported = TeamTemplateResolutionInput {
+                                    dominant_programme_code: resolution.dominant_programme_code,
+                                    resolution_method: resolution.resolution_method,
+                                    external_team_key: Some(plan.external_team_key.clone()),
+                                    source_import_job_id: Some(job_id),
+                                };
+                                state
+                                    .v2
+                                    .create_template_paper_team(
+                                        principal.user_id(),
+                                        principal.session.tenant_id,
+                                        WorkspaceId::new(),
+                                        &plan.team_name,
+                                        leader,
+                                        &writers,
+                                        &mentors,
+                                        resolution.selected_template_id,
+                                        &source_identity,
+                                        &main_path,
+                                        &seeds,
+                                        Some(&imported),
+                                    )
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|error_value| error_value.to_string())
+                            }
+                        }
+                    }
+                },
+            }
+        };
+        match result {
+            Ok(()) => {
+                if let Err(error_value) = state.institution.mark_team_resolved(principal.user_id(), job_id, &plan.external_team_key).await { return institution_error(error_value); }
+                results.push(serde_json::json!({"external_team_key":plan.external_team_key,"ok":true}));
+            }
+            Err(message) => results.push(serde_json::json!({"external_team_key":plan.external_team_key,"ok":false,"errors":[message]})),
+        }
+    }
+    let succeeded = results.iter().filter(|result| result["ok"] == true).count();
+    Json(serde_json::json!({"job_id":job_id,"succeeded":succeeded,"failed":results.len().saturating_sub(succeeded),"results":results})).into_response()
+}
+
 async fn admin_v2_institution_imports(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1429,12 +1682,31 @@ async fn admin_v2_institution_imports(
     if let Err(response) = institution_admin(&state, &headers).await {
         return response;
     }
-    match state
-        .institution
-        .list_jobs(query.limit.unwrap_or(50), query.before)
-        .await
-    {
-        Ok(jobs) => Json(jobs).into_response(),
+    let uses_page_contract = query.page.is_some()
+        || query.search.is_some()
+        || query.status.is_some()
+        || query.mode.is_some()
+        || query.file_type.is_some();
+    if !uses_page_contract {
+        return match state
+            .institution
+            .list_jobs(query.limit.unwrap_or(50), query.before)
+            .await
+        {
+            Ok(jobs) => Json(jobs).into_response(),
+            Err(error_value) => institution_error(error_value),
+        };
+    }
+    let filter = ImportJobPageFilter {
+        limit: query.limit.unwrap_or(50),
+        page: query.page.unwrap_or(1),
+        search: query.search,
+        status: query.status,
+        mode: query.mode,
+        file_type: query.file_type,
+    };
+    match state.institution.paginated_jobs(&filter).await {
+        Ok(page) => Json(page).into_response(),
         Err(error_value) => institution_error(error_value),
     }
 }
@@ -1447,12 +1719,164 @@ async fn admin_v2_institution_import(
     if let Err(response) = institution_admin(&state, &headers).await {
         return response;
     }
-    match (
-        state.institution.job(job_id).await,
-        state.institution.job_rows(job_id, false).await,
-    ) {
-        (Ok(job), Ok(rows)) => Json(serde_json::json!({"job":job,"rows":rows})).into_response(),
-        (Err(error_value), _) | (_, Err(error_value)) => institution_error(error_value),
+    match state.institution.job_detail(job_id, 100).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+fn institution_page_filter(query: InstitutionDirectoryQuery) -> InstitutionPageFilter {
+    InstitutionPageFilter {
+        limit: query.limit.unwrap_or(50),
+        page: query.page.unwrap_or(1),
+        search: query.search,
+        programme_code: query.programme_code,
+        department_id: query.department_id,
+        link_status: query.link_status,
+        external_type: query.external_type,
+    }
+}
+
+async fn admin_v2_institution_students(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstitutionDirectoryQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .paginated_students(&institution_page_filter(query))
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_faculty(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstitutionDirectoryQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .paginated_faculty(&institution_page_filter(query))
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_programmes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstitutionDirectoryQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .paginated_programmes(&institution_page_filter(query))
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_identity_links(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstitutionDirectoryQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .paginated_identity_links(&institution_page_filter(query))
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_manual_identity_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ManualIdentityLinkInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .manual_link_identity(
+            principal.user_id(),
+            &input.external_type,
+            &input.external_id,
+            input.user_id,
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_unlink_identity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((external_type, external_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .unlink_identity(principal.user_id(), &external_type, &external_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_user_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<V2UserSearchQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .search_v2_users(
+            query.q.as_deref().unwrap_or(""),
+            query.role.as_deref(),
+            query.limit.unwrap_or(20),
+        )
+        .await
+    {
+        Ok(users) => Json(users).into_response(),
+        Err(error_value) => institution_error(error_value),
     }
 }
 
@@ -1577,8 +2001,8 @@ async fn admin_v2_global_fallback(State(state): State<AppState>, headers: Header
     if let Err(response) = institution_admin(&state, &headers).await {
         return response;
     }
-    match state.institution.global_fallback().await {
-        Ok(template_id) => Json(serde_json::json!({"template_id":template_id})).into_response(),
+    match state.institution.global_fallback_detail().await {
+        Ok(detail) => Json(detail).into_response(),
         Err(error_value) => institution_error(error_value),
     }
 }
@@ -1618,15 +2042,344 @@ async fn admin_v2_paper_team(
         state.v2.paper_team(id).await,
         state.v2.list_paper_team_member_views(id).await,
         state.v2.paper_template_pin(principal.user_id(), id).await,
+        state.institution.paper_team_admin_summary(id).await,
     ) {
-        (Ok(team), Ok(members), Ok(template_pin)) => {
-            Json(serde_json::json!({"team":team,"members":members,"template_pin":template_pin}))
+        (Ok(team), Ok(members), Ok(template_pin), Ok(summary)) => {
+            Json(serde_json::json!({"team":team,"members":members,"template_pin":template_pin,"summary":summary}))
                 .into_response()
         }
-        (Err(error_value), _, _) | (_, Err(error_value), _) | (_, _, Err(error_value)) => {
+        (Err(error_value), _, _, _) | (_, Err(error_value), _, _) | (_, _, Err(error_value), _) => {
             v2_error(error_value)
         }
+        (_, _, _, Err(error_value)) => institution_error(error_value),
     }
+}
+
+struct PreparedTemplateChange {
+    response: serde_json::Value,
+    token: String,
+    request: TemplateChangeRequest,
+    document_epoch: u64,
+    blocking_conflicts: usize,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact-state conflict classification stays adjacent so preview and apply share one safety decision"
+)]
+async fn prepare_template_change(
+    state: &AppState,
+    admin: UserId,
+    paper_id: uuid::Uuid,
+    input: &TemplateChangeInput,
+) -> Result<PreparedTemplateChange, Response> {
+    let team = state.v2.paper_team(paper_id).await.map_err(v2_error)?;
+    if team.status == persistence::PaperStatus::Archived {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "archived Paper Team template cannot be changed",
+        ));
+    }
+    let pin = state
+        .v2
+        .paper_template_pin(admin, paper_id)
+        .await
+        .map_err(v2_error)?
+        .ok_or_else(|| error(StatusCode::CONFLICT, "Paper Team has no pinned template"))?;
+    let old_template_id = pin
+        .get("template_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid current template pin",
+            )
+        })?;
+    if old_template_id == input.new_template_id {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "selected template is already pinned",
+        ));
+    }
+    let paper = persistence::WriterPaper {
+        id: team.id,
+        workspace_id: team.workspace_id,
+        name: team.name.clone(),
+        kind: persistence::PaperKind::Team,
+        status: team.status,
+        is_team_leader: false,
+        updated_at: team.updated_at.clone(),
+    };
+    let exact = capture_exact_v2_state(state, &paper).await?;
+    let workspace_manifest: WorkspaceManifestV1 =
+        serde_json::from_value(exact.manifest.get("workspace").cloned().ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exact state has no workspace manifest",
+            )
+        })?)
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exact workspace manifest is invalid",
+            )
+        })?;
+    let old_files = state
+        .repo
+        .template_files(old_template_id)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "current template lookup failed",
+            )
+        })?;
+    let old_by_path = old_files
+        .into_iter()
+        .map(|file| (file.path, file.blob_hash))
+        .collect::<BTreeMap<_, _>>();
+    let (new_main, new_seeds, new_source_identity) =
+        template_seeds(state, input.new_template_id).await?;
+    let live_files = state
+        .v2
+        .list_live_paper_files(team.workspace_id)
+        .await
+        .map_err(v2_error)?;
+    let live_by_path = live_files
+        .into_iter()
+        .map(|file| (file.path.as_str().to_owned(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut files_to_add = Vec::new();
+    let mut managed_updates = Vec::new();
+    let mut unchanged_template_updates = Vec::new();
+    let mut unchanged_files = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut mutations = Vec::new();
+    for seed in new_seeds {
+        let path = seed.path.as_str().to_owned();
+        let current_entry = workspace_manifest.files().get(&seed.path);
+        let existing = live_by_path.get(&path);
+        match current_entry {
+            None => {
+                files_to_add.push(path.clone());
+                mutations.push(TemplateChangeFile {
+                    path: seed.path,
+                    blob_hash: seed.blob_hash,
+                    size_bytes: seed.size_bytes,
+                    policy: seed.policy,
+                    existing_file_id: None,
+                });
+            }
+            Some(current) if current.blob_hash == seed.blob_hash => unchanged_files.push(path),
+            Some(current) => {
+                let policy = if let Some(file) = existing {
+                    state.v2.file_policy(file.file_id).await.map_err(v2_error)?
+                } else {
+                    conflicts.push(serde_json::json!({"path":path,"reason":"workspace path has no stable Paper file identity"}));
+                    continue;
+                };
+                let unchanged_from_old = old_by_path
+                    .get(&path)
+                    .is_some_and(|hash| *hash == current.blob_hash);
+                if policy == V2FilePolicy::TemplateManaged || unchanged_from_old {
+                    if policy == V2FilePolicy::TemplateManaged {
+                        managed_updates.push(path.clone());
+                    } else {
+                        unchanged_template_updates.push(path.clone());
+                    }
+                    mutations.push(TemplateChangeFile {
+                        path: seed.path,
+                        blob_hash: seed.blob_hash,
+                        size_bytes: seed.size_bytes,
+                        policy: seed.policy,
+                        existing_file_id: existing.map(|file| file.file_id),
+                    });
+                } else {
+                    conflicts.push(serde_json::json!({"path":path,"reason":"Writer-created or Writer-modified content occupies the new template path"}));
+                }
+            }
+        }
+    }
+    for path in workspace_manifest.files().keys() {
+        if !mutations.iter().any(|file| &file.path == path)
+            && !unchanged_files.iter().any(|value| value == path.as_str())
+        {
+            unchanged_files.push(path.as_str().to_owned());
+        }
+    }
+    let main_changed = workspace_manifest.main_file() != &new_main;
+    if main_changed && !input.confirm_main_file_change {
+        conflicts.push(serde_json::json!({"path":new_main,"reason":"Main file change requires explicit confirmation"}));
+    }
+    let token = digest(&format!(
+        "{paper_id}:{}:{old_template_id}:{}:{}",
+        exact.state_hash, input.new_template_id, input.confirm_main_file_change
+    ));
+    let blocking_conflicts = conflicts.len();
+    let request = TemplateChangeRequest {
+        paper_id,
+        workspace_id: team.workspace_id,
+        expected_workspace_version: exact.source_sequence,
+        expected_template_id: old_template_id,
+        new_template_id: input.new_template_id,
+        new_source_identity,
+        new_main_file: main_changed.then_some(new_main.clone()),
+        files: mutations,
+        safety: ExactRestoreState {
+            document_epoch: exact.document_epoch,
+            workspace_version: exact.source_sequence,
+            snapshot_id: exact.snapshot_id,
+            manifest: exact.manifest.clone(),
+            state_hash: exact.state_hash.clone(),
+        },
+    };
+    let response = serde_json::json!({
+        "paper_id":paper_id,"current_template_id":old_template_id,"new_template_id":input.new_template_id,
+        "preview_token":token,"workspace_state_hash":exact.state_hash,
+        "files_to_add":files_to_add,"template_managed_files_to_update":managed_updates,
+        "unchanged_old_template_files_to_update":unchanged_template_updates,"unchanged_files":unchanged_files,
+        "writer_modified_conflicts":conflicts,"blocking_conflicts":blocking_conflicts,
+        "main_file_change":{"changed":main_changed,"from":workspace_manifest.main_file(),"to":new_main,"confirmed":input.confirm_main_file_change},
+        "package_preamble_notes":["Template replacement is whole-file only; no per-line merge is attempted.","Files absent from the new template are preserved."],
+        "can_apply":blocking_conflicts == 0,
+    });
+    Ok(PreparedTemplateChange {
+        response,
+        token,
+        request,
+        document_epoch: exact.document_epoch,
+        blocking_conflicts,
+    })
+}
+
+async fn admin_v2_template_change_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<TemplateChangeInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match prepare_template_change(&state, principal.user_id(), id, &input).await {
+        Ok(prepared) => {
+            if let Err(error_value) = state
+                .institution
+                .audit_template_preview(
+                    principal.user_id(),
+                    id,
+                    input.new_template_id,
+                    prepared.blocking_conflicts,
+                )
+                .await
+            {
+                return institution_error(error_value);
+            }
+            Json(prepared.response).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+async fn admin_v2_template_change_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<TemplateChangeInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let supplied_token = match input.preview_token.as_deref() {
+        Some(value) if value.len() == 64 => value,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "a valid template-change preview token is required",
+            );
+        }
+    };
+    let prepared = match prepare_template_change(&state, principal.user_id(), id, &input).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if supplied_token != prepared.token {
+        return error(
+            StatusCode::CONFLICT,
+            "Paper Team state changed after preview; preview again",
+        );
+    }
+    if prepared.blocking_conflicts != 0 {
+        return error(
+            StatusCode::CONFLICT,
+            "template change conflicts with Writer files",
+        );
+    }
+    let next = match state
+        .v2
+        .apply_template_change(principal.user_id(), &prepared.request)
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let team = match state.v2.paper_team(id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let paper = persistence::WriterPaper {
+        id: team.id,
+        workspace_id: team.workspace_id,
+        name: team.name,
+        kind: persistence::PaperKind::Team,
+        status: team.status,
+        is_team_leader: false,
+        updated_at: team.updated_at,
+    };
+    let exact = match capture_exact_v2_state(&state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if exact.source_sequence != next {
+        return error(
+            StatusCode::CONFLICT,
+            "workspace changed while finalizing template update",
+        );
+    }
+    let version_id = match state
+        .v2
+        .finalize_template_change(
+            principal.user_id(),
+            id,
+            paper.workspace_id,
+            input.new_template_id,
+            ExactRestoreState {
+                document_epoch: exact.document_epoch,
+                workspace_version: exact.source_sequence,
+                snapshot_id: exact.snapshot_id,
+                manifest: exact.manifest,
+                state_hash: exact.state_hash,
+            },
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    state
+        .collaboration
+        .epoch_changed(paper.workspace_id, prepared.document_epoch)
+        .await;
+    Json(serde_json::json!({"paper_id":id,"template_id":input.new_template_id,"resolution_method":"MANUAL_OVERRIDE","workspace_version":next,"template_update_version_id":version_id,"safety_checkpoint":"PRE_TEMPLATE_CHANGE"})).into_response()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3679,6 +4432,13 @@ async fn template_seeds(
 }
 
 fn csv_escape(value: &str) -> String {
+    let neutralized;
+    let value = if value.starts_with(['=', '+', '-', '@']) {
+        neutralized = format!("'{value}");
+        neutralized.as_str()
+    } else {
+        value
+    };
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
@@ -7094,7 +7854,10 @@ mod tests {
         for required in [
             "OVERVIEW",
             "V2 USERS",
+            "INSTITUTION DATA",
+            "IMPORTS",
             "PAPER TEAMS",
+            "PROGRAMME TEMPLATES",
             "TEMPLATES",
             "FILE POLICIES",
             "VERSIONS",
@@ -7106,6 +7869,15 @@ mod tests {
             assert!(admin.contains(required), "missing Admin section {required}");
         }
         assert!(!admin.contains("LEGACY RESEARCH GROUPS"));
+    }
+
+    #[test]
+    fn institution_error_csv_neutralizes_spreadsheet_formulas() {
+        assert_eq!(csv_escape("=2+2"), "'=2+2");
+        assert_eq!(csv_escape("+cmd"), "'+cmd");
+        assert_eq!(csv_escape("-1"), "'-1");
+        assert_eq!(csv_escape("@SUM(A1:A2)"), "'@SUM(A1:A2)");
+        assert_eq!(csv_escape("safe,value"), "\"safe,value\"");
     }
 }
 
@@ -10477,6 +11249,188 @@ mod database_tests {
             StatusCode::CONFLICT
         );
 
+        let replacement_id = uuid::Uuid::new_v4();
+        let replacement_main = state
+            .blobs
+            .put(Bytes::from_static(
+                b"\\documentclass{article}\n\\begin{document}\nReplacement\n\\end{document}\n",
+            ))
+            .await
+            .unwrap();
+        let appendix = state
+            .blobs
+            .put(Bytes::from_static(b"Appendix\n"))
+            .await
+            .unwrap();
+        state
+            .repo
+            .create_template(
+                replacement_id,
+                "Replacement template",
+                None,
+                Some("main.tex"),
+                &[
+                    AppTemplateFileRecord {
+                        path: "main.tex".into(),
+                        blob_hash: replacement_main.hash(),
+                        size_bytes: replacement_main.size_bytes(),
+                    },
+                    AppTemplateFileRecord {
+                        path: "appendix.tex".into(),
+                        blob_hash: appendix.hash(),
+                        size_bytes: appendix.size_bytes(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE latex_core.templates SET policy_default='managed' WHERE id=$1")
+            .bind(replacement_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let workspace_id =
+            uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap();
+        let before_head: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let before_versions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.paper_versions WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let change_path = format!("/api/admin/v2/paper-teams/{paper_id}/template-change");
+        let preview = test_json(request(&app, Method::POST, &format!("{change_path}/preview"), Some(&admin.cookie), &serde_json::json!({"new_template_id":replacement_id,"confirm_main_file_change":true}).to_string(), Some("application/json")).await).await;
+        assert_eq!(preview["can_apply"], true);
+        assert!(
+            preview["files_to_add"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "appendix.tex")
+        );
+        let unchanged_pin: uuid::Uuid = sqlx::query_scalar(
+            "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1",
+        )
+        .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged_pin, template_id);
+        let unchanged_head: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged_head, before_head);
+        let applied = test_json(request(&app, Method::POST, &format!("{change_path}/apply"), Some(&admin.cookie), &serde_json::json!({"new_template_id":replacement_id,"preview_token":preview["preview_token"],"confirm_main_file_change":true}).to_string(), Some("application/json")).await).await;
+        assert_eq!(applied["resolution_method"], "MANUAL_OVERRIDE");
+        let changed_pin: uuid::Uuid = sqlx::query_scalar(
+            "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1",
+        )
+        .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(changed_pin, replacement_id);
+        let version_types: Vec<(String, Option<String>)> = sqlx::query_as("SELECT version_type,name FROM latex_core.paper_versions WHERE workspace_id=$1 ORDER BY version_number").bind(workspace_id).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            version_types.len(),
+            usize::try_from(before_versions).unwrap() + 2
+        );
+        assert!(version_types.iter().any(|value| value
+            == &(
+                "manual_checkpoint".into(),
+                Some("PRE_TEMPLATE_CHANGE".into())
+            )));
+        assert!(
+            version_types
+                .iter()
+                .any(|value| value == &("template_update".into(), Some("TEMPLATE_UPDATE".into())))
+        );
+        let appendix_count: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.paper_files WHERE workspace_id=$1 AND path='appendix.tex' AND NOT tombstoned").bind(workspace_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(appendix_count, 1);
+        let appendix_file_id: uuid::Uuid = sqlx::query_scalar("SELECT file_id FROM latex_core.paper_files WHERE workspace_id=$1 AND path='appendix.tex' AND NOT tombstoned").bind(workspace_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("/api/admin/v2/paper-teams/{paper_id}/file-policies/{appendix_file_id}"),
+                Some(&admin.cookie),
+                r#"{"policy":"EDITABLE"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &format!("/api/v2/papers/{paper_id}/files/{appendix_file_id}"),
+                Some(&writer.cookie),
+                r#"{"content":"Writer appendix","version":2}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let conflicting_id = uuid::Uuid::new_v4();
+        let conflicting_appendix = state
+            .blobs
+            .put(Bytes::from_static(b"Template appendix replacement\n"))
+            .await
+            .unwrap();
+        state
+            .repo
+            .create_template(
+                conflicting_id,
+                "Conflicting template",
+                None,
+                Some("main.tex"),
+                &[
+                    AppTemplateFileRecord {
+                        path: "main.tex".into(),
+                        blob_hash: replacement_main.hash(),
+                        size_bytes: replacement_main.size_bytes(),
+                    },
+                    AppTemplateFileRecord {
+                        path: "appendix.tex".into(),
+                        blob_hash: conflicting_appendix.hash(),
+                        size_bytes: conflicting_appendix.size_bytes(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let conflict_preview = test_json(request(&app, Method::POST, &format!("{change_path}/preview"), Some(&admin.cookie), &serde_json::json!({"new_template_id":conflicting_id,"confirm_main_file_change":true}).to_string(), Some("application/json")).await).await;
+        assert_eq!(conflict_preview["can_apply"], false);
+        assert!(
+            conflict_preview["writer_modified_conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value["path"] == "appendix.tex")
+        );
+        let retained_pin: uuid::Uuid = sqlx::query_scalar(
+            "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1",
+        )
+        .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_pin, replacement_id);
+
         let status_path = format!("/api/admin/v2/paper-teams/{paper_id}/status");
         assert_eq!(
             request(
@@ -10681,6 +11635,7 @@ mod database_tests {
         let state = AppState {
             repo: AppRepository::new(database.clone()),
             v2,
+            institution: InstitutionRepository::new(database.clone()),
             workspaces,
             queue: PostgresCompileQueue::new(
                 database.clone(),

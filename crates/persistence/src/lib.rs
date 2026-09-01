@@ -70,12 +70,13 @@ pub use database::Database;
 pub use error::PersistenceError;
 pub use governance::{
     ExactRestoreState, RestorationApplied, RestorationRequest, TeamTemplateResolutionInput,
-    TemplateSeedFile, V2FilePolicy, V2FilePolicyRecord,
+    TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile, V2FilePolicy, V2FilePolicyRecord,
 };
 pub use institution::{
-    ImportFileType, ImportLimits, ImportMode, ImportedTeamPlan, InstitutionError,
-    InstitutionImportJob, InstitutionImportRow, InstitutionRepository, PaperTeamPage,
-    PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
+    ImportFileType, ImportJobPageFilter, ImportLimits, ImportMode, ImportedTeamPlan,
+    InstitutionError, InstitutionImportJob, InstitutionImportRow, InstitutionPageFilter,
+    InstitutionRepository, PaperTeamPage, PaperTeamPageFilter, ProgrammeTemplateDefault,
+    TemplateResolution,
 };
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{

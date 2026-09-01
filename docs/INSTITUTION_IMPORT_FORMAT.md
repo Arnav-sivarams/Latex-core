@@ -55,3 +55,11 @@ The dependency order is departments, schools, admins, faculty, programmes, stude
 After application, exact normalized-email linking runs without changing global roles. A Team with missing links, an incompatible Writer/Mentor role, or no explicit Leader is marked unresolved and is not partially activated. Other valid Teams may materialize. Error rows remain downloadable from the job's `errors.csv` endpoint.
 
 Manual Team creation remains supported and requires an Admin-selected Leader.
+
+## Admin import wizard
+
+The four steps are select file/mode, validate, review, and apply. CSV requires one of the documented target tables; an exact filename preselects it, while an unknown filename is never guessed. XLSX uses worksheet names and hides the CSV target.
+
+Validation results show job identity, filename, SHA-256, mode/type/status, aggregate actions, and per-sheet/table counts. Only a bounded row preview is rendered. `VALIDATE_ONLY`, failed/error validation, and already-applied jobs cannot be applied. PostgreSQL row locks and external Team keys make repeated Apply safe from duplicate canonical rows or Teams.
+
+History uses page/limit plus optional filename/job, status, mode, and file-type filters. Uploaded bytes are not retained in history and file contents are not written to Audit. Error CSV cells beginning with `=`, `+`, `-`, or `@` are prefixed to prevent spreadsheet formula execution.

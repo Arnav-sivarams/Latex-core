@@ -552,16 +552,39 @@ impl AppRepository {
         transaction.commit().await.map_err(AppError::Database)
     }
     pub async fn admin_overview(&self) -> Result<serde_json::Value, AppError> {
-        async fn count(pool: &sqlx::PgPool, table: &str) -> Result<i64, AppError> {
-            sqlx::query_scalar(&format!("SELECT count(*) FROM latex_core.{table}"))
-                .fetch_one(pool)
-                .await
-                .map_err(AppError::Database)
-        }
         let pool = self.database.pool();
-        Ok(
-            json!({"users": count(pool,"users").await?, "personal_projects": count(pool,"projects").await?, "research_groups": count(pool,"research_groups").await?, "teams": count(pool,"teams").await?, "team_projects": count(pool,"team_projects").await?, "queued_jobs": sqlx::query_scalar::<_,i64>("SELECT count(*) FROM latex_core.compile_jobs WHERE state='queued'").fetch_one(pool).await.map_err(AppError::Database)?, "running_jobs": sqlx::query_scalar::<_,i64>("SELECT count(*) FROM latex_core.compile_jobs WHERE state IN ('claimed','running')").fetch_one(pool).await.map_err(AppError::Database)?}),
+        let row = sqlx::query(
+            r"SELECT
+                (SELECT count(*) FROM latex_core.paper_teams WHERE status='active') AS active_paper_teams,
+                (SELECT count(DISTINCT paper_id) FROM latex_core.review_rounds WHERE status IN ('OPEN','OPEN_FOR_REVIEW')) AS teams_in_review,
+                (SELECT count(*) FROM latex_core.global_user_roles WHERE role='writer') AS writers,
+                (SELECT count(*) FROM latex_core.global_user_roles WHERE role='mentor') AS mentors,
+                (SELECT count(*) FROM vcap.students) AS institutional_students,
+                (SELECT count(*) FROM vcap.faculty) AS institutional_faculty,
+                (SELECT count(*) FROM vcap.student_user_links WHERE status<>'LINKED') AS unlinked_students,
+                (SELECT count(*) FROM vcap.faculty_user_links WHERE status<>'LINKED') AS unlinked_faculty,
+                (SELECT count(DISTINCT natural_key->>'external_team_key') FROM latex_core.institution_import_rows WHERE status='UNRESOLVED') AS unresolved_imported_teams,
+                (SELECT count(*) FROM latex_core.compile_jobs WHERE state='queued') AS queued_builds,
+                (SELECT count(*) FROM latex_core.compile_jobs WHERE state IN ('claimed','running')) AS running_builds,
+                (SELECT status FROM latex_core.institution_import_jobs ORDER BY created_at DESC,id DESC LIMIT 1) AS latest_import_status",
         )
+        .fetch_one(pool)
+        .await
+        .map_err(AppError::Database)?;
+        Ok(json!({
+            "active_paper_teams": row.try_get::<i64,_>("active_paper_teams").map_err(AppError::Database)?,
+            "teams_in_review": row.try_get::<i64,_>("teams_in_review").map_err(AppError::Database)?,
+            "writers": row.try_get::<i64,_>("writers").map_err(AppError::Database)?,
+            "mentors": row.try_get::<i64,_>("mentors").map_err(AppError::Database)?,
+            "institutional_students": row.try_get::<i64,_>("institutional_students").map_err(AppError::Database)?,
+            "institutional_faculty": row.try_get::<i64,_>("institutional_faculty").map_err(AppError::Database)?,
+            "unlinked_students": row.try_get::<i64,_>("unlinked_students").map_err(AppError::Database)?,
+            "unlinked_faculty": row.try_get::<i64,_>("unlinked_faculty").map_err(AppError::Database)?,
+            "unresolved_imported_teams": row.try_get::<i64,_>("unresolved_imported_teams").map_err(AppError::Database)?,
+            "queued_builds": row.try_get::<i64,_>("queued_builds").map_err(AppError::Database)?,
+            "running_builds": row.try_get::<i64,_>("running_builds").map_err(AppError::Database)?,
+            "latest_import_status": row.try_get::<Option<String>,_>("latest_import_status").map_err(AppError::Database)?.unwrap_or_else(|| "No imports".into()),
+        }))
     }
     pub async fn admin_teams(&self) -> Result<Vec<serde_json::Value>, AppError> {
         let rows = sqlx::query("SELECT t.id,t.name,c.email AS creator,t.created_at::text,(SELECT count(*) FROM latex_core.team_members m WHERE m.team_id=t.id) AS members,(SELECT count(*) FROM latex_core.team_projects p WHERE p.team_id=t.id) AS projects FROM latex_core.teams t JOIN latex_core.user_credentials c ON c.user_id=t.created_by ORDER BY t.created_at DESC").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Admin — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=v2-hotfix-1">
+  <link rel="stylesheet" href="/static/shells.css?v=v2-2-admin-1">
 </head>
 <body>
   <header class="shell-topbar">
@@ -17,7 +17,10 @@
     <nav id="adminNav" class="admin-nav" aria-label="Administrative sections">
       <button type="button" data-section="Overview" aria-current="page">OVERVIEW</button>
       <button type="button" data-section="V2 Users">V2 USERS</button>
+      <button type="button" data-section="Institution Data">INSTITUTION DATA</button>
+      <button type="button" data-section="Imports">IMPORTS</button>
       <button type="button" data-section="Paper Teams">PAPER TEAMS</button>
+      <button type="button" data-section="Programme Templates">PROGRAMME TEMPLATES</button>
       <button type="button" data-section="Templates">TEMPLATES</button>
       <button type="button" data-section="File Policies">FILE POLICIES</button>
       <button type="button" data-section="Versions">VERSIONS</button>
@@ -31,7 +34,11 @@
       <p class="empty-copy">Loading operational data…</p>
     </main>
   </div>
+  <dialog id="adminDialog" class="admin-dialog" aria-labelledby="adminDialogTitle">
+    <div id="adminDialogBody"></div>
+    <form method="dialog"><button type="submit" aria-label="Close dialog" title="Close dialog">Close</button></form>
+  </dialog>
   <div id="adminStatus" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/admin.js?v=v2-hotfix-1"></script>
+  <script type="module" src="/static/admin.js?v=v2-2-admin-1"></script>
 </body>
 </html>

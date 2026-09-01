@@ -175,9 +175,11 @@ pub struct TemplateResolution {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProgrammeTemplateDefault {
     pub programme_code: String,
+    pub student_count: i64,
     pub template_id: Option<Uuid>,
     pub template_name: Option<String>,
     pub updated_at: Option<String>,
+    pub updated_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,6 +215,27 @@ pub struct PaperTeamPage {
     pub page: i64,
     pub limit: i64,
     pub items: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InstitutionPageFilter {
+    pub limit: i64,
+    pub page: i64,
+    pub search: Option<String>,
+    pub programme_code: Option<String>,
+    pub department_id: Option<Uuid>,
+    pub link_status: Option<String>,
+    pub external_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportJobPageFilter {
+    pub limit: i64,
+    pub page: i64,
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub mode: Option<String>,
+    pub file_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -498,6 +521,96 @@ impl InstitutionRepository {
         rows.into_iter().map(decode_job).collect()
     }
 
+    pub async fn paginated_jobs(
+        &self,
+        filter: &ImportJobPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let rows = sqlx::query(
+            r"SELECT j.id,j.mode,j.original_filename,j.file_type,j.status,j.total_rows,
+                     j.inserted_rows,j.updated_rows,j.skipped_rows,j.error_rows,
+                     j.created_at::text AS created_at,c.email AS submitted_by,
+                     count(*) OVER() AS total
+              FROM latex_core.institution_import_jobs j
+              JOIN latex_core.user_credentials c ON c.user_id=j.submitted_by_user_id
+              WHERE ($1::text IS NULL OR j.original_filename ILIKE '%' || $1 || '%' OR j.id::text ILIKE '%' || $1 || '%')
+                AND ($2::text IS NULL OR j.status=$2)
+                AND ($3::text IS NULL OR j.mode=$3)
+                AND ($4::text IS NULL OR j.file_type=$4)
+              ORDER BY j.created_at DESC,j.id DESC LIMIT $5 OFFSET $6",
+        )
+        .bind(clean_filter(filter.search.as_deref()))
+        .bind(clean_filter(filter.status.as_deref()))
+        .bind(clean_filter(filter.mode.as_deref()))
+        .bind(clean_filter(filter.file_type.as_deref()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            Ok(json!({
+                "id": row.try_get::<Uuid,_>("id").map_err(InstitutionError::Database)?,
+                "mode": row.try_get::<String,_>("mode").map_err(InstitutionError::Database)?,
+                "original_filename": row.try_get::<String,_>("original_filename").map_err(InstitutionError::Database)?,
+                "file_type": row.try_get::<String,_>("file_type").map_err(InstitutionError::Database)?,
+                "status": row.try_get::<String,_>("status").map_err(InstitutionError::Database)?,
+                "total_rows": row.try_get::<i64,_>("total_rows").map_err(InstitutionError::Database)?,
+                "inserted_rows": row.try_get::<i64,_>("inserted_rows").map_err(InstitutionError::Database)?,
+                "updated_rows": row.try_get::<i64,_>("updated_rows").map_err(InstitutionError::Database)?,
+                "skipped_rows": row.try_get::<i64,_>("skipped_rows").map_err(InstitutionError::Database)?,
+                "error_rows": row.try_get::<i64,_>("error_rows").map_err(InstitutionError::Database)?,
+                "created_at": row.try_get::<String,_>("created_at").map_err(InstitutionError::Database)?,
+                "submitted_by": row.try_get::<String,_>("submitted_by").map_err(InstitutionError::Database)?,
+            }))
+        })
+    }
+
+    pub async fn job_detail(&self, id: Uuid, row_limit: i64) -> Result<Value, InstitutionError> {
+        let job = self.job(id).await?;
+        let summaries = sqlx::query(
+            r"SELECT source_table_or_sheet,
+                     count(*) AS total,
+                     count(*) FILTER (WHERE action='INSERT') AS insert_rows,
+                     count(*) FILTER (WHERE action='UPDATE') AS update_rows,
+                     count(*) FILTER (WHERE action='SKIP') AS skip_rows,
+                     count(*) FILTER (WHERE status IN ('ERROR','UNRESOLVED')) AS error_rows
+              FROM latex_core.institution_import_rows WHERE job_id=$1
+              GROUP BY source_table_or_sheet ORDER BY source_table_or_sheet",
+        )
+        .bind(id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        let summaries = summaries
+            .into_iter()
+            .map(|row| {
+                Ok(json!({
+                    "source":row.try_get::<String,_>("source_table_or_sheet").map_err(InstitutionError::Database)?,
+                    "total":row.try_get::<i64,_>("total").map_err(InstitutionError::Database)?,
+                    "insert":row.try_get::<i64,_>("insert_rows").map_err(InstitutionError::Database)?,
+                    "update":row.try_get::<i64,_>("update_rows").map_err(InstitutionError::Database)?,
+                    "skip":row.try_get::<i64,_>("skip_rows").map_err(InstitutionError::Database)?,
+                    "error":row.try_get::<i64,_>("error_rows").map_err(InstitutionError::Database)?,
+                }))
+            })
+            .collect::<Result<Vec<_>, InstitutionError>>()?;
+        let preview_rows = sqlx::query(
+            "SELECT job_id,source_table_or_sheet,row_number,natural_key,payload,action,status,error_code,error_message FROM latex_core.institution_import_rows WHERE job_id=$1 ORDER BY (status IN ('ERROR','UNRESOLVED')) DESC,source_table_or_sheet,row_number LIMIT $2",
+        )
+        .bind(id)
+        .bind(row_limit.clamp(1, 200))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .into_iter()
+        .map(decode_import_row)
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({"job":job,"summaries":summaries,"rows":preview_rows,"rows_limited":true}))
+    }
+
     pub async fn job(&self, id: Uuid) -> Result<InstitutionImportJob, InstitutionError> {
         let row = sqlx::query(
             "SELECT id,import_kind,mode,original_filename,content_sha256,file_type,submitted_by_user_id,status,total_rows,inserted_rows,updated_rows,skipped_rows,error_rows,created_at::text,validated_at::text,applied_at::text \
@@ -617,9 +730,12 @@ impl InstitutionRepository {
         &self,
     ) -> Result<Vec<ProgrammeTemplateDefault>, InstitutionError> {
         let rows = sqlx::query(
-            "SELECT p.programme_code,d.template_id,t.name AS template_name,d.updated_at::text \
-             FROM vcap.programmes p LEFT JOIN latex_core.programme_template_defaults d USING(programme_code) \
-             LEFT JOIN latex_core.templates t ON t.id=d.template_id ORDER BY p.programme_code",
+            "SELECT p.programme_code,count(s.reg_no) AS student_count,d.template_id,t.name AS template_name,d.updated_at::text,u.email AS updated_by \
+             FROM vcap.programmes p LEFT JOIN vcap.students s USING(programme_code) \
+             LEFT JOIN latex_core.programme_template_defaults d USING(programme_code) \
+             LEFT JOIN latex_core.templates t ON t.id=d.template_id \
+             LEFT JOIN latex_core.user_credentials u ON u.user_id=d.updated_by_user_id \
+             GROUP BY p.programme_code,d.template_id,t.name,d.updated_at,u.email ORDER BY p.programme_code",
         )
         .fetch_all(self.database.pool())
         .await
@@ -630,6 +746,9 @@ impl InstitutionRepository {
                     programme_code: row
                         .try_get("programme_code")
                         .map_err(InstitutionError::Database)?,
+                    student_count: row
+                        .try_get("student_count")
+                        .map_err(InstitutionError::Database)?,
                     template_id: row
                         .try_get("template_id")
                         .map_err(InstitutionError::Database)?,
@@ -638,6 +757,9 @@ impl InstitutionRepository {
                         .map_err(InstitutionError::Database)?,
                     updated_at: row
                         .try_get("updated_at")
+                        .map_err(InstitutionError::Database)?,
+                    updated_by: row
+                        .try_get("updated_by")
                         .map_err(InstitutionError::Database)?,
                 })
             })
@@ -656,6 +778,7 @@ impl InstitutionRepository {
             .begin()
             .await
             .map_err(InstitutionError::Database)?;
+        require_materializable_template(&mut tx, template_id).await?;
         let result = sqlx::query(
             "INSERT INTO latex_core.programme_template_defaults (programme_code,template_id,updated_by_user_id) \
              VALUES ($1,$2,$3) ON CONFLICT(programme_code) DO UPDATE SET template_id=EXCLUDED.template_id,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=statement_timestamp()",
@@ -720,6 +843,7 @@ impl InstitutionRepository {
             .begin()
             .await
             .map_err(InstitutionError::Database)?;
+        require_materializable_template(&mut tx, template_id).await?;
         sqlx::query("UPDATE latex_core.institution_template_config SET global_fallback_template_id=$1,updated_by_user_id=$2,updated_at=statement_timestamp() WHERE singleton")
             .bind(template_id).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(InstitutionError::Database)?;
         audit_tx(
@@ -741,6 +865,464 @@ impl InstitutionRepository {
         .fetch_one(self.database.pool())
         .await
         .map_err(InstitutionError::Database)
+    }
+
+    pub async fn global_fallback_detail(&self) -> Result<Value, InstitutionError> {
+        let row = sqlx::query(
+            r"SELECT c.global_fallback_template_id,t.name AS template_name,
+                     c.updated_at::text AS updated_at,u.email AS updated_by
+              FROM latex_core.institution_template_config c
+              LEFT JOIN latex_core.templates t ON t.id=c.global_fallback_template_id
+              LEFT JOIN latex_core.user_credentials u ON u.user_id=c.updated_by_user_id
+              WHERE c.singleton",
+        )
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        Ok(json!({
+            "template_id":row.try_get::<Option<Uuid>,_>("global_fallback_template_id").map_err(InstitutionError::Database)?,
+            "template_name":row.try_get::<Option<String>,_>("template_name").map_err(InstitutionError::Database)?,
+            "updated_at":row.try_get::<Option<String>,_>("updated_at").map_err(InstitutionError::Database)?,
+            "updated_by":row.try_get::<Option<String>,_>("updated_by").map_err(InstitutionError::Database)?,
+        }))
+    }
+
+    pub async fn paginated_students(
+        &self,
+        filter: &InstitutionPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let rows = sqlx::query(
+            r"SELECT s.reg_no,s.name,s.email,s.programme_code,l.user_id,l.status AS link_status,
+                     u.email AS v2_email,count(*) OVER() AS total
+              FROM vcap.students s LEFT JOIN vcap.student_user_links l USING(reg_no)
+              LEFT JOIN latex_core.user_credentials u ON u.user_id=l.user_id
+              WHERE ($1::text IS NULL OR s.reg_no ILIKE '%' || $1 || '%' OR s.name ILIKE '%' || $1 || '%' OR s.email ILIKE '%' || $1 || '%')
+                AND ($2::text IS NULL OR s.programme_code=$2)
+                AND ($3::text IS NULL OR COALESCE(l.status,'UNLINKED')=$3)
+              ORDER BY s.reg_no LIMIT $4 OFFSET $5",
+        )
+        .bind(clean_filter(filter.search.as_deref()))
+        .bind(clean_filter(filter.programme_code.as_deref()))
+        .bind(clean_filter(filter.link_status.as_deref()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            Ok(json!({
+                "external_type":"STUDENT",
+                "external_id":row.try_get::<String,_>("reg_no").map_err(InstitutionError::Database)?,
+                "registration_number":row.try_get::<String,_>("reg_no").map_err(InstitutionError::Database)?,
+                "name":row.try_get::<Option<String>,_>("name").map_err(InstitutionError::Database)?,
+                "email":row.try_get::<Option<String>,_>("email").map_err(InstitutionError::Database)?,
+                "programme_code":row.try_get::<Option<String>,_>("programme_code").map_err(InstitutionError::Database)?,
+                "user_id":row.try_get::<Option<Uuid>,_>("user_id").map_err(InstitutionError::Database)?,
+                "v2_account":row.try_get::<Option<String>,_>("v2_email").map_err(InstitutionError::Database)?,
+                "link_status":row.try_get::<Option<String>,_>("link_status").map_err(InstitutionError::Database)?.unwrap_or_else(|| "UNLINKED".into()),
+            }))
+        })
+    }
+
+    pub async fn paginated_faculty(
+        &self,
+        filter: &InstitutionPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let rows = sqlx::query(
+            r"SELECT f.faculty_id,f.name,f.email,f.dept_id,f.designation,f.status,
+                     l.user_id,l.status AS link_status,u.email AS v2_email,
+                     COALESCE((SELECT jsonb_agg(jsonb_build_object('academic_year',c.academic_year,'ug',c.ug_max_projects,'pg',c.pg_max_projects,'integrated_pg',c.integrated_pg_max_projects,'status',c.status) ORDER BY c.academic_year DESC) FROM vcap.faculty_guide_capacity c WHERE c.faculty_id=f.faculty_id),'[]'::jsonb) AS guide_capacity,
+                     count(*) OVER() AS total
+              FROM vcap.faculty f LEFT JOIN vcap.faculty_user_links l USING(faculty_id)
+              LEFT JOIN latex_core.user_credentials u ON u.user_id=l.user_id
+              WHERE ($1::text IS NULL OR f.faculty_id ILIKE '%' || $1 || '%' OR f.name ILIKE '%' || $1 || '%' OR f.email ILIKE '%' || $1 || '%')
+                AND ($2::uuid IS NULL OR f.dept_id=$2)
+                AND ($3::text IS NULL OR COALESCE(l.status,'UNLINKED')=$3)
+              ORDER BY f.faculty_id LIMIT $4 OFFSET $5",
+        )
+        .bind(clean_filter(filter.search.as_deref()))
+        .bind(filter.department_id)
+        .bind(clean_filter(filter.link_status.as_deref()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            Ok(json!({
+                "external_type":"FACULTY",
+                "external_id":row.try_get::<String,_>("faculty_id").map_err(InstitutionError::Database)?,
+                "faculty_id":row.try_get::<String,_>("faculty_id").map_err(InstitutionError::Database)?,
+                "name":row.try_get::<Option<String>,_>("name").map_err(InstitutionError::Database)?,
+                "email":row.try_get::<Option<String>,_>("email").map_err(InstitutionError::Database)?,
+                "department_id":row.try_get::<Option<Uuid>,_>("dept_id").map_err(InstitutionError::Database)?,
+                "designation":row.try_get::<Option<String>,_>("designation").map_err(InstitutionError::Database)?,
+                "status":row.try_get::<Option<String>,_>("status").map_err(InstitutionError::Database)?,
+                "user_id":row.try_get::<Option<Uuid>,_>("user_id").map_err(InstitutionError::Database)?,
+                "v2_account":row.try_get::<Option<String>,_>("v2_email").map_err(InstitutionError::Database)?,
+                "link_status":row.try_get::<Option<String>,_>("link_status").map_err(InstitutionError::Database)?.unwrap_or_else(|| "UNLINKED".into()),
+                "guide_capacity":row.try_get::<Value,_>("guide_capacity").map_err(InstitutionError::Database)?,
+            }))
+        })
+    }
+
+    pub async fn paginated_programmes(
+        &self,
+        filter: &InstitutionPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let rows = sqlx::query(
+            r"SELECT p.programme_code,p.hod_id,f.name AS hod_name,
+                     count(s.reg_no) AS student_count,d.template_id,t.name AS template_name,
+                     count(*) OVER() AS total
+              FROM vcap.programmes p LEFT JOIN vcap.faculty f ON f.faculty_id=p.hod_id
+              LEFT JOIN vcap.students s USING(programme_code)
+              LEFT JOIN latex_core.programme_template_defaults d USING(programme_code)
+              LEFT JOIN latex_core.templates t ON t.id=d.template_id
+              WHERE ($1::text IS NULL OR p.programme_code ILIKE '%' || $1 || '%' OR f.name ILIKE '%' || $1 || '%')
+              GROUP BY p.programme_code,p.hod_id,f.name,d.template_id,t.name
+              ORDER BY p.programme_code LIMIT $2 OFFSET $3",
+        )
+        .bind(clean_filter(filter.search.as_deref()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            Ok(json!({
+                "programme_code":row.try_get::<String,_>("programme_code").map_err(InstitutionError::Database)?,
+                "hod_id":row.try_get::<Option<String>,_>("hod_id").map_err(InstitutionError::Database)?,
+                "hod_name":row.try_get::<Option<String>,_>("hod_name").map_err(InstitutionError::Database)?,
+                "student_count":row.try_get::<i64,_>("student_count").map_err(InstitutionError::Database)?,
+                "template_id":row.try_get::<Option<Uuid>,_>("template_id").map_err(InstitutionError::Database)?,
+                "template_name":row.try_get::<Option<String>,_>("template_name").map_err(InstitutionError::Database)?,
+            }))
+        })
+    }
+
+    pub async fn paginated_identity_links(
+        &self,
+        filter: &InstitutionPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let rows = sqlx::query(
+            r"WITH links AS (
+                SELECT 'STUDENT'::text AS external_type,s.reg_no::text AS external_id,s.name,s.email,l.user_id,COALESCE(l.status,'UNLINKED') AS status,l.match_method,u.email AS v2_email
+                  FROM vcap.students s LEFT JOIN vcap.student_user_links l USING(reg_no) LEFT JOIN latex_core.user_credentials u ON u.user_id=l.user_id
+                UNION ALL
+                SELECT 'FACULTY',f.faculty_id::text,f.name,f.email,l.user_id,COALESCE(l.status,'UNLINKED'),l.match_method,u.email
+                  FROM vcap.faculty f LEFT JOIN vcap.faculty_user_links l USING(faculty_id) LEFT JOIN latex_core.user_credentials u ON u.user_id=l.user_id
+                UNION ALL
+                SELECT 'ADMIN',a.admin_id::text,a.name,a.email,l.user_id,COALESCE(l.status,'UNLINKED'),l.match_method,u.email
+                  FROM vcap.admins a LEFT JOIN vcap.admin_user_links l USING(admin_id) LEFT JOIN latex_core.user_credentials u ON u.user_id=l.user_id
+              ) SELECT *,count(*) OVER() AS total FROM links
+              WHERE ($1::text IS NULL OR external_id ILIKE '%' || $1 || '%' OR name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%' OR v2_email ILIKE '%' || $1 || '%')
+                AND ($2::text IS NULL OR status=$2) AND ($3::text IS NULL OR external_type=$3)
+              ORDER BY external_type,external_id LIMIT $4 OFFSET $5",
+        )
+        .bind(clean_filter(filter.search.as_deref()))
+        .bind(clean_filter(filter.link_status.as_deref()))
+        .bind(clean_filter(filter.external_type.as_deref()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            Ok(json!({
+                "external_type":row.try_get::<String,_>("external_type").map_err(InstitutionError::Database)?,
+                "external_id":row.try_get::<String,_>("external_id").map_err(InstitutionError::Database)?,
+                "name":row.try_get::<Option<String>,_>("name").map_err(InstitutionError::Database)?,
+                "email":row.try_get::<Option<String>,_>("email").map_err(InstitutionError::Database)?,
+                "user_id":row.try_get::<Option<Uuid>,_>("user_id").map_err(InstitutionError::Database)?,
+                "v2_account":row.try_get::<Option<String>,_>("v2_email").map_err(InstitutionError::Database)?,
+                "status":row.try_get::<String,_>("status").map_err(InstitutionError::Database)?,
+                "match_method":row.try_get::<Option<String>,_>("match_method").map_err(InstitutionError::Database)?,
+            }))
+        })
+    }
+
+    pub async fn search_v2_users(
+        &self,
+        search: &str,
+        role: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Value>, InstitutionError> {
+        let rows = sqlx::query(
+            r"SELECT c.user_id,c.email,r.role FROM latex_core.user_credentials c
+              JOIN latex_core.global_user_roles r ON r.user_id=c.user_id
+              WHERE c.enabled AND ($1='' OR c.email ILIKE '%' || $1 || '%' OR c.user_id::text ILIKE '%' || $1 || '%')
+                AND ($2::text IS NULL OR r.role=$2)
+              ORDER BY c.email LIMIT $3",
+        )
+        .bind(search.trim())
+        .bind(clean_filter(role))
+        .bind(limit.clamp(1, 50))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(json!({
+                    "user_id":row.try_get::<Uuid,_>("user_id").map_err(InstitutionError::Database)?,
+                    "email":row.try_get::<String,_>("email").map_err(InstitutionError::Database)?,
+                    "role":row.try_get::<String,_>("role").map_err(InstitutionError::Database)?,
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn manual_link_identity(
+        &self,
+        actor: UserId,
+        external_type: &str,
+        external_id: &str,
+        user_id: Uuid,
+    ) -> Result<(), InstitutionError> {
+        let kind = external_type.trim().to_ascii_uppercase();
+        let (people_table, id_column, links_table, required_role) = identity_table(&kind)?;
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        let role: Option<String> =
+            sqlx::query_scalar("SELECT role FROM latex_core.global_user_roles WHERE user_id=$1")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+        if required_role.is_some_and(|required| role.as_deref() != Some(required)) {
+            return Err(InstitutionError::Conflict(format!(
+                "{kind} identity requires a V2 {} account",
+                required_role.unwrap_or_default()
+            )));
+        }
+        let user_linked_elsewhere: bool = sqlx::query_scalar(
+            r"SELECT EXISTS(
+                 SELECT 1 FROM vcap.student_user_links WHERE user_id=$1
+                 UNION ALL SELECT 1 FROM vcap.faculty_user_links WHERE user_id=$1
+                 UNION ALL SELECT 1 FROM vcap.admin_user_links WHERE user_id=$1
+               )",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        if user_linked_elsewhere {
+            return Err(InstitutionError::Conflict(
+                "V2 user is already linked to an institutional identity".into(),
+            ));
+        }
+        let person_exists =
+            format!("SELECT EXISTS(SELECT 1 FROM vcap.{people_table} WHERE {id_column}=$1)");
+        let exists: bool = sqlx::query_scalar(&person_exists)
+            .bind(external_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+        if !exists {
+            return Err(InstitutionError::NotFound);
+        }
+        let statement = format!(
+            "INSERT INTO vcap.{links_table} ({id_column},user_id,match_method,status,linked_at) VALUES ($1,$2,'MANUAL','LINKED',statement_timestamp()) ON CONFLICT({id_column}) DO UPDATE SET user_id=EXCLUDED.user_id,match_method='MANUAL',status='LINKED',linked_at=statement_timestamp()"
+        );
+        sqlx::query(&statement)
+            .bind(external_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                if error
+                    .as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+                {
+                    InstitutionError::Conflict(
+                        "institutional identity or V2 user is already linked".into(),
+                    )
+                } else {
+                    InstitutionError::Database(error)
+                }
+            })?;
+        audit_tx(&mut tx, actor, "institution.identity.manual_link", links_table, Uuid::nil(), json!({
+            "external_type":kind,"external_id":external_id,"user_id":user_id,"match_method":"MANUAL"
+        })).await?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
+    pub async fn unlink_identity(
+        &self,
+        actor: UserId,
+        external_type: &str,
+        external_id: &str,
+    ) -> Result<(), InstitutionError> {
+        let kind = external_type.trim().to_ascii_uppercase();
+        let (_, id_column, links_table, _) = identity_table(&kind)?;
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        let used_by_active_team: bool = match kind.as_str() {
+            "STUDENT" => sqlx::query_scalar(
+                r"SELECT EXISTS(SELECT 1 FROM vcap.paper_assignment_students a
+                   JOIN latex_core.external_paper_team_links x USING(external_team_key)
+                   JOIN latex_core.paper_teams t ON t.id=x.paper_team_id
+                   WHERE a.student_reg_no=$1 AND t.status<>'archived')",
+            )
+            .bind(external_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?,
+            "FACULTY" => sqlx::query_scalar(
+                r"SELECT EXISTS(SELECT 1 FROM vcap.paper_assignment_mentors a
+                   JOIN latex_core.external_paper_team_links x USING(external_team_key)
+                   JOIN latex_core.paper_teams t ON t.id=x.paper_team_id
+                   WHERE a.faculty_id=$1 AND t.status<>'archived')",
+            )
+            .bind(external_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?,
+            "ADMIN" => false,
+            _ => unreachable!(),
+        };
+        if used_by_active_team {
+            return Err(InstitutionError::Conflict(
+                "identity link is used by an active imported Paper Team and cannot be removed"
+                    .into(),
+            ));
+        }
+        let statement = format!(
+            "UPDATE vcap.{links_table} SET user_id=NULL,match_method='MANUAL',status='UNLINKED',linked_at=NULL WHERE {id_column}=$1"
+        );
+        let affected = sqlx::query(&statement)
+            .bind(external_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?
+            .rows_affected();
+        if affected == 0 {
+            return Err(InstitutionError::NotFound);
+        }
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.identity.manual_unlink",
+            links_table,
+            Uuid::nil(),
+            json!({
+                "external_type":kind,"external_id":external_id
+            }),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
+    pub async fn audit_bulk_lifecycle(
+        &self,
+        actor: UserId,
+        requested_status: &str,
+        succeeded: usize,
+        failed: usize,
+    ) -> Result<(), InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.team.bulk_lifecycle",
+            "paper_team",
+            Uuid::nil(),
+            json!({
+                "requested_status":requested_status,"succeeded":succeeded,"failed":failed
+            }),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
+    pub async fn audit_template_preview(
+        &self,
+        actor: UserId,
+        paper_id: Uuid,
+        new_template_id: Uuid,
+        conflicts: usize,
+    ) -> Result<(), InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.team.template_previewed",
+            "paper_team",
+            paper_id,
+            json!({
+                "new_template_id":new_template_id,"blocking_conflicts":conflicts
+            }),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
+    pub async fn paper_team_admin_summary(
+        &self,
+        paper_id: Uuid,
+    ) -> Result<Value, InstitutionError> {
+        let row = sqlx::query(
+            r"SELECT resolution.dominant_programme_code,resolution.resolution_method,
+                     link.external_team_key,link.source_import_job_id,job.applied_at::text AS last_imported_at,
+                     COALESCE(review.status,'NONE') AS review_state,
+                     (SELECT count(*) FROM latex_core.paper_files f WHERE f.workspace_id=t.workspace_id AND NOT f.tombstoned) AS file_count,
+                     build.id AS current_build_id,build.status AS current_build_status
+              FROM latex_core.paper_teams t
+              LEFT JOIN latex_core.paper_template_resolutions resolution ON resolution.paper_team_id=t.id
+              LEFT JOIN latex_core.external_paper_team_links link ON link.paper_team_id=t.id
+              LEFT JOIN latex_core.institution_import_jobs job ON job.id=link.source_import_job_id
+              LEFT JOIN LATERAL (SELECT r.status FROM latex_core.review_rounds r WHERE r.paper_id=t.id ORDER BY r.opened_at DESC,r.id DESC LIMIT 1) review ON TRUE
+              LEFT JOIN latex_core.v2_paper_build_state bs ON bs.paper_id=t.id
+              LEFT JOIN latex_core.v2_paper_builds build ON build.id=COALESCE(bs.active_build_id,bs.current_build_id)
+              WHERE t.id=$1",
+        )
+        .bind(paper_id)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .ok_or(InstitutionError::NotFound)?;
+        Ok(json!({
+            "dominant_programme_code":row.try_get::<Option<String>,_>("dominant_programme_code").map_err(InstitutionError::Database)?,
+            "resolution_method":row.try_get::<Option<String>,_>("resolution_method").map_err(InstitutionError::Database)?,
+            "external_team_key":row.try_get::<Option<String>,_>("external_team_key").map_err(InstitutionError::Database)?,
+            "source_import_job_id":row.try_get::<Option<Uuid>,_>("source_import_job_id").map_err(InstitutionError::Database)?,
+            "last_imported_at":row.try_get::<Option<String>,_>("last_imported_at").map_err(InstitutionError::Database)?,
+            "review_state":row.try_get::<String,_>("review_state").map_err(InstitutionError::Database)?,
+            "file_count":row.try_get::<i64,_>("file_count").map_err(InstitutionError::Database)?,
+            "current_build":{
+                "id":row.try_get::<Option<Uuid>,_>("current_build_id").map_err(InstitutionError::Database)?,
+                "status":row.try_get::<Option<String>,_>("current_build_status").map_err(InstitutionError::Database)?,
+            }
+        }))
     }
 
     pub async fn mark_team_unresolved(
@@ -775,6 +1357,36 @@ impl InstitutionRepository {
         .execute(&mut *tx)
         .await
         .map_err(InstitutionError::Database)?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
+    pub async fn mark_team_resolved(
+        &self,
+        actor: UserId,
+        job_id: Uuid,
+        external_team_key: &str,
+    ) -> Result<(), InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        sqlx::query("UPDATE latex_core.institution_import_rows SET status=CASE WHEN action='SKIP' THEN 'SKIPPED' ELSE 'APPLIED' END,error_code=NULL,error_message=NULL WHERE job_id=$1 AND (natural_key->>'external_team_key')=$2 AND status='UNRESOLVED'")
+            .bind(job_id).bind(external_team_key).execute(&mut *tx).await.map_err(InstitutionError::Database)?;
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.institution_import_rows WHERE job_id=$1 AND status IN ('ERROR','UNRESOLVED')")
+            .bind(job_id).fetch_one(&mut *tx).await.map_err(InstitutionError::Database)?;
+        sqlx::query("UPDATE latex_core.institution_import_jobs SET error_rows=$2,status=CASE WHEN $2=0 THEN 'APPLIED' ELSE 'PARTIAL' END WHERE id=$1")
+            .bind(job_id).bind(remaining).execute(&mut *tx).await.map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.team.materialization_retried",
+            "institution_import_job",
+            job_id,
+            json!({"external_team_key":external_team_key,"resolved":true}),
+        )
+        .await?;
         tx.commit().await.map_err(InstitutionError::Database)
     }
 
@@ -1022,17 +1634,20 @@ impl InstitutionRepository {
             r"SELECT t.id,t.name,t.status,t.updated_at::text AS updated_at,
                      count(*) OVER() AS total,
                      (SELECT count(*) FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='writer' WHERE m.paper_team_id=t.id) AS writer_count,
+                     COALESCE((SELECT jsonb_agg(jsonb_build_object('user_id',m.user_id,'email',c.email,'writer_order',m.writer_order) ORDER BY m.writer_order,c.email) FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='writer' JOIN latex_core.user_credentials c ON c.user_id=m.user_id WHERE m.paper_team_id=t.id),'[]'::jsonb) AS writers,
                      (SELECT jsonb_build_object('user_id',m.user_id,'email',c.email) FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='writer' JOIN latex_core.user_credentials c ON c.user_id=m.user_id WHERE m.paper_team_id=t.id AND m.is_leader LIMIT 1) AS leader,
                      COALESCE((SELECT jsonb_agg(jsonb_build_object('user_id',m.user_id,'email',c.email) ORDER BY c.email) FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='mentor' JOIN latex_core.user_credentials c ON c.user_id=m.user_id WHERE m.paper_team_id=t.id),'[]'::jsonb) AS mentors,
                      resolution.dominant_programme_code,resolution.resolution_method,
                      pin.template_id,template.name AS template_name,
                      COALESCE(review.status,'NONE') AS review_state,
-                     link.external_team_key,CASE WHEN link.external_team_key IS NULL THEN 'manual' ELSE 'imported' END AS source
+                     link.external_team_key,link.source_import_job_id,job.applied_at::text AS last_imported_at,
+                     CASE WHEN link.external_team_key IS NULL THEN 'manual' ELSE 'imported' END AS source
               FROM latex_core.paper_teams t
               LEFT JOIN latex_core.paper_template_resolutions resolution ON resolution.paper_team_id=t.id
               LEFT JOIN latex_core.paper_template_pins pin ON pin.paper_id=t.id
               LEFT JOIN latex_core.templates template ON template.id=pin.template_id
               LEFT JOIN latex_core.external_paper_team_links link ON link.paper_team_id=t.id
+              LEFT JOIN latex_core.institution_import_jobs job ON job.id=link.source_import_job_id
               LEFT JOIN LATERAL (SELECT r.status FROM latex_core.review_rounds r WHERE r.paper_id=t.id ORDER BY r.opened_at DESC,r.id DESC LIMIT 1) review ON TRUE
               WHERE ($1::text IS NULL OR t.name ILIKE '%' || $1 || '%' OR link.external_team_key ILIKE '%' || $1 || '%')
                 AND ($2::text IS NULL OR t.status=$2)
@@ -1076,6 +1691,7 @@ impl InstitutionRepository {
                 "name": row.try_get::<String,_>("name").map_err(InstitutionError::Database)?,
                 "status": row.try_get::<String,_>("status").map_err(InstitutionError::Database)?,
                 "writer_count": row.try_get::<i64,_>("writer_count").map_err(InstitutionError::Database)?,
+                "writers": row.try_get::<Value,_>("writers").map_err(InstitutionError::Database)?,
                 "leader": row.try_get::<Option<Value>,_>("leader").map_err(InstitutionError::Database)?,
                 "mentors": row.try_get::<Value,_>("mentors").map_err(InstitutionError::Database)?,
                 "dominant_programme_code": row.try_get::<Option<String>,_>("dominant_programme_code").map_err(InstitutionError::Database)?,
@@ -1085,6 +1701,8 @@ impl InstitutionRepository {
                 "updated_at": row.try_get::<String,_>("updated_at").map_err(InstitutionError::Database)?,
                 "source": row.try_get::<String,_>("source").map_err(InstitutionError::Database)?,
                 "external_team_key": row.try_get::<Option<String>,_>("external_team_key").map_err(InstitutionError::Database)?,
+                "source_import_job_id": row.try_get::<Option<Uuid>,_>("source_import_job_id").map_err(InstitutionError::Database)?,
+                "last_imported_at": row.try_get::<Option<String>,_>("last_imported_at").map_err(InstitutionError::Database)?,
                 "unresolved": false,
             }));
         }
@@ -1119,9 +1737,14 @@ impl InstitutionRepository {
         }
         let rows = sqlx::query(
             r"WITH unresolved AS (
-                  SELECT g.external_team_key,g.team_name,g.status,
+                  SELECT g.external_team_key,g.team_name,g.status,g.academic_year,g.semester,
                          max(job.created_at)::text AS updated_at,
                          count(DISTINCT writer.student_reg_no) AS writer_count,
+                         (array_agg(import_row.error_code ORDER BY import_row.row_number) FILTER (WHERE import_row.error_code IS NOT NULL))[1] AS error_code,
+                         (array_agg(import_row.error_message ORDER BY import_row.row_number) FILTER (WHERE import_row.error_message IS NOT NULL))[1] AS error_message,
+                         (array_agg(job.id ORDER BY job.created_at DESC))[1] AS source_import_job_id,
+                         ARRAY(SELECT assigned.student_reg_no FROM vcap.paper_assignment_students assigned LEFT JOIN vcap.student_user_links identity ON identity.reg_no=assigned.student_reg_no AND identity.status='LINKED' WHERE assigned.external_team_key=g.external_team_key AND identity.user_id IS NULL ORDER BY assigned.writer_order) AS unresolved_student_ids,
+                         ARRAY(SELECT assigned.faculty_id FROM vcap.paper_assignment_mentors assigned LEFT JOIN vcap.faculty_user_links identity ON identity.faculty_id=assigned.faculty_id AND identity.status='LINKED' WHERE assigned.external_team_key=g.external_team_key AND identity.user_id IS NULL ORDER BY assigned.faculty_id) AS unresolved_faculty_ids,
                          count(*) OVER() AS total
                   FROM vcap.paper_assignment_groups g
                   JOIN latex_core.institution_import_rows import_row ON (import_row.natural_key->>'external_team_key')=g.external_team_key AND import_row.status='UNRESOLVED'
@@ -1134,7 +1757,7 @@ impl InstitutionRepository {
                     AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_students assigned JOIN vcap.students student ON student.reg_no=assigned.student_reg_no WHERE assigned.external_team_key=g.external_team_key AND student.programme_code=$3))
                     AND ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_mentors assigned JOIN vcap.faculty_user_links identity ON identity.faculty_id=assigned.faculty_id AND identity.status='LINKED' WHERE assigned.external_team_key=g.external_team_key AND identity.user_id=$4))
                     AND ($5::uuid IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_students assigned JOIN vcap.student_user_links identity ON identity.reg_no=assigned.student_reg_no AND identity.status='LINKED' WHERE assigned.external_team_key=g.external_team_key AND assigned.is_leader AND identity.user_id=$5))
-                  GROUP BY g.external_team_key,g.team_name,g.status
+                  GROUP BY g.external_team_key,g.team_name,g.status,g.academic_year,g.semester
               ) SELECT * FROM unresolved ORDER BY updated_at DESC,external_team_key LIMIT $6 OFFSET $7",
         )
         .bind(
@@ -1164,6 +1787,7 @@ impl InstitutionRepository {
                 "name": row.try_get::<String,_>("team_name").map_err(InstitutionError::Database)?,
                 "status": row.try_get::<Option<String>,_>("status").map_err(InstitutionError::Database)?.unwrap_or_else(|| "unresolved".into()),
                 "writer_count": row.try_get::<i64,_>("writer_count").map_err(InstitutionError::Database)?,
+                "writers": [],
                 "leader": null,
                 "mentors": [],
                 "dominant_programme_code": null,
@@ -1173,6 +1797,14 @@ impl InstitutionRepository {
                 "updated_at": row.try_get::<String,_>("updated_at").map_err(InstitutionError::Database)?,
                 "source": "imported",
                 "external_team_key": row.try_get::<String,_>("external_team_key").map_err(InstitutionError::Database)?,
+                "academic_year": row.try_get::<Option<String>,_>("academic_year").map_err(InstitutionError::Database)?,
+                "semester": row.try_get::<Option<String>,_>("semester").map_err(InstitutionError::Database)?,
+                "error_code": row.try_get::<Option<String>,_>("error_code").map_err(InstitutionError::Database)?,
+                "error_message": row.try_get::<Option<String>,_>("error_message").map_err(InstitutionError::Database)?,
+                "unresolved_student_ids": row.try_get::<Vec<String>,_>("unresolved_student_ids").map_err(InstitutionError::Database)?,
+                "unresolved_faculty_ids": row.try_get::<Vec<String>,_>("unresolved_faculty_ids").map_err(InstitutionError::Database)?,
+                "source_import_job_id": row.try_get::<Uuid,_>("source_import_job_id").map_err(InstitutionError::Database)?,
+                "last_imported_at": row.try_get::<String,_>("updated_at").map_err(InstitutionError::Database)?,
                 "unresolved": true,
             }));
         }
@@ -2157,6 +2789,90 @@ fn decode_job(row: PgRow) -> Result<InstitutionImportJob, InstitutionError> {
         applied_at: row
             .try_get("applied_at")
             .map_err(InstitutionError::Database)?,
+    })
+}
+
+fn page_limit(limit: i64) -> i64 {
+    if limit == 0 { 50 } else { limit.clamp(1, 100) }
+}
+
+fn clean_filter(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn identity_table(
+    external_type: &str,
+) -> Result<
+    (
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+    ),
+    InstitutionError,
+> {
+    match external_type {
+        "STUDENT" => Ok(("students", "reg_no", "student_user_links", Some("writer"))),
+        "FACULTY" => Ok((
+            "faculty",
+            "faculty_id",
+            "faculty_user_links",
+            Some("mentor"),
+        )),
+        "ADMIN" => Ok(("admins", "admin_id", "admin_user_links", None)),
+        _ => Err(InstitutionError::InvalidInput(
+            "external type must be STUDENT, FACULTY, or ADMIN".into(),
+        )),
+    }
+}
+
+async fn require_materializable_template(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    template_id: Uuid,
+) -> Result<(), InstitutionError> {
+    let valid: bool = sqlx::query_scalar(
+        r"SELECT EXISTS(SELECT 1 FROM latex_core.templates t
+           JOIN latex_core.template_files f ON f.template_id=t.id AND f.path=t.main_file
+           WHERE t.id=$1 AND t.main_file IS NOT NULL)",
+    )
+    .bind(template_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(InstitutionError::Database)?;
+    if valid {
+        Ok(())
+    } else {
+        Err(InstitutionError::Conflict(
+            "selected template must exist and contain its configured Main file".into(),
+        ))
+    }
+}
+
+fn page_from_rows<F>(
+    rows: Vec<PgRow>,
+    page: i64,
+    limit: i64,
+    offset: i64,
+    mut decode: F,
+) -> Result<PaperTeamPage, InstitutionError>
+where
+    F: FnMut(&PgRow) -> Result<Value, InstitutionError>,
+{
+    let total = rows
+        .first()
+        .map_or(Ok(0_i64), |row| row.try_get("total"))
+        .map_err(InstitutionError::Database)?;
+    let items = rows
+        .iter()
+        .map(&mut decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let returned = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    Ok(PaperTeamPage {
+        total,
+        has_more: offset.saturating_add(returned) < total,
+        page,
+        limit,
+        items,
     })
 }
 

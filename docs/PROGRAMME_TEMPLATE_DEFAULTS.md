@@ -20,7 +20,9 @@ Provenance methods are `MODE`, `TIE_FIRST_WRITER`, `GLOBAL_FALLBACK`, and `MANUA
 
 Materialization clones the selected template into one V2 workspace and writes the existing immutable `paper_template_pins` record. `paper_template_resolutions` records why it was selected. Changing a programme default affects only later resolutions; it never rewrites an existing Team pin or resolution.
 
-An explicit template on manual Team creation is recorded as `MANUAL_OVERRIDE` and always wins. Run 1 does not add a workflow for changing an existing Team's pin; that remains a separately governed Run 2 concern.
+An explicit template on manual Team creation is recorded as `MANUAL_OVERRIDE` and always wins. The Admin UI also supports a separate existing-Team preview/apply workflow. It never propagates programme-default changes to pinned Teams, never performs a line merge, never deletes a Writer file, and blocks when current content differs from the old template unless the file is explicitly `TEMPLATE_MANAGED`.
+
+The global fallback and every programme default must point to an existing immutable template whose configured Main path exists in its template files. The UI always states that mapping changes affect future Teams only.
 
 ## Admin endpoints
 
@@ -31,3 +33,10 @@ An explicit template on manual Team creation is recorded as `MANUAL_OVERRIDE` an
 - `GET|PUT /api/admin/v2/institution/template-defaults/global-fallback`
 
 All endpoints require the canonical V2 Admin global role. Institutional Admin rows alone provide no access.
+
+Existing-Team override endpoints are:
+
+- `POST /api/admin/v2/paper-teams/{id}/template-change/preview`
+- `POST /api/admin/v2/paper-teams/{id}/template-change/apply`
+
+Apply requires the preview token and any Main-file confirmation. It retains a pre-change safety checkpoint and a post-change template-update version.

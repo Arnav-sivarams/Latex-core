@@ -21,7 +21,7 @@ Foreign keys use `ON DELETE RESTRICT`. Imports are additive and do not hard-dele
 
 ## Login identity links
 
-`vcap.student_user_links`, `vcap.faculty_user_links`, and `vcap.admin_user_links` bridge institutional identities to canonical `latex_core.users`. Each external identity and each linked user is unique within its link table.
+`vcap.student_user_links`, `vcap.faculty_user_links`, and `vcap.admin_user_links` bridge institutional identities to canonical `latex_core.users`. Each external identity and each linked user is unique within its link table. Manual-link application additionally checks all three tables, preventing one V2 account from being reused across Student, Faculty, or Admin identities.
 
 Link statuses are:
 
@@ -30,7 +30,7 @@ Link statuses are:
 - `AMBIGUOUS`: multiple normalized account or institutional identity matches exist.
 - `ROLE_INCOMPATIBLE`: the unique account has the wrong existing V2 global role.
 
-Students require an existing global Writer role and faculty require an existing global Mentor role before they can be materialized into a Team. Institutional Admin identities require an existing V2 Admin role to link; importing them never grants that role. Passwords and authentication secrets are never imported.
+Students require an existing global Writer role and faculty require an existing global Mentor role before they can be materialized into a Team. Automatic Admin email reconciliation requires an existing V2 Admin, while a manual Admin identity link is informational and grants no authority. Importing or linking never changes a global role. Passwords and authentication secrets are never imported. Automatic reconciliation does not overwrite `MANUAL` links, and unlink is blocked while the identity is used by a non-archived imported Team.
 
 ## Paper assignments
 
@@ -43,3 +43,5 @@ Students require an existing global Writer role and faculty require an existing 
 `latex_core.institution_import_jobs` and `latex_core.institution_import_rows` retain job counters, source row numbers, natural keys, normalized payloads, actions, errors, and status. They do not retain uploaded source files or secrets.
 
 `latex_core.programme_template_defaults` maps `students.programme_code` to an immutable template. `latex_core.institution_template_config` contains the global fallback. `latex_core.paper_template_resolutions` records the selected template, dominant programme, method, and whether selection was a manual override. Existing `paper_template_pins` remains authoritative for the immutable Team template pin.
+
+Directory endpoints query these tables with bounded page/limit, search, programme/department, link-status, and identity-type predicates. Programme student counts and template mappings are aggregated in PostgreSQL rather than by loading the institutional directory into the browser.

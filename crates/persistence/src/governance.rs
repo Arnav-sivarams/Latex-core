@@ -130,6 +130,28 @@ pub struct TemplateSeedFile {
     pub policy: V2FilePolicy,
 }
 
+#[derive(Clone, Debug)]
+pub struct TemplateChangeFile {
+    pub path: LogicalPath,
+    pub blob_hash: BlobHash,
+    pub size_bytes: u64,
+    pub policy: V2FilePolicy,
+    pub existing_file_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TemplateChangeRequest {
+    pub paper_id: Uuid,
+    pub workspace_id: WorkspaceId,
+    pub expected_workspace_version: u64,
+    pub expected_template_id: Uuid,
+    pub new_template_id: Uuid,
+    pub new_source_identity: String,
+    pub new_main_file: Option<LogicalPath>,
+    pub files: Vec<TemplateChangeFile>,
+    pub safety: ExactRestoreState,
+}
+
 impl V2Repository {
     pub async fn paper_template_pin(
         &self,
@@ -327,6 +349,11 @@ impl V2Repository {
             sqlx::query("INSERT INTO latex_core.audit_events (id,actor_user_id,event_type,resource_type,resource_id,metadata) VALUES ($1,$2,'institution.team.materialized','paper_team',$3,$4)")
                 .bind(Uuid::new_v4()).bind(admin.as_uuid()).bind(team.id).bind(json!({"external_team_key":external_team_key,"job_id":source_import_job_id,"template_id":template_id,"resolution_method":resolution.map(|value| value.resolution_method.as_str())}))
                 .execute(&mut *tx).await.map_err(V2Error::Database)?;
+        } else {
+            sqlx::query("INSERT INTO latex_core.audit_events (id,actor_user_id,event_type,resource_type,resource_id,metadata) VALUES ($1,$2,'institution.team.manual_created','paper_team',$3,$4)")
+                .bind(Uuid::new_v4()).bind(admin.as_uuid()).bind(team.id)
+                .bind(json!({"template_id":template_id,"resolution_method":resolution.map_or("MANUAL_OVERRIDE", |value| value.resolution_method.as_str()),"writer_count":writer_ids.len(),"mentor_count":mentor_ids.len()}))
+                .execute(&mut *tx).await.map_err(V2Error::Database)?;
         }
         tx.commit().await.map_err(V2Error::Database)?;
         Ok((team, paper_files))
@@ -426,6 +453,181 @@ impl V2Repository {
         .map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
         decode_policy(row)
+    }
+
+    pub async fn apply_template_change(
+        &self,
+        admin: UserId,
+        request: &TemplateChangeRequest,
+    ) -> Result<u64, V2Error> {
+        if request.files.is_empty()
+            || request.new_source_identity.len() != 64
+            || request.safety.workspace_version != request.expected_workspace_version
+        {
+            return Err(V2Error::Integrity {
+                message: "invalid template-change request".into(),
+            });
+        }
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
+        workspace_mutation_lock(&mut tx, request.workspace_id).await?;
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM latex_core.paper_teams WHERE id=$1 AND workspace_id=$2 FOR UPDATE",
+        )
+        .bind(request.paper_id)
+        .bind(request.workspace_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?
+        .ok_or(V2Error::NotFound {
+            entity: "Paper Team",
+        })?;
+        if status == "archived" {
+            return Err(V2Error::Conflict {
+                entity: "archived Paper Team template",
+            });
+        }
+        let actual: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
+        )
+        .bind(request.workspace_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if u64::try_from(actual).ok() != Some(request.expected_workspace_version) {
+            return Err(V2Error::VersionConflict {
+                expected: request.expected_workspace_version,
+                actual: u64::try_from(actual).unwrap_or_default(),
+            });
+        }
+        let pinned: Uuid = sqlx::query_scalar(
+            "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1 FOR UPDATE",
+        )
+        .bind(request.paper_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if pinned != request.expected_template_id {
+            return Err(V2Error::Conflict {
+                entity: "Paper Team template pin changed after preview",
+            });
+        }
+        let number: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(max(version_number),0)+1 FROM latex_core.paper_versions WHERE workspace_id=$1",
+        )
+        .bind(request.workspace_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.paper_versions (id,paper_id,workspace_id,document_epoch,version_number,version_type,name,created_by_user_id,workspace_version,snapshot_id,manifest,state_hash) VALUES ($1,$2,$3,$4,$5,'manual_checkpoint','PRE_TEMPLATE_CHANGE',$6,$7,$8,$9,$10)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(request.paper_id)
+        .bind(request.workspace_id.as_uuid())
+        .bind(to_i64(request.safety.document_epoch)?)
+        .bind(number)
+        .bind(admin.as_uuid())
+        .bind(actual)
+        .bind(request.safety.snapshot_id.to_hex())
+        .bind(&request.safety.manifest)
+        .bind(&request.safety.state_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        let mut operations = request.files.iter().map(|file| json!({
+            "op":"put_file","path":file.path,"blob_hash":file.blob_hash,"size_bytes":file.size_bytes
+        })).collect::<Vec<_>>();
+        if let Some(main) = &request.new_main_file {
+            operations.push(json!({"op":"set_main_file","path":main}));
+        }
+        let next = request
+            .expected_workspace_version
+            .checked_add(1)
+            .ok_or_else(|| V2Error::Integrity {
+                message: "workspace version overflow".into(),
+            })?;
+        sqlx::query(
+            "INSERT INTO latex_core.workspace_events (workspace_id,sequence,event_id,base_version,event_type,event_schema_version,payload,created_by_user_id) VALUES ($1,$2,$3,$4,'workspace.mutation',1,$5,$6)",
+        )
+        .bind(request.workspace_id.as_uuid())
+        .bind(to_i64(next)?)
+        .bind(Uuid::new_v4())
+        .bind(actual)
+        .bind(json!({"schema_version":1,"operations":operations}))
+        .bind(admin.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        sqlx::query("UPDATE latex_core.workspace_heads SET durable_version=$2,updated_at=statement_timestamp() WHERE workspace_id=$1")
+            .bind(request.workspace_id.as_uuid()).bind(to_i64(next)?).execute(&mut *tx).await.map_err(V2Error::Database)?;
+        for file in &request.files {
+            let file_id = if let Some(file_id) = file.existing_file_id {
+                sqlx::query("UPDATE latex_core.paper_files SET revision=revision+1,updated_at=statement_timestamp() WHERE file_id=$1 AND workspace_id=$2 AND NOT tombstoned")
+                    .bind(file_id).bind(request.workspace_id.as_uuid()).execute(&mut *tx).await.map_err(V2Error::Database)?;
+                file_id
+            } else {
+                let file_id = Uuid::new_v4();
+                sqlx::query("INSERT INTO latex_core.paper_files (file_id,workspace_id,path) VALUES ($1,$2,$3)")
+                    .bind(file_id).bind(request.workspace_id.as_uuid()).bind(file.path.as_str()).execute(&mut *tx).await.map_err(V2Error::Database)?;
+                file_id
+            };
+            sqlx::query("INSERT INTO latex_core.paper_file_policies (file_id,workspace_id,policy,updated_by_admin_user_id) VALUES ($1,$2,$3,$4) ON CONFLICT(file_id) DO UPDATE SET policy=EXCLUDED.policy,updated_by_admin_user_id=EXCLUDED.updated_by_admin_user_id,updated_at=statement_timestamp()")
+                .bind(file_id).bind(request.workspace_id.as_uuid()).bind(file.policy.as_str()).bind(admin.as_uuid()).execute(&mut *tx).await.map_err(V2Error::Database)?;
+        }
+        sqlx::query("UPDATE latex_core.paper_template_pins SET template_id=$2,source_identity=$3,pinned_by_admin_user_id=$4,pinned_at=statement_timestamp() WHERE paper_id=$1")
+            .bind(request.paper_id).bind(request.new_template_id).bind(&request.new_source_identity).bind(admin.as_uuid()).execute(&mut *tx).await.map_err(V2Error::Database)?;
+        sqlx::query("INSERT INTO latex_core.paper_template_resolutions (paper_team_id,selected_template_id,dominant_programme_code,resolution_method,manual_override) VALUES ($1,$2,NULL,'MANUAL_OVERRIDE',TRUE) ON CONFLICT(paper_team_id) DO UPDATE SET selected_template_id=EXCLUDED.selected_template_id,resolution_method='MANUAL_OVERRIDE',manual_override=TRUE,resolved_at=statement_timestamp()")
+            .bind(request.paper_id).bind(request.new_template_id).execute(&mut *tx).await.map_err(V2Error::Database)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(next)
+    }
+
+    pub async fn finalize_template_change(
+        &self,
+        admin: UserId,
+        paper_id: Uuid,
+        workspace_id: WorkspaceId,
+        template_id: Uuid,
+        exact: ExactRestoreState,
+    ) -> Result<Uuid, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
+        let pinned: Option<Uuid> = sqlx::query_scalar(
+            "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1 FOR UPDATE",
+        )
+        .bind(paper_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if pinned != Some(template_id) {
+            return Err(V2Error::Conflict {
+                entity: "Paper Team template finalization",
+            });
+        }
+        let number: i64 = sqlx::query_scalar("SELECT COALESCE(max(version_number),0)+1 FROM latex_core.paper_versions WHERE workspace_id=$1")
+            .bind(workspace_id.as_uuid()).fetch_one(&mut *tx).await.map_err(V2Error::Database)?;
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO latex_core.paper_versions (id,paper_id,workspace_id,document_epoch,version_number,version_type,name,created_by_user_id,workspace_version,snapshot_id,manifest,state_hash) VALUES ($1,$2,$3,$4,$5,'template_update','TEMPLATE_UPDATE',$6,$7,$8,$9,$10)")
+            .bind(id).bind(paper_id).bind(workspace_id.as_uuid()).bind(to_i64(exact.document_epoch)?).bind(number).bind(admin.as_uuid())
+            .bind(to_i64(exact.workspace_version)?).bind(exact.snapshot_id.to_hex()).bind(&exact.manifest).bind(&exact.state_hash)
+            .execute(&mut *tx).await.map_err(V2Error::Database)?;
+        sqlx::query("INSERT INTO latex_core.audit_events (id,actor_user_id,event_type,resource_type,resource_id,metadata) VALUES ($1,$2,'institution.team.template_applied','paper_team',$3,$4)")
+            .bind(Uuid::new_v4()).bind(admin.as_uuid()).bind(paper_id).bind(json!({"template_id":template_id,"version_id":id,"workspace_version":exact.workspace_version,"resolution_method":"MANUAL_OVERRIDE"}))
+            .execute(&mut *tx).await.map_err(V2Error::Database)?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(id)
     }
 
     pub async fn create_restoration_request(
