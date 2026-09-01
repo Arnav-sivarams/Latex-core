@@ -92,7 +92,9 @@ test('Writer surface uses Save semantics and inline historical review highlights
   assert.match(writer, /review-source-highlight/);
   assert.match(writer, /button\('Done'/);
   assert.match(writer, /button\('Apply'/);
-  assert.match(html, />Send for Review</);
+  assert.match(html, /id="sendReview"[^>]*hidden[^>]*>Send for Review</);
+  assert.match(writer, /ui\.sendReview\.hidden = !teamLeader/);
+  assert.match(writer, /ui\.createCheckpoint\.hidden = paper\.kind === 'team' && !teamLeader/);
 });
 
 test('Admin Team UI requires and can reassign an assigned Writer Leader', () => {

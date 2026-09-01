@@ -534,6 +534,10 @@ async function openPaper(paper) {
   ui.structuralUndo.disabled = !model.paperDetail.editable;
   ui.structuralRedo.disabled = !model.paperDetail.editable;
   ui.compilePaper.disabled = !model.paperDetail.editable;
+  const teamLeader = paper.kind === 'team' && paper.is_team_leader;
+  ui.createCheckpoint.hidden = paper.kind === 'team' && !teamLeader;
+  ui.sendReview.hidden = !teamLeader;
+  ui.endReview.hidden = !teamLeader;
   ui.createCheckpoint.disabled = !model.paperDetail.editable || (paper.kind === 'team' && !paper.is_team_leader);
   ui.sendReview.disabled = paper.kind !== 'team' || !paper.is_team_leader || !model.paperDetail.editable;
   ui.endReview.disabled = true;
