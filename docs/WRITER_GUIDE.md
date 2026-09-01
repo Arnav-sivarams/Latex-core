@@ -13,7 +13,7 @@ The five policies are `EDITABLE`, `CONTENT_READ_ONLY`, `STRUCTURE_LOCKED`, `TEMP
 
 ## Realtime, offline, and saving
 
-Source changes synchronize through durable collaboration rooms. **Save** and `Ctrl/Cmd+S` request durable CRDT synchronization; they do not compile or create a checkpoint. The indicator distinguishes Saving, Saved/Synced, Offline, and Reconnecting states.
+Source changes synchronize through durable collaboration rooms. **Save** and `Ctrl/Cmd+S` request durable CRDT synchronization; they do not compile or create a checkpoint. The indicator distinguishes Saving, Saved, Offline, and Reconnecting states.
 
 Offline state is stored per paper epoch. After a governed restoration, changes from the previous epoch are preserved locally and are not merged into the restored paper. Use **Copy recovery text** to retrieve that buffer.
 
@@ -30,3 +30,7 @@ For a Team Paper, a regular Writer chooses **Request Revert**, selects a version
 ## Reviews and productivity
 
 The Team Leader can use **Send for Review** only when the exact current source has a successful matching PDF, and **End Review** to close the window. Writers see Mentor source annotations as inline highlights; Done resolves and hides a highlight without deleting history, and Apply uses the Writer-attributed suggestion flow.
+
+The workspace keeps Papers/Files, source, and PDF as three independently scrolling panes. Save, Compile, Insert, Math, Problems, History, and Comments are available from the compact toolbar. Problems, immutable versions/revert controls, and active/resolved comments open in temporary drawers. File Rename, Delete, and Set Main live in the selected file's ellipsis or right-click menu.
+
+Math is a searchable first-class palette (`∑`) covering common symbols, descriptions, components, and equation/matrix templates. Selection inserts through the same Writer-local Yjs transaction as the existing safe builders. `Ctrl/Cmd+P` opens files, `Ctrl/Cmd+K` opens commands, and a Team Leader can use `Ctrl/Cmd+Shift+R` to send an eligible paper for review.

@@ -6,7 +6,7 @@ import { stex } from '@codemirror/legacy-modes/mode/stex';
 import { yCollab } from 'y-codemirror.next';
 import * as Y from 'yjs';
 import * as pdfjsLib from '/static/pdf.min.mjs';
-import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
+import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange } from './review-helpers.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
 const INITIAL_STATE = 0x10;
@@ -46,9 +46,10 @@ const ui = Object.fromEntries([
   'reviewTitle', 'reviewSummary', 'buildStatus', 'compileReview',
   'reviewEditor', 'sourceSelection', 'reviewSelection', 'previousPage', 'pageLabel', 'nextPage', 'zoomOut',
   'zoomLabel', 'zoomIn', 'pdfState', 'pdfViewport', 'pdfCanvas', 'pdfOverlay',
-  'annotationComposer', 'anchorSummary', 'threadType', 'threadMessage', 'cancelAnnotation',
-  'createAnnotation', 'threadFilters', 'threadList',
-  'roundList', 'reviewNotice',
+  'reviewPopover', 'anchorSummary', 'threadType', 'threadMessage', 'cancelAnnotation',
+  'createAnnotation', 'createComment', 'createSuggestion', 'threadFilters', 'threadList',
+  'roundList', 'reviewNotice', 'reviewGateBadge', 'mentorCommentsToggle', 'mentorReviewDrawer',
+  'mentorDrawerClose',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -113,8 +114,8 @@ function mountReadOnlyEditor(session) {
 
 async function sourceSelected(state) {
   const range = state.selection.main;
-  if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text to annotate'; ui.reviewSelection.disabled = true; return; }
-  if (!reviewOpen()) { ui.sourceSelection.textContent = 'This paper has not been sent for review.'; ui.reviewSelection.disabled = true; return; }
+  if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text, then right-click to review'; ui.reviewSelection.disabled = true; return; }
+  if (!reviewOpen()) { ui.sourceSelection.textContent = 'Waiting for Team Review'; ui.reviewSelection.disabled = true; return; }
   const quoted = state.sliceDoc(range.from, range.to);
   const relativeStart = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.from));
   const relativeEnd = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.to));
@@ -124,17 +125,27 @@ async function sourceSelected(state) {
     quoted_text: quoted, context_hash: await sha256(context), source_sequence: model.detail.version,
     source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch,
   };
-  const line = state.doc.lineAt(range.from);
-  let pdfAnchor = null;
-  try {
-    const mapping = await api.map(model.paper.id, { direction: 'FORWARD', file_id: model.file.file_id, line: line.number, column: range.from - line.from });
-    pdfAnchor = await pdfAnchorFromMapping(mapping);
-  } catch { /* Source annotation remains valid without a projection. */ }
-  model.pendingAnchor = { source_anchor: sourceAnchor, pdf_anchor: pdfAnchor };
+  const pending = { source_anchor: sourceAnchor, pdf_anchor: null };
+  model.pendingAnchor = pending;
   ui.sourceSelection.textContent = `${quoted.length} characters selected`;
   model.pendingAnchorSummary = `Source: ${model.file.path} · “${quoted.slice(0, 80)}”`;
   ui.reviewSelection.disabled = false;
+  const line = state.doc.lineAt(range.from);
+  try {
+    const mapping = await api.map(model.paper.id, { direction: 'FORWARD', file_id: model.file.file_id, line: line.number, column: range.from - line.from });
+    const pdfAnchor = await pdfAnchorFromMapping(mapping);
+    if (model.pendingAnchor === pending) { pending.pdf_anchor = pdfAnchor; renderOverlays(); }
+  } catch { /* Source annotation remains valid without a projection. */ }
 }
+
+ui.reviewEditor.addEventListener('contextmenu', (event) => {
+  if (!reviewOpen() || !model.pendingAnchor?.source_anchor || !model.view) return;
+  const selection = model.view.state.selection.main;
+  const position = model.view.posAtCoords({ x: event.clientX, y: event.clientY });
+  if (selection.empty || position == null || position < selection.from || position > selection.to) return;
+  event.preventDefault();
+  showReviewPopover(event.clientX, event.clientY, model.pendingAnchorSummary);
+});
 
 async function sha256(value) { const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)); return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join(''); }
 
@@ -209,12 +220,19 @@ async function pdfAnchorFromMapping(mapping) {
 ui.pdfOverlay.addEventListener('pointerdown', (event) => { if (!model.viewport || event.target !== ui.pdfOverlay) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); model.dragStart = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; ui.pdfOverlay.setPointerCapture(event.pointerId); });
 ui.pdfOverlay.addEventListener('pointerup', async (event) => {
   if (!model.dragStart || !model.viewport) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); const end = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; const rectangle = normalizeRectangle({ x1: model.dragStart.x, y1: model.dragStart.y, x2: end.x, y2: end.y }, model.viewport.width, model.viewport.height); model.dragStart = null; if (rectangle.width < 0.005 || rectangle.height < 0.005) return;
-  if (!reviewOpen()) return notice('This paper has not been sent for review.', true);
+  if (!reviewOpen()) return;
   const point = { x: (rectangle.x + rectangle.width / 2) * model.viewport.width / model.scale, y: (rectangle.y + rectangle.height / 2) * model.viewport.height / model.scale };
   let mapping = { mapping_status: 'PDF_ONLY' }; try { mapping = await api.map(model.paper.id, { direction: 'INVERSE', page: model.page, ...point }); } catch { /* PDF-only is truthful. */ }
   let sourceAnchor = null; if (mapping.mapped_file_id) sourceAnchor = await anchorMappedLine(mapping);
   model.pendingAnchor = { source_anchor: sourceAnchor, pdf_anchor: { page: model.page, normalized_rectangles: [rectangle], mapping_status: mapping.mapping_status, mapped_file_id: mapping.mapped_file_id || null, mapped_line: mapping.mapped_line || null, mapped_column: mapping.mapped_column ?? null } };
-  renderOverlays(); showComposer(`PDF page ${model.page} · ${mapping.mapping_status}`);
+  model.pendingAnchorSummary = `PDF page ${model.page} · ${mapping.mapping_status}`;
+  renderOverlays();
+});
+
+ui.pdfOverlay.addEventListener('contextmenu', (event) => {
+  if (!event.target.closest?.('.pdf-highlight.pending') || !reviewOpen()) return;
+  event.preventDefault();
+  showReviewPopover(event.clientX, event.clientY, model.pendingAnchorSummary || `PDF page ${model.page}`);
 });
 
 async function anchorMappedLine(mapping) {
@@ -225,13 +243,30 @@ async function anchorMappedLine(mapping) {
 }
 
 function reviewOpen() { return model.rounds.some((round) => round.status === 'OPEN_FOR_REVIEW'); }
-function showComposer(summary) { if (!reviewOpen()) return notice('This paper has not been sent for review.', true); ui.annotationComposer.hidden = false; ui.anchorSummary.textContent = summary; ui.annotationComposer.scrollIntoView({ block: 'nearest' }); }
-function hideComposer() { ui.annotationComposer.hidden = true; model.pendingAnchor = null; model.pendingAnchorSummary = null; ui.reviewSelection.disabled = true; renderOverlays(); }
+function showReviewPopover(x, y, summary) {
+  if (!reviewOpen() || !model.pendingAnchor) return;
+  ui.anchorSummary.textContent = summary;
+  ui.createSuggestion.hidden = !model.pendingAnchor.source_anchor;
+  ui.reviewPopover.hidden = false;
+  const width = ui.reviewPopover.offsetWidth; const height = ui.reviewPopover.offsetHeight;
+  Object.assign(ui.reviewPopover.style, {
+    left: `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`,
+    top: `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`,
+  });
+  ui.threadMessage.focus();
+}
+function hideComposer({ clearAnchor = true } = {}) {
+  ui.reviewPopover.hidden = true;
+  ui.threadMessage.value = '';
+  if (clearAnchor) { model.pendingAnchor = null; model.pendingAnchorSummary = null; ui.reviewSelection.disabled = true; renderOverlays(); }
+}
 
-async function createAnnotation(body = null) {
+async function createAnnotation(type = 'COMMENT') {
   if (!reviewOpen()) throw new Error('This paper has not been sent for review.');
-  if (!body && !ui.threadMessage.value.trim()) throw new Error('Comment text is required.');
-  const request = body || { thread_type: ui.threadType.value, message: ui.threadMessage.value, severity: 'NOTE', category: 'WRITING', assigned_writer_user_id: null, due_at: null, source_anchor: model.pendingAnchor?.source_anchor || null, pdf_anchor: model.pendingAnchor?.pdf_anchor || null, suggested_replacement: ui.threadType.value === 'SUGGESTION' ? ui.threadMessage.value : null, section_label: null };
+  const message = ui.threadMessage.value.trim();
+  if (!message) throw new Error(type === 'SUGGESTION' ? 'Suggestion text is required.' : 'Comment text is required.');
+  if (type === 'SUGGESTION' && !model.pendingAnchor?.source_anchor) throw new Error('Suggestions require a source selection.');
+  const request = { thread_type: type, message, severity: 'NOTE', category: 'WRITING', assigned_writer_user_id: null, due_at: null, source_anchor: model.pendingAnchor?.source_anchor || null, pdf_anchor: model.pendingAnchor?.pdf_anchor || null, suggested_replacement: type === 'SUGGESTION' ? message : null, section_label: null };
   await api.createThread(model.paper.id, request); hideComposer(); ui.threadMessage.value = ''; await Promise.all([refreshThreads(), refreshRounds()]); notice('Review annotation created.');
 }
 
@@ -266,11 +301,34 @@ async function focusThread(thread) {
 function base64(value) { if (!value) return null; const binary = atob(value.replaceAll('\n', '')); return Uint8Array.from(binary, (character) => character.charCodeAt(0)); }
 
 async function refreshRounds() { const payload = await api.rounds(model.paper.id); model.rounds = payload.rounds; renderRounds(); }
-function renderRounds() { ui.roundList.replaceChildren(); if (!model.rounds.length) return clearNode(ui.roundList, 'This paper has not been sent for review.'); model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status.replaceAll('_', ' ')}`; row.append(text); ui.roundList.append(row); }); if (!reviewOpen()) hideComposer(); }
+function renderRounds() {
+  ui.roundList.replaceChildren();
+  const open = reviewOpen();
+  ui.reviewGateBadge.textContent = open ? 'Review open' : 'Waiting for Team Review';
+  if (!model.rounds.length) clearNode(ui.roundList, 'This paper has not been sent for review.');
+  else model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status.replaceAll('_', ' ')}`; row.append(text); ui.roundList.append(row); });
+  if (!open) hideComposer();
+}
 
-ui.threadType.addEventListener('change', () => { const suggestion = showsReplacementInput(ui.threadType.value); ui.threadMessage.placeholder = suggestion ? 'Suggested replacement text' : 'Review comment'; });
-ui.reviewSelection.addEventListener('click', () => { if (model.pendingAnchor && model.pendingAnchorSummary) showComposer(model.pendingAnchorSummary); });
-ui.cancelAnnotation.addEventListener('click', hideComposer); ui.createAnnotation.addEventListener('click', () => createAnnotation().catch((failure) => notice(failure.message, true)));
+ui.reviewSelection.addEventListener('click', () => {
+  if (!model.pendingAnchor || !model.pendingAnchorSummary || !model.view) return;
+  const coordinates = model.view.coordsAtPos(model.view.state.selection.main.to);
+  showReviewPopover(coordinates?.left || window.innerWidth / 2, coordinates?.bottom || 100, model.pendingAnchorSummary);
+});
+ui.cancelAnnotation.addEventListener('click', () => hideComposer());
+ui.createComment.addEventListener('click', () => createAnnotation('COMMENT').catch((failure) => notice(failure.message, true)));
+ui.createSuggestion.addEventListener('click', () => createAnnotation('SUGGESTION').catch((failure) => notice(failure.message, true)));
+ui.createAnnotation.addEventListener('click', () => createAnnotation(ui.threadType.value).catch((failure) => notice(failure.message, true)));
+ui.mentorCommentsToggle.addEventListener('click', () => { ui.mentorReviewDrawer.hidden = false; });
+ui.mentorDrawerClose.addEventListener('click', () => { ui.mentorReviewDrawer.hidden = true; });
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  hideComposer({ clearAnchor: false });
+  ui.mentorReviewDrawer.hidden = true;
+});
+document.addEventListener('pointerdown', (event) => {
+  if (!ui.reviewPopover.hidden && !ui.reviewPopover.contains(event.target)) hideComposer({ clearAnchor: false });
+});
 ui.compileReview.addEventListener('click', async () => { try { ui.buildStatus.textContent = 'Building…'; await api.build(model.paper.id); await refreshBuild(); } catch (failure) { notice(failure.message, true); } });
 ui.previousPage.addEventListener('click', async () => { if (model.page > 1) { model.page -= 1; await renderPage(); } }); ui.nextPage.addEventListener('click', async () => { if (model.page < model.pdf.numPages) { model.page += 1; await renderPage(); } }); ui.zoomOut.addEventListener('click', async () => { model.scale = Math.max(0.5, model.scale - 0.25); await renderPage(); }); ui.zoomIn.addEventListener('click', async () => { model.scale = Math.min(3, model.scale + 0.25); await renderPage(); });
 ui.threadFilters.addEventListener('click', (event) => { const filter = event.target.dataset.filter; if (!filter) return; model.filter = filter; [...ui.threadFilters.children].forEach((node) => node.toggleAttribute('aria-current', node === event.target)); renderThreads(); });

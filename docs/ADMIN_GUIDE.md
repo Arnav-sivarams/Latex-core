@@ -26,6 +26,8 @@ An Active Team may be frozen, submitted, or archived. A Frozen Team can return t
 
 Team creation requires exactly one Leader selected from the assigned Writers. Reassignment is transactional and cannot select a Mentor, Admin, or unassigned Writer or leave an active Team leaderless. Admin may inspect historical governance data under Audit, but ordinary Team revert decisions belong to the Team Leader.
 
+The Writer toolbar exposes review/checkpoint/revert controls only to that selected Leader. Admin does not open review rounds or approve ordinary Team reverts; it manages membership and leadership from Paper Teams and may inspect retained history under Audit.
+
 ## Operator boundary
 
 SYSTEM health is read-only. BUILD QUEUE uses only existing allow-listed actions. Host-level operational actions remain CLI-only in this release candidate. The API has no Docker-socket mount and no arbitrary shell endpoint.

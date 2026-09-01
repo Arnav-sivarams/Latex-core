@@ -11,6 +11,10 @@ Mentors use `/review`. Only Team Papers explicitly assigned to the signed-in Men
 - Linked source/PDF anchors, threads, suggestions, and review rounds preserve review context.
 - A Mentor cannot mutate source through HTTP, WebSocket, or suggestion bypasses.
 
+The normal Mentor viewport contains only the compact toolbar and independently scrolling Papers/Files, read-only source, and PDF panes. Before review opens, the toolbar quietly says **Waiting for Team Review**; source and PDF remain readable and selection behaves normally.
+
+During an open review, select a non-empty source range or drag a PDF region, then right-click the selection to open the small review popover. It has one text input and Comment/Suggest actions—no severity, category, Writer assignment, or due-date form. Escape or clicking outside closes it without moving the page. The toolbar Comments action opens active/resolved history in a temporary drawer.
+
 Submitted suggestions become source changes only when an authorized Writer accepts them. New feedback uses a simple Comment or Suggestion body; severity, category, assignment, and due date are not requested. Archived papers remain available for historical reading but do not accept new review actions.
 
 Mentors do not participate in Team revert authorization. Revert requests are handled within the Team by its Writer Leader.

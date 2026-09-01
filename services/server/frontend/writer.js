@@ -10,6 +10,7 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 import { resolveSuggestionRange } from './review-helpers.mjs';
 import { createIdleBuildScheduler } from './auto-build.mjs';
 import { pdfPreviewState } from './writer-pdf.mjs';
+import { MATH_CATALOG } from './math-catalog.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
   buildOutlineTree, buildPlot, buildTable, buildTheorem, commonSnippets,
@@ -101,6 +102,10 @@ const ui = Object.fromEntries([
   'structuralUndo', 'structuralRedo', 'problemsCount', 'problemsList', 'productivityDialog',
   'dialogTitle', 'dialogSearch', 'dialogBody', 'dialogPreview', 'dialogActions',
   'copyRecoveryText',
+  'reviewStateBadge', 'undoText', 'redoText', 'mathPalette', 'tableBuilder', 'figureBuilder',
+  'plotBuilder', 'problemsToggle', 'historyToggle', 'commentsToggle', 'fileActionsToggle',
+  'fileActionsMenu', 'workspaceDrawer', 'drawerTitle', 'drawerClose', 'problems', 'reviews', 'history',
+  'moreActions',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -125,6 +130,7 @@ const model = {
   searchTimer: null,
   compileDiagnostic: null,
   recoveryText: null,
+  undoManager: null,
 };
 
 const autoBuild = createIdleBuildScheduler({
@@ -140,9 +146,9 @@ function notice(message, failed = false) {
 
 function saveState(state) {
   const labels = {
-    local: 'Saved/Synced',
+    local: 'Saved',
     syncing: 'Saving…',
-    synced: 'Saved/Synced',
+    synced: 'Saved',
     offline: 'Offline',
     reconnecting: 'Reconnecting…',
     conflict: 'Conflict/Error',
@@ -222,6 +228,12 @@ function renderTree(node) {
   node.files.sort((a, b) => a.label.localeCompare(b.label)).forEach((file) => {
     const item = document.createElement('li');
     const leaf = button(file.label, () => openFile(file), model.file?.file_id === file.file_id);
+    leaf.addEventListener('contextmenu', async (event) => {
+      event.preventDefault();
+      if (model.file?.file_id !== file.file_id) await openFile(file);
+      ui.fileActionsMenu.hidden = false;
+      Object.assign(ui.fileActionsMenu.style, { left: `${Math.min(event.clientX, window.innerWidth - 188)}px`, top: `${Math.min(event.clientY, window.innerHeight - 210)}px` });
+    });
     if (model.paperDetail?.main_file === file.path) leaf.append(Object.assign(document.createElement('small'), { textContent: 'Main' }));
     item.append(leaf);
     list.append(item);
@@ -534,6 +546,7 @@ async function openPaper(paper) {
   ui.structuralUndo.disabled = !model.paperDetail.editable;
   ui.structuralRedo.disabled = !model.paperDetail.editable;
   ui.compilePaper.disabled = !model.paperDetail.editable;
+  ui.fileActionsToggle.disabled = false;
   const teamLeader = paper.kind === 'team' && paper.is_team_leader;
   ui.createCheckpoint.hidden = paper.kind === 'team' && !teamLeader;
   ui.sendReview.hidden = !teamLeader;
@@ -541,6 +554,7 @@ async function openPaper(paper) {
   ui.createCheckpoint.disabled = !model.paperDetail.editable || (paper.kind === 'team' && !paper.is_team_leader);
   ui.sendReview.disabled = paper.kind !== 'team' || !paper.is_team_leader || !model.paperDetail.editable;
   ui.endReview.disabled = true;
+  ui.reviewStateBadge.textContent = 'Draft';
   renderPapers();
   renderFiles();
   const initial = model.files.find((file) => file.path === model.paperDetail.main_file) || model.files[0];
@@ -633,6 +647,7 @@ function mountEditor(ytext, editable, latex) {
   destroyEditorView();
   ui.editorMount.replaceChildren();
   const undoManager = new Y.UndoManager(ytext, { captureTimeout: 500 });
+  model.undoManager = undoManager;
   const extensions = [
     basicSetup,
     keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => { syncCurrent(); return true; } }]),
@@ -647,12 +662,17 @@ function mountEditor(ytext, editable, latex) {
     state: EditorState.create({ doc: ytext.toString(), extensions }),
     parent: ui.editorMount,
   });
+  ui.undoText.disabled = !editable;
+  ui.redoText.disabled = !editable;
   applyReviewHighlights();
 }
 
 function destroyEditorView() {
   if (model.view) model.view.destroy();
   model.view = null;
+  model.undoManager = null;
+  ui.undoText.disabled = true;
+  ui.redoText.disabled = true;
 }
 
 function closeEditor() {
@@ -669,6 +689,11 @@ function updateFileActions(editable) {
   ui.saveFile.disabled = !selected || !editable;
   ui.insertMenu.disabled = !selected || !editable;
   ui.symbolPalette.disabled = !selected || !editable;
+  ui.mathPalette.disabled = !selected || !editable;
+  ui.tableBuilder.disabled = !selected || !editable;
+  ui.figureBuilder.disabled = !selected || !editable;
+  ui.plotBuilder.disabled = !selected || !editable;
+  ui.fileActionsToggle.disabled = !selected;
   ui.showInPdf.disabled = !selected || !model.currentBuildId;
 }
 
@@ -787,6 +812,7 @@ async function refreshReviewRounds() {
     const leader = Boolean(model.paper.is_team_leader && model.paperDetail?.editable);
     ui.sendReview.disabled = !leader || Boolean(open);
     ui.endReview.disabled = !leader || !open;
+    ui.reviewStateBadge.textContent = open ? 'In Review' : 'Draft';
   } catch (error) {
     notice(error.message, true);
   }
@@ -960,8 +986,8 @@ function applyReviewHighlights() {
     if (!range || range.to <= range.from) return;
     const body = thread.messages?.[0]?.body || 'Review annotation';
     marks.push(Decoration.mark({
-      class: 'review-source-highlight',
-      attributes: { 'data-review-thread': thread.id, title: `${thread.mentor_email}: ${body} · Done` },
+      class: `review-source-highlight review-${thread.thread_type.toLowerCase()}`,
+      attributes: { 'data-review-thread': thread.id, 'data-review-kind': thread.thread_type.toLowerCase(), title: `${thread.mentor_email}: ${body} · Done` },
     }).range(range.from, range.to));
   });
   model.view.dispatch({ effects: setReviewMarks.of(marks) });
@@ -970,7 +996,7 @@ function applyReviewHighlights() {
 let reviewPopoverTimer = null;
 function hideReviewPopover() {
   window.clearTimeout(reviewPopoverTimer);
-  reviewPopoverTimer = window.setTimeout(() => document.querySelector('#writerReviewPopover')?.remove(), 200);
+  reviewPopoverTimer = window.setTimeout(() => document.querySelector('#writerReviewPopover')?.remove(), 140);
 }
 ui.editorMount.addEventListener('mouseover', (event) => {
   const mark = event.target.closest?.('[data-review-thread]');
@@ -981,15 +1007,23 @@ ui.editorMount.addEventListener('mouseover', (event) => {
   document.querySelector('#writerReviewPopover')?.remove();
   const popover = document.createElement('aside'); popover.id = 'writerReviewPopover'; popover.className = 'review-highlight-popover';
   const body = thread.messages?.[0]?.body || 'Review annotation';
-  popover.append(Object.assign(document.createElement('strong'), { textContent: thread.mentor_email }), Object.assign(document.createElement('p'), { textContent: body }));
+  popover.append(
+    Object.assign(document.createElement('strong'), { textContent: thread.mentor_email }),
+    Object.assign(document.createElement('span'), { className: 'review-kind', textContent: thread.thread_type.toLowerCase() }),
+    Object.assign(document.createElement('p'), { textContent: body }),
+  );
   popover.append(button('Done', async () => {
     try { await api.reviewState(model.paper.id, thread.id, 'RESOLVED'); popover.remove(); await refreshReviews(); }
     catch (error) { notice(error.message, true); }
   }));
   if (thread.suggestion?.status === 'PENDING') popover.append(button('Apply', () => writerAcceptSuggestion(thread)));
-  const bounds = mark.getBoundingClientRect(); Object.assign(popover.style, { left: `${bounds.left}px`, top: `${bounds.bottom + 6}px` });
-  popover.addEventListener('mouseenter', () => window.clearTimeout(reviewPopoverTimer)); popover.addEventListener('mouseleave', hideReviewPopover);
+  const bounds = mark.getBoundingClientRect();
   document.body.append(popover);
+  const width = popover.offsetWidth; const height = popover.offsetHeight;
+  const left = Math.max(8, Math.min(bounds.left, window.innerWidth - width - 8));
+  const top = bounds.bottom + height + 8 < window.innerHeight ? bounds.bottom + 6 : Math.max(8, bounds.top - height - 6);
+  Object.assign(popover.style, { left: `${left}px`, top: `${top}px` });
+  popover.addEventListener('mouseenter', () => window.clearTimeout(reviewPopoverTimer)); popover.addEventListener('mouseleave', hideReviewPopover);
 });
 ui.editorMount.addEventListener('mouseout', (event) => { if (event.target.closest?.('[data-review-thread]')) hideReviewPopover(); });
 
@@ -1078,7 +1112,7 @@ function showPalette(title, items) {
   let selected = 0;
   const render = () => {
     const query = ui.dialogSearch.value.toLowerCase();
-    const visible = items.filter((item) => item.label.toLowerCase().includes(query));
+    const visible = items.filter((item) => `${item.label} ${item.detail || ''} ${item.search || ''}`.toLowerCase().includes(query));
     selected = Math.min(selected, Math.max(visible.length - 1, 0));
     const list = document.createElement('div');
     list.className = 'palette-list';
@@ -1228,10 +1262,19 @@ function openBuilder(kind, defaults = {}) {
 
 function openInsertMenu() {
   showPalette('Insert LaTeX', [
-    ...['table', 'figure', 'equation', 'plot', 'algorithm', 'code', 'bibliography', 'theorem'].map((kind) => ({ label: `${kind[0].toUpperCase()}${kind.slice(1)} Builder`, run: () => openBuilder(kind) })),
+    ...['table', 'figure', 'plot', 'algorithm', 'code', 'bibliography', 'theorem'].map((kind) => ({ label: `${kind[0].toUpperCase()}${kind.slice(1)} Builder`, run: () => openBuilder(kind) })),
     { label: 'Insert Citation', run: openCitationPalette }, { label: 'Insert Reference', run: openReferencePalette },
     ...Object.entries(commonSnippets).map(([name, source]) => ({ label: `${name} snippet`, run: () => insertLatex(`${source}\n`, 'writer-snippet') })),
   ]);
+}
+
+function openMathPalette() {
+  showPalette('Math', MATH_CATALOG.map((entry) => ({
+    label: `${entry.symbol}  ${entry.latex}`,
+    detail: `${entry.category} · ${entry.description}`,
+    search: `${entry.category} ${entry.description} ${entry.keywords}`,
+    run: () => insertLatex(entry.latex, 'writer-math-palette'),
+  })));
 }
 
 function openCitationPalette() {
@@ -1245,6 +1288,23 @@ function openReferencePalette() {
 function openSymbols() {
   const items = Object.entries(symbols).flatMap(([category, values]) => values.map((value) => ({ label: `${category} · ${value}`, run: () => insertLatex(value, 'writer-symbol') })));
   showPalette('Symbols', items);
+}
+
+function closeDrawer() {
+  ui.workspaceDrawer.hidden = true;
+  [ui.problems, ui.reviews, ui.history].forEach((panel) => { panel.hidden = true; });
+}
+
+function openDrawer(kind) {
+  const panels = { problems: ui.problems, reviews: ui.reviews, history: ui.history };
+  const titles = { problems: 'Problems', reviews: 'Comments', history: 'History' };
+  Object.values(panels).forEach((panel) => { panel.hidden = panel !== panels[kind]; });
+  ui.drawerTitle.textContent = titles[kind];
+  ui.workspaceDrawer.hidden = false;
+}
+
+function closeTransientMenus() {
+  ui.fileActionsMenu.hidden = true;
 }
 
 async function runStructural(redo) {
@@ -1270,12 +1330,16 @@ async function showInPdf() {
 }
 
 function commandItems() {
-  return [
+  const items = [
     ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ['Set Main', () => ui.setMain.click()],
-    ['Compile', manualCompile], ['Create Checkpoint', () => ui.createCheckpoint.click()], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
-    ['Open Table Builder', () => openBuilder('table')], ['Open Figure Builder', () => openBuilder('figure')], ['Open Equation Builder', () => openBuilder('equation')], ['Open Plot Builder', () => openBuilder('plot')],
+    ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
+    ['Open Table Builder', () => openBuilder('table')], ['Open Figure Builder', () => openBuilder('figure')], ['Open Math Palette', openMathPalette], ['Open Equation Builder', () => openBuilder('equation')], ['Open Plot Builder', () => openBuilder('plot')],
+    ['Open Problems', () => openDrawer('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
     ['Insert Citation', openCitationPalette], ['Insert Reference', openReferencePalette], ['Show in PDF', showInPdf],
-  ].map(([label, run]) => ({ label, run }));
+  ];
+  if (model.paper?.kind !== 'team' || model.paper?.is_team_leader) items.push(['Create Checkpoint', () => ui.createCheckpoint.click()]);
+  if (model.paper?.is_team_leader && !ui.sendReview.disabled) items.push(['Send for Review', () => ui.sendReview.click()]);
+  return items.map(([label, run]) => ({ label, run }));
 }
 
 ui.newPaper.addEventListener('click', async () => {
@@ -1352,8 +1416,25 @@ ui.endReview.addEventListener('click', async () => {
 });
 ui.quickOpen.addEventListener('click', quickOpen);
 ui.commandPalette.addEventListener('click', () => showPalette('Command Palette', commandItems()));
+ui.moreActions.addEventListener('click', () => showPalette('More actions', commandItems()));
 ui.insertMenu.addEventListener('click', openInsertMenu);
 ui.symbolPalette.addEventListener('click', openSymbols);
+ui.mathPalette.addEventListener('click', openMathPalette);
+ui.tableBuilder.addEventListener('click', () => openBuilder('table'));
+ui.figureBuilder.addEventListener('click', () => openBuilder('figure'));
+ui.plotBuilder.addEventListener('click', () => openBuilder('plot'));
+ui.undoText.addEventListener('click', () => model.undoManager?.undo());
+ui.redoText.addEventListener('click', () => model.undoManager?.redo());
+ui.problemsToggle.addEventListener('click', () => openDrawer('problems'));
+ui.historyToggle.addEventListener('click', () => openDrawer('history'));
+ui.commentsToggle.addEventListener('click', () => openDrawer('reviews'));
+ui.drawerClose.addEventListener('click', closeDrawer);
+ui.fileActionsToggle.addEventListener('click', (event) => {
+  event.stopPropagation();
+  const bounds = ui.fileActionsToggle.getBoundingClientRect();
+  ui.fileActionsMenu.hidden = !ui.fileActionsMenu.hidden;
+  Object.assign(ui.fileActionsMenu.style, { left: `${Math.max(8, bounds.right - 180)}px`, top: `${bounds.bottom + 4}px` });
+});
 ui.showInPdf.addEventListener('click', showInPdf);
 ui.structuralUndo.addEventListener('click', () => runStructural(false));
 ui.structuralRedo.addEventListener('click', () => runStructural(true));
@@ -1402,10 +1483,13 @@ ui.projectSearch.addEventListener('input', () => {
 });
 ui.caseSensitive.addEventListener('change', () => ui.projectSearch.dispatchEvent(new Event('input')));
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') { closeDrawer(); closeTransientMenus(); return; }
   if (!(event.ctrlKey || event.metaKey)) return;
   if (event.key.toLowerCase() === 'p') { event.preventDefault(); quickOpen(); }
   if (event.key.toLowerCase() === 'k') { event.preventDefault(); showPalette('Command Palette', commandItems()); }
+  if (event.shiftKey && event.key.toLowerCase() === 'r' && model.paper?.is_team_leader && !ui.sendReview.disabled) { event.preventDefault(); ui.sendReview.click(); }
 });
+document.addEventListener('click', (event) => { if (!ui.fileActionsMenu.contains(event.target) && event.target !== ui.fileActionsToggle) closeTransientMenus(); });
 ui.createCheckpoint.addEventListener('click', async () => {
   if (!model.paper || !await syncCurrent(false)) return;
   const name = window.prompt('Checkpoint name');

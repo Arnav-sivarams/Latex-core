@@ -6370,17 +6370,17 @@ mod tests {
     }
 
     #[test]
-    fn v2_shells_expose_the_frozen_information_architecture_only() {
+    fn v2_shells_expose_the_compact_three_pane_information_architecture_only() {
         let writer = writer_html();
         for required in [
-            "MY PAPERS",
+            "PAPERS",
             "TEAM PAPERS",
             "FILES",
-            "EDITOR",
+            "SOURCE",
             "PDF",
-            "PROBLEMS",
-            "REVIEWS",
-            "HISTORY",
+            "workspaceDrawer",
+            "Math palette",
+            "Send for Review",
         ] {
             assert!(
                 writer.contains(required),
@@ -6404,13 +6404,11 @@ mod tests {
 
         let mentor = mentor_html();
         for required in [
-            "ASSIGNED REVIEWS",
-            "REVIEW STATUS",
+            "ASSIGNED PAPERS",
             "READ-ONLY SOURCE",
-            "PDF.JS",
-            "COMMENTS",
-            "NEW ANNOTATION",
-            "Suggestion",
+            "Waiting for Team Review",
+            "reviewPopover",
+            "Suggest replacement",
         ] {
             assert!(
                 mentor.contains(required),
@@ -6430,11 +6428,11 @@ mod tests {
             "Move",
             "Delete",
             "Publish",
-            "<textarea",
             "ACTIVITY",
             "CHANGES SINCE",
             "RESTORATION REQUESTS",
             "APPROVALS",
+            "NEW ANNOTATION",
         ] {
             assert!(
                 !mentor.contains(forbidden),

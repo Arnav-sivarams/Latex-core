@@ -35,16 +35,16 @@ test('review round and replacement controls require their exact prerequisites', 
   assert.equal(showsReplacementInput('SUGGESTION'), true);
   assert.equal(showsReplacementInput('SUGGESTED_REPLACEMENT'), true);
   const css = readFileSync(new URL('../static/shells.css', import.meta.url), 'utf8');
-  assert.match(css, /\.annotation-composer \[hidden\] \{ display: none !important; \}/);
+  assert.match(css, /\.context-review-popover\[hidden\][^{]*\{ display: none !important; \}/);
 });
 
-test('source selection preserves viewport until Review selection is clicked', () => {
+test('source selection preserves viewport until contextual review is invoked', () => {
   const review = readFileSync(new URL('./review.js', import.meta.url), 'utf8');
-  const handler = review.slice(review.indexOf('async function sourceSelected'), review.indexOf('async function sha256'));
+  const handler = review.slice(review.indexOf('async function sourceSelected'), review.indexOf("ui.reviewEditor.addEventListener('contextmenu'"));
   assert.doesNotMatch(handler, /scrollIntoView|\.focus\(|showComposer/);
   assert.match(review, /ui\.reviewSelection\.addEventListener\('click'/);
   const html = readFileSync(new URL('../src/review.html', import.meta.url), 'utf8');
-  assert.match(html, /id="reviewSelection"[^>]*disabled>Review selection/);
+  assert.match(html, /id="reviewSelection"[^>]*disabled[^>]*aria-label="Comment on selected source"/);
 });
 
 test('suggestion helper refuses an anchor unresolved in the current document', () => {
@@ -85,14 +85,14 @@ test('V2.1 review UI exposes only gated comments and suggestions', () => {
 test('Writer surface uses Save semantics and inline historical review highlights', () => {
   const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
   const html = readFileSync(new URL('../src/write.html', import.meta.url), 'utf8');
-  assert.match(html, /id="saveFile"[^>]*>Save</);
+  assert.match(html, /id="saveFile"[^>]*aria-label="Save"/);
   assert.doesNotMatch(html, /Sync now/);
   assert.match(writer, /Saving…/);
-  assert.match(writer, /Saved\/Synced/);
+  assert.match(writer, /synced: 'Saved'/);
   assert.match(writer, /review-source-highlight/);
   assert.match(writer, /button\('Done'/);
   assert.match(writer, /button\('Apply'/);
-  assert.match(html, /id="sendReview"[^>]*hidden[^>]*>Send for Review</);
+  assert.match(html, /id="sendReview"[^>]*hidden[^>]*aria-label="Send for Review"/);
   assert.match(writer, /ui\.sendReview\.hidden = !teamLeader/);
   assert.match(writer, /ui\.createCheckpoint\.hidden = paper\.kind === 'team' && !teamLeader/);
 });

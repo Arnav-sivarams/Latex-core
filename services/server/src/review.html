@@ -4,53 +4,73 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Mentor Review — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=v2-hotfix-1">
+  <link rel="stylesheet" href="/static/shells.css?v=v2-run2">
 </head>
-<body>
+<body class="workspace-shell mentor-shell">
   <header class="shell-topbar">
     <a class="shell-brand" href="/review" aria-current="page">LaTeX Core</a>
-    <span class="role-badge">Mentor</span>
     <span id="reviewContext" class="current-context">No paper selected</span>
+    <span class="role-badge">Mentor</span>
     <span class="shell-spacer"></span>
     <span id="liveStatus" class="save-status" data-state="synced">Read only</span>
-    <form method="post" action="/logout"><button type="submit">Log out</button></form>
+    <form method="post" action="/logout"><button class="quiet-button" type="submit" title="Log out">Log out</button></form>
   </header>
-  <div class="review-workspace">
-    <nav class="review-nav" aria-label="Mentor review navigation">
-      <section aria-labelledby="assigned-heading"><h2 id="assigned-heading">ASSIGNED REVIEWS</h2><div id="assignedPapers"><p class="empty-copy">Loading…</p></div></section>
+
+  <nav class="action-toolbar" aria-label="Mentor review actions">
+    <div class="toolbar-group">
+      <button id="compileReview" class="icon-button" type="button" disabled aria-label="Compile" title="Compile latest paper"><span aria-hidden="true">▶</span></button>
+      <span id="buildStatus" class="toolbar-status">No PDF yet</span>
+    </div>
+    <div class="toolbar-group">
+      <span id="reviewGateBadge" class="subtle-badge">Waiting for Team Review</span>
+      <button id="reviewSelection" class="icon-button" type="button" disabled aria-label="Comment on selected source" title="Comment on selected source"><span aria-hidden="true">◰</span></button>
+      <button id="mentorCommentsToggle" class="icon-button" type="button" aria-label="Comments and review history" title="Comments and review history"><span aria-hidden="true">☰</span></button>
+      <a id="csvExport" class="icon-link" href="#" aria-disabled="true" aria-label="Export comments as CSV" title="Export comments as CSV">⇩</a>
+      <a id="printExport" class="icon-link" href="#" aria-disabled="true" target="_blank" aria-label="Print review report" title="Print review report">▤</a>
+    </div>
+    <span id="sourceSelection" class="toolbar-status">Select text, then right-click to review</span>
+  </nav>
+
+  <div class="review-workspace three-pane-workspace">
+    <nav class="review-nav workspace-pane files-pane" aria-label="Mentor papers and files">
+      <section aria-labelledby="assigned-heading"><h2 id="assigned-heading">ASSIGNED PAPERS</h2><div id="assignedPapers"><p class="empty-copy">Loading…</p></div></section>
       <section aria-labelledby="review-files-heading"><h2 id="review-files-heading">FILES</h2><div id="reviewFiles"><p class="empty-copy">Choose a paper.</p></div></section>
-      <a href="#rounds">REVIEW STATUS</a>
-      <a id="csvExport" href="#" aria-disabled="true">EXPORT CSV</a><a id="printExport" href="#" aria-disabled="true" target="_blank">PRINT REPORT</a>
+      <div class="paper-summary"><strong id="reviewTitle">No assigned paper</strong><small id="reviewSummary">Select an assigned Team Paper.</small></div>
     </nav>
-    <main class="review-stage">
-      <header class="review-toolbar">
-        <div><p class="eyebrow">Review workspace</p><h1 id="reviewTitle">No assigned paper</h1><p id="reviewSummary">Select an assigned Team Paper.</p></div>
-        <div class="review-actions"><span id="buildStatus">No PDF yet</span><button id="compileReview" class="primary" type="button" disabled>Compile</button></div>
-      </header>
-      <div class="review-split">
-        <section class="review-source" aria-labelledby="source-heading">
-          <div class="panel-heading"><h2 id="source-heading">READ-ONLY SOURCE</h2><div class="source-selection-actions"><span id="sourceSelection">Select text to annotate</span><button id="reviewSelection" type="button" disabled>Review selection</button></div></div>
-          <div id="reviewEditor" class="editor-mount"><div class="foundation-empty"><strong>No source selected</strong></div></div>
-        </section>
-        <section class="review-pdf" aria-labelledby="review-pdf-heading">
-          <div class="panel-heading"><h2 id="review-pdf-heading">PDF.JS</h2><div class="pdf-controls"><button id="previousPage" type="button" disabled>Previous</button><span id="pageLabel">0 / 0</span><button id="nextPage" type="button" disabled>Next</button><button id="zoomOut" type="button" disabled>−</button><span id="zoomLabel">100%</span><button id="zoomIn" type="button" disabled>+</button></div></div>
-          <div id="pdfState" class="pdf-relation">No current PDF</div>
-          <div id="pdfViewport" class="pdfjs-viewport" aria-label="PDF region selection surface"><canvas id="pdfCanvas"></canvas><div id="pdfOverlay" class="pdf-overlay"></div></div>
-        </section>
-      </div>
-      <section id="annotationComposer" class="annotation-composer" aria-labelledby="composer-heading" hidden>
-        <div><h2 id="composer-heading">NEW ANNOTATION</h2><p id="anchorSummary">No anchor</p></div>
-        <label>Type<select id="threadType"><option value="COMMENT">Comment</option><option value="SUGGESTION">Suggestion</option></select></label>
-        <label class="composer-message">Comment<input id="threadMessage" type="text" maxlength="20000" placeholder="Review feedback"></label>
-        <div class="review-actions"><button id="cancelAnnotation" type="button">Cancel</button><button id="createAnnotation" class="primary" type="button">Create</button></div>
-      </section>
-      <section class="review-details">
-        <article id="threads" class="review-card" aria-labelledby="threads-heading"><div class="panel-heading"><h2 id="threads-heading">COMMENTS</h2><div id="threadFilters" class="thread-filters"><button data-filter="active" aria-current="page">Open</button><button data-filter="RESOLVED">Done</button><button data-filter="all">All</button></div></div><div id="threadList"><p class="empty-copy">No comments.</p></div></article>
-        <article id="rounds" class="review-card" aria-labelledby="rounds-heading"><div class="panel-heading"><h2 id="rounds-heading">REVIEW STATUS</h2></div><div id="roundList"><p class="empty-copy">This paper has not been sent for review.</p></div></article>
-      </section>
+
+    <main class="review-source workspace-pane source-pane" aria-labelledby="source-heading">
+      <div class="panel-heading"><h1 id="source-heading">READ-ONLY SOURCE</h1></div>
+      <div id="reviewEditor" class="editor-mount"><div class="foundation-empty"><strong>No source selected</strong></div></div>
     </main>
+
+    <section class="review-pdf workspace-pane pdf-pane" aria-labelledby="review-pdf-heading">
+      <div class="panel-heading"><h2 id="review-pdf-heading">PDF</h2><div class="pdf-controls"><button id="previousPage" class="mini-icon" type="button" disabled aria-label="Previous PDF page" title="Previous page">‹</button><span id="pageLabel">0 / 0</span><button id="nextPage" class="mini-icon" type="button" disabled aria-label="Next PDF page" title="Next page">›</button><button id="zoomOut" class="mini-icon" type="button" disabled aria-label="Zoom out" title="Zoom out">−</button><span id="zoomLabel">100%</span><button id="zoomIn" class="mini-icon" type="button" disabled aria-label="Zoom in" title="Zoom in">+</button></div></div>
+      <div id="pdfState" class="pdf-relation">No current PDF</div>
+      <div class="pdf-scroll-region"><div id="pdfViewport" class="pdfjs-viewport" aria-label="PDF region selection surface"><canvas id="pdfCanvas"></canvas><div id="pdfOverlay" class="pdf-overlay"></div></div></div>
+    </section>
   </div>
+
+  <aside id="reviewPopover" class="context-review-popover" hidden aria-label="Add review comment">
+    <label for="threadMessage">Add review…</label>
+    <textarea id="threadMessage" maxlength="20000" rows="3" placeholder="Comment"></textarea>
+    <p id="anchorSummary" class="anchor-summary"></p>
+    <div class="popover-actions">
+      <button id="createComment" type="button" aria-label="Add comment" title="Add comment">💬 Comment</button>
+      <button id="createSuggestion" type="button" aria-label="Suggest replacement" title="Suggest replacement">✎ Suggest</button>
+      <button id="cancelAnnotation" type="button" aria-label="Cancel annotation" title="Cancel">×</button>
+    </div>
+  </aside>
+
+  <aside id="mentorReviewDrawer" class="workspace-drawer" hidden aria-labelledby="mentorDrawerTitle">
+    <header><h2 id="mentorDrawerTitle">Comments</h2><button id="mentorDrawerClose" class="icon-button" type="button" aria-label="Close comments" title="Close comments">×</button></header>
+    <div id="threadFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Active</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="all">All</button></div>
+    <div id="threadList"><p class="empty-copy">No review comments.</p></div>
+    <details><summary>Review submissions</summary><div id="roundList"><p class="empty-copy">This paper has not been sent for review.</p></div></details>
+  </aside>
+
+  <select id="threadType" hidden aria-label="Annotation type"><option value="COMMENT">Comment</option><option value="SUGGESTION">Suggestion</option></select>
+  <button id="createAnnotation" type="button" hidden>Create</button>
   <div id="reviewNotice" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/review.js?v=v2-hotfix-1"></script>
+  <script type="module" src="/static/review.js?v=v2-run2"></script>
 </body>
 </html>

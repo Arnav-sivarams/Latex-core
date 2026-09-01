@@ -4,23 +4,53 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Writer — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=v2-hotfix-1">
+  <link rel="stylesheet" href="/static/shells.css?v=v2-run2">
 </head>
-<body>
+<body class="workspace-shell writer-shell">
   <header class="shell-topbar">
     <a class="shell-brand" href="/write" aria-current="page">LaTeX Core</a>
-    <span class="role-badge">Writer</span>
     <span id="currentPaper" class="current-context">No paper selected</span>
+    <span class="role-badge">Writer</span>
+    <span id="reviewStateBadge" class="subtle-badge">Draft</span>
     <span class="shell-spacer"></span>
-    <span id="saveStatus" class="save-status" data-state="local">Local</span>
-    <button id="quickOpen" type="button" title="Quick Open (Ctrl/Cmd+P)">Quick Open</button>
-    <button id="commandPalette" type="button" title="Command Palette (Ctrl/Cmd+K)">Commands</button>
-    <form method="post" action="/logout"><button type="submit">Log out</button></form>
+    <span id="saveStatus" class="save-status" data-state="local">Saved</span>
+    <form method="post" action="/logout"><button class="quiet-button" type="submit" title="Log out">Log out</button></form>
   </header>
-  <div class="writer-layout">
-    <nav class="paper-nav" aria-label="Writer papers and files">
+
+  <nav class="action-toolbar" aria-label="Paper actions">
+    <div class="toolbar-group" aria-label="File and edit">
+      <button id="saveFile" class="icon-button primary" type="button" disabled aria-label="Save" title="Save (Ctrl/Cmd+S)"><span aria-hidden="true">▣</span></button>
+      <button id="undoText" class="icon-button" type="button" disabled aria-label="Undo edit" title="Undo edit"><span aria-hidden="true">↶</span></button>
+      <button id="redoText" class="icon-button" type="button" disabled aria-label="Redo edit" title="Redo edit"><span aria-hidden="true">↷</span></button>
+      <button id="quickOpen" class="icon-button" type="button" aria-label="Quick Open" title="Quick Open (Ctrl/Cmd+P)"><span aria-hidden="true">⌕</span></button>
+      <button id="commandPalette" class="icon-button" type="button" aria-label="Command palette" title="Command palette (Ctrl/Cmd+K)"><span aria-hidden="true">⌘</span></button>
+    </div>
+    <div class="toolbar-group" aria-label="Build and review">
+      <button id="compilePaper" class="icon-button" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span></button>
+      <span id="buildStatus" class="toolbar-status">No PDF yet</span>
+      <button id="sendReview" class="icon-button" type="button" disabled hidden aria-label="Send for Review" title="Send for Review (Ctrl/Cmd+Shift+R)"><span aria-hidden="true">⚑</span></button>
+      <button id="endReview" class="icon-button" type="button" disabled hidden aria-label="End Review" title="End Review"><span aria-hidden="true">■</span></button>
+    </div>
+    <div class="toolbar-group" aria-label="Insert">
+      <button id="insertMenu" class="icon-button menu-button" type="button" disabled aria-label="Insert" title="Insert"><span aria-hidden="true">＋</span><small>Insert</small></button>
+      <button id="mathPalette" class="icon-button menu-button" type="button" disabled aria-label="Math palette" title="Math palette"><span aria-hidden="true">∑</span><small>Math</small></button>
+      <button id="tableBuilder" class="icon-button" type="button" disabled aria-label="Insert table" title="Table builder"><span aria-hidden="true">▦</span></button>
+      <button id="figureBuilder" class="icon-button" type="button" disabled aria-label="Insert figure" title="Figure builder"><span aria-hidden="true">▧</span></button>
+      <button id="plotBuilder" class="icon-button" type="button" disabled aria-label="Insert plot" title="Plot builder"><span aria-hidden="true">⌁</span></button>
+    </div>
+    <div class="toolbar-group toolbar-view" aria-label="View">
+      <button id="problemsToggle" class="icon-button badge-button" type="button" aria-label="Problems" title="Problems"><span aria-hidden="true">△</span><small id="problemsCount">0</small></button>
+      <button id="historyToggle" class="icon-button" type="button" aria-label="History" title="Version history"><span aria-hidden="true">◷</span></button>
+      <button id="commentsToggle" class="icon-button" type="button" aria-label="Comments and review" title="Comments and review"><span aria-hidden="true">◰</span></button>
+      <button id="showInPdf" class="icon-button" type="button" disabled aria-label="Show source in PDF" title="Show source in PDF"><span aria-hidden="true">⇥</span></button>
+      <button id="moreActions" class="icon-button" type="button" aria-label="More actions" title="More actions"><span aria-hidden="true">⋯</span></button>
+    </div>
+  </nav>
+
+  <div class="writer-layout three-pane-workspace">
+    <nav class="paper-nav workspace-pane files-pane" aria-label="Writer papers and files">
       <section aria-labelledby="my-papers-heading">
-        <div class="section-heading"><h2 id="my-papers-heading">MY PAPERS</h2><button id="newPaper" type="button">New Personal Paper</button></div>
+        <div class="section-heading"><h2 id="my-papers-heading">PAPERS</h2><button id="newPaper" class="mini-icon" type="button" aria-label="New personal paper" title="New personal paper">＋</button></div>
         <div id="myPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="team-papers-heading">
@@ -28,70 +58,46 @@
         <div id="teamPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="files-heading">
-        <div class="section-heading"><h2 id="files-heading">FILES</h2><div><button id="uploadImage" type="button" disabled>Upload</button><button id="newFile" type="button" disabled>New</button></div></div>
+        <div class="section-heading"><h2 id="files-heading">FILES</h2><div class="mini-actions">
+          <button id="newFile" class="mini-icon" type="button" disabled aria-label="New file" title="New file">＋</button>
+          <button id="uploadImage" class="mini-icon" type="button" disabled aria-label="Upload asset" title="Upload asset">⇧</button>
+          <button id="fileActionsToggle" class="mini-icon" type="button" disabled aria-label="File actions" title="File actions">⋯</button>
+        </div></div>
         <input id="assetInput" type="file" accept="image/png,image/jpeg,application/pdf,text/csv,.csv" hidden>
         <div id="fileTree"><p class="empty-copy">Choose a paper to view its files.</p></div>
       </section>
-      <section aria-labelledby="outline-heading">
-        <div class="section-heading"><h2 id="outline-heading">OUTLINE</h2><button id="refreshIntelligence" type="button" disabled>Refresh</button></div>
-        <div id="outlineTree"><p class="empty-copy">Choose a paper to view its outline.</p></div>
-      </section>
-      <section aria-labelledby="search-heading">
-        <h2 id="search-heading">SEARCH</h2>
-        <div class="project-search"><input id="projectSearch" type="search" placeholder="Search paper" disabled><label><input id="caseSensitive" type="checkbox"> Aa</label></div>
-        <div id="searchResults"></div>
-      </section>
+      <details><summary>Outline</summary><button id="refreshIntelligence" class="quiet-button" type="button" disabled>Refresh outline</button><div id="outlineTree"><p class="empty-copy">Choose a paper to view its outline.</p></div></details>
+      <details><summary>Search paper</summary><div class="project-search"><input id="projectSearch" type="search" placeholder="Search paper" disabled><label><input id="caseSensitive" type="checkbox"> Aa</label></div><div id="searchResults"></div></details>
     </nav>
-    <main class="writer-main">
-      <section class="editor-foundation" aria-labelledby="editor-heading">
-        <div class="panel-heading editor-heading">
-          <div><h1 id="editor-heading">EDITOR</h1><span id="currentFile">No file selected</span><span id="mainBadge" class="main-badge" hidden>Main</span></div>
-          <div class="editor-actions">
-            <button id="insertMenu" type="button" disabled>Insert</button>
-            <button id="symbolPalette" type="button" disabled>Symbols</button>
-            <button id="showInPdf" type="button" disabled>Show in PDF</button>
-            <button id="structuralUndo" type="button" disabled>Undo File Action</button>
-            <button id="structuralRedo" type="button" disabled>Redo File Action</button>
-            <button id="renameFile" type="button" disabled>Rename</button>
-            <button id="deleteFile" type="button" disabled>Delete</button>
-            <button id="setMain" type="button" disabled>Set Main</button>
-            <button id="saveFile" class="primary" type="button" disabled>Save</button>
-            <button id="copyRecoveryText" type="button" hidden>Copy recovery text</button>
-          </div>
-        </div>
-        <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No paper selected</strong><p>Create a personal paper or open an assigned team paper.</p></div></div>
-      </section>
-      <section class="pdf-foundation" aria-labelledby="pdf-heading">
-        <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><div class="pdf-actions"><span id="buildStatus">No PDF yet</span><button id="compilePaper" class="primary" type="button" disabled>Compile</button><button id="sendReview" type="button" disabled hidden>Send for Review</button><button id="endReview" type="button" disabled hidden>End Review</button></div></div>
-        <div id="pdfRelation" class="pdf-relation">No PDF yet</div>
-        <div id="pdfEmpty" class="foundation-empty"><strong>No PDF yet</strong><p>Compile, or pause after an edit for an automatic exact-state build.</p></div>
-        <iframe id="pdfFrame" class="pdf-frame" title="Current successful PDF" hidden></iframe>
-      </section>
-      <nav class="detail-tabs" aria-label="Paper details">
-        <a href="#problems">PROBLEMS <span id="problemsCount">0</span></a>
-        <a href="#reviews">REVIEWS</a>
-        <a href="#history" aria-current="page">HISTORY</a>
-      </nav>
-      <section id="problems" class="detail-panel" aria-labelledby="problems-heading">
-        <div class="history-heading"><div><h2 id="problems-heading">PROBLEMS</h2><p>Parser, reference, citation, and latest build diagnostics.</p></div></div>
-        <div id="problemsList"><p class="empty-copy">Choose a paper to analyze it.</p></div>
-      </section>
-      <section id="reviews" class="detail-panel" aria-labelledby="writer-reviews-heading">
-        <div class="history-heading"><div><h2 id="writer-reviews-heading">REVIEWS</h2><p>Mentor requests, discussion, and Writer-attributed suggestions.</p></div><div id="reviewCounts"></div></div>
-        <div id="writerReviewFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Open</button><button type="button" data-filter="ADDRESSED">Addressed</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="blocking">Blocking</button><button type="button" data-filter="all">All</button></div>
-        <div id="writerReviewList"><p class="empty-copy">Choose a Team Paper to view reviews.</p></div>
-      </section>
-      <section id="history" class="detail-panel" aria-labelledby="history-heading">
-        <div class="history-heading"><div><h2 id="history-heading">HISTORY</h2><p>Immutable checkpoints and exact compile states.</p></div><button id="createCheckpoint" type="button" disabled>Create checkpoint</button></div>
-        <div id="versionHistory" class="version-history"><p class="empty-copy">Choose a paper to view history.</p></div>
-        <pre id="versionDiff" class="version-diff">Select two versions to compare.</pre>
-      </section>
+
+    <main class="editor-foundation workspace-pane source-pane" aria-labelledby="editor-heading">
+      <div class="panel-heading editor-heading"><div><h1 id="editor-heading">SOURCE</h1><span id="currentFile">No file selected</span><span id="mainBadge" class="main-badge" hidden>Main</span></div></div>
+      <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No paper selected</strong><p>Create a personal paper or open an assigned team paper.</p></div></div>
     </main>
+
+    <section class="pdf-foundation workspace-pane pdf-pane" aria-labelledby="pdf-heading">
+      <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><span id="pdfRelation">No PDF yet</span></div>
+      <div id="pdfEmpty" class="foundation-empty"><strong>No PDF yet</strong><p>Compile the current paper to create an exact PDF.</p></div>
+      <iframe id="pdfFrame" class="pdf-frame" title="Current successful PDF" hidden></iframe>
+    </section>
   </div>
-  <dialog id="productivityDialog" class="productivity-dialog">
-    <form method="dialog" class="dialog-shell"><div class="dialog-heading"><h2 id="dialogTitle">Writer tool</h2><button value="cancel" aria-label="Close">Close</button></div><input id="dialogSearch" type="search" placeholder="Type to filter" hidden><div id="dialogBody"></div><pre id="dialogPreview" hidden></pre><div id="dialogActions" class="dialog-actions"></div></form>
-  </dialog>
+
+  <div id="fileActionsMenu" class="compact-popover file-actions-menu" hidden>
+    <button id="renameFile" type="button" disabled>Rename</button><button id="deleteFile" type="button" disabled>Delete</button><button id="setMain" type="button" disabled>Set Main</button><hr>
+    <button id="structuralUndo" type="button" disabled>Undo file action</button><button id="structuralRedo" type="button" disabled>Redo file action</button>
+  </div>
+
+  <aside id="workspaceDrawer" class="workspace-drawer" hidden aria-labelledby="drawerTitle">
+    <header><h2 id="drawerTitle">Paper details</h2><button id="drawerClose" class="icon-button" type="button" aria-label="Close drawer" title="Close drawer">×</button></header>
+    <section id="problems" class="drawer-panel" hidden aria-labelledby="problems-heading"><h3 id="problems-heading">Problems</h3><div id="problemsList"><p class="empty-copy">Choose a paper to analyze it.</p></div></section>
+    <section id="reviews" class="drawer-panel" hidden aria-labelledby="writer-reviews-heading"><div class="drawer-section-heading"><h3 id="writer-reviews-heading">Comments</h3><span id="reviewCounts"></span></div><div id="writerReviewFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Active</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="all">All</button></div><div id="writerReviewList"><p class="empty-copy">No review comments.</p></div></section>
+    <section id="history" class="drawer-panel" hidden aria-labelledby="history-heading"><div class="drawer-section-heading"><h3 id="history-heading">History</h3><button id="createCheckpoint" type="button" disabled>Create checkpoint</button></div><div id="versionHistory" class="version-history"><p class="empty-copy">Choose a paper to view history.</p></div><pre id="versionDiff" class="version-diff">Select two versions to compare.</pre></section>
+  </aside>
+
+  <dialog id="productivityDialog" class="productivity-dialog"><form method="dialog" class="dialog-shell"><div class="dialog-heading"><h2 id="dialogTitle">Writer tool</h2><button value="cancel" aria-label="Close" title="Close">Close</button></div><input id="dialogSearch" type="search" placeholder="Type to filter" hidden><div id="dialogBody"></div><pre id="dialogPreview" hidden></pre><div id="dialogActions" class="dialog-actions"></div></form></dialog>
+  <button id="symbolPalette" type="button" hidden aria-label="Legacy symbol palette" title="Symbols">Symbols</button>
+  <button id="copyRecoveryText" type="button" hidden>Copy recovery text</button>
   <div id="writerNotice" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/writer.js?v=v2-hotfix-1"></script>
+  <script type="module" src="/static/writer.js?v=v2-run2"></script>
 </body>
 </html>
