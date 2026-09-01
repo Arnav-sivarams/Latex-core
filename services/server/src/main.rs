@@ -7508,6 +7508,58 @@ mod database_tests {
         let current = test_json(get(&app, &build_path, Some(&mentor.cookie)).await).await;
         assert!(current["build"]["current_build_id"].is_string());
 
+        let legacy_round_id = uuid::Uuid::new_v4();
+        let legacy_thread_id = uuid::Uuid::new_v4();
+        let baseline_version_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM latex_core.paper_versions WHERE workspace_id=$1 ORDER BY version_number DESC LIMIT 1",
+        )
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO latex_core.review_rounds \
+             (id,paper_id,workspace_id,round_number,baseline_version_id,opened_by_mentor_user_id,status) \
+             VALUES ($1,$2,$3,1,$4,$5,'OPEN')",
+        )
+        .bind(legacy_round_id)
+        .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+        .bind(workspace_id)
+        .bind(baseline_version_id)
+        .bind(mentor_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO latex_core.review_threads \
+             (id,review_round_id,workspace_id,thread_type,severity,category,created_by_mentor_user_id) \
+             VALUES ($1,$2,$3,'COMMENT','NOTE','WRITING',$4)",
+        )
+        .bind(legacy_thread_id)
+        .bind(legacy_round_id)
+        .bind(workspace_id)
+        .bind(mentor_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO latex_core.review_messages (id,thread_id,author_user_id,body) \
+             VALUES ($1,$2,$3,'Historical review comment')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(legacy_thread_id)
+        .bind(mentor_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_state =
+            test_json(get(&app, &format!("{review_root}/rounds"), Some(&mentor.cookie)).await)
+                .await;
+        assert_eq!(legacy_state["review_open"], false);
+        assert!(legacy_state["current_review_round"].is_null());
+        assert_eq!(legacy_state["rounds"][0]["status"], "OPEN");
+
         let round = request(
             &app,
             Method::POST,
@@ -7520,6 +7572,7 @@ mod database_tests {
         assert_eq!(round.status(), StatusCode::CREATED);
         let round = test_json(round).await;
         let round_id = round["id"].as_str().unwrap();
+        assert_eq!(round["round_number"], 2);
         assert_eq!(round["status"], "OPEN_FOR_REVIEW");
         assert_eq!(
             round["submitted_by_leader_writer_id"],
@@ -7528,6 +7581,45 @@ mod database_tests {
         assert!(round["baseline_version_id"].is_string());
         assert!(round["baseline_build_id"].is_string());
         let first_baseline_hash = round["baseline_state_hash"].as_str().unwrap().to_owned();
+        let legacy_after: (String, bool, i64) = sqlx::query_as(
+            "SELECT rr.status,rr.closed_at IS NOT NULL,count(rm.id) \
+             FROM latex_core.review_rounds rr \
+             LEFT JOIN latex_core.review_threads rt ON rt.review_round_id=rr.id \
+             LEFT JOIN latex_core.review_messages rm ON rm.thread_id=rt.id \
+             WHERE rr.id=$1 GROUP BY rr.id",
+        )
+        .bind(legacy_round_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_after.0, "CLOSED");
+        assert!(legacy_after.1);
+        assert_eq!(legacy_after.2, 1, "legacy comments must be retained");
+
+        let repeated = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/rounds"),
+            Some(&writer.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(test_json(repeated).await["id"], round_id);
+        for participant in [&writer, &mentor] {
+            let state = test_json(
+                get(
+                    &app,
+                    &format!("{review_root}/rounds"),
+                    Some(&participant.cookie),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(state["review_open"], true);
+            assert_eq!(state["current_review_round"]["id"], round_id);
+        }
         for denied in [&writer, &admin] {
             assert_eq!(
                 request(
@@ -7572,7 +7664,11 @@ mod database_tests {
             .to_owned();
         let admin_reviews =
             test_json(get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await).await;
-        assert_eq!(admin_reviews.as_array().unwrap().len(), 1);
+        assert_eq!(
+            admin_reviews.as_array().unwrap().len(),
+            2,
+            "current and historical review comments remain visible to Admin"
+        );
         assert_eq!(admin_reviews[0]["paper_name"], "S5 Review Team");
         assert_eq!(admin_reviews[0]["thread_type"], "COMMENT");
         assert_eq!(admin_reviews[0]["severity"], "NOTE");
@@ -7729,6 +7825,11 @@ mod database_tests {
         .await;
         assert_eq!(closed.status(), StatusCode::OK);
         assert_eq!(test_json(closed).await["status"], "CLOSED");
+        let closed_state =
+            test_json(get(&app, &format!("{review_root}/rounds"), Some(&mentor.cookie)).await)
+                .await;
+        assert_eq!(closed_state["review_open"], false);
+        assert!(closed_state["current_review_round"].is_null());
         let after_close = request(
             &app,
             Method::POST,
@@ -7821,9 +7922,17 @@ mod database_tests {
         .await;
         assert_eq!(second_round.status(), StatusCode::CREATED);
         let second_round = test_json(second_round).await;
-        assert_eq!(second_round["round_number"], 2);
+        assert_eq!(second_round["round_number"], 3);
         assert_eq!(second_round["status"], "OPEN_FOR_REVIEW");
         assert_ne!(second_round["baseline_state_hash"], first_baseline_hash);
+        let reopened_state =
+            test_json(get(&app, &format!("{review_root}/rounds"), Some(&mentor.cookie)).await)
+                .await;
+        assert_eq!(reopened_state["review_open"], true);
+        assert_eq!(
+            reopened_state["current_review_round"]["id"],
+            second_round["id"]
+        );
 
         assert_eq!(
             get(

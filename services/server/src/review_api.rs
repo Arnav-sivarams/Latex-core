@@ -306,7 +306,7 @@ async fn review_rounds(
         Err(response) => return response,
     };
     match state.v2.review_rounds(actor, paper_id).await {
-        Ok(rounds) => Json(json!({"schema_version":1,"rounds":rounds})).into_response(),
+        Ok(rounds) => Json(rounds).into_response(),
         Err(value) => v2_error(value),
     }
 }
@@ -360,7 +360,15 @@ async fn open_round(
         .open_review_round(leader, paper_id, &state_hash)
         .await
     {
-        Ok(round) => (StatusCode::CREATED, Json(round)).into_response(),
+        Ok((round, created)) => (
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(round),
+        )
+            .into_response(),
         Err(V2Error::Conflict {
             entity: "current review PDF",
         }) => error(
@@ -654,6 +662,7 @@ async fn changes_since_review(
         Err(value) => return v2_error(value),
     };
     let baseline_id = rounds
+        .rounds
         .first()
         .and_then(|round| round["baseline_version_id"].as_str())
         .and_then(|value| Uuid::parse_str(value).ok());

@@ -27,6 +27,14 @@ pub struct ReviewPaperSummary {
     pub latest_activity: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReviewRoundList {
+    pub schema_version: u8,
+    pub review_open: bool,
+    pub current_review_round: Option<Value>,
+    pub rounds: Vec<Value>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReviewSourceAnchorInput {
     pub file_id: Uuid,
@@ -156,11 +164,12 @@ impl V2Repository {
         &self,
         actor: UserId,
         paper_id: Uuid,
-    ) -> Result<Vec<Value>, V2Error> {
+    ) -> Result<ReviewRoundList, V2Error> {
         let (paper, _) = self.review_paper(actor, paper_id).await?;
         let rows = sqlx::query(
             "SELECT rr.id,rr.round_number,rr.baseline_version_id,rr.baseline_build_id,rr.baseline_state_hash, \
-                    rr.submitted_by_leader_writer_id,rr.status,rr.opened_at::text AS opened_at,rr.closed_at::text AS closed_at, \
+                    rr.opened_by_mentor_user_id,rr.submitted_by_leader_writer_id,rr.status, \
+                    rr.opened_at::text AS opened_at,rr.closed_at::text AS closed_at, \
                     count(rt.id) FILTER (WHERE rt.state IN ('OPEN','ADDRESSED','REOPENED')) AS open_threads, \
                     count(rt.id) FILTER (WHERE rt.severity='BLOCKING' AND rt.state IN ('OPEN','ADDRESSED','REOPENED')) AS blocking_threads \
              FROM latex_core.review_rounds rr LEFT JOIN latex_core.review_threads rt ON rt.review_round_id=rr.id \
@@ -170,7 +179,20 @@ impl V2Repository {
         .fetch_all(self.database.pool())
         .await
         .map_err(V2Error::Database)?;
-        rows.into_iter().map(round_json).collect()
+        let rounds = rows
+            .into_iter()
+            .map(round_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        let current_review_round = rounds
+            .iter()
+            .find(|round| round["status"] == "OPEN_FOR_REVIEW")
+            .cloned();
+        Ok(ReviewRoundList {
+            schema_version: 1,
+            review_open: current_review_round.is_some(),
+            current_review_round,
+            rounds,
+        })
     }
 
     pub async fn open_review_round(
@@ -178,7 +200,7 @@ impl V2Repository {
         leader: UserId,
         paper_id: Uuid,
         expected_state_hash: &str,
-    ) -> Result<Value, V2Error> {
+    ) -> Result<(Value, bool), V2Error> {
         let (paper, role) = self.review_paper(leader, paper_id).await?;
         if role != GlobalRole::Writer {
             return Err(forbidden(leader, role, "Paper Team Leader Writer"));
@@ -195,17 +217,25 @@ impl V2Repository {
             });
         }
         require_team_leader(&mut tx, paper_id, leader).await?;
-        let already_open: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM latex_core.review_rounds WHERE workspace_id=$1 AND status IN ('OPEN','OPEN_FOR_REVIEW'))",
+        let legacy_closed = sqlx::query(
+            "UPDATE latex_core.review_rounds SET status='CLOSED',closed_at=statement_timestamp() \
+             WHERE workspace_id=$1 AND status IN ('OPEN','OPEN_FOR_REVIEW') \
+               AND NOT (status='OPEN_FOR_REVIEW' AND submitted_by_leader_writer_id IS NOT NULL \
+                        AND baseline_build_id IS NOT NULL AND baseline_state_hash IS NOT NULL)",
         )
         .bind(paper.workspace_id.as_uuid())
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await
-        .map_err(V2Error::Database)?;
-        if already_open {
-            return Err(V2Error::Conflict {
-                entity: "open review round",
-            });
+        .map_err(V2Error::Database)?
+        .rows_affected();
+        if legacy_closed > 0 {
+            tracing::info!(%paper_id, %legacy_closed, "stale legacy review rounds retained as closed history");
+        }
+        if let Some(row) = current_review_round(&mut tx, paper.workspace_id).await? {
+            let round = round_json(row)?;
+            tx.commit().await.map_err(V2Error::Database)?;
+            tracing::info!(%paper_id, round_id=%round["id"], "existing paper review returned idempotently");
+            return Ok((round, false));
         }
         let baseline = sqlx::query(
             "SELECT b.version_id,b.id AS build_id,b.state_hash FROM latex_core.v2_paper_build_state s \
@@ -242,7 +272,7 @@ impl V2Repository {
               submitted_by_leader_writer_id,baseline_build_id,baseline_state_hash,status) \
              VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,'OPEN_FOR_REVIEW') \
              RETURNING id,round_number,baseline_version_id,baseline_build_id,baseline_state_hash, \
-                       submitted_by_leader_writer_id,status,opened_at::text AS opened_at, \
+                       opened_by_mentor_user_id,submitted_by_leader_writer_id,status,opened_at::text AS opened_at, \
                        closed_at::text AS closed_at,0::bigint AS open_threads,0::bigint AS blocking_threads",
         )
         .bind(id)
@@ -258,7 +288,7 @@ impl V2Repository {
         .map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
         tracing::info!(%paper_id, round_id=%id, leader_writer_user_id=%leader, %baseline_version_id, %baseline_build_id, state_hash=%baseline_state_hash, "paper sent for review");
-        round_json(row)
+        Ok((round_json(row)?, true))
     }
 
     pub async fn close_review_round(
@@ -297,7 +327,7 @@ impl V2Repository {
         let row = sqlx::query(
             "UPDATE latex_core.review_rounds SET status='CLOSED',closed_at=statement_timestamp() WHERE id=$1 \
              RETURNING id,round_number,baseline_version_id,baseline_build_id,baseline_state_hash, \
-                       submitted_by_leader_writer_id,status,opened_at::text AS opened_at, \
+                       opened_by_mentor_user_id,submitted_by_leader_writer_id,status,opened_at::text AS opened_at, \
                        closed_at::text AS closed_at,0::bigint AS open_threads,0::bigint AS blocking_threads",
         )
         .bind(round_id)
@@ -897,6 +927,28 @@ async fn lock_thread(
     })
 }
 
+async fn current_review_round(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+) -> Result<Option<PgRow>, V2Error> {
+    sqlx::query(
+        "SELECT rr.id,rr.round_number,rr.baseline_version_id,rr.baseline_build_id,rr.baseline_state_hash, \
+                rr.opened_by_mentor_user_id,rr.submitted_by_leader_writer_id,rr.status, \
+                rr.opened_at::text AS opened_at,rr.closed_at::text AS closed_at, \
+                (SELECT count(*) FROM latex_core.review_threads rt WHERE rt.review_round_id=rr.id \
+                    AND rt.state IN ('OPEN','ADDRESSED','REOPENED')) AS open_threads, \
+                (SELECT count(*) FROM latex_core.review_threads rt WHERE rt.review_round_id=rr.id \
+                    AND rt.severity='BLOCKING' AND rt.state IN ('OPEN','ADDRESSED','REOPENED')) AS blocking_threads \
+         FROM latex_core.review_rounds rr \
+         WHERE rr.workspace_id=$1 AND rr.status='OPEN_FOR_REVIEW' \
+         ORDER BY rr.round_number DESC LIMIT 1 FOR UPDATE",
+    )
+    .bind(workspace_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(V2Error::Database)
+}
+
 async fn lock_thread_state_and_type(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: WorkspaceId,
@@ -1006,7 +1058,7 @@ fn decode_review_paper(row: PgRow) -> Result<ReviewPaperSummary, V2Error> {
 
 fn round_json(row: PgRow) -> Result<Value, V2Error> {
     Ok(
-        json!({"schema_version":1,"id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"round_number":row.try_get::<i64,_>("round_number").map_err(V2Error::Database)?,"baseline_version_id":row.try_get::<Uuid,_>("baseline_version_id").map_err(V2Error::Database)?,"baseline_build_id":row.try_get::<Option<Uuid>,_>("baseline_build_id").map_err(V2Error::Database)?,"baseline_state_hash":row.try_get::<Option<String>,_>("baseline_state_hash").map_err(V2Error::Database)?,"submitted_by_leader_writer_id":row.try_get::<Option<Uuid>,_>("submitted_by_leader_writer_id").map_err(V2Error::Database)?,"status":row.try_get::<String,_>("status").map_err(V2Error::Database)?,"opened_at":row.try_get::<String,_>("opened_at").map_err(V2Error::Database)?,"closed_at":row.try_get::<Option<String>,_>("closed_at").map_err(V2Error::Database)?,"open_threads":row.try_get::<i64,_>("open_threads").map_err(V2Error::Database)?,"blocking_threads":row.try_get::<i64,_>("blocking_threads").map_err(V2Error::Database)?}),
+        json!({"schema_version":1,"id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"round_number":row.try_get::<i64,_>("round_number").map_err(V2Error::Database)?,"baseline_version_id":row.try_get::<Uuid,_>("baseline_version_id").map_err(V2Error::Database)?,"baseline_build_id":row.try_get::<Option<Uuid>,_>("baseline_build_id").map_err(V2Error::Database)?,"baseline_state_hash":row.try_get::<Option<String>,_>("baseline_state_hash").map_err(V2Error::Database)?,"opened_by_mentor_user_id":row.try_get::<Option<Uuid>,_>("opened_by_mentor_user_id").map_err(V2Error::Database)?,"submitted_by_leader_writer_id":row.try_get::<Option<Uuid>,_>("submitted_by_leader_writer_id").map_err(V2Error::Database)?,"status":row.try_get::<String,_>("status").map_err(V2Error::Database)?,"opened_at":row.try_get::<String,_>("opened_at").map_err(V2Error::Database)?,"closed_at":row.try_get::<Option<String>,_>("closed_at").map_err(V2Error::Database)?,"open_threads":row.try_get::<i64,_>("open_threads").map_err(V2Error::Database)?,"blocking_threads":row.try_get::<i64,_>("blocking_threads").map_err(V2Error::Database)?}),
     )
 }
 

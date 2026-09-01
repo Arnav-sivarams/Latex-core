@@ -54,6 +54,7 @@ const ui = Object.fromEntries([
 
 const model = {
   papers: [], paper: null, detail: null, files: [], file: null, rounds: [], threads: [],
+  reviewOpen: false, currentReviewRound: null,
   filter: 'active', collaboration: null, view: null, pendingAnchor: null, pendingAnchorSummary: null,
   pdf: null, pdfBuildId: null, page: 1, scale: 1, viewport: null, renderTask: null, dragStart: null,
   suppressSelection: false,
@@ -242,7 +243,7 @@ async function anchorMappedLine(mapping) {
   return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.detail.version, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch };
 }
 
-function reviewOpen() { return model.rounds.some((round) => round.status === 'OPEN_FOR_REVIEW'); }
+function reviewOpen() { return model.reviewOpen; }
 function showReviewPopover(x, y, summary) {
   if (!reviewOpen() || !model.pendingAnchor) return;
   ui.anchorSummary.textContent = summary;
@@ -300,7 +301,13 @@ async function focusThread(thread) {
 }
 function base64(value) { if (!value) return null; const binary = atob(value.replaceAll('\n', '')); return Uint8Array.from(binary, (character) => character.charCodeAt(0)); }
 
-async function refreshRounds() { const payload = await api.rounds(model.paper.id); model.rounds = payload.rounds; renderRounds(); }
+async function refreshRounds() {
+  const payload = await api.rounds(model.paper.id);
+  model.rounds = payload.rounds;
+  model.reviewOpen = payload.review_open;
+  model.currentReviewRound = payload.current_review_round;
+  renderRounds();
+}
 function renderRounds() {
   ui.roundList.replaceChildren();
   const open = reviewOpen();

@@ -123,6 +123,8 @@ const model = {
   versions: [],
   restorationRequests: [],
   reviewRounds: [],
+  reviewOpen: false,
+  currentReviewRound: null,
   reviews: [],
   reviewFilter: 'active',
   intelligence: { outline: [], labels: [], bibliography: [], diagnostics: [], environments: [], packages: [] },
@@ -801,6 +803,8 @@ async function refreshHistory() {
 async function refreshReviewRounds() {
   if (!model.paper || model.paper.kind !== 'team') {
     model.reviewRounds = [];
+    model.reviewOpen = false;
+    model.currentReviewRound = null;
     ui.sendReview.disabled = true;
     ui.endReview.disabled = true;
     return;
@@ -808,11 +812,12 @@ async function refreshReviewRounds() {
   try {
     const payload = await api.reviewRounds(model.paper.id);
     model.reviewRounds = payload.rounds;
-    const open = model.reviewRounds.find((round) => round.status === 'OPEN_FOR_REVIEW');
+    model.reviewOpen = payload.review_open;
+    model.currentReviewRound = payload.current_review_round;
     const leader = Boolean(model.paper.is_team_leader && model.paperDetail?.editable);
-    ui.sendReview.disabled = !leader || Boolean(open);
-    ui.endReview.disabled = !leader || !open;
-    ui.reviewStateBadge.textContent = open ? 'In Review' : 'Draft';
+    ui.sendReview.disabled = !leader || model.reviewOpen;
+    ui.endReview.disabled = !leader || !model.reviewOpen;
+    ui.reviewStateBadge.textContent = model.reviewOpen ? 'In Review' : 'Draft';
   } catch (error) {
     notice(error.message, true);
   }
@@ -1406,7 +1411,7 @@ ui.sendReview.addEventListener('click', async () => {
   } catch (error) { notice(error.message, true); }
 });
 ui.endReview.addEventListener('click', async () => {
-  const open = model.reviewRounds.find((round) => round.status === 'OPEN_FOR_REVIEW');
+  const open = model.currentReviewRound;
   if (!open || !window.confirm('End the current review? Mentor annotation controls will be disabled.')) return;
   try {
     await api.endReview(model.paper.id, open.id);

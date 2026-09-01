@@ -79,7 +79,9 @@ test('V2.1 review UI exposes only gated comments and suggestions', () => {
   assert.doesNotMatch(html, /id="severity"|id="category"|id="assignedWriter"|id="dueDate"/);
   assert.doesNotMatch(html, /RESTORATION REQUESTS|CHANGES SINCE LAST REVIEW|>ACTIVITY</);
   assert.match(review, /This paper has not been sent for review\./);
-  assert.match(review, /status === 'OPEN_FOR_REVIEW'/);
+  assert.match(review, /model\.reviewOpen = payload\.review_open/);
+  assert.match(review, /model\.currentReviewRound = payload\.current_review_round/);
+  assert.doesNotMatch(review, /round\.status === 'OPEN_FOR_REVIEW'/);
 });
 
 test('Writer surface uses Save semantics and inline historical review highlights', () => {
@@ -94,6 +96,8 @@ test('Writer surface uses Save semantics and inline historical review highlights
   assert.match(writer, /button\('Apply'/);
   assert.match(html, /id="sendReview"[^>]*hidden[^>]*aria-label="Send for Review"/);
   assert.match(writer, /ui\.sendReview\.hidden = !teamLeader/);
+  assert.match(writer, /model\.reviewOpen = payload\.review_open/);
+  assert.match(writer, /model\.currentReviewRound = payload\.current_review_round/);
   assert.match(writer, /ui\.createCheckpoint\.hidden = paper\.kind === 'team' && !teamLeader/);
 });
 
