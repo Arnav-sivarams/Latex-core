@@ -31,10 +31,10 @@ use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, AppTemplateFileRecord,
     ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState,
     FilePolicy, GlobalRole, GroupType, ImportJobPageFilter, ImportLimits, ImportMode,
-    InstitutionError, InstitutionPageFilter, InstitutionRepository, PaperTeamPageFilter,
-    PostgresCompileQueue, ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord,
-    TeamTemplateResolutionInput, TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile,
-    V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
+    InstitutionBatchUpload, InstitutionError, InstitutionOperation, InstitutionPageFilter,
+    InstitutionRepository, PaperTeamPageFilter, PostgresCompileQueue, ProjectAccess, ProjectRoles,
+    PublishResult, QueueLimits, TeamFileRecord, TeamTemplateResolutionInput, TemplateChangeFile,
+    TemplateChangeRequest, TemplateSeedFile, V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -177,6 +177,12 @@ struct ManualIdentityLinkInput {
     external_type: String,
     external_id: String,
     user_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+struct ManualInstitutionOperationInput {
+    operation: String,
+    payload: serde_json::Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -632,6 +638,22 @@ fn router(state: AppState) -> Router {
             post(admin_v2_institution_validate),
         )
         .route(
+            "/api/admin/v2/institution/import-batches/validate",
+            post(admin_v2_institution_batch_validate),
+        )
+        .route(
+            "/api/admin/v2/institution/import-batches",
+            get(admin_v2_institution_batches),
+        )
+        .route(
+            "/api/admin/v2/institution/import-batches/{batch_id}",
+            get(admin_v2_institution_batch),
+        )
+        .route(
+            "/api/admin/v2/institution/import-batches/{batch_id}/apply",
+            post(admin_v2_institution_batch_apply),
+        )
+        .route(
             "/api/admin/v2/institution/imports/{job_id}/apply",
             post(admin_v2_institution_apply),
         )
@@ -662,6 +684,14 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/institution/programmes",
             get(admin_v2_institution_programmes),
+        )
+        .route(
+            "/api/admin/v2/institution/data/{dataset}",
+            get(admin_v2_institution_dataset),
+        )
+        .route(
+            "/api/admin/v2/institution/data/{dataset}/validate",
+            post(admin_v2_institution_manual_validate),
         )
         .route(
             "/api/admin/v2/institution/identity-links",
@@ -1383,6 +1413,182 @@ async fn admin_v2_institution_validate(
     }
 }
 
+#[derive(Default)]
+struct InstitutionBatchUploadFields {
+    operation: Option<String>,
+    uploads: Vec<InstitutionBatchUpload>,
+}
+
+async fn institution_batch_upload_fields(
+    mut multipart: Multipart,
+) -> Result<InstitutionBatchUploadFields, Response> {
+    let mut fields = InstitutionBatchUploadFields::default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid institution batch upload"))?
+    {
+        match field.name() {
+            Some("operation") => {
+                fields.operation = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid operation"))?,
+                );
+            }
+            Some("files[]" | "file") => {
+                let filename = field.file_name().map(str::to_owned).ok_or_else(|| {
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "every uploaded file needs a filename",
+                    )
+                })?;
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid uploaded file"))?;
+                fields.uploads.push(InstitutionBatchUpload {
+                    filename,
+                    target_table: None,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            Some("target_table") => {
+                let target = field
+                    .text()
+                    .await
+                    .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid target dataset"))?;
+                let Some(upload) = fields.uploads.last_mut() else {
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "target dataset must follow its file",
+                    ));
+                };
+                upload.target_table = Some(target);
+            }
+            _ => {}
+        }
+    }
+    if fields.uploads.is_empty() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "select at least one CSV or XLSX file",
+        ));
+    }
+    Ok(fields)
+}
+
+async fn admin_v2_institution_batch_validate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let fields = match institution_batch_upload_fields(multipart).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let operation = match fields
+        .operation
+        .as_deref()
+        .unwrap_or("ADD")
+        .parse::<InstitutionOperation>()
+    {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    match state
+        .institution
+        .validate_batch(
+            principal.user_id(),
+            operation,
+            &fields.uploads,
+            ImportLimits::default(),
+        )
+        .await
+    {
+        Ok(batch) => (StatusCode::CREATED, Json(batch)).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_batch_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let detail = match state
+        .institution
+        .apply_batch(batch_id, principal.user_id())
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    if detail["batch"]["operation"] != "DELETE" {
+        let job_id = match state.institution.batch_primary_job(batch_id).await {
+            Ok(value) => value,
+            Err(error_value) => return institution_error(error_value),
+        };
+        let _materialization =
+            admin_v2_institution_apply(State(state.clone()), headers.clone(), Path(job_id)).await;
+    }
+    match state.institution.batch_detail(batch_id, 100).await {
+        Ok(batch) => Json(batch).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_batches(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ImportListQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    let filter = ImportJobPageFilter {
+        limit: query.limit.unwrap_or(25),
+        page: query.page.unwrap_or(1),
+        search: query.search,
+        status: query.status,
+        mode: query.mode,
+        file_type: None,
+    };
+    match state.institution.paginated_batches(&filter).await {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state.institution.batch_detail(batch_id, 100).await {
+        Ok(batch) => Json(batch).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "per-Team isolation keeps resolution, template cloning, and unresolved provenance adjacent"
@@ -1787,6 +1993,52 @@ async fn admin_v2_institution_programmes(
         .await
     {
         Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_dataset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(dataset): Path<String>,
+    Query(query): Query<InstitutionDirectoryQuery>,
+) -> Response {
+    if let Err(response) = institution_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .institution
+        .paginated_dataset(&dataset, &institution_page_filter(query))
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_institution_manual_validate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(dataset): Path<String>,
+    Json(input): Json<ManualInstitutionOperationInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let operation = match input.operation.parse::<InstitutionOperation>() {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
+    };
+    match state
+        .institution
+        .validate_manual_operation(principal.user_id(), &dataset, operation, &input.payload)
+        .await
+    {
+        Ok(detail) => (StatusCode::CREATED, Json(detail)).into_response(),
         Err(error_value) => institution_error(error_value),
     }
 }

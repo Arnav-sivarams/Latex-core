@@ -54,6 +54,8 @@ pub enum ImportMode {
     ValidateOnly,
     Merge,
     AddOnly,
+    UpdateOnly,
+    DeleteOnly,
 }
 
 impl ImportMode {
@@ -63,6 +65,8 @@ impl ImportMode {
             Self::ValidateOnly => "VALIDATE_ONLY",
             Self::Merge => "MERGE",
             Self::AddOnly => "ADD_ONLY",
+            Self::UpdateOnly => "UPDATE_ONLY",
+            Self::DeleteOnly => "DELETE_ONLY",
         }
     }
 }
@@ -75,7 +79,52 @@ impl FromStr for ImportMode {
             "VALIDATE_ONLY" => Ok(Self::ValidateOnly),
             "MERGE" => Ok(Self::Merge),
             "ADD_ONLY" => Ok(Self::AddOnly),
+            "UPDATE_ONLY" | "EDIT" => Ok(Self::UpdateOnly),
+            "DELETE_ONLY" | "DELETE" => Ok(Self::DeleteOnly),
             _ => Err(InstitutionError::InvalidInput("unknown import mode".into())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstitutionOperation {
+    Add,
+    Edit,
+    Delete,
+}
+
+impl InstitutionOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "ADD",
+            Self::Edit => "EDIT",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    #[must_use]
+    pub const fn mode(self) -> ImportMode {
+        match self {
+            Self::Add => ImportMode::AddOnly,
+            Self::Edit => ImportMode::UpdateOnly,
+            Self::Delete => ImportMode::DeleteOnly,
+        }
+    }
+}
+
+impl FromStr for InstitutionOperation {
+    type Err = InstitutionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "ADD" => Ok(Self::Add),
+            "EDIT" => Ok(Self::Edit),
+            "DELETE" => Ok(Self::Delete),
+            _ => Err(InstitutionError::InvalidInput(
+                "operation must be ADD, EDIT, or DELETE".into(),
+            )),
         }
     }
 }
@@ -147,6 +196,31 @@ pub struct InstitutionImportJob {
     pub created_at: String,
     pub validated_at: Option<String>,
     pub applied_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstitutionImportBatch {
+    pub id: Uuid,
+    pub operation: String,
+    pub status: String,
+    pub submitted_by_user_id: Uuid,
+    pub total_files: i32,
+    pub total_rows: i64,
+    pub added_rows: i64,
+    pub edited_rows: i64,
+    pub deleted_rows: i64,
+    pub skipped_rows: i64,
+    pub error_rows: i64,
+    pub created_at: String,
+    pub validated_at: Option<String>,
+    pub applied_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InstitutionBatchUpload {
+    pub filename: String,
+    pub target_table: Option<String>,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -240,10 +314,12 @@ pub struct ImportJobPageFilter {
 
 #[derive(Clone, Debug)]
 struct SourceRow {
+    upload_index: usize,
     table: String,
     row_number: i64,
     natural_key: Value,
     payload: Value,
+    existing_payload: Option<Value>,
     error: Option<(&'static str, String)>,
 }
 
@@ -277,19 +353,22 @@ impl InstitutionRepository {
         }
         let file_type = file_type(filename)?;
         let mut rows = match file_type {
-            ImportFileType::Csv => parse_csv(filename, target_table, bytes, limits)?,
+            ImportFileType::Csv => parse_csv(filename, target_table, bytes, limits, mode, 0)?,
             ImportFileType::Xlsx => {
                 if target_table.is_some() {
                     return Err(InstitutionError::InvalidInput(
                         "XLSX target table comes from worksheet names".into(),
                     ));
                 }
-                parse_xlsx(bytes, limits)?
+                parse_xlsx(bytes, limits, mode, 0)?
             }
         };
         validate_cross_rows(&mut rows);
-        self.validate_database_references(&mut rows).await?;
         self.assign_actions(&mut rows, mode).await?;
+        self.validate_database_references(&mut rows).await?;
+        if mode == ImportMode::DeleteOnly {
+            self.validate_delete_dependencies(&mut rows).await?;
+        }
 
         let id = Uuid::new_v4();
         let digest = hex::encode(Sha256::digest(bytes));
@@ -336,7 +415,7 @@ impl InstitutionRepository {
         for chunk in rows.chunks(500) {
             let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
                 "INSERT INTO latex_core.institution_import_rows \
-                 (job_id,source_table_or_sheet,row_number,natural_key,payload,action,status,error_code,error_message) ",
+                 (job_id,source_table_or_sheet,row_number,natural_key,payload,existing_payload,action,status,error_code,error_message) ",
             );
             builder.push_values(chunk, |mut separated, row| {
                 let (code, message) = row
@@ -349,6 +428,7 @@ impl InstitutionRepository {
                     .push_bind(row.row_number)
                     .push_bind(&row.natural_key)
                     .push_bind(&row.payload)
+                    .push_bind(&row.existing_payload)
                     .push_bind(if row.error.is_some() {
                         "INVALID"
                     } else {
@@ -388,6 +468,219 @@ impl InstitutionRepository {
         .await?;
         tx.commit().await.map_err(InstitutionError::Database)?;
         self.job(id).await
+    }
+
+    pub async fn validate_batch(
+        &self,
+        submitted_by: UserId,
+        operation: InstitutionOperation,
+        uploads: &[InstitutionBatchUpload],
+        limits: ImportLimits,
+    ) -> Result<Value, InstitutionError> {
+        if uploads.is_empty() || uploads.len() > 20 {
+            return Err(InstitutionError::InvalidInput(
+                "select between 1 and 20 CSV/XLSX files".into(),
+            ));
+        }
+        let total_bytes = uploads.iter().try_fold(0_usize, |total, upload| {
+            total
+                .checked_add(upload.bytes.len())
+                .ok_or_else(|| InstitutionError::InvalidInput("batch upload size overflow".into()))
+        })?;
+        if total_bytes > 64 * 1024 * 1024 {
+            return Err(InstitutionError::InvalidInput(
+                "the combined batch exceeds the 64 MiB limit".into(),
+            ));
+        }
+        let mut seen_files = HashSet::new();
+        let mut rows = Vec::new();
+        let mode = operation.mode();
+        let mut file_metadata = Vec::with_capacity(uploads.len());
+        for (upload_index, upload) in uploads.iter().enumerate() {
+            if upload.filename.trim().is_empty() || upload.filename.chars().count() > 255 {
+                return Err(InstitutionError::InvalidInput("invalid filename".into()));
+            }
+            if upload.bytes.is_empty() || upload.bytes.len() > limits.max_upload_bytes {
+                return Err(InstitutionError::InvalidInput(format!(
+                    "{} is empty or exceeds the per-file limit",
+                    upload.filename
+                )));
+            }
+            let digest = hex::encode(Sha256::digest(&upload.bytes));
+            if !seen_files.insert((upload.filename.to_ascii_lowercase(), digest.clone())) {
+                return Err(InstitutionError::InvalidInput(format!(
+                    "{} was selected more than once; remove the duplicate file",
+                    upload.filename
+                )));
+            }
+            let file_type = file_type(&upload.filename)?;
+            let parsed = match file_type {
+                ImportFileType::Csv => parse_csv(
+                    &upload.filename,
+                    upload.target_table.as_deref(),
+                    &upload.bytes,
+                    limits,
+                    mode,
+                    upload_index,
+                )?,
+                ImportFileType::Xlsx => {
+                    if upload.target_table.is_some() {
+                        return Err(InstitutionError::InvalidInput(
+                            "XLSX datasets are detected from worksheet names".into(),
+                        ));
+                    }
+                    parse_xlsx(&upload.bytes, limits, mode, upload_index)?
+                }
+            };
+            let import_kind = if file_type == ImportFileType::Csv {
+                parsed
+                    .first()
+                    .map_or_else(|| "empty".to_owned(), |row| row.table.clone())
+            } else {
+                "workbook".to_owned()
+            };
+            file_metadata.push((file_type, digest, import_kind));
+            rows.extend(parsed);
+        }
+        if rows.len() > 250_000 {
+            return Err(InstitutionError::InvalidInput(
+                "the combined batch exceeds the 250,000-row limit".into(),
+            ));
+        }
+        validate_cross_rows(&mut rows);
+        self.assign_actions(&mut rows, mode).await?;
+        self.validate_database_references(&mut rows).await?;
+        if operation == InstitutionOperation::Delete {
+            self.validate_delete_dependencies(&mut rows).await?;
+        }
+
+        let batch_id = Uuid::new_v4();
+        let job_ids = (0..uploads.len())
+            .map(|_| Uuid::new_v4())
+            .collect::<Vec<_>>();
+        let total_rows = i64::try_from(rows.len())
+            .map_err(|_| InstitutionError::InvalidInput("too many rows".into()))?;
+        let error_rows = count_rows(&rows, |row| row.error.is_some())?;
+        let added_rows = count_rows(&rows, |row| {
+            row.error.is_none() && action_for(row) == "INSERT"
+        })?;
+        let edited_rows = count_rows(&rows, |row| {
+            row.error.is_none() && action_for(row) == "UPDATE"
+        })?;
+        let deleted_rows = count_rows(&rows, |row| {
+            row.error.is_none() && action_for(row) == "DELETE"
+        })?;
+        let skipped_rows = count_rows(&rows, |row| {
+            row.error.is_none() && action_for(row) == "SKIP"
+        })?;
+        let status = if error_rows == 0 {
+            "VALIDATED"
+        } else {
+            "FAILED"
+        };
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.institution_import_batches \
+             (id,operation,status,submitted_by_user_id,total_files,total_rows,added_rows,edited_rows,deleted_rows,skipped_rows,error_rows,validated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,statement_timestamp())",
+        )
+        .bind(batch_id)
+        .bind(operation.as_str())
+        .bind(status)
+        .bind(submitted_by.as_uuid())
+        .bind(i32::try_from(uploads.len()).map_err(|_| InstitutionError::InvalidInput("too many files".into()))?)
+        .bind(total_rows)
+        .bind(added_rows)
+        .bind(edited_rows)
+        .bind(deleted_rows)
+        .bind(skipped_rows)
+        .bind(error_rows)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        for (index, upload) in uploads.iter().enumerate() {
+            let (file_type, digest, import_kind) = &file_metadata[index];
+            let file_rows = rows
+                .iter()
+                .filter(|row| row.upload_index == index)
+                .collect::<Vec<_>>();
+            let file_total = i64::try_from(file_rows.len())
+                .map_err(|_| InstitutionError::InvalidInput("too many rows".into()))?;
+            let file_errors =
+                i64::try_from(file_rows.iter().filter(|row| row.error.is_some()).count())
+                    .map_err(|_| InstitutionError::InvalidInput("too many errors".into()))?;
+            sqlx::query(
+                "INSERT INTO latex_core.institution_import_jobs \
+                 (id,batch_id,import_kind,mode,original_filename,content_sha256,file_type,submitted_by_user_id,status,total_rows,error_rows,validated_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,statement_timestamp())",
+            )
+            .bind(job_ids[index])
+            .bind(batch_id)
+            .bind(import_kind)
+            .bind(mode.as_str())
+            .bind(&upload.filename)
+            .bind(digest)
+            .bind(file_type.as_str())
+            .bind(submitted_by.as_uuid())
+            .bind(if file_errors == 0 { "VALIDATED" } else { "FAILED" })
+            .bind(file_total)
+            .bind(file_errors)
+            .execute(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+        }
+        for chunk in rows.chunks(500) {
+            let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+                "INSERT INTO latex_core.institution_import_rows \
+                 (job_id,source_table_or_sheet,row_number,natural_key,payload,existing_payload,action,status,error_code,error_message) ",
+            );
+            builder.push_values(chunk, |mut separated, row| {
+                let (code, message) = row
+                    .error
+                    .as_ref()
+                    .map_or((None, None), |(code, message)| (Some(*code), Some(message)));
+                separated
+                    .push_bind(job_ids[row.upload_index])
+                    .push_bind(&row.table)
+                    .push_bind(row.row_number)
+                    .push_bind(&row.natural_key)
+                    .push_bind(&row.payload)
+                    .push_bind(&row.existing_payload)
+                    .push_bind(if row.error.is_some() {
+                        "INVALID"
+                    } else {
+                        action_for(row)
+                    })
+                    .push_bind(if row.error.is_some() {
+                        "ERROR"
+                    } else {
+                        "VALID"
+                    })
+                    .push_bind(code)
+                    .push_bind(message);
+            });
+            builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+        }
+        audit_tx(
+            &mut tx,
+            submitted_by,
+            "institution.import_batch.validated",
+            "institution_import_batch",
+            batch_id,
+            json!({"operation":operation.as_str(),"total_files":uploads.len(),"total_rows":total_rows,"error_rows":error_rows}),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)?;
+        self.batch_detail(batch_id, 100).await
     }
 
     pub async fn apply_import(
@@ -434,8 +727,13 @@ impl InstitutionRepository {
             .await
             .map_err(InstitutionError::Database)?;
 
-        let merge = mode == "MERGE";
-        for table in APPLY_ORDER {
+        let import_mode = mode.parse::<ImportMode>()?;
+        let order = if import_mode == ImportMode::DeleteOnly {
+            APPLY_ORDER.iter().rev().copied().collect::<Vec<_>>()
+        } else {
+            APPLY_ORDER.to_vec()
+        };
+        for table in order {
             let payloads: Vec<Value> = sqlx::query_scalar(
                 "SELECT payload FROM latex_core.institution_import_rows \
                  WHERE job_id=$1 AND source_table_or_sheet=$2 AND status='VALID' ORDER BY row_number",
@@ -446,7 +744,7 @@ impl InstitutionRepository {
             .await
             .map_err(InstitutionError::Database)?;
             if !payloads.is_empty() {
-                apply_table(&mut tx, table, merge, Value::Array(payloads)).await?;
+                apply_table(&mut tx, table, import_mode, Value::Array(payloads)).await?;
             }
         }
         reconcile_identity_links_tx(&mut tx, actor).await?;
@@ -501,6 +799,337 @@ impl InstitutionRepository {
         self.job(job_id).await
     }
 
+    pub async fn apply_batch(
+        &self,
+        batch_id: Uuid,
+        actor: UserId,
+    ) -> Result<Value, InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        let row = sqlx::query(
+            "SELECT operation,status,error_rows FROM latex_core.institution_import_batches WHERE id=$1 FOR UPDATE",
+        )
+        .bind(batch_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?
+        .ok_or(InstitutionError::NotFound)?;
+        let operation: String = row
+            .try_get("operation")
+            .map_err(InstitutionError::Database)?;
+        let status: String = row.try_get("status").map_err(InstitutionError::Database)?;
+        let error_rows: i64 = row
+            .try_get("error_rows")
+            .map_err(InstitutionError::Database)?;
+        if status == "APPLIED" || status == "PARTIAL" {
+            tx.rollback().await.map_err(InstitutionError::Database)?;
+            return self.batch_detail(batch_id, 100).await;
+        }
+        if status != "VALIDATED" || error_rows != 0 {
+            return Err(InstitutionError::Conflict(
+                "only an error-free reviewed batch can be applied".into(),
+            ));
+        }
+        let mode = operation.parse::<InstitutionOperation>()?.mode();
+        sqlx::query(
+            "UPDATE latex_core.institution_import_batches SET status='APPLYING' WHERE id=$1",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        sqlx::query(
+            "UPDATE latex_core.institution_import_jobs SET status='APPLYING' WHERE batch_id=$1",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        let order = if mode == ImportMode::DeleteOnly {
+            APPLY_ORDER.iter().rev().copied().collect::<Vec<_>>()
+        } else {
+            APPLY_ORDER.to_vec()
+        };
+        for table in order {
+            let payloads: Vec<Value> = sqlx::query_scalar(
+                "SELECT row.payload FROM latex_core.institution_import_rows row \
+                 JOIN latex_core.institution_import_jobs job ON job.id=row.job_id \
+                 WHERE job.batch_id=$1 AND row.source_table_or_sheet=$2 AND row.status='VALID' \
+                 AND row.action IN ('INSERT','UPDATE','DELETE') ORDER BY row.row_number",
+            )
+            .bind(batch_id)
+            .bind(table)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+            if !payloads.is_empty() {
+                apply_table(&mut tx, table, mode, Value::Array(payloads)).await?;
+            }
+        }
+        reconcile_identity_links_tx(&mut tx, actor).await?;
+        sqlx::query(
+            r"UPDATE latex_core.institution_import_jobs job SET
+                 status='APPLIED',
+                 inserted_rows=(SELECT count(*) FROM latex_core.institution_import_rows row WHERE row.job_id=job.id AND row.action='INSERT'),
+                 updated_rows=(SELECT count(*) FROM latex_core.institution_import_rows row WHERE row.job_id=job.id AND row.action='UPDATE'),
+                 skipped_rows=(SELECT count(*) FROM latex_core.institution_import_rows row WHERE row.job_id=job.id AND row.action='SKIP'),
+                 applied_at=statement_timestamp()
+               WHERE job.batch_id=$1",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        sqlx::query(
+            "UPDATE latex_core.institution_import_rows row SET status=CASE WHEN action='SKIP' THEN 'SKIPPED' ELSE 'APPLIED' END \
+             FROM latex_core.institution_import_jobs job WHERE row.job_id=job.id AND job.batch_id=$1 AND row.status='VALID'",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        sqlx::query(
+            "UPDATE latex_core.institution_import_batches SET status='APPLIED',applied_at=statement_timestamp() WHERE id=$1",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.import_batch.applied",
+            "institution_import_batch",
+            batch_id,
+            json!({"operation":operation}),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)?;
+        self.batch_detail(batch_id, 100).await
+    }
+
+    pub async fn batch_primary_job(&self, batch_id: Uuid) -> Result<Uuid, InstitutionError> {
+        sqlx::query_scalar(
+            r"SELECT job.id FROM latex_core.institution_import_jobs job WHERE job.batch_id=$1
+               ORDER BY EXISTS(
+                   SELECT 1 FROM latex_core.institution_import_rows row WHERE row.job_id=job.id
+                   AND row.source_table_or_sheet IN ('paper_teams','paper_team_writers','paper_team_mentors')
+               ) DESC,job.created_at,job.id LIMIT 1",
+        )
+        .bind(batch_id)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .ok_or(InstitutionError::NotFound)
+    }
+
+    pub async fn batch_detail(&self, id: Uuid, row_limit: i64) -> Result<Value, InstitutionError> {
+        let batch = self.batch(id).await?;
+        let files = sqlx::query(
+            r"SELECT job.id,job.original_filename,job.content_sha256,job.file_type,job.status,job.total_rows,job.error_rows,
+                     COALESCE(array_agg(DISTINCT row.source_table_or_sheet ORDER BY row.source_table_or_sheet) FILTER (WHERE row.source_table_or_sheet IS NOT NULL),'{}') AS datasets
+              FROM latex_core.institution_import_jobs job
+              LEFT JOIN latex_core.institution_import_rows row ON row.job_id=job.id
+              WHERE job.batch_id=$1 GROUP BY job.id ORDER BY job.created_at,job.id",
+        )
+        .bind(id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id":row.try_get::<Uuid,_>("id").map_err(InstitutionError::Database)?,
+                "filename":row.try_get::<String,_>("original_filename").map_err(InstitutionError::Database)?,
+                "checksum":row.try_get::<String,_>("content_sha256").map_err(InstitutionError::Database)?,
+                "file_type":row.try_get::<String,_>("file_type").map_err(InstitutionError::Database)?,
+                "status":row.try_get::<String,_>("status").map_err(InstitutionError::Database)?,
+                "total_rows":row.try_get::<i64,_>("total_rows").map_err(InstitutionError::Database)?,
+                "error_rows":row.try_get::<i64,_>("error_rows").map_err(InstitutionError::Database)?,
+                "datasets":row.try_get::<Vec<String>,_>("datasets").map_err(InstitutionError::Database)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, InstitutionError>>()?;
+        let summaries = sqlx::query(
+            r"SELECT row.source_table_or_sheet,count(*) AS total,
+                     count(*) FILTER (WHERE row.action='INSERT') AS add_rows,
+                     count(*) FILTER (WHERE row.action='UPDATE') AS edit_rows,
+                     count(*) FILTER (WHERE row.action='DELETE') AS delete_rows,
+                     count(*) FILTER (WHERE row.action='SKIP') AS skip_rows,
+                     count(*) FILTER (WHERE row.status IN ('ERROR','UNRESOLVED')) AS error_rows
+              FROM latex_core.institution_import_rows row
+              JOIN latex_core.institution_import_jobs job ON job.id=row.job_id
+              WHERE job.batch_id=$1 GROUP BY row.source_table_or_sheet ORDER BY row.source_table_or_sheet",
+        )
+        .bind(id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .into_iter()
+        .map(|row| {
+            let source: String = row.try_get("source_table_or_sheet").map_err(InstitutionError::Database)?;
+            Ok(json!({
+                "source":source,"dataset":friendly_dataset(&source),
+                "total":row.try_get::<i64,_>("total").map_err(InstitutionError::Database)?,
+                "add":row.try_get::<i64,_>("add_rows").map_err(InstitutionError::Database)?,
+                "edit":row.try_get::<i64,_>("edit_rows").map_err(InstitutionError::Database)?,
+                "delete":row.try_get::<i64,_>("delete_rows").map_err(InstitutionError::Database)?,
+                "skip":row.try_get::<i64,_>("skip_rows").map_err(InstitutionError::Database)?,
+                "error":row.try_get::<i64,_>("error_rows").map_err(InstitutionError::Database)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, InstitutionError>>()?;
+        let issues = sqlx::query(
+            r"SELECT job.original_filename,row.source_table_or_sheet,row.row_number,row.natural_key,row.payload,row.existing_payload,row.error_code,row.error_message
+              FROM latex_core.institution_import_rows row JOIN latex_core.institution_import_jobs job ON job.id=row.job_id
+              WHERE job.batch_id=$1 AND row.status IN ('ERROR','UNRESOLVED')
+              ORDER BY job.created_at,row.source_table_or_sheet,row.row_number LIMIT $2",
+        )
+        .bind(id)
+        .bind(row_limit.clamp(1, 200))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .into_iter()
+        .map(|row| {
+            let source: String = row.try_get("source_table_or_sheet").map_err(InstitutionError::Database)?;
+            Ok(json!({
+                "file":row.try_get::<String,_>("original_filename").map_err(InstitutionError::Database)?,
+                "row":row.try_get::<i64,_>("row_number").map_err(InstitutionError::Database)?,
+                "dataset":friendly_dataset(&source),"source":source,
+                "key":row.try_get::<Value,_>("natural_key").map_err(InstitutionError::Database)?,
+                "payload":row.try_get::<Value,_>("payload").map_err(InstitutionError::Database)?,
+                "existing":row.try_get::<Option<Value>,_>("existing_payload").map_err(InstitutionError::Database)?,
+                "code":row.try_get::<Option<String>,_>("error_code").map_err(InstitutionError::Database)?,
+                "problem":row.try_get::<Option<String>,_>("error_message").map_err(InstitutionError::Database)?,
+                "suggested_action":friendly_suggestion(row.try_get::<Option<String>,_>("error_code").map_err(InstitutionError::Database)?.as_deref()),
+            }))
+        })
+        .collect::<Result<Vec<_>, InstitutionError>>()?;
+        let changes = sqlx::query(
+            r"SELECT row.source_table_or_sheet,row.natural_key,row.payload,row.existing_payload
+              FROM latex_core.institution_import_rows row JOIN latex_core.institution_import_jobs job ON job.id=row.job_id
+              WHERE job.batch_id=$1 AND row.action='UPDATE' AND row.status NOT IN ('ERROR','UNRESOLVED')
+              ORDER BY job.created_at,row.source_table_or_sheet,row.row_number LIMIT $2",
+        )
+        .bind(id)
+        .bind(row_limit.clamp(1, 200))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .into_iter()
+        .map(|row| {
+            let source: String = row
+                .try_get("source_table_or_sheet")
+                .map_err(InstitutionError::Database)?;
+            let natural_key: Value = row
+                .try_get("natural_key")
+                .map_err(InstitutionError::Database)?;
+            let payload: Value = row.try_get("payload").map_err(InstitutionError::Database)?;
+            let existing: Value = row
+                .try_get::<Option<Value>, _>("existing_payload")
+                .map_err(InstitutionError::Database)?
+                .unwrap_or_else(|| json!({}));
+            let mut fields = Map::new();
+            if let Some(values) = payload.as_object() {
+                for (field, new_value) in values {
+                    if field == "__action" || spec(&source).keys.contains(&field.as_str()) {
+                        continue;
+                    }
+                    let old_value = existing.get(field).cloned().unwrap_or(Value::Null);
+                    if old_value != *new_value {
+                        fields.insert(
+                            field.clone(),
+                            json!({"old":old_value,"new":new_value}),
+                        );
+                    }
+                }
+            }
+            let display_key = natural_key.as_object().map_or_else(String::new, |values| {
+                values
+                    .values()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            });
+            let template_effect = (source == "students"
+                && fields.contains_key("programme_code"))
+            .then_some("Programme changed. Existing Team template remains pinned.");
+            Ok(json!({
+                "dataset":friendly_dataset(&source),"source":source,"display_key":display_key,
+                "fields":fields,"template_effect":template_effect,
+            }))
+        })
+        .collect::<Result<Vec<_>, InstitutionError>>()?;
+        Ok(json!({
+            "batch":batch,"files":files,"summaries":summaries,"issues":issues,"changes":changes,
+            "issues_limited":true,"changes_limited":true
+        }))
+    }
+
+    pub async fn batch(&self, id: Uuid) -> Result<InstitutionImportBatch, InstitutionError> {
+        let row = sqlx::query(
+            "SELECT id,operation,status,submitted_by_user_id,total_files,total_rows,added_rows,edited_rows,deleted_rows,skipped_rows,error_rows,created_at::text,validated_at::text,applied_at::text FROM latex_core.institution_import_batches WHERE id=$1",
+        )
+        .bind(id)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?
+        .ok_or(InstitutionError::NotFound)?;
+        decode_batch(row)
+    }
+
+    pub async fn paginated_batches(
+        &self,
+        filter: &ImportJobPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let rows = sqlx::query(
+            r"SELECT batch.id,batch.operation,batch.status,batch.total_files,batch.total_rows,batch.added_rows,batch.edited_rows,batch.deleted_rows,batch.skipped_rows,batch.error_rows,batch.created_at::text AS created_at,
+                     string_agg(job.original_filename, ', ' ORDER BY job.created_at,job.id) AS filenames,count(*) OVER() AS total
+              FROM latex_core.institution_import_batches batch
+              JOIN latex_core.institution_import_jobs job ON job.batch_id=batch.id
+              WHERE ($1::text IS NULL OR job.original_filename ILIKE '%' || $1 || '%' OR batch.id::text ILIKE '%' || $1 || '%')
+                AND ($2::text IS NULL OR batch.status=$2)
+                AND ($3::text IS NULL OR batch.operation=$3)
+              GROUP BY batch.id ORDER BY batch.created_at DESC,batch.id DESC LIMIT $4 OFFSET $5",
+        )
+        .bind(clean_filter(filter.search.as_deref()))
+        .bind(clean_filter(filter.status.as_deref()))
+        .bind(clean_filter(filter.mode.as_deref()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            Ok(json!({
+                "id":row.try_get::<Uuid,_>("id").map_err(InstitutionError::Database)?,
+                "operation":row.try_get::<String,_>("operation").map_err(InstitutionError::Database)?,
+                "status":row.try_get::<String,_>("status").map_err(InstitutionError::Database)?,
+                "total_files":row.try_get::<i32,_>("total_files").map_err(InstitutionError::Database)?,
+                "total_rows":row.try_get::<i64,_>("total_rows").map_err(InstitutionError::Database)?,
+                "added_rows":row.try_get::<i64,_>("added_rows").map_err(InstitutionError::Database)?,
+                "edited_rows":row.try_get::<i64,_>("edited_rows").map_err(InstitutionError::Database)?,
+                "deleted_rows":row.try_get::<i64,_>("deleted_rows").map_err(InstitutionError::Database)?,
+                "skipped_rows":row.try_get::<i64,_>("skipped_rows").map_err(InstitutionError::Database)?,
+                "error_rows":row.try_get::<i64,_>("error_rows").map_err(InstitutionError::Database)?,
+                "created_at":row.try_get::<String,_>("created_at").map_err(InstitutionError::Database)?,
+                "filenames":row.try_get::<String,_>("filenames").map_err(InstitutionError::Database)?,
+            }))
+        })
+    }
+
     pub async fn list_jobs(
         &self,
         limit: i64,
@@ -529,7 +1158,7 @@ impl InstitutionRepository {
         let page = filter.page.max(1);
         let offset = (page - 1).saturating_mul(limit);
         let rows = sqlx::query(
-            r"SELECT j.id,j.mode,j.original_filename,j.file_type,j.status,j.total_rows,
+            r"SELECT j.id,j.batch_id,j.mode,j.original_filename,j.file_type,j.status,j.total_rows,
                      j.inserted_rows,j.updated_rows,j.skipped_rows,j.error_rows,
                      j.created_at::text AS created_at,c.email AS submitted_by,
                      count(*) OVER() AS total
@@ -553,6 +1182,7 @@ impl InstitutionRepository {
         page_from_rows(rows, page, limit, offset, |row| {
             Ok(json!({
                 "id": row.try_get::<Uuid,_>("id").map_err(InstitutionError::Database)?,
+                "batch_id": row.try_get::<Option<Uuid>,_>("batch_id").map_err(InstitutionError::Database)?,
                 "mode": row.try_get::<String,_>("mode").map_err(InstitutionError::Database)?,
                 "original_filename": row.try_get::<String,_>("original_filename").map_err(InstitutionError::Database)?,
                 "file_type": row.try_get::<String,_>("file_type").map_err(InstitutionError::Database)?,
@@ -1009,6 +1639,149 @@ impl InstitutionRepository {
         })
     }
 
+    pub async fn paginated_dataset(
+        &self,
+        dataset: &str,
+        filter: &InstitutionPageFilter,
+    ) -> Result<PaperTeamPage, InstitutionError> {
+        if dataset == "students" {
+            let mut page = self.paginated_students(filter).await?;
+            for item in &mut page.items {
+                if let Some(values) = item.as_object_mut() {
+                    if let Some(registration_number) = values.remove("registration_number") {
+                        values.insert("reg_no".into(), registration_number);
+                    }
+                }
+            }
+            return Ok(page);
+        }
+        if dataset == "faculty" {
+            let mut page = self.paginated_faculty(filter).await?;
+            for item in &mut page.items {
+                if let Some(values) = item.as_object_mut() {
+                    if let Some(department_id) = values.remove("department_id") {
+                        values.insert("dept_id".into(), department_id);
+                    }
+                }
+            }
+            return Ok(page);
+        }
+        if dataset == "programmes" {
+            return self.paginated_programmes(filter).await;
+        }
+        let limit = page_limit(filter.limit);
+        let page = filter.page.max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let query = match dataset {
+            "departments" => {
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.departments record WHERE ($1::text IS NULL OR record.department_id::text ILIKE '%' || $1 || '%') ORDER BY record.department_id LIMIT $2 OFFSET $3"
+            }
+            "schools" => {
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.schools record WHERE ($1::text IS NULL OR record.school_id ILIKE '%' || $1 || '%') ORDER BY record.school_id LIMIT $2 OFFSET $3"
+            }
+            "student_course_registrations" => {
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.student_course_registrations record WHERE ($1::text IS NULL OR record.student_reg_no ILIKE '%' || $1 || '%' OR record.course_id ILIKE '%' || $1 || '%' OR record.academic_year ILIKE '%' || $1 || '%' OR record.semester ILIKE '%' || $1 || '%') ORDER BY record.student_reg_no,record.academic_year,record.semester,record.course_id LIMIT $2 OFFSET $3"
+            }
+            "faculty_guide_capacity" => {
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.faculty_guide_capacity record WHERE ($1::text IS NULL OR record.capacity_id::text ILIKE '%' || $1 || '%' OR record.faculty_id ILIKE '%' || $1 || '%' OR record.academic_year ILIKE '%' || $1 || '%') ORDER BY record.academic_year DESC,record.faculty_id,record.capacity_id LIMIT $2 OFFSET $3"
+            }
+            "department_roles" => {
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.department_roles record WHERE ($1::text IS NULL OR record.id::text ILIKE '%' || $1 || '%' OR record.dept_id ILIKE '%' || $1 || '%' OR record.faculty_id ILIKE '%' || $1 || '%' OR record.role_type ILIKE '%' || $1 || '%') ORDER BY record.dept_id,record.role_type,record.id LIMIT $2 OFFSET $3"
+            }
+            "faculty_roles" => {
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.faculty_roles record WHERE ($1::text IS NULL OR record.role_id::text ILIKE '%' || $1 || '%' OR record.faculty_id ILIKE '%' || $1 || '%' OR record.role_type ILIKE '%' || $1 || '%' OR record.programme_code ILIKE '%' || $1 || '%') ORDER BY record.faculty_id,record.role_type,record.role_id LIMIT $2 OFFSET $3"
+            }
+            "paper_teams" => {
+                r"SELECT jsonb_build_object(
+                    'external_team_key',record.external_team_key,'team_name',record.team_name,
+                    'academic_year',record.academic_year,'semester',record.semester,'status',record.status,
+                    'writers',(SELECT COALESCE(jsonb_agg(jsonb_build_object('student_reg_no',writer.student_reg_no,'writer_order',writer.writer_order,'is_leader',writer.is_leader) ORDER BY writer.writer_order),'[]') FROM vcap.paper_assignment_students writer WHERE writer.external_team_key=record.external_team_key),
+                    'mentors',(SELECT COALESCE(jsonb_agg(jsonb_build_object('faculty_id',mentor.faculty_id) ORDER BY mentor.faculty_id),'[]') FROM vcap.paper_assignment_mentors mentor WHERE mentor.external_team_key=record.external_team_key),
+                    'materialized_paper_team_id',link.paper_team_id) AS payload,count(*) OVER() AS total
+                FROM vcap.paper_assignment_groups record LEFT JOIN latex_core.external_paper_team_links link USING(external_team_key)
+                WHERE ($1::text IS NULL OR record.external_team_key ILIKE '%' || $1 || '%' OR record.team_name ILIKE '%' || $1 || '%'
+                    OR EXISTS(SELECT 1 FROM vcap.paper_assignment_students writer WHERE writer.external_team_key=record.external_team_key AND writer.student_reg_no ILIKE '%' || $1 || '%')
+                    OR EXISTS(SELECT 1 FROM vcap.paper_assignment_mentors mentor WHERE mentor.external_team_key=record.external_team_key AND mentor.faculty_id ILIKE '%' || $1 || '%'))
+                ORDER BY record.external_team_key LIMIT $2 OFFSET $3"
+            }
+            _ => {
+                return Err(InstitutionError::InvalidInput(
+                    "unknown institution dataset".into(),
+                ));
+            }
+        };
+        let rows = sqlx::query(query)
+            .bind(clean_filter(filter.search.as_deref()))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(self.database.pool())
+            .await
+            .map_err(InstitutionError::Database)?;
+        page_from_rows(rows, page, limit, offset, |row| {
+            row.try_get::<Value, _>("payload")
+                .map_err(InstitutionError::Database)
+        })
+    }
+
+    pub async fn validate_manual_operation(
+        &self,
+        actor: UserId,
+        dataset: &str,
+        operation: InstitutionOperation,
+        payload: &Value,
+    ) -> Result<Value, InstitutionError> {
+        if !INSTITUTION_TABLES.contains(&dataset) {
+            return Err(InstitutionError::InvalidInput(
+                "unknown institution dataset".into(),
+            ));
+        }
+        let values = payload.as_object().ok_or_else(|| {
+            InstitutionError::InvalidInput("manual record must be a JSON object".into())
+        })?;
+        if values.is_empty() {
+            return Err(InstitutionError::InvalidInput(
+                "manual record has no fields".into(),
+            ));
+        }
+        for field in values.keys() {
+            if !spec(dataset).columns.contains(&field.as_str()) {
+                return Err(InstitutionError::InvalidInput(format!(
+                    "{dataset}: unknown field {field}"
+                )));
+            }
+        }
+        let headers = values.keys().cloned().collect::<Vec<_>>();
+        let record = headers
+            .iter()
+            .map(|field| match values.get(field) {
+                Some(Value::Null) | None => String::new(),
+                Some(Value::String(value)) => value.clone(),
+                Some(value) => value.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let mut writer = csv::Writer::from_writer(Vec::new());
+        writer.write_record(&headers).map_err(|error| {
+            InstitutionError::InvalidInput(format!("could not encode manual record: {error}"))
+        })?;
+        writer.write_record(&record).map_err(|error| {
+            InstitutionError::InvalidInput(format!("could not encode manual record: {error}"))
+        })?;
+        let bytes = writer.into_inner().map_err(|error| {
+            InstitutionError::InvalidInput(format!("could not encode manual record: {error}"))
+        })?;
+        self.validate_batch(
+            actor,
+            operation,
+            &[InstitutionBatchUpload {
+                filename: format!("Manual {dataset}.csv"),
+                target_table: Some(dataset.to_owned()),
+                bytes,
+            }],
+            ImportLimits::default(),
+        )
+        .await
+    }
+
     pub async fn paginated_identity_links(
         &self,
         filter: &InstitutionPageFilter,
@@ -1357,6 +2130,17 @@ impl InstitutionRepository {
         .execute(&mut *tx)
         .await
         .map_err(InstitutionError::Database)?;
+        sqlx::query(
+            r"UPDATE latex_core.institution_import_batches batch SET status='PARTIAL',
+                 error_rows=(SELECT count(*) FROM latex_core.institution_import_rows row
+                     JOIN latex_core.institution_import_jobs sibling ON sibling.id=row.job_id
+                     WHERE sibling.batch_id=batch.id AND row.status IN ('ERROR','UNRESOLVED'))
+               WHERE batch.id=(SELECT batch_id FROM latex_core.institution_import_jobs WHERE id=$1)",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
         tx.commit().await.map_err(InstitutionError::Database)
     }
 
@@ -1378,6 +2162,20 @@ impl InstitutionRepository {
             .bind(job_id).fetch_one(&mut *tx).await.map_err(InstitutionError::Database)?;
         sqlx::query("UPDATE latex_core.institution_import_jobs SET error_rows=$2,status=CASE WHEN $2=0 THEN 'APPLIED' ELSE 'PARTIAL' END WHERE id=$1")
             .bind(job_id).bind(remaining).execute(&mut *tx).await.map_err(InstitutionError::Database)?;
+        sqlx::query(
+            r"UPDATE latex_core.institution_import_batches batch SET
+                 error_rows=(SELECT count(*) FROM latex_core.institution_import_rows row
+                     JOIN latex_core.institution_import_jobs sibling ON sibling.id=row.job_id
+                     WHERE sibling.batch_id=batch.id AND row.status IN ('ERROR','UNRESOLVED')),
+                 status=CASE WHEN NOT EXISTS(SELECT 1 FROM latex_core.institution_import_rows row
+                     JOIN latex_core.institution_import_jobs sibling ON sibling.id=row.job_id
+                     WHERE sibling.batch_id=batch.id AND row.status IN ('ERROR','UNRESOLVED')) THEN 'APPLIED' ELSE 'PARTIAL' END
+               WHERE batch.id=(SELECT batch_id FROM latex_core.institution_import_jobs WHERE id=$1)",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
         audit_tx(
             &mut tx,
             actor,
@@ -1397,7 +2195,11 @@ impl InstitutionRepository {
         let groups = sqlx::query(
             "SELECT g.external_team_key,g.team_name,link.paper_team_id FROM vcap.paper_assignment_groups g \
              LEFT JOIN latex_core.external_paper_team_links link USING(external_team_key) \
-             WHERE EXISTS (SELECT 1 FROM latex_core.institution_import_rows r WHERE r.job_id=$1 AND r.source_table_or_sheet IN ('paper_teams','paper_team_writers','paper_team_mentors') AND (r.natural_key->>'external_team_key')=g.external_team_key) \
+             WHERE EXISTS (SELECT 1 FROM latex_core.institution_import_rows r \
+                 JOIN latex_core.institution_import_jobs source_job ON source_job.id=r.job_id \
+                 WHERE (r.job_id=$1 OR source_job.batch_id=(SELECT batch_id FROM latex_core.institution_import_jobs WHERE id=$1)) \
+                 AND r.source_table_or_sheet IN ('paper_teams','paper_team_writers','paper_team_mentors') \
+                 AND (r.natural_key->>'external_team_key')=g.external_team_key) \
              ORDER BY g.external_team_key",
         )
         .bind(job_id)
@@ -1823,22 +2625,35 @@ impl InstitutionRepository {
         rows: &mut [SourceRow],
         mode: ImportMode,
     ) -> Result<(), InstitutionError> {
-        let mut existing = HashMap::<String, HashSet<String>>::new();
+        let mut existing = HashMap::<String, HashMap<String, Value>>::new();
         for table in INSTITUTION_TABLES {
             if rows
                 .iter()
                 .any(|row| row.table == table && row.error.is_none())
             {
-                existing.insert(table.to_owned(), self.existing_keys(table).await?);
+                existing.insert(table.to_owned(), self.existing_records(table).await?);
             }
         }
         for row in rows {
-            if row.error.is_some() {
+            if row.error.is_some() || matches!(action_for(row), "SKIP" | "DELETE") {
                 continue;
             }
-            let present = existing
+            let existing_payload = existing
                 .get(&row.table)
-                .is_some_and(|keys| keys.contains(&key_token(&row.natural_key)));
+                .and_then(|records| records.get(&key_token(&row.natural_key)))
+                .cloned();
+            let present = existing_payload.is_some();
+            row.existing_payload = existing_payload;
+            if !present && matches!(mode, ImportMode::UpdateOnly | ImportMode::DeleteOnly) {
+                row.error = Some((
+                    "NOT_FOUND",
+                    format!(
+                        "{} was not found; check the canonical key and try again",
+                        friendly_dataset(&row.table)
+                    ),
+                ));
+                continue;
+            }
             row.payload
                 .as_object_mut()
                 .expect("validated payload object")
@@ -1846,9 +2661,14 @@ impl InstitutionRepository {
                     "__action".into(),
                     Value::String(
                         match (present, mode) {
-                            (false, _) => "INSERT",
-                            (true, ImportMode::Merge) => "UPDATE",
+                            (
+                                false,
+                                ImportMode::ValidateOnly | ImportMode::Merge | ImportMode::AddOnly,
+                            ) => "INSERT",
+                            (true, ImportMode::Merge | ImportMode::UpdateOnly) => "UPDATE",
+                            (true, ImportMode::DeleteOnly) => "DELETE",
                             (true, ImportMode::ValidateOnly | ImportMode::AddOnly) => "SKIP",
+                            (false, ImportMode::UpdateOnly | ImportMode::DeleteOnly) => "INVALID",
                         }
                         .into(),
                     ),
@@ -1857,38 +2677,49 @@ impl InstitutionRepository {
         Ok(())
     }
 
-    async fn existing_keys(&self, table: &str) -> Result<HashSet<String>, InstitutionError> {
+    async fn existing_records(
+        &self,
+        table: &str,
+    ) -> Result<HashMap<String, Value>, InstitutionError> {
         let query = match table {
             "departments" => {
-                "SELECT jsonb_build_object('department_id',department_id::text) FROM vcap.departments"
+                "SELECT jsonb_build_object('department_id',department_id::text) AS natural_key,to_jsonb(record) AS payload FROM vcap.departments record"
             }
-            "admins" => "SELECT jsonb_build_object('admin_id',admin_id) FROM vcap.admins",
-            "faculty" => "SELECT jsonb_build_object('faculty_id',faculty_id) FROM vcap.faculty",
+            "admins" => {
+                "SELECT jsonb_build_object('admin_id',admin_id) AS natural_key,to_jsonb(record) AS payload FROM vcap.admins record"
+            }
+            "faculty" => {
+                "SELECT jsonb_build_object('faculty_id',faculty_id) AS natural_key,to_jsonb(record) AS payload FROM vcap.faculty record"
+            }
             "programmes" => {
-                "SELECT jsonb_build_object('programme_code',programme_code) FROM vcap.programmes"
+                "SELECT jsonb_build_object('programme_code',programme_code) AS natural_key,to_jsonb(record) AS payload FROM vcap.programmes record"
             }
-            "schools" => "SELECT jsonb_build_object('school_id',school_id) FROM vcap.schools",
-            "students" => "SELECT jsonb_build_object('reg_no',reg_no) FROM vcap.students",
+            "schools" => {
+                "SELECT jsonb_build_object('school_id',school_id) AS natural_key,to_jsonb(record) AS payload FROM vcap.schools record"
+            }
+            "students" => {
+                "SELECT jsonb_build_object('reg_no',reg_no) AS natural_key,to_jsonb(record) AS payload FROM vcap.students record"
+            }
             "student_course_registrations" => {
-                "SELECT jsonb_build_object('student_reg_no',student_reg_no,'course_id',course_id,'academic_year',academic_year,'semester',semester) FROM vcap.student_course_registrations"
+                "SELECT jsonb_build_object('student_reg_no',student_reg_no,'course_id',course_id,'academic_year',academic_year,'semester',semester) AS natural_key,to_jsonb(record) AS payload FROM vcap.student_course_registrations record"
             }
             "faculty_guide_capacity" => {
-                "SELECT jsonb_build_object('capacity_id',capacity_id::text) FROM vcap.faculty_guide_capacity"
+                "SELECT jsonb_build_object('capacity_id',capacity_id::text) AS natural_key,to_jsonb(record) AS payload FROM vcap.faculty_guide_capacity record"
             }
             "department_roles" => {
-                "SELECT jsonb_build_object('id',id::text) FROM vcap.department_roles"
+                "SELECT jsonb_build_object('id',id::text) AS natural_key,to_jsonb(record) AS payload FROM vcap.department_roles record"
             }
             "faculty_roles" => {
-                "SELECT jsonb_build_object('role_id',role_id::text) FROM vcap.faculty_roles"
+                "SELECT jsonb_build_object('role_id',role_id::text) AS natural_key,to_jsonb(record) AS payload FROM vcap.faculty_roles record"
             }
             "paper_teams" => {
-                "SELECT jsonb_build_object('external_team_key',external_team_key) FROM vcap.paper_assignment_groups"
+                "SELECT jsonb_build_object('external_team_key',external_team_key) AS natural_key,to_jsonb(record) AS payload FROM vcap.paper_assignment_groups record"
             }
             "paper_team_writers" => {
-                "SELECT jsonb_build_object('external_team_key',external_team_key,'student_reg_no',student_reg_no) FROM vcap.paper_assignment_students"
+                "SELECT jsonb_build_object('external_team_key',external_team_key,'student_reg_no',student_reg_no) AS natural_key,to_jsonb(record) AS payload FROM vcap.paper_assignment_students record"
             }
             "paper_team_mentors" => {
-                "SELECT jsonb_build_object('external_team_key',external_team_key,'faculty_id',faculty_id) FROM vcap.paper_assignment_mentors"
+                "SELECT jsonb_build_object('external_team_key',external_team_key,'faculty_id',faculty_id) AS natural_key,to_jsonb(record) AS payload FROM vcap.paper_assignment_mentors record"
             }
             _ => {
                 return Err(InstitutionError::InvalidInput(
@@ -1896,11 +2727,20 @@ impl InstitutionRepository {
                 ));
             }
         };
-        let values: Vec<Value> = sqlx::query_scalar(query)
+        let values = sqlx::query(query)
             .fetch_all(self.database.pool())
             .await
             .map_err(InstitutionError::Database)?;
-        Ok(values.into_iter().map(|value| key_token(&value)).collect())
+        values
+            .into_iter()
+            .map(|row| {
+                let natural_key: Value = row
+                    .try_get("natural_key")
+                    .map_err(InstitutionError::Database)?;
+                let payload: Value = row.try_get("payload").map_err(InstitutionError::Database)?;
+                Ok((key_token(&natural_key), payload))
+            })
+            .collect()
     }
 
     async fn validate_database_references(
@@ -1986,6 +2826,100 @@ impl InstitutionRepository {
         }
         Ok(())
     }
+
+    async fn validate_delete_dependencies(
+        &self,
+        rows: &mut [SourceRow],
+    ) -> Result<(), InstitutionError> {
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.error.is_none() && action_for(row) == "DELETE")
+        {
+            let payload = row.payload.as_object().expect("validated payload object");
+            let (query, key) = match row.table.as_str() {
+                "students" => (
+                    r"SELECT 'Course registration ' || course_id FROM vcap.student_course_registrations WHERE student_reg_no=$1
+                      UNION ALL SELECT 'Paper Team ' || external_team_key || ' — Writer' FROM vcap.paper_assignment_students WHERE student_reg_no=$1",
+                    text_value(payload, "reg_no"),
+                ),
+                "faculty" => (
+                    r"SELECT 'Guide capacity ' || capacity_id::text FROM vcap.faculty_guide_capacity WHERE faculty_id=$1
+                      UNION ALL SELECT 'Department role ' || id::text FROM vcap.department_roles WHERE faculty_id=$1
+                      UNION ALL SELECT 'Faculty role ' || role_id::text FROM vcap.faculty_roles WHERE faculty_id=$1
+                      UNION ALL SELECT 'Paper Team ' || external_team_key || ' — Mentor' FROM vcap.paper_assignment_mentors WHERE faculty_id=$1
+                      UNION ALL SELECT 'Programme ' || programme_code || ' — HOD' FROM vcap.programmes WHERE hod_id=$1",
+                    text_value(payload, "faculty_id"),
+                ),
+                "programmes" => (
+                    r"SELECT 'Student ' || reg_no FROM vcap.students WHERE programme_code=$1
+                      UNION ALL SELECT 'Faculty role ' || role_id::text FROM vcap.faculty_roles WHERE programme_code=$1
+                      UNION ALL SELECT 'Programme template default' FROM latex_core.programme_template_defaults WHERE programme_code=$1
+                      UNION ALL SELECT 'Existing Team template resolution' FROM latex_core.paper_template_resolutions WHERE dominant_programme_code=$1",
+                    text_value(payload, "programme_code"),
+                ),
+                "departments" => (
+                    r"SELECT 'Faculty ' || faculty_id FROM vcap.faculty WHERE dept_id::text=$1
+                      UNION ALL SELECT 'Department role ' || id::text FROM vcap.department_roles WHERE dept_id=$1
+                      UNION ALL SELECT 'Faculty role ' || role_id::text FROM vcap.faculty_roles WHERE department_id::text=$1",
+                    text_value(payload, "department_id"),
+                ),
+                "schools" => (
+                    "SELECT 'Faculty role ' || role_id::text FROM vcap.faculty_roles WHERE school_id=$1",
+                    text_value(payload, "school_id"),
+                ),
+                "paper_teams" => (
+                    r"SELECT 'Writer ' || student_reg_no FROM vcap.paper_assignment_students WHERE external_team_key=$1
+                      UNION ALL SELECT 'Mentor ' || faculty_id FROM vcap.paper_assignment_mentors WHERE external_team_key=$1
+                      UNION ALL SELECT 'Materialized LaTeX Core Paper Team ' || paper_team_id::text FROM latex_core.external_paper_team_links WHERE external_team_key=$1",
+                    text_value(payload, "external_team_key"),
+                ),
+                "paper_team_writers" | "paper_team_mentors" => (
+                    "SELECT 'Materialized LaTeX Core Paper Team ' || paper_team_id::text FROM latex_core.external_paper_team_links WHERE external_team_key=$1",
+                    text_value(payload, "external_team_key"),
+                ),
+                _ => continue,
+            };
+            let Some(key) = key else {
+                continue;
+            };
+            let dependencies: Vec<String> = sqlx::query_scalar(query)
+                .bind(key)
+                .fetch_all(self.database.pool())
+                .await
+                .map_err(InstitutionError::Database)?;
+            if !dependencies.is_empty() {
+                row.error = Some((
+                    "DELETE_BLOCKED_DEPENDENCY",
+                    format!(
+                        "Cannot delete this {}. Used by: {}. Remove or archive those relationships explicitly first.",
+                        friendly_dataset(&row.table),
+                        dependencies.join("; ")
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn friendly_dataset(table: &str) -> String {
+    match table {
+        "paper_teams" => "Paper assignment".into(),
+        "paper_team_writers" => "Paper assignment Writer".into(),
+        "paper_team_mentors" => "Paper assignment Mentor".into(),
+        value => value
+            .trim_end_matches('s')
+            .replace('_', " ")
+            .split_whitespace()
+            .map(|word| {
+                let mut characters = word.chars();
+                characters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + characters.as_str()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
 }
 
 fn file_type(filename: &str) -> Result<ImportFileType, InstitutionError> {
@@ -2004,7 +2938,51 @@ fn file_type(filename: &str) -> Result<ImportFileType, InstitutionError> {
 
 fn infer_csv_table(filename: &str) -> Option<&str> {
     let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
-    INSTITUTION_TABLES.into_iter().find(|table| *table == stem)
+    let normalized = stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    INSTITUTION_TABLES
+        .into_iter()
+        .find(|table| normalized == *table)
+        .or_else(|| {
+            INSTITUTION_TABLES
+                .into_iter()
+                .filter(|table| {
+                    normalized.starts_with(&format!("{table}_"))
+                        || normalized.ends_with(&format!("_{table}"))
+                        || normalized.contains(&format!("_{table}_"))
+                })
+                .max_by_key(|table| table.len())
+        })
+}
+
+fn infer_csv_table_from_headers(
+    headers: &StringRecord,
+    mode: ImportMode,
+) -> Result<&'static str, InstitutionError> {
+    let candidates = INSTITUTION_TABLES
+        .into_iter()
+        .filter(|table| {
+            validate_headers(table, headers.iter(), ImportLimits::default(), mode).is_ok()
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [table] => Ok(*table),
+        [] => Err(InstitutionError::InvalidInput(
+            "CSV columns do not match a supported dataset; check the header row".into(),
+        )),
+        values => Err(InstitutionError::InvalidInput(format!(
+            "What data is this? Matching datasets: {}",
+            values.join(", ")
+        ))),
+    }
 }
 
 fn parse_csv(
@@ -2012,26 +2990,24 @@ fn parse_csv(
     target: Option<&str>,
     bytes: &[u8],
     limits: ImportLimits,
+    mode: ImportMode,
+    upload_index: usize,
 ) -> Result<Vec<SourceRow>, InstitutionError> {
-    let table = target
-        .or_else(|| infer_csv_table(filename))
-        .ok_or_else(|| {
-            InstitutionError::InvalidInput(
-                "CSV target table is required or filename must exactly match a supported table"
-                    .into(),
-            )
-        })?;
-    if !INSTITUTION_TABLES.contains(&table) {
-        return Err(InstitutionError::InvalidInput(
-            "unknown CSV target table".into(),
-        ));
-    }
     let mut reader = csv::ReaderBuilder::new().flexible(false).from_reader(bytes);
     let headers = reader
         .headers()
         .map_err(|error| InstitutionError::InvalidInput(format!("malformed CSV header: {error}")))?
         .clone();
-    validate_headers(table, headers.iter(), limits)?;
+    let table = match target.or_else(|| infer_csv_table(filename)) {
+        Some(table) if INSTITUTION_TABLES.contains(&table) => table,
+        Some(_) => {
+            return Err(InstitutionError::InvalidInput(
+                "unknown CSV target table".into(),
+            ));
+        }
+        None => infer_csv_table_from_headers(&headers, mode)?,
+    };
+    validate_headers(table, headers.iter(), limits, mode)?;
     let mut rows = Vec::new();
     for (index, result) in reader.records().enumerate() {
         if index >= limits.max_rows_per_sheet {
@@ -2050,12 +3026,19 @@ fn parse_csv(
             &record,
             None,
             limits,
+            mode,
+            upload_index,
         )?);
     }
     Ok(rows)
 }
 
-fn parse_xlsx(bytes: &[u8], limits: ImportLimits) -> Result<Vec<SourceRow>, InstitutionError> {
+fn parse_xlsx(
+    bytes: &[u8],
+    limits: ImportLimits,
+    mode: ImportMode,
+    upload_index: usize,
+) -> Result<Vec<SourceRow>, InstitutionError> {
     let mut workbook = Xlsx::new(Cursor::new(bytes)).map_err(|error| {
         InstitutionError::InvalidInput(format!("malformed XLSX workbook: {error}"))
     })?;
@@ -2095,7 +3078,12 @@ fn parse_xlsx(bytes: &[u8], limits: ImportLimits) -> Result<Vec<SourceRow>, Inst
             .iter()
             .map(cell_string)
             .collect::<Result<Vec<_>, _>>()?;
-        validate_headers(&name, header_values.iter().map(String::as_str), limits)?;
+        validate_headers(
+            &name,
+            header_values.iter().map(String::as_str),
+            limits,
+            mode,
+        )?;
         let headers = StringRecord::from(header_values);
         let key_indexes: HashSet<usize> = spec(&name)
             .keys
@@ -2124,6 +3112,8 @@ fn parse_xlsx(bytes: &[u8], limits: ImportLimits) -> Result<Vec<SourceRow>, Inst
                 &record,
                 formula_key.then_some("formula in identity/key cell"),
                 limits,
+                mode,
+                upload_index,
             )?);
         }
     }
@@ -2331,6 +3321,7 @@ fn validate_headers<'a>(
     table: &str,
     headers: impl Iterator<Item = &'a str>,
     limits: ImportLimits,
+    mode: ImportMode,
 ) -> Result<(), InstitutionError> {
     let values = headers.map(str::trim).collect::<Vec<_>>();
     if values.is_empty() || values.len() > limits.max_columns {
@@ -2351,7 +3342,12 @@ fn validate_headers<'a>(
             )));
         }
     }
-    for required in spec(table).required {
+    let required = if matches!(mode, ImportMode::UpdateOnly | ImportMode::DeleteOnly) {
+        spec(table).keys
+    } else {
+        spec(table).required
+    };
+    for required in required {
         if !unique.contains(required) {
             return Err(InstitutionError::InvalidInput(format!(
                 "{table}: missing required column {required}"
@@ -2361,6 +3357,10 @@ fn validate_headers<'a>(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded parser context is explicit at the row validation boundary"
+)]
 fn source_row(
     table: &str,
     row_number: i64,
@@ -2368,6 +3368,8 @@ fn source_row(
     record: &StringRecord,
     formula_error: Option<&str>,
     limits: ImportLimits,
+    mode: ImportMode,
+    upload_index: usize,
 ) -> Result<SourceRow, InstitutionError> {
     let table_spec = spec(table);
     let mut payload = Map::new();
@@ -2389,7 +3391,12 @@ fn source_row(
     }
     let mut error = formula_error.map(|message| ("FORMULA_IN_KEY", message.to_owned()));
     if error.is_none() {
-        for field in table_spec.required {
+        let required = if matches!(mode, ImportMode::UpdateOnly | ImportMode::DeleteOnly) {
+            table_spec.keys
+        } else {
+            table_spec.required
+        };
+        for field in required {
             if text_value(&payload, field).is_none_or(str::is_empty) {
                 error = Some(("MISSING_VALUE", format!("required value {field} is empty")));
                 break;
@@ -2465,10 +3472,12 @@ fn source_row(
             .collect(),
     );
     Ok(SourceRow {
+        upload_index,
         table: table.to_owned(),
         row_number,
         natural_key,
         payload: Value::Object(payload),
+        existing_payload: None,
         error,
     })
 }
@@ -2582,19 +3591,135 @@ fn valid_email(value: &str) -> bool {
 async fn apply_table(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table: &str,
-    merge: bool,
+    mode: ImportMode,
     payloads: Value,
 ) -> Result<(), InstitutionError> {
-    let query = apply_query(table, merge);
+    if mode == ImportMode::DeleteOnly {
+        let link_delete = match table {
+            "students" => Some(
+                "DELETE FROM vcap.student_user_links WHERE reg_no IN (SELECT payload->>'reg_no' FROM jsonb_array_elements($1) item(payload))",
+            ),
+            "faculty" => Some(
+                "DELETE FROM vcap.faculty_user_links WHERE faculty_id IN (SELECT payload->>'faculty_id' FROM jsonb_array_elements($1) item(payload))",
+            ),
+            "admins" => Some(
+                "DELETE FROM vcap.admin_user_links WHERE admin_id IN (SELECT payload->>'admin_id' FROM jsonb_array_elements($1) item(payload))",
+            ),
+            _ => None,
+        };
+        if let Some(statement) = link_delete {
+            sqlx::query(statement)
+                .bind(&payloads)
+                .execute(&mut **tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+        }
+    }
+    let query = match mode {
+        ImportMode::Merge => apply_query(table, true),
+        ImportMode::ValidateOnly | ImportMode::AddOnly => apply_query(table, false),
+        ImportMode::UpdateOnly => update_query(table),
+        ImportMode::DeleteOnly => delete_query(table),
+    };
     sqlx::query(query)
-        .bind(payloads)
+        .bind(&payloads)
         .execute(&mut **tx)
         .await
         .map_err(InstitutionError::Database)?;
-    if table == "department_roles" {
+    if table == "department_roles" && mode != ImportMode::DeleteOnly {
         sqlx::query("SELECT setval(pg_get_serial_sequence('vcap.department_roles','id'),GREATEST((SELECT COALESCE(max(id),1) FROM vcap.department_roles),1),TRUE)").execute(&mut **tx).await.map_err(InstitutionError::Database)?;
     }
     Ok(())
+}
+
+fn update_query(table: &str) -> &'static str {
+    match table {
+        "departments" => {
+            "UPDATE vcap.departments record SET department_id=record.department_id FROM jsonb_array_elements($1) item(payload) WHERE record.department_id::text=item.payload->>'department_id'"
+        }
+        "admins" => {
+            "UPDATE vcap.admins record SET email=CASE WHEN item.payload ? 'email' THEN item.payload->>'email' ELSE record.email END,name=CASE WHEN item.payload ? 'name' THEN item.payload->>'name' ELSE record.name END,pfp=CASE WHEN item.payload ? 'pfp' THEN item.payload->>'pfp' ELSE record.pfp END FROM jsonb_array_elements($1) item(payload) WHERE record.admin_id=item.payload->>'admin_id'"
+        }
+        "faculty" => {
+            "UPDATE vcap.faculty record SET name=CASE WHEN item.payload ? 'name' THEN item.payload->>'name' ELSE record.name END,email=CASE WHEN item.payload ? 'email' THEN item.payload->>'email' ELSE record.email END,dept_id=CASE WHEN item.payload ? 'dept_id' THEN (item.payload->>'dept_id')::uuid ELSE record.dept_id END,honorific=CASE WHEN item.payload ? 'honorific' THEN item.payload->>'honorific' ELSE record.honorific END,designation=CASE WHEN item.payload ? 'designation' THEN item.payload->>'designation' ELSE record.designation END,status=CASE WHEN item.payload ? 'status' THEN item.payload->>'status' ELSE record.status END FROM jsonb_array_elements($1) item(payload) WHERE record.faculty_id=item.payload->>'faculty_id'"
+        }
+        "programmes" => {
+            "UPDATE vcap.programmes record SET hod_id=CASE WHEN item.payload ? 'hod_id' THEN item.payload->>'hod_id' ELSE record.hod_id END FROM jsonb_array_elements($1) item(payload) WHERE record.programme_code=item.payload->>'programme_code'"
+        }
+        "schools" => {
+            "UPDATE vcap.schools record SET school_id=record.school_id FROM jsonb_array_elements($1) item(payload) WHERE record.school_id=item.payload->>'school_id'"
+        }
+        "students" => {
+            "UPDATE vcap.students record SET name=CASE WHEN item.payload ? 'name' THEN item.payload->>'name' ELSE record.name END,email=CASE WHEN item.payload ? 'email' THEN item.payload->>'email' ELSE record.email END,programme_code=CASE WHEN item.payload ? 'programme_code' THEN item.payload->>'programme_code' ELSE record.programme_code END FROM jsonb_array_elements($1) item(payload) WHERE record.reg_no=item.payload->>'reg_no'"
+        }
+        "student_course_registrations" => {
+            "UPDATE vcap.student_course_registrations record SET registration_status=CASE WHEN item.payload ? 'registration_status' THEN item.payload->>'registration_status' ELSE record.registration_status END FROM jsonb_array_elements($1) item(payload) WHERE record.student_reg_no=item.payload->>'student_reg_no' AND record.course_id=item.payload->>'course_id' AND record.academic_year=item.payload->>'academic_year' AND record.semester=item.payload->>'semester'"
+        }
+        "faculty_guide_capacity" => {
+            "UPDATE vcap.faculty_guide_capacity record SET faculty_id=CASE WHEN item.payload ? 'faculty_id' THEN item.payload->>'faculty_id' ELSE record.faculty_id END,academic_year=CASE WHEN item.payload ? 'academic_year' THEN item.payload->>'academic_year' ELSE record.academic_year END,ug_max_projects=CASE WHEN item.payload ? 'ug_max_projects' THEN (item.payload->>'ug_max_projects')::int ELSE record.ug_max_projects END,pg_max_projects=CASE WHEN item.payload ? 'pg_max_projects' THEN (item.payload->>'pg_max_projects')::int ELSE record.pg_max_projects END,integrated_pg_max_projects=CASE WHEN item.payload ? 'integrated_pg_max_projects' THEN (item.payload->>'integrated_pg_max_projects')::int ELSE record.integrated_pg_max_projects END,status=CASE WHEN item.payload ? 'status' THEN item.payload->>'status' ELSE record.status END FROM jsonb_array_elements($1) item(payload) WHERE record.capacity_id::text=item.payload->>'capacity_id'"
+        }
+        "department_roles" => {
+            "UPDATE vcap.department_roles record SET dept_id=CASE WHEN item.payload ? 'dept_id' THEN item.payload->>'dept_id' ELSE record.dept_id END,role_type=CASE WHEN item.payload ? 'role_type' THEN item.payload->>'role_type' ELSE record.role_type END,faculty_id=CASE WHEN item.payload ? 'faculty_id' THEN item.payload->>'faculty_id' ELSE record.faculty_id END FROM jsonb_array_elements($1) item(payload) WHERE record.id::text=item.payload->>'id'"
+        }
+        "faculty_roles" => {
+            "UPDATE vcap.faculty_roles record SET faculty_id=CASE WHEN item.payload ? 'faculty_id' THEN item.payload->>'faculty_id' ELSE record.faculty_id END,role_type=CASE WHEN item.payload ? 'role_type' THEN item.payload->>'role_type' ELSE record.role_type END,school_id=CASE WHEN item.payload ? 'school_id' THEN item.payload->>'school_id' ELSE record.school_id END,department_id=CASE WHEN item.payload ? 'department_id' THEN (item.payload->>'department_id')::uuid ELSE record.department_id END,programme_code=CASE WHEN item.payload ? 'programme_code' THEN item.payload->>'programme_code' ELSE record.programme_code END,status=CASE WHEN item.payload ? 'status' THEN item.payload->>'status' ELSE record.status END FROM jsonb_array_elements($1) item(payload) WHERE record.role_id::text=item.payload->>'role_id'"
+        }
+        "paper_teams" => {
+            "UPDATE vcap.paper_assignment_groups record SET team_name=CASE WHEN item.payload ? 'team_name' THEN item.payload->>'team_name' ELSE record.team_name END,academic_year=CASE WHEN item.payload ? 'academic_year' THEN item.payload->>'academic_year' ELSE record.academic_year END,semester=CASE WHEN item.payload ? 'semester' THEN item.payload->>'semester' ELSE record.semester END,status=CASE WHEN item.payload ? 'status' THEN item.payload->>'status' ELSE record.status END FROM jsonb_array_elements($1) item(payload) WHERE record.external_team_key=item.payload->>'external_team_key'"
+        }
+        "paper_team_writers" => {
+            "UPDATE vcap.paper_assignment_students record SET writer_order=CASE WHEN item.payload ? 'writer_order' THEN (item.payload->>'writer_order')::int ELSE record.writer_order END,is_leader=CASE WHEN item.payload ? 'is_leader' THEN (item.payload->>'is_leader')::boolean ELSE record.is_leader END FROM jsonb_array_elements($1) item(payload) WHERE record.external_team_key=item.payload->>'external_team_key' AND record.student_reg_no=item.payload->>'student_reg_no'"
+        }
+        "paper_team_mentors" => {
+            "UPDATE vcap.paper_assignment_mentors record SET faculty_id=record.faculty_id FROM jsonb_array_elements($1) item(payload) WHERE record.external_team_key=item.payload->>'external_team_key' AND record.faculty_id=item.payload->>'faculty_id'"
+        }
+        _ => unreachable!("update table is fixed"),
+    }
+}
+
+fn delete_query(table: &str) -> &'static str {
+    match table {
+        "departments" => {
+            "DELETE FROM vcap.departments record USING jsonb_array_elements($1) item(payload) WHERE record.department_id::text=item.payload->>'department_id'"
+        }
+        "admins" => {
+            "DELETE FROM vcap.admins record USING jsonb_array_elements($1) item(payload) WHERE record.admin_id=item.payload->>'admin_id'"
+        }
+        "faculty" => {
+            "DELETE FROM vcap.faculty record USING jsonb_array_elements($1) item(payload) WHERE record.faculty_id=item.payload->>'faculty_id'"
+        }
+        "programmes" => {
+            "DELETE FROM vcap.programmes record USING jsonb_array_elements($1) item(payload) WHERE record.programme_code=item.payload->>'programme_code'"
+        }
+        "schools" => {
+            "DELETE FROM vcap.schools record USING jsonb_array_elements($1) item(payload) WHERE record.school_id=item.payload->>'school_id'"
+        }
+        "students" => {
+            "DELETE FROM vcap.students record USING jsonb_array_elements($1) item(payload) WHERE record.reg_no=item.payload->>'reg_no'"
+        }
+        "student_course_registrations" => {
+            "DELETE FROM vcap.student_course_registrations record USING jsonb_array_elements($1) item(payload) WHERE record.student_reg_no=item.payload->>'student_reg_no' AND record.course_id=item.payload->>'course_id' AND record.academic_year=item.payload->>'academic_year' AND record.semester=item.payload->>'semester'"
+        }
+        "faculty_guide_capacity" => {
+            "DELETE FROM vcap.faculty_guide_capacity record USING jsonb_array_elements($1) item(payload) WHERE record.capacity_id::text=item.payload->>'capacity_id'"
+        }
+        "department_roles" => {
+            "DELETE FROM vcap.department_roles record USING jsonb_array_elements($1) item(payload) WHERE record.id::text=item.payload->>'id'"
+        }
+        "faculty_roles" => {
+            "DELETE FROM vcap.faculty_roles record USING jsonb_array_elements($1) item(payload) WHERE record.role_id::text=item.payload->>'role_id'"
+        }
+        "paper_teams" => {
+            "DELETE FROM vcap.paper_assignment_groups record USING jsonb_array_elements($1) item(payload) WHERE record.external_team_key=item.payload->>'external_team_key'"
+        }
+        "paper_team_writers" => {
+            "DELETE FROM vcap.paper_assignment_students record USING jsonb_array_elements($1) item(payload) WHERE record.external_team_key=item.payload->>'external_team_key' AND record.student_reg_no=item.payload->>'student_reg_no'"
+        }
+        "paper_team_mentors" => {
+            "DELETE FROM vcap.paper_assignment_mentors record USING jsonb_array_elements($1) item(payload) WHERE record.external_team_key=item.payload->>'external_team_key' AND record.faculty_id=item.payload->>'faculty_id'"
+        }
+        _ => unreachable!("delete table is fixed"),
+    }
 }
 
 fn apply_query(table: &str, merge: bool) -> &'static str {
@@ -2792,6 +3917,75 @@ fn decode_job(row: PgRow) -> Result<InstitutionImportJob, InstitutionError> {
     })
 }
 
+fn decode_batch(row: PgRow) -> Result<InstitutionImportBatch, InstitutionError> {
+    Ok(InstitutionImportBatch {
+        id: row.try_get("id").map_err(InstitutionError::Database)?,
+        operation: row
+            .try_get("operation")
+            .map_err(InstitutionError::Database)?,
+        status: row.try_get("status").map_err(InstitutionError::Database)?,
+        submitted_by_user_id: row
+            .try_get("submitted_by_user_id")
+            .map_err(InstitutionError::Database)?,
+        total_files: row
+            .try_get("total_files")
+            .map_err(InstitutionError::Database)?,
+        total_rows: row
+            .try_get("total_rows")
+            .map_err(InstitutionError::Database)?,
+        added_rows: row
+            .try_get("added_rows")
+            .map_err(InstitutionError::Database)?,
+        edited_rows: row
+            .try_get("edited_rows")
+            .map_err(InstitutionError::Database)?,
+        deleted_rows: row
+            .try_get("deleted_rows")
+            .map_err(InstitutionError::Database)?,
+        skipped_rows: row
+            .try_get("skipped_rows")
+            .map_err(InstitutionError::Database)?,
+        error_rows: row
+            .try_get("error_rows")
+            .map_err(InstitutionError::Database)?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(InstitutionError::Database)?,
+        validated_at: row
+            .try_get("validated_at")
+            .map_err(InstitutionError::Database)?,
+        applied_at: row
+            .try_get("applied_at")
+            .map_err(InstitutionError::Database)?,
+    })
+}
+
+fn count_rows(
+    rows: &[SourceRow],
+    predicate: impl Fn(&SourceRow) -> bool,
+) -> Result<i64, InstitutionError> {
+    i64::try_from(rows.iter().filter(|row| predicate(row)).count())
+        .map_err(|_| InstitutionError::InvalidInput("too many rows".into()))
+}
+
+fn friendly_suggestion(code: Option<&str>) -> Option<&'static str> {
+    match code {
+        Some("INVALID_FK") => {
+            Some("Add the referenced parent to this batch or correct the identifier.")
+        }
+        Some("NOT_FOUND") => {
+            Some("Check the canonical key; Edit and Delete never create missing records.")
+        }
+        Some("DELETE_BLOCKED_DEPENDENCY") => Some(
+            "Remove or archive the listed relationship explicitly, then review the delete again.",
+        ),
+        Some("INVALID_EMAIL") => Some("Use a complete institutional email address."),
+        Some("MISSING_VALUE") => Some("Fill in the named required field."),
+        Some("DUPLICATE_KEY") => Some("Keep one row for this canonical key in the batch."),
+        _ => None,
+    }
+}
+
 fn page_limit(limit: i64) -> i64 {
     if limit == 0 { 50 } else { limit.clamp(1, 100) }
 }
@@ -2909,8 +4103,15 @@ mod tests {
     #[test]
     fn csv_parser_accepts_valid_students_and_rejects_duplicate_keys() {
         let bytes = b"reg_no,name,email,programme_code\nS1,One,one@example.edu,CSE\nS1,Again,again@example.edu,CSE\n";
-        let mut rows =
-            parse_csv("students.csv", None, bytes, ImportLimits::default()).expect("CSV parses");
+        let mut rows = parse_csv(
+            "students.csv",
+            None,
+            bytes,
+            ImportLimits::default(),
+            ImportMode::AddOnly,
+            0,
+        )
+        .expect("CSV parses");
         validate_cross_rows(&mut rows);
         assert!(rows[0].error.is_none());
         assert_eq!(
@@ -2926,7 +4127,9 @@ mod tests {
                 "departments.csv",
                 None,
                 b"wrong\nvalue\n",
-                ImportLimits::default()
+                ImportLimits::default(),
+                ImportMode::AddOnly,
+                0,
             )
             .is_err()
         );
@@ -2935,6 +4138,8 @@ mod tests {
             None,
             b"department_id\nnot-a-uuid\n",
             ImportLimits::default(),
+            ImportMode::AddOnly,
+            0,
         )
         .expect("shape parses");
         assert_eq!(
@@ -2962,14 +4167,16 @@ mod tests {
         let valid = workbook_bytes(
             r#"<row r="1"><c r="A1" t="inlineStr"><is><t>reg_no</t></is></c><c r="B1" t="inlineStr"><is><t>name</t></is></c><c r="C1" t="inlineStr"><is><t>email</t></is></c><c r="D1" t="inlineStr"><is><t>programme_code</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>S1</t></is></c><c r="B2" t="inlineStr"><is><t>Student</t></is></c><c r="C2" t="inlineStr"><is><t>student@example.edu</t></is></c><c r="D2" t="inlineStr"><is><t>CSE</t></is></c></row>"#,
         );
-        let rows = parse_xlsx(&valid, ImportLimits::default()).expect("valid XLSX parses");
+        let rows = parse_xlsx(&valid, ImportLimits::default(), ImportMode::AddOnly, 0)
+            .expect("valid XLSX parses");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].error.is_none());
 
         let formula = workbook_bytes(
             r#"<row r="1"><c r="A1" t="inlineStr"><is><t>reg_no</t></is></c><c r="B1" t="inlineStr"><is><t>name</t></is></c><c r="C1" t="inlineStr"><is><t>email</t></is></c><c r="D1" t="inlineStr"><is><t>programme_code</t></is></c></row><row r="2"><c r="A2"><f>CONCAT(&quot;S&quot;,&quot;1&quot;)</f><v>1</v></c><c r="B2" t="inlineStr"><is><t>Student</t></is></c><c r="C2" t="inlineStr"><is><t>student@example.edu</t></is></c><c r="D2" t="inlineStr"><is><t>CSE</t></is></c></row>"#,
         );
-        let rows = parse_xlsx(&formula, ImportLimits::default()).expect("XLSX shape parses");
+        let rows = parse_xlsx(&formula, ImportLimits::default(), ImportMode::AddOnly, 0)
+            .expect("XLSX shape parses");
         assert_eq!(
             rows[0].error.as_ref().map(|value| value.0),
             Some("FORMULA_IN_KEY")

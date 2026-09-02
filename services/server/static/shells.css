@@ -238,6 +238,24 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .wizard-step::before { counter-increment: wizard; content: counter(wizard) ". "; font-weight: 800; }
 .wizard-step.current { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .import-form, .manual-team-form { min-width: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; align-items: end; margin: 14px 0; }
+.batch-import-form { display: grid; gap: 14px; margin: 16px 0 28px; }
+.import-dropzone { min-height: 190px; display: grid; place-content: center; justify-items: center; gap: 8px; padding: 28px; border: 2px dashed var(--border); border-radius: 10px; background: var(--surface-subtle); cursor: pointer; text-align: center; transition: border-color .15s, background .15s; }
+.import-dropzone:hover, .import-dropzone:focus, .import-dropzone.drag-active { outline: none; border-color: var(--accent); background: var(--accent-soft); }
+.import-dropzone strong { font-size: 18px; }
+.import-dropzone span { color: var(--muted); }
+.import-file-list { display: grid; gap: 7px; }
+.import-file-chip { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(150px, .6fr) auto auto; align-items: center; gap: 10px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 7px; }
+.import-file-chip .ready { color: #27733c; font-weight: 700; }
+.operation-control { display: flex; flex-wrap: wrap; gap: 6px; padding: 0; border: 0; }
+.operation-control legend { width: 100%; margin-bottom: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.operation-control label { padding: 8px 15px; border: 1px solid var(--border); border-radius: 999px; cursor: pointer; }
+.import-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 9px; margin: 14px 0; }
+.import-summary-card, .issue-card, .change-card { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--border); border-radius: 7px; }
+.import-summary-card span, .import-summary-card small, .issue-card small { color: var(--muted); }
+.issue-list, .change-list { display: grid; gap: 8px; margin: 18px 0; }
+.issue-list h3, .change-list h3 { margin: 0; }
+.technical-details { margin-top: 14px; padding: 10px 0; color: var(--muted); }
+.technical-details summary { cursor: pointer; font-weight: 700; }
 .admin-section { min-width: 0; margin: 16px 0; padding: 14px; border: 1px solid var(--border); border-radius: 7px; }
 .admin-section > h2 { margin-top: 0; }
 .compact-list { margin: 4px 0; padding-left: 18px; }
@@ -258,6 +276,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .detail-tabs, .detail-panel { grid-column: 1; }
   .admin-user-form { grid-template-columns: 1fr; }
   .admin-team-form { grid-template-columns: 1fr; }
+  .import-file-chip { grid-template-columns: 1fr; }
   .review-split, .review-details { grid-template-columns: 1fr; }
   .annotation-composer { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
 }

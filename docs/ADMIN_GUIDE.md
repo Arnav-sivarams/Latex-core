@@ -6,8 +6,8 @@ Admins use `/admin` as the V2 governance control plane. Admin inspection does no
 
 - **OVERVIEW** — product and queue summary.
 - **V2 USERS** — provision users and assign one exclusive Writer, Mentor, or Admin role.
-- **INSTITUTION DATA** — server-paginated Students, Faculty, Programmes, and identity-link state.
-- **IMPORTS** — upload CSV/XLSX, validate, review bounded results, apply, and inspect paginated history.
+- **INSTITUTION DATA** — server-paginated institutional datasets with manual Add, Edit, dependency-previewed Delete, and Paper Assignment membership management.
+- **IMPORTS** — multi-file CSV/XLSX drag/drop, automatic dataset detection, one batch review/apply action, and concise paginated history.
 - **PAPER TEAMS** — server-paginated Team grid, manual creation, unresolved imports, safe template override, and lifecycle actions.
 - **PROGRAMME TEMPLATES** — programme mappings, global fallback, and ordered-Writer resolution preview.
 - **TEMPLATES** — inspect the existing immutable library and select a template at Team creation.
@@ -33,7 +33,9 @@ The Writer toolbar exposes review/checkpoint/revert controls only to that select
 
 ## Institutional operations
 
-Import modes are shown as Validate only, Merge / Update, and Import More — Add Only. Validation never applies data. Merge is additive: absent rows never remove records or Team memberships. Import More inserts only unseen keys. The result view limits displayed errors and provides the complete formula-neutralized `errors.csv` download.
+The primary operations are Add, Edit, and Delete. Add never changes an existing key. Edit changes only supplied fields on known keys and never inserts. Delete affects only explicitly supplied keys; omission is never synchronization-by-absence. Multi-file validation sees parents staged anywhere in the batch and Apply chooses dependency order automatically. The bounded review uses dataset names, record counts, actionable file/row issues, and field-level Edit diffs. IDs, checksums, file jobs, and formula-neutralized `errors.csv` downloads are under Technical details.
+
+Manual forms use the same authoritative server validation. A manual Delete always checks dependencies first. Institutional deletion never removes a V2 account or paper history, and a materialized Paper Assignment is blocked pending explicit Team lifecycle handling. Existing standalone VALIDATE_ONLY/MERGE/ADD_ONLY jobs remain available under Legacy single-file imports.
 
 Manual links require a compatible existing V2 role: Student to Writer and Faculty to Mentor. Admin identity linkage grants no role. Automatic reconciliation preserves `MANUAL` links. An identity used by a non-archived imported Team cannot be unlinked.
 

@@ -1,65 +1,57 @@
-# Institution CSV/XLSX import format
+# Institution data management
 
-The Admin-only API accepts bytes through `multipart/form-data`; server filesystem paths are not accepted. Upload field names are `file`, `mode`, and optional `target_table`. Limits default to 32 MiB, 20 worksheets, 100,000 data rows per sheet, 128 columns, and 16,384 characters per cell.
+V2 Admins manage institutional source records from **INSTITUTION DATA** or **DATA IMPORT**. Both paths use the same server-side parser, validation, dependency checks, and apply operations. Writer and Mentor accounts cannot use these endpoints.
 
-## Modes
+## Add, Edit, and Delete
 
-- `VALIDATE_ONLY` validates and stages provenance without canonical mutation. It cannot be applied.
-- `MERGE` inserts unseen keys and updates matching keys. Rows absent from a later file are retained.
-- `ADD_ONLY` inserts unseen keys and reports existing keys as skipped. It never updates or deletes them.
+- **Add** inserts keys that are not present. Existing keys are reported as already existing and remain unchanged.
+- **Edit** updates only supplied mutable fields on a matching canonical key. An unknown key is `NOT_FOUND`; it is not inserted. Key fields are immutable in this operation.
+- **Delete** removes only keys explicitly listed in the input. A record missing from a file is never deleted. Before apply, the server lists dependencies and blocks destructive operations with `DELETE_BLOCKED_DEPENDENCY`.
 
-There is no replace or hard-delete mode. Reimports remain visible as separate SHA-addressed jobs. External Team keys prevent duplicate Paper Teams.
+Delete never cascades into a LaTeX Core user, materialized Paper Team, paper workspace, version, review, or build artifact. Deleting a materialized assignment source requires the separate Paper Team lifecycle workflow. Missing Delete keys are reported safely as `NOT_FOUND`.
 
-## XLSX worksheets and columns
+## Multi-file import
 
-Worksheet names are exact. Unknown non-empty sheets are rejected. Columns not listed below are rejected; columns shown in **bold** are required.
+Drop or browse for as many as 20 CSV/XLSX files (32 MiB per file, 64 MiB combined). Files can be removed before review. A duplicate name-and-content pair is rejected. Each worksheet/file remains a child job with its checksum and error CSV, while the normal history shows one concise batch.
 
-| Worksheet | Header, in any order |
-|---|---|
-| `departments` | **`department_id`** |
-| `admins` | **`admin_id`**, `email`, `name`, `pfp` |
-| `faculty` | **`faculty_id`**, `name`, `email`, `dept_id`, `honorific`, `designation`, `status` |
-| `programmes` | **`programme_code`**, `hod_id` |
-| `schools` | **`school_id`** |
-| `students` | **`reg_no`**, `name`, `email`, `programme_code` |
-| `student_course_registrations` | **`student_reg_no`**, **`course_id`**, **`academic_year`**, **`semester`**, `registration_status` |
-| `faculty_guide_capacity` | **`capacity_id`**, `faculty_id`, `academic_year`, `ug_max_projects`, `pg_max_projects`, `integrated_pg_max_projects`, `status` |
-| `department_roles` | **`id`**, **`dept_id`**, `role_type`, `faculty_id` |
-| `faculty_roles` | **`role_id`**, `faculty_id`, `role_type`, `school_id`, `department_id`, `programme_code`, `status` |
-| `paper_teams` | **`external_team_key`**, **`team_name`**, `academic_year`, `semester`, `status` |
-| `paper_team_writers` | **`external_team_key`**, **`student_reg_no`**, **`writer_order`**, **`is_leader`** |
-| `paper_team_mentors` | **`external_team_key`**, **`faculty_id`** |
+CSV datasets are inferred from a normalized filename such as `students.csv`, `students_2026.csv`, or `VIT_students.csv`, then from a compatible header signature. If more than one dataset matches, the Admin is asked once, “What data is this?” XLSX datasets are inferred from recognized worksheet names. Target selection is not required for an ordinary detected file.
 
-Example headers:
+The complete batch is validated together against the canonical database plus staged rows from every selected file. File/drop order does not matter. Apply uses a dependency-safe order with PostgreSQL constraints enabled:
 
-```csv
-reg_no,name,email,programme_code
-```
+1. Departments, Schools, Admins
+2. Faculty, Programmes, Students
+3. Registrations, capacity, and role metadata
+4. Paper assignment groups, ordered Writers/Leader, and Mentors
+5. Identity reconciliation and Paper Team materialization
 
-```csv
-external_team_key,student_reg_no,writer_order,is_leader
-```
+No compilation is triggered. For fully valid assignment batches, Team materialization is part of the one Apply action; Retry Team Materialization remains recovery-only.
 
-Examples intentionally omit personal data.
+## Supported datasets and canonical keys
 
-## CSV
+| Dataset | Canonical key | Mutable fields |
+|---|---|---|
+| Departments | `department_id` | — |
+| Admins | `admin_id` | `email`, `name`, `pfp` |
+| Faculty | `faculty_id` | `name`, `email`, `dept_id`, `honorific`, `designation`, `status` |
+| Programmes | `programme_code` | `hod_id` |
+| Schools | `school_id` | — |
+| Students | `reg_no` | `name`, `email`, `programme_code` |
+| Course Registrations | `student_reg_no`, `course_id`, `academic_year`, `semester` | `registration_status` |
+| Guide Capacity | `capacity_id` | faculty/year/capacity/status fields |
+| Department Roles | `id` | department/role/faculty fields |
+| Faculty Roles | `role_id` | faculty/scope/role/status fields |
+| Paper Assignments | `external_team_key` | team name/year/semester/status |
+| Assignment Writers | `external_team_key`, `student_reg_no` | `writer_order`, `is_leader` |
+| Assignment Mentors | `external_team_key`, `faculty_id` | — |
 
-One CSV represents one table. Supply `target_table`, or name the file exactly after a supported table, such as `students.csv`. Unknown names are never guessed. UTF-8 CSV quoting follows RFC-style CSV rules.
+Add files must contain the dataset’s required fields. Edit and Delete files may contain only canonical keys plus fields being changed. Values are bounded and validated for UUID, integer, Boolean, normalized email, duplicate key, relationship, Writer order, and Leader rules. Spreadsheet formulas in identity cells are rejected for XLSX. Downloaded error CSV cells are neutralized against formula injection.
 
-## Validation and application
+## Manual management
 
-Validation checks column shape, duplicate columns and keys, required key values, UUIDs, nonnegative capacities, positive IDs/order, normalized email shape, foreign keys, department-role UUID existence, Writer-order uniqueness, one Leader at most, and at least one Writer when Team and Writer sheets are supplied together. Formulas in identity/key cells are rejected, not evaluated.
+INSTITUTION DATA provides server-side search and pagination for every dataset. **+ Add**, **Edit**, and **Delete** open compact forms generated from the same schema. Delete first creates a dependency preview; blocked references are named before any mutation. Paper Assignments expand to ordered Writers, the explicit Leader, Mentors, and materialization state.
 
-The dependency order is departments, schools, admins, faculty, programmes, students, registrations, capacities, department roles, faculty roles, Team groups, Writers, and Mentors. PostgreSQL constraints remain enabled.
+Changing a Student programme can affect resolution for future Teams. Existing Team template pins never change automatically and the Edit preview says so.
 
-After application, exact normalized-email linking runs without changing global roles. A Team with missing links, an incompatible Writer/Mentor role, or no explicit Leader is marked unresolved and is not partially activated. Other valid Teams may materialize. Error rows remain downloadable from the job's `errors.csv` endpoint.
+## Backward compatibility
 
-Manual Team creation remains supported and requires an Admin-selected Leader.
-
-## Admin import wizard
-
-The four steps are select file/mode, validate, review, and apply. CSV requires one of the documented target tables; an exact filename preselects it, while an unknown filename is never guessed. XLSX uses worksheet names and hides the CSV target.
-
-Validation results show job identity, filename, SHA-256, mode/type/status, aggregate actions, and per-sheet/table counts. Only a bounded row preview is rendered. `VALIDATE_ONLY`, failed/error validation, and already-applied jobs cannot be applied. PostgreSQL row locks and external Team keys make repeated Apply safe from duplicate canonical rows or Teams.
-
-History uses page/limit plus optional filename/job, status, mode, and file-type filters. Uploaded bytes are not retained in history and file contents are not written to Audit. Error CSV cells beginning with `=`, `+`, `-`, or `@` are prefixed to prevent spreadsheet formula execution.
+Existing standalone jobs and their error downloads remain readable as **Legacy single-file imports**. Internally, `ADD_ONLY`, `UPDATE_ONLY`, and `DELETE_ONLY` implement the three user operations. The older `VALIDATE_ONLY` and `MERGE` endpoints remain available for compatibility; absent rows still never imply deletion.

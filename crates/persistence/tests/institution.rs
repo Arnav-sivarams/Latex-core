@@ -7,9 +7,9 @@
 
 use core_types::{BlobHash, LogicalPath, TenantId, UserId, WorkspaceId};
 use persistence::{
-    Database, DatabaseConfig, ImportLimits, ImportMode, InstitutionPageFilter,
-    InstitutionRepository, PaperTeamPageFilter, TeamTemplateResolutionInput, TemplateSeedFile,
-    V2FilePolicy, V2Repository,
+    Database, DatabaseConfig, ImportLimits, ImportMode, InstitutionBatchUpload,
+    InstitutionOperation, InstitutionPageFilter, InstitutionRepository, PaperTeamPageFilter,
+    TeamTemplateResolutionInput, TemplateSeedFile, V2FilePolicy, V2Repository,
 };
 use sqlx::PgPool;
 use std::{env, fmt::Write as _, time::Duration};
@@ -67,9 +67,194 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
     )
     .await;
     import_modes_and_ten_thousand_rows(&pool, &repository, actor).await;
+    batch_dependency_edit_and_delete_contract(&pool, &repository, actor).await;
 
     pool.close().await;
     database.close().await;
+}
+
+async fn batch_dependency_edit_and_delete_contract(
+    pool: &PgPool,
+    repository: &InstitutionRepository,
+    actor: UserId,
+) {
+    let department = Uuid::new_v4();
+    let uploads = vec![
+        InstitutionBatchUpload {
+            filename: "VIT_students_2026.csv".into(),
+            target_table: None,
+            bytes: b"reg_no,name,email,programme_code\nBATCH-STUDENT,Random Order Student,batch-student@example.edu,BATCH-PROGRAMME\n".to_vec(),
+        },
+        InstitutionBatchUpload {
+            filename: "programmes_2026.csv".into(),
+            target_table: None,
+            bytes: b"programme_code,hod_id\nBATCH-PROGRAMME,BATCH-FACULTY\n".to_vec(),
+        },
+        InstitutionBatchUpload {
+            filename: "faculty.csv".into(),
+            target_table: None,
+            bytes: format!("faculty_id,name,email,dept_id,honorific,designation,status\nBATCH-FACULTY,Batch Faculty,batch-faculty@example.edu,{department},Dr,Guide,ACTIVE\n").into_bytes(),
+        },
+        InstitutionBatchUpload {
+            filename: "departments.csv".into(),
+            target_table: None,
+            bytes: format!("department_id\n{department}\n").into_bytes(),
+        },
+    ];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Add,
+            &uploads,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail["batch"]["status"], "VALIDATED");
+    assert_eq!(detail["batch"]["added_rows"], 4);
+    let batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    repository.apply_batch(batch_id, actor).await.unwrap();
+    let student: (String, Option<String>) = sqlx::query_as(
+        "SELECT name,programme_code FROM vcap.students WHERE reg_no='BATCH-STUDENT'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(student.1.as_deref(), Some("BATCH-PROGRAMME"));
+
+    let edit = [InstitutionBatchUpload {
+        filename: "students_edit.csv".into(),
+        target_table: None,
+        bytes: b"reg_no,name,email,programme_code\nBATCH-STUDENT,Edited Student,edited-batch@example.edu,BATCH-PROGRAMME\n".to_vec(),
+    }];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Edit,
+            &edit,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail["batch"]["edited_rows"], 1);
+    let batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    repository.apply_batch(batch_id, actor).await.unwrap();
+    let edited: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT name,email FROM vcap.students WHERE reg_no='BATCH-STUDENT'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(edited.0.as_deref(), Some("Edited Student"));
+    assert_eq!(edited.1.as_deref(), Some("edited-batch@example.edu"));
+
+    let missing = [InstitutionBatchUpload {
+        filename: "students.csv".into(),
+        target_table: None,
+        bytes: b"reg_no,name\nDOES-NOT-EXIST,Nobody\n".to_vec(),
+    }];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Edit,
+            &missing,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail["batch"]["status"], "FAILED");
+    assert_eq!(detail["issues"][0]["code"], "NOT_FOUND");
+
+    let delete = [InstitutionBatchUpload {
+        filename: "students.csv".into(),
+        target_table: None,
+        bytes: b"reg_no\nBATCH-STUDENT\n".to_vec(),
+    }];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Delete,
+            &delete,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail["batch"]["status"], "VALIDATED");
+    let batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    repository.apply_batch(batch_id, actor).await.unwrap();
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vcap.students WHERE reg_no='BATCH-STUDENT')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!exists);
+
+    let (preserved_user, _) = insert_user(pool, "delete-safe-writer@example.edu", "writer").await;
+    let linked_add = [InstitutionBatchUpload {
+        filename: "students.csv".into(),
+        target_table: None,
+        bytes: b"reg_no,name,email,programme_code\nDELETE-SAFE-STUDENT,Delete Safe,delete-safe-writer@example.edu,BATCH-PROGRAMME\n".to_vec(),
+    }];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Add,
+            &linked_add,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    let add_batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    repository.apply_batch(add_batch_id, actor).await.unwrap();
+    let linked_delete = [InstitutionBatchUpload {
+        filename: "students.csv".into(),
+        target_table: None,
+        bytes: b"reg_no\nDELETE-SAFE-STUDENT\n".to_vec(),
+    }];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Delete,
+            &linked_delete,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    let delete_batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    repository
+        .apply_batch(delete_batch_id, actor)
+        .await
+        .unwrap();
+    let user_preserved: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.users WHERE id=$1)")
+            .bind(preserved_user.as_uuid())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(user_preserved);
+
+    let materialized_student: String = sqlx::query_scalar(
+        "SELECT assignment.student_reg_no FROM vcap.paper_assignment_students assignment JOIN latex_core.external_paper_team_links link USING(external_team_key) LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let blocked_delete = [InstitutionBatchUpload {
+        filename: "students.csv".into(),
+        target_table: None,
+        bytes: format!("reg_no\n{materialized_student}\n").into_bytes(),
+    }];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Delete,
+            &blocked_delete,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail["batch"]["status"], "FAILED");
+    assert_eq!(detail["issues"][0]["code"], "DELETE_BLOCKED_DEPENDENCY");
 }
 
 async fn verify_vcap_schema_and_department_role_guard(pool: &PgPool) {

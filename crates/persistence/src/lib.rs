@@ -74,9 +74,9 @@ pub use governance::{
 };
 pub use institution::{
     ImportFileType, ImportJobPageFilter, ImportLimits, ImportMode, ImportedTeamPlan,
-    InstitutionError, InstitutionImportJob, InstitutionImportRow, InstitutionPageFilter,
-    InstitutionRepository, PaperTeamPage, PaperTeamPageFilter, ProgrammeTemplateDefault,
-    TemplateResolution,
+    InstitutionBatchUpload, InstitutionError, InstitutionImportBatch, InstitutionImportJob,
+    InstitutionImportRow, InstitutionOperation, InstitutionPageFilter, InstitutionRepository,
+    PaperTeamPage, PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
 };
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{
