@@ -68,9 +68,76 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
     .await;
     import_modes_and_ten_thousand_rows(&pool, &repository, actor).await;
     batch_dependency_edit_and_delete_contract(&pool, &repository, actor).await;
+    legacy_history_cleanup_preserves_canonical_data(&pool, actor).await;
 
     pool.close().await;
     database.close().await;
+}
+
+async fn legacy_history_cleanup_preserves_canonical_data(pool: &PgPool, actor: UserId) {
+    let job_id = Uuid::new_v4();
+    let canonical_before: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vcap.students),\
+                (SELECT count(*) FROM latex_core.users),\
+                (SELECT count(*) FROM latex_core.paper_teams)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO latex_core.institution_import_jobs \
+         (id,import_kind,mode,original_filename,content_sha256,file_type,submitted_by_user_id,status) \
+         VALUES ($1,'departments','VALIDATE_ONLY','legacy-test.csv',$2,'CSV',$3,'VALIDATED')",
+    )
+    .bind(job_id)
+    .bind("d".repeat(64))
+    .bind(actor.as_uuid())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO latex_core.institution_import_rows \
+         (job_id,source_table_or_sheet,row_number,natural_key,payload,action,status) \
+         VALUES ($1,'departments',2,jsonb_build_object('department_id',$2),\
+         jsonb_build_object('department_id',$2),'INSERT','VALID')",
+    )
+    .bind(job_id)
+    .bind(Uuid::new_v4().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM latex_core.institution_import_rows WHERE job_id=$1")
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM latex_core.institution_import_jobs WHERE id=$1 AND batch_id IS NULL")
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let canonical_after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vcap.students),\
+                (SELECT count(*) FROM latex_core.users),\
+                (SELECT count(*) FROM latex_core.paper_teams)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(canonical_after, canonical_before);
+    let history_remaining: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM latex_core.institution_import_jobs WHERE id=$1) +\
+                (SELECT count(*) FROM latex_core.institution_import_rows WHERE job_id=$1)",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(history_remaining, 0);
 }
 
 async fn batch_dependency_edit_and_delete_contract(

@@ -431,6 +431,113 @@ const targetColumns = {
   departments: ['department_id'], admins: ['admin_id', 'email', 'name', 'pfp'], faculty: ['faculty_id', 'name', 'email', 'dept_id', 'honorific', 'designation', 'status'], programmes: ['programme_code', 'hod_id'], schools: ['school_id'], students: ['reg_no', 'name', 'email', 'programme_code'], student_course_registrations: ['student_reg_no', 'course_id', 'academic_year', 'semester', 'registration_status'], faculty_guide_capacity: ['capacity_id', 'faculty_id', 'academic_year', 'ug_max_projects', 'pg_max_projects', 'integrated_pg_max_projects', 'status'], department_roles: ['id', 'dept_id', 'role_type', 'faculty_id'], faculty_roles: ['role_id', 'faculty_id', 'role_type', 'school_id', 'department_id', 'programme_code', 'status'], paper_teams: ['external_team_key', 'team_name', 'academic_year', 'semester', 'status'], paper_team_writers: ['external_team_key', 'student_reg_no', 'writer_order', 'is_leader'], paper_team_mentors: ['external_team_key', 'faculty_id'],
 };
 
+const teamGenerationDatasets = [
+  ['departments', 'Identifies institutional departments referenced by Faculty.'],
+  ['faculty', 'Identifies institutional Faculty/Mentors.'],
+  ['programmes', 'Defines CSE/ECE/etc and drives programme-based template resolution.'],
+  ['students', 'Identifies institutional Students/Writers and their programme.'],
+  ['paper_teams', 'Defines the institutional paper/project Team.'],
+  ['paper_team_writers', 'Maps Students into the Team, establishes deterministic Writer order, and explicitly selects one Team Leader.'],
+  ['paper_team_mentors', 'Assigns Faculty Mentor(s) to the Team.'],
+];
+
+function createImportGuide() {
+  const trigger = element('button', 'import-guide-trigger', 'ⓘ');
+  trigger.type = 'button';
+  trigger.setAttribute('aria-label', 'What data do I need?');
+  trigger.setAttribute('title', 'What data do I need?');
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  trigger.setAttribute('aria-expanded', 'false');
+
+  const guide = element('dialog', 'import-guide-dialog');
+  guide.setAttribute('aria-labelledby', 'importGuideTitle');
+  const shell = element('div', 'import-guide-shell');
+  const header = element('header', 'import-guide-header');
+  const title = element('h2', '', 'What data do I need?');
+  title.id = 'importGuideTitle';
+  const close = element('button', '', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Close import guide');
+  close.setAttribute('title', 'Close import guide');
+  close.addEventListener('click', () => guide.close());
+  header.append(title, close);
+
+  const body = element('div', 'import-guide-body');
+  body.append(element('p', '', "To automatically create a Paper Team, LaTeX Core needs institutional people records plus the Team's Writer and Mentor assignments. Drop the files together; dependency order is handled automatically."));
+
+  const datasetHeading = element('h3', '', 'Team-generation datasets');
+  const datasetWrap = element('div', 'admin-table-wrap');
+  const datasetTable = element('table', 'admin-table import-guide-table');
+  datasetTable.innerHTML = '<thead><tr><th>Dataset</th><th>Fields</th><th>Purpose</th></tr></thead>';
+  const datasetBody = document.createElement('tbody');
+  teamGenerationDatasets.forEach(([dataset, purpose]) => {
+    const fields = element('code', '', targetColumns[dataset].join(', '));
+    const fieldCell = element('td');
+    fieldCell.append(fields);
+    const row = document.createElement('tr');
+    row.append(element('td', '', dataset), fieldCell, element('td', '', purpose));
+    datasetBody.append(row);
+  });
+  datasetTable.append(datasetBody);
+  datasetWrap.append(datasetTable);
+  body.append(datasetHeading, datasetWrap);
+
+  const prerequisites = element('section', 'import-guide-section');
+  prerequisites.append(
+    element('h3', '', 'Before Teams can be created'),
+    element('h4', '', 'Student account link'),
+    element('p', '', 'Student.email must resolve to an existing V2 WRITER account for that Student to become a Team Writer. Importing a Student does NOT create a privileged Writer account.'),
+    element('h4', '', 'Faculty account link'),
+    element('p', '', 'Faculty.email must resolve to an existing V2 MENTOR account for that Faculty member to become a Paper Team Mentor.'),
+    element('h4', '', 'Team Leader'),
+    element('p', '', 'Exactly one paper_team_writers row per Team must be marked is_leader = true.'),
+    element('h4', '', 'Template'),
+    element('p', '', 'Programme defaults may be configured, for example CSE → CSE Template and ECE → ECE Template. If no programme mapping is available, the configured global fallback template is used. Existing Team template pins do not silently change later.'),
+  );
+
+  const templateExample = element('section', 'import-guide-section');
+  templateExample.append(
+    element('h3', '', 'Template selection'),
+    element('pre', 'import-guide-example', 'Writer 1 → CSE\nWriter 2 → CSE\nWriter 3 → ECE\nResult: CSE template · MODE\n\nTie:\nWriter 1 → ECE\nWriter 2 → CSE\nResult: ECE template · TIE_FIRST_WRITER'),
+  );
+
+  const optional = element('details', 'import-guide-section');
+  optional.append(element('summary', '', 'Additional institutional data (optional)'));
+  const optionalList = element('ul', 'compact-list');
+  ['schools', 'admins', 'student_course_registrations', 'faculty_guide_capacity', 'department_roles', 'faculty_roles'].forEach((dataset) => optionalList.append(element('li', '', dataset)));
+  optional.append(
+    element('p', '', 'These are optional for basic Paper Team creation. They may be imported when the institution wants the additional People & Roles metadata.'),
+    optionalList,
+    element('p', 'muted-note', 'Optional does not mean invalid parent references are ignored. If an optional child row references another entity, its referenced parent must exist in the database or the same import batch.'),
+  );
+
+  const formats = element('section', 'import-guide-section');
+  const formatList = element('ul', 'compact-list');
+  formatList.append(
+    element('li', '', 'CSV: one dataset per file; filename/header detection identifies the dataset automatically in normal cases.'),
+    element('li', '', 'XLSX: one workbook may contain all datasets as named worksheets and is recommended for a full institutional import.'),
+  );
+  formats.append(
+    element('h3', '', 'File format'),
+    formatList,
+    element('p', '', 'Recommended Team-creation workbook sheets:'),
+    element('code', 'import-guide-fields', teamGenerationDatasets.map(([dataset]) => dataset).join(', ')),
+  );
+
+  body.append(prerequisites, templateExample, optional, formats);
+  shell.append(header, body);
+  guide.append(shell);
+  trigger.addEventListener('click', () => {
+    trigger.setAttribute('aria-expanded', 'true');
+    guide.showModal();
+  });
+  guide.addEventListener('close', () => trigger.setAttribute('aria-expanded', 'false'));
+  guide.addEventListener('click', (event) => {
+    if (event.target === guide) guide.close();
+  });
+  return { trigger, guide };
+}
+
 function datasetLabel(value) { return value === 'paper_teams' ? 'Paper Assignments' : value.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()); }
 
 async function detectInstitutionDataset(file) {
@@ -458,6 +565,11 @@ async function renderBatchDetail(batchId) {
 }
 
 async function renderImports(options = {}) {
+  const heading = content.querySelector('h1');
+  const headingRow = element('div', 'import-heading');
+  const { trigger: guideTrigger, guide } = createImportGuide();
+  heading.replaceWith(headingRow);
+  headingRow.append(heading, guideTrigger, guide);
   content.append(element('p', 'muted-note', 'Add new records, edit known records, or delete only the exact keys you provide. File order and database dependency order are handled automatically.'));
   const form = element('form', 'batch-import-form'); form.enctype = 'multipart/form-data'; const operations = element('fieldset', 'operation-control'); operations.innerHTML = '<legend>Operation</legend><label><input type="radio" name="operation" value="ADD" checked>Add</label><label><input type="radio" name="operation" value="EDIT">Edit</label><label><input type="radio" name="operation" value="DELETE">Delete</label>';
   const drop = element('div', 'import-dropzone'); drop.tabIndex = 0; drop.setAttribute('role', 'button'); drop.setAttribute('aria-label', 'Browse for CSV or XLSX files'); drop.append(element('strong', '', 'Drop CSV or XLSX files here'), element('span', '', 'or browse · multiple files supported')); const fileInput = document.createElement('input'); fileInput.type = 'file'; fileInput.multiple = true; fileInput.accept = '.csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'; fileInput.hidden = true; drop.append(fileInput); const fileHost = element('div', 'import-file-list'); const submit = element('button', 'primary', 'Review changes'); submit.type = 'submit'; submit.disabled = true; const selected = [];
@@ -469,7 +581,6 @@ async function renderImports(options = {}) {
   if (options.jobId) await renderImportDetail(options.jobId);
   const history = element('section', 'admin-section'); history.append(element('h2', '', 'Recent imports')); const state = { page: 1, limit: 25, search: '', status: '', mode: '' }; const filters = filterForm([{ name: 'search', label: 'Filename' }, { name: 'status', label: 'State', type: 'select', options: ['VALIDATED', 'APPLIED', 'PARTIAL', 'FAILED'].map((value) => [value]) }, { name: 'mode', label: 'Operation', type: 'select', options: [['Add', 'ADD'], ['Edit', 'EDIT'], ['Delete', 'DELETE']] }], (values) => { Object.assign(state, values, { page: 1 }); load(); }); const host = element('div'); history.append(filters, host); content.append(history);
   const load = async (page = state.page) => { state.page = page; const data = await api(`/api/admin/v2/institution/import-batches?${queryString(state)}`); if (!data.items.length) { host.replaceChildren(element('p', 'empty-copy', 'No batch imports yet.'), pager(data, load)); return; } const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Filename / batch</th><th>Operation</th><th>Result</th><th>Date</th><th>State</th><th></th></tr></thead>'; const body = document.createElement('tbody'); data.items.forEach((batch) => { const result = batch.operation === 'ADD' ? `Added ${batch.added_rows} records` : batch.operation === 'EDIT' ? `Edited ${batch.edited_rows} records` : `Deleted ${batch.deleted_rows} records`; const row = document.createElement('tr'); const action = element('td'); action.append(buttonAction('View details', () => showSection('Imports', { batchId: batch.id }))); row.append(element('td', '', batch.filenames), element('td', '', `${batch.operation[0]}${batch.operation.slice(1).toLowerCase()}`), element('td', '', `${result}${batch.skipped_rows ? ` · ${batch.skipped_rows} skipped` : ''}${batch.error_rows ? ` · ${batch.error_rows} need attention` : ''}`), element('td', '', new Date(batch.created_at).toLocaleString()), element('td', '', batch.status === 'APPLIED' ? 'Complete' : batch.status), action); body.append(row); }); table.append(body); wrap.append(table); host.replaceChildren(wrap, pager(data, load)); }; await load();
-  const legacy = element('details', 'technical-details'); const legacyHost = element('div'); legacy.append(element('summary', '', 'Legacy single-file imports'), element('p', 'muted-note', 'Standalone jobs remain readable and keep their original internal modes.'), legacyHost); let legacyLoaded = false; legacy.addEventListener('toggle', async () => { if (!legacy.open || legacyLoaded) return; legacyLoaded = true; try { const data = await api('/api/admin/v2/institution/imports?page=1&limit=100'); const standalone = data.items.filter((job) => !job.batch_id); if (!standalone.length) { legacyHost.replaceChildren(element('p', 'empty-copy', 'No legacy single-file imports.')); return; } const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Filename</th><th>Internal mode</th><th>State</th><th>Date</th><th></th></tr></thead>'; const body = document.createElement('tbody'); standalone.forEach((job) => { const row = document.createElement('tr'); const action = element('td'); action.append(buttonAction('View details', () => showSection('Imports', { jobId: job.id }))); row.append(element('td', '', job.original_filename), element('td', '', job.mode), element('td', '', job.status), element('td', '', new Date(job.created_at).toLocaleString()), action); body.append(row); }); table.append(body); legacyHost.replaceChildren(table); } catch (error) { legacyHost.replaceChildren(element('p', 'danger', error.message)); } }); content.append(legacy);
 }
 
 const institutionDatasets = [

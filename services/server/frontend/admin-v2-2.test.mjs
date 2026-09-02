@@ -27,10 +27,47 @@ test('data import supports multi-file drag/drop and Add Edit Delete batches', ()
   assert.match(js, /Review changes/);
   assert.match(js, /What data is this\?/);
   assert.match(js, /Technical details/);
-  assert.match(js, /Legacy single-file imports/);
+  assert.doesNotMatch(js, /Legacy single-file imports/);
+  assert.doesNotMatch(js, /Internal mode/);
   assert.match(js, /import-batches\/validate/);
   assert.doesNotMatch(js, /Select the CSV target table; unknown filenames are never guessed/);
   assert.match(css, /\.import-dropzone/);
+});
+
+test('data import guide documents Team creation without exposing legacy history', () => {
+  assert.match(js, /aria-label', 'What data do I need\?'/);
+  assert.match(js, /title', 'What data do I need\?'/);
+  assert.match(js, /showModal\(\)/);
+  assert.match(js, /event\.target === guide/);
+
+  for (const dataset of [
+    'departments',
+    'faculty',
+    'programmes',
+    'students',
+    'paper_teams',
+    'paper_team_writers',
+    'paper_team_mentors',
+  ]) assert.match(js, new RegExp(`\\['${dataset}',`));
+
+  for (const field of [
+    'department_id',
+    'faculty_id', 'name', 'email', 'dept_id', 'honorific', 'designation', 'status',
+    'programme_code', 'hod_id',
+    'reg_no',
+    'external_team_key', 'team_name', 'academic_year', 'semester',
+    'student_reg_no', 'writer_order', 'is_leader',
+  ]) assert.match(js, new RegExp(`['"]${field}['"]`));
+
+  assert.match(js, /Student\.email must resolve to an existing V2 WRITER account/);
+  assert.match(js, /does NOT create a privileged Writer account/);
+  assert.match(js, /Faculty\.email must resolve to an existing V2 MENTOR account/);
+  assert.match(js, /Exactly one paper_team_writers row per Team must be marked is_leader = true/);
+  assert.match(js, /programme mapping is available, the configured global fallback template is used/);
+  assert.match(js, /Existing Team template pins do not silently change later/);
+  assert.match(js, /Additional institutional data \(optional\)/);
+  assert.match(js, /optional for basic Paper Team creation/);
+  assert.match(css, /\.import-guide-dialog/);
 });
 
 test('institution data manager uses server pagination and authoritative manual operations', () => {
