@@ -9568,18 +9568,21 @@ mod tests {
         assert!(!admin.contains("<textarea"));
         assert!(!admin.contains(">Workspace<"));
         for required in [
-            "OVERVIEW",
-            "V2 USERS",
-            "INSTITUTION DATA",
-            "IMPORTS",
-            "PAPER TEAMS",
-            "TEMPLATES",
-            "FILE POLICIES",
-            "VERSIONS",
-            "REVIEWS",
-            "BUILD QUEUE",
-            "AUDIT",
-            "SYSTEM",
+            "Overview",
+            "V2 Users",
+            "Institution Data",
+            "Imports",
+            "Paper Teams",
+            "Templates",
+            "File Policies",
+            "Versions",
+            "Reviews",
+            "Build Queue",
+            "Audit",
+            "System",
+            "People &amp; data",
+            "Papers",
+            "Operations",
         ] {
             assert!(admin.contains(required), "missing Admin section {required}");
         }

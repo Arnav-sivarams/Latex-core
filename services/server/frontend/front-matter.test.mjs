@@ -11,7 +11,7 @@ const mentor = readFileSync(new URL('./review.js', import.meta.url), 'utf8');
 
 test('Front Matter shares the single Templates navigation destination', () => {
   assert.equal((adminHtml.match(/data-section="Templates"/g) || []).length, 1);
-  for (const label of ['Main Content Templates', 'Front Matter Packs', 'Automatic Defaults']) {
+  for (const label of ['Main templates', 'Front Matter', 'Automatic defaults']) {
     assert.match(admin, new RegExp(label));
   }
   assert.match(admin, /Programme<\/th><th>Main Content Template<\/th><th>Front Matter Pack/);

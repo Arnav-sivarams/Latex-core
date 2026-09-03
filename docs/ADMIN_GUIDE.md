@@ -10,15 +10,17 @@ Admins use `/admin` as the V2 governance control plane. Admin inspection does no
 
 ## Control-plane sections
 
-- **OVERVIEW** — product and queue summary.
-- **V2 USERS** — manually provision users, inspect account state, and generate one-time temporary passwords for Writers or Mentors.
-- **INSTITUTION DATA** — server-paginated institutional datasets with manual Add, Edit, dependency-previewed Delete, and Paper Assignment membership management.
-- **IMPORTS** — multi-file CSV/XLSX drag/drop, automatic dataset detection, one batch review/apply action, and concise paginated history.
-- **PAPER TEAMS** — server-paginated Team grid, manual creation, full membership editing, unresolved imports, safe template changes, and lifecycle actions.
-- **TEMPLATES** — immutable template library, import, global fallback, and programme defaults in one page.
-- **FILE POLICIES** — inspect stable file IDs and set server-enforced policies.
-- **VERSIONS** — inspect immutable Team Paper history.
-- **REVIEWS**, **BUILD QUEUE**, **AUDIT**, and **SYSTEM** — operational inspection using existing bounded APIs.
+The fixed Admin shell groups navigation into **People & data**, **Papers**, and **Operations**. These labels are visual aids rather than additional destinations; the navigation and current section scroll independently.
+
+- **Overview** — product and queue summary, plus actionable items that need attention.
+- **V2 Users** — manually provision users, inspect account and email-delivery state, and generate one-time temporary passwords for Writers or Mentors.
+- **Institution Data** — server-paginated institutional datasets with manual Add, Edit, dependency-previewed Delete, and Paper Assignment membership management.
+- **Imports** — multi-file CSV/XLSX drag/drop, automatic dataset detection, one batch review/apply action, and concise paginated history.
+- **Paper Teams** — server-paginated Team grid, manual creation, full membership editing, unresolved imports, safe template changes, and lifecycle actions.
+- **Templates** — Main templates, Front Matter, and Automatic defaults in one page.
+- **File Policies** — inspect ordinary Team files and set server-enforced policies.
+- **Versions** — inspect immutable Team Paper history; revert authority remains with the Writer Leader.
+- **Reviews**, **Build Queue**, **Audit**, and **System** — read-only operational inspection using existing bounded APIs.
 
 ## Templates and policies
 
@@ -40,7 +42,7 @@ The Writer toolbar exposes review/checkpoint/revert controls only to that select
 
 The primary operations are Add, Edit, and Delete. Add never changes an existing key. Edit changes only supplied fields on known keys and never inserts. Delete affects only explicitly supplied keys; omission is never synchronization-by-absence. Multi-file validation sees parents staged anywhere in the batch and Apply chooses dependency order automatically. The bounded review uses dataset names, record counts, actionable file/row issues, and field-level Edit diffs. IDs, checksums, file jobs, and formula-neutralized `errors.csv` downloads are under Technical details.
 
-Manual forms use the same authoritative server validation. A manual Delete always checks dependencies first. Institutional deletion never removes a V2 account or paper history, and a materialized Paper Assignment is blocked pending explicit Team lifecycle handling. Existing standalone VALIDATE_ONLY/MERGE/ADD_ONLY jobs remain available under Legacy single-file imports.
+Manual forms use the same authoritative server validation. A manual Delete always checks dependencies first. Institutional deletion never removes a V2 account or paper history, and a materialized Paper Assignment is blocked pending explicit Team lifecycle handling. Legacy single-file import history is not part of the normal Admin interface.
 
 During Add, each valid imported Student receives or reuses a V2 Writer account. Only Faculty referenced by `paper_team_mentors` receive or reuse a V2 Mentor account. Existing compatible accounts retain their password; incompatible roles are reported and never changed. `vcap.admins` never provisions or grants V2 Admin. Automatic reconciliation preserves `MANUAL` links, and an identity used by a non-archived imported Team cannot be unlinked.
 

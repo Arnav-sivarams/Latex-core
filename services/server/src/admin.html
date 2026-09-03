@@ -4,40 +4,47 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Admin — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=v2-2-admin-3">
+  <link rel="stylesheet" href="/static/shells.css?v=v2-3-admin-unified">
 </head>
-<body>
+<body class="workspace-shell admin-shell">
   <header class="shell-topbar">
     <a class="shell-brand" href="/admin" aria-current="page">LaTeX Core</a>
     <span class="role-badge">Admin</span>
+    <span id="adminSectionTitle" class="current-context">Overview</span>
     <span class="shell-spacer"></span>
-    <form method="post" action="/logout"><button type="submit">Log out</button></form>
+    <form method="post" action="/logout"><button class="quiet-button" type="submit" title="Log out">Log out</button></form>
   </header>
   <div class="admin-layout">
     <nav id="adminNav" class="admin-nav" aria-label="Administrative sections">
-      <button type="button" data-section="Overview" aria-current="page">OVERVIEW</button>
-      <button type="button" data-section="V2 Users">V2 USERS</button>
-      <button type="button" data-section="Institution Data">INSTITUTION DATA</button>
-      <button type="button" data-section="Imports">IMPORTS</button>
-      <button type="button" data-section="Paper Teams">PAPER TEAMS</button>
-      <button type="button" data-section="Templates">TEMPLATES</button>
-      <button type="button" data-section="File Policies">FILE POLICIES</button>
-      <button type="button" data-section="Versions">VERSIONS</button>
-      <button type="button" data-section="Reviews">REVIEWS</button>
-      <button type="button" data-section="Build Queue">BUILD QUEUE</button>
-      <button type="button" data-section="Audit">AUDIT</button>
-      <button type="button" data-section="System">SYSTEM</button>
+      <button type="button" data-section="Overview" aria-current="page">Overview</button>
+      <span class="admin-nav-group">People &amp; data</span>
+      <button type="button" data-section="V2 Users">V2 Users</button>
+      <button type="button" data-section="Institution Data">Institution Data</button>
+      <button type="button" data-section="Imports">Imports</button>
+      <span class="admin-nav-group">Papers</span>
+      <button type="button" data-section="Paper Teams">Paper Teams</button>
+      <button type="button" data-section="Templates">Templates</button>
+      <button type="button" data-section="File Policies">File Policies</button>
+      <button type="button" data-section="Versions">Versions</button>
+      <button type="button" data-section="Reviews">Reviews</button>
+      <span class="admin-nav-group">Operations</span>
+      <button type="button" data-section="Build Queue">Build Queue</button>
+      <button type="button" data-section="Audit">Audit</button>
+      <button type="button" data-section="System">System</button>
     </nav>
     <main id="adminContent" class="admin-content" tabindex="-1">
-      <h1>OVERVIEW</h1>
+      <h1>Overview</h1>
       <p class="empty-copy">Loading operational data…</p>
     </main>
   </div>
-  <dialog id="adminDialog" class="admin-dialog" aria-labelledby="adminDialogTitle">
-    <div id="adminDialogBody"></div>
-    <form method="dialog"><button type="submit" aria-label="Close dialog" title="Close dialog">Close</button></form>
+  <dialog id="adminDialog" class="admin-dialog" aria-modal="true" aria-labelledby="adminDialogTitle">
+    <div class="admin-dialog-shell">
+      <header class="admin-dialog-header"><h2 id="adminDialogTitle">Admin details</h2><form method="dialog"><button class="icon-button" value="cancel" aria-label="Close dialog" title="Close dialog"><span aria-hidden="true">×</span></button></form></header>
+      <div id="adminDialogBody" class="admin-dialog-body"></div>
+      <footer class="admin-dialog-footer"><form method="dialog"><button value="cancel">Close</button></form></footer>
+    </div>
   </dialog>
   <div id="adminStatus" class="status-region" aria-live="polite"></div>
-  <script type="module" src="/static/admin.js?v=v2-2-admin-3"></script>
+  <script type="module" src="/static/admin.js?v=v2-3-admin-unified"></script>
 </body>
 </html>

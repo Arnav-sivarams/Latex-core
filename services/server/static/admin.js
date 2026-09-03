@@ -3,6 +3,10 @@ import { api } from '/static/api.js?v=control-plane-groups-1';
 const nav = document.querySelector('#adminNav');
 const content = document.querySelector('#adminContent');
 const status = document.querySelector('#adminStatus');
+const sectionTitle = document.querySelector('#adminSectionTitle');
+const adminDialog = document.querySelector('#adminDialog');
+const adminDialogTitle = document.querySelector('#adminDialogTitle');
+let dialogReturnFocus = null;
 
 const endpoints = {
   Overview: '/api/admin/overview',
@@ -28,6 +32,60 @@ function announce(message, failed = false) {
 
 function showError(error) {
   announce(error.message || 'The administrative request failed.', true);
+}
+
+function openAdminDialog(title) {
+  adminDialogTitle.textContent = title;
+  dialogReturnFocus = document.activeElement;
+  adminDialog.showModal();
+  queueMicrotask(() => {
+    const firstControl = adminDialog.querySelector('.admin-dialog-body input:not([disabled]), .admin-dialog-body select:not([disabled]), .admin-dialog-body button:not([disabled])') || adminDialog.querySelector('.admin-dialog-header button');
+    firstControl?.focus();
+  });
+}
+
+adminDialog.addEventListener('close', () => {
+  if (dialogReturnFocus instanceof HTMLElement) dialogReturnFocus.focus();
+  dialogReturnFocus = null;
+});
+
+function humanLabel(value) {
+  return String(value ?? '').replaceAll('_', ' ').toLowerCase().replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
+}
+
+function statusChip(label, tone = '') {
+  return element('span', `status-chip ${tone}`.trim(), label);
+}
+
+const iconPaths = {
+  more: 'M5 12h.01M12 12h.01M19 12h.01',
+  close: 'M6 6l12 12M18 6L6 18',
+  delete: 'M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5',
+  details: 'M12 9h.01M11 12h1v4h1m8-4a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z',
+};
+
+function icon(name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('width', '16'); svg.setAttribute('height', '16'); svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', iconPaths[name]); path.setAttribute('fill', 'none'); path.setAttribute('stroke', 'currentColor'); path.setAttribute('stroke-width', '1.8'); path.setAttribute('stroke-linecap', 'round'); path.setAttribute('stroke-linejoin', 'round');
+  svg.append(path); return svg;
+}
+
+function iconAction(label, iconName, handler, className = '') {
+  const action = buttonAction('', handler, `icon-button ${className}`.trim());
+  action.append(icon(iconName)); action.setAttribute('aria-label', label); action.title = label; return action;
+}
+
+function rowMenu(label, actions) {
+  const menu = element('details', 'admin-row-menu');
+  const summary = element('summary'); summary.append(icon('more'));
+  summary.setAttribute('aria-label', label);
+  summary.title = label;
+  const items = element('div', 'admin-row-menu-items');
+  actions.filter(Boolean).forEach((action) => items.append(action));
+  menu.append(summary, items);
+  return menu;
 }
 
 function csvCell(value) {
@@ -60,7 +118,7 @@ function showCredentialHandoff(provisioning, batchId) {
     element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again.'),
   );
   const download = buttonAction('Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
-  download.disabled = credentials.length === 0; host.append(download); dialog.showModal();
+  download.disabled = credentials.length === 0; host.append(download); openAdminDialog('Account setup');
   if (credentials.length) downloadCredentials(credentials, batchId);
 }
 
@@ -69,6 +127,7 @@ function setActive(section) {
     if (button.dataset.section === section) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   });
+  sectionTitle.textContent = section;
 }
 
 function renderJson(value) {
@@ -78,38 +137,130 @@ function renderJson(value) {
 }
 
 function renderOverview(data) {
+  const metrics = [
+    ['active_paper_teams', 'Paper Teams'], ['teams_in_review', 'Teams in Review'],
+    ['writers', 'Writers'], ['mentors', 'Mentors'],
+    ['institutional_students', 'Institutional Students'], ['institutional_faculty', 'Institutional Faculty'],
+    ['unlinked_total', 'Unlinked / needs attention'], ['email_attention', 'Pending / failed emails'],
+    ['build_activity', 'Queued / running builds'],
+  ];
+  const values = {
+    ...data,
+    unlinked_total: Number(data.unlinked_students || 0) + Number(data.unlinked_faculty || 0) + Number(data.unresolved_imported_teams || 0),
+    email_attention: `${Number(data.pending_email_count || 0).toLocaleString()} / ${Number(data.failed_email_count || 0).toLocaleString()}`,
+    build_activity: `${Number(data.queued_builds || 0).toLocaleString()} / ${Number(data.running_builds || 0).toLocaleString()}`,
+  };
   const grid = element('div', 'admin-metrics');
-  Object.entries(data).forEach(([key, value]) => {
+  metrics.forEach(([key, label]) => {
     const metric = element('div', 'admin-metric');
-    metric.append(element('strong', '', String(value)), element('span', '', key.replaceAll('_', ' ')));
+    const value = values[key] ?? 0;
+    metric.append(element('strong', '', typeof value === 'number' ? value.toLocaleString() : String(value)), element('span', '', label));
     grid.append(metric);
   });
   content.append(grid);
+
+  const attention = [];
+  if (Number(data.unresolved_imported_teams || 0)) attention.push([`${data.unresolved_imported_teams} imported Teams need resolution`, 'Paper Teams']);
+  if (Number(data.failed_email_count || 0)) attention.push([`${data.failed_email_count} credential emails failed`, 'V2 Users']);
+  if (String(data.latest_import_status || '').match(/FAIL|PARTIAL|ERROR/i)) attention.push([`Latest import: ${humanLabel(data.latest_import_status)}`, 'Imports']);
+  if (attention.length) {
+    content.append(element('h2', '', 'Needs attention'));
+    const list = element('ul', 'admin-attention');
+    attention.forEach(([label, section]) => {
+      const action = buttonAction(label, () => showSection(section));
+      action.append(element('span', '', '→'));
+      const item = element('li'); item.append(action); list.append(item);
+    });
+    content.append(list);
+  }
 }
 
 function renderAdminReviews(reviews) {
-  if (!reviews.length) return content.append(element('p', 'empty-copy', 'No review activity yet.'));
-  const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table');
-  table.innerHTML = '<thead><tr><th>Paper Team</th><th>Type</th><th>State</th><th>Severity</th><th>Mentor</th><th>Assigned Writer</th><th>Updated</th></tr></thead>';
-  const body = document.createElement('tbody');
+  if (!reviews.length) return content.append(element('p', 'empty-copy', 'No Team reviews have been submitted yet.'));
+  const grouped = new Map();
   reviews.forEach((review) => {
+    const item = grouped.get(review.paper_id) || { ...review, open: 0, blocking: 0, last_activity: review.updated_at || review.created_at };
+    if (review.state !== 'RESOLVED') item.open += 1;
+    if (review.severity === 'BLOCKING' && review.state !== 'RESOLVED') item.blocking += 1;
+    if (new Date(review.updated_at || review.created_at) > new Date(item.last_activity)) item.last_activity = review.updated_at || review.created_at;
+    grouped.set(review.paper_id, item);
+  });
+  const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table');
+  table.innerHTML = '<thead><tr><th>Team</th><th>Review state</th><th>Mentor</th><th>Open comments</th><th>Blocking comments</th><th>Submitted</th><th>Last activity</th></tr></thead>';
+  const body = document.createElement('tbody');
+  grouped.forEach((review) => {
     const row = document.createElement('tr');
     row.append(
-      element('td', '', review.paper_name), element('td', '', review.thread_type.replaceAll('_', ' ')),
-      element('td', '', review.state), element('td', '', review.severity), element('td', '', review.mentor),
-      element('td', '', review.assigned_writer || 'Unassigned'),
-      element('td', '', new Date(review.updated_at || review.created_at).toLocaleString()),
+      element('td', '', review.paper_name), element('td', '', humanLabel(review.state)),
+      element('td', '', review.mentor), element('td', '', String(review.open)), element('td', '', String(review.blocking)),
+      element('td', '', new Date(review.created_at).toLocaleString()), element('td', '', new Date(review.last_activity).toLocaleString()),
     );
     body.append(row);
   });
   table.append(body); wrap.append(table); content.append(wrap);
 }
 
+function renderVersions(versions) {
+  if (!versions.length) return content.append(element('p', 'empty-copy', 'No Team versions have been recorded yet.'));
+  const host = element('div');
+  const filters = filterForm([
+    { name: 'search', label: 'Team or actor', type: 'search', placeholder: 'Filter history…' },
+    { name: 'version_type', label: 'Version type', type: 'select', options: [...new Set(versions.map((item) => item.version_type))].map((value) => [humanLabel(value), value]) },
+  ], ({ search, version_type }) => draw(search, version_type));
+  const draw = (search = '', versionType = '') => {
+    const visible = versions.filter((item) => (!versionType || item.version_type === versionType) && (!search || `${item.paper_name} ${item.author}`.toLowerCase().includes(search.toLowerCase())));
+    if (!visible.length) { host.replaceChildren(element('p', 'empty-copy', 'No Team versions match these filters.')); return; }
+    const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table');
+    table.innerHTML = '<thead><tr><th>Team</th><th>Version type</th><th>Actor</th><th>Created</th></tr></thead>';
+    const body = document.createElement('tbody'); visible.forEach((item) => { const row = element('tr'); row.append(element('td', '', item.paper_name), element('td', '', humanLabel(item.version_type)), element('td', '', item.author), element('td', '', new Date(item.created_at).toLocaleString())); body.append(row); });
+    table.append(body); wrap.append(table); host.replaceChildren(wrap);
+  };
+  content.append(element('p', 'muted-note', 'Inspection only. Team version and revert authority remains with the Writer Leader.'), filters, host); draw();
+}
+
+function renderBuildQueue(jobs) {
+  const host = element('div');
+  const filters = filterForm([{ name: 'state', label: 'State', type: 'select', options: [['Queued', 'queued'], ['Running', 'running'], ['Failed', 'failed'], ['Succeeded', 'succeeded']] }], ({ state }) => draw(state));
+  const draw = (state = '') => {
+    const visible = jobs.filter((job) => !state || job.state === state || (state === 'running' && job.state === 'claimed'));
+    if (!visible.length) { host.replaceChildren(element('p', 'empty-copy', state ? `No ${state} builds.` : 'No builds have been queued yet.')); return; }
+    const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Team / workspace</th><th>Trigger</th><th>State</th><th>Queued</th><th>Started</th><th>Duration</th></tr></thead>';
+    const body = document.createElement('tbody'); visible.forEach((job) => { const row = element('tr'); const start = job.started_at ? new Date(job.started_at) : null; const end = job.finished_at ? new Date(job.finished_at) : new Date(); const duration = start ? `${Math.max(0, Math.round((end - start) / 1000))}s` : '—'; row.append(element('td', '', job.workspace_id), element('td', '', job.requester || 'System'), element('td', '', humanLabel(job.state)), element('td', '', new Date(job.created_at).toLocaleString()), element('td', '', start ? start.toLocaleString() : '—'), element('td', '', duration)); body.append(row); }); table.append(body); wrap.append(table); host.replaceChildren(wrap);
+  };
+  content.append(filters, host); draw();
+}
+
+const auditLabels = {
+  'account.credential_email.sent': 'Credential email sent',
+  'paper_team.member.changed': 'Team membership changed',
+};
+
+function renderAudit(events) {
+  content.append(element('p', '', 'Audit records important administrative and security actions: who did what, when, and to which object.'));
+  if (!events.length) return content.append(element('p', 'empty-copy', 'No administrative or security actions have been recorded yet.'));
+  const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>';
+  const body = document.createElement('tbody'); events.forEach((event) => { const row = element('tr'); const details = element('details'); details.append(element('summary', '', 'View'), element('p', 'muted-note', `Event type: ${event.event}`), element('p', 'muted-note', `Object ID: ${event.resource_id || 'Not recorded'}`)); const detailCell = element('td'); detailCell.append(details); row.append(element('td', '', new Date(event.created_at).toLocaleString()), element('td', '', event.actor || 'System'), element('td', '', auditLabels[event.event] || humanLabel(event.event.replaceAll('.', ' '))), element('td', '', humanLabel(event.resource)), detailCell); body.append(row); });
+  table.append(body); wrap.append(table); content.append(wrap);
+}
+
+function renderSystem(data, overview) {
+  content.append(element('p', 'muted-note', 'Read-only operational summary. Administrative actions remain in the operator service.'));
+  const systems = [
+    ['API', 'Healthy', data.version],
+    ['PostgreSQL', 'Healthy', data.database],
+    ['Blob storage', 'Healthy', 'Content-addressed storage configured'],
+    ['Worker', 'Healthy', data.queue],
+    ['Compiler M7', 'Healthy', data.compiler],
+    ['Mail delivery', overview.mail_delivery_enabled ? 'Healthy' : 'Disabled', overview.mail_delivery_enabled ? 'Credential delivery enabled' : 'Disabled in this environment'],
+  ];
+  const grid = element('div', 'system-grid'); systems.forEach(([name, state, detail]) => { const card = element('article', 'system-card'); card.append(element('strong', '', name), statusChip(state, state === 'Healthy' ? 'good' : state === 'Disabled' ? '' : 'warning'), element('span', '', detail)); grid.append(card); }); content.append(grid);
+}
+
 async function renderTemplates(templates, frontMatterPacks) {
-  content.append(element('h2', '', 'Main Content Templates'));
+  const heading = element('h2', 'admin-section-anchor', 'Main templates'); heading.id = 'main-templates'; content.append(heading);
   const intro = element('p', 'empty-copy', 'Import a bounded local ZIP, inspect its safe file tree, select Main when detection is ambiguous, then save an immutable template. Existing-Team changes use the separate conflict-safe preview workflow.');
   const form = element('form', 'admin-template-form');
-  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>Import Template</button>';
+  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>+ Import Main Template</button>';
   const archiveInput = form.elements.archive;
   const mainSelect = form.elements.main;
   const validate = form.querySelector('[data-action="validate-template"]');
@@ -188,10 +339,10 @@ async function renderTemplates(templates, frontMatterPacks) {
 }
 
 async function renderFrontMatterPacks(packs) {
-  content.append(element('h2', '', 'Front Matter Packs'));
+  const heading = element('h2', 'admin-section-anchor', 'Front Matter'); heading.id = 'front-matter'; content.append(heading);
   const intro = element('p', 'empty-copy', 'Import a safe ZIP containing frontmatter.json and immutable TeX/assets. Pack content never changes after import.');
   const form = element('form', 'admin-template-form');
-  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Front Matter ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><button type="button" data-action="validate-front-matter">Validate</button><button class="primary" type="submit" disabled>Import Front Matter Pack</button>';
+  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Front Matter ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><button type="button" data-action="validate-front-matter">Validate</button><button class="primary" type="submit" disabled>+ Import Front Matter Pack</button>';
   const previewHost = element('div', 'template-preview'); let preview = null;
   const validate = async () => { const file = form.elements.archive.files[0]; if (!file) throw new Error('Choose a Front Matter ZIP.'); const body = new FormData(); body.set('archive', file); preview = await api('/api/admin/v2/front-matter-packs/preview', { method: 'POST', body }); form.querySelector('button[type="submit"]').disabled = false; const sections = element('ul', 'compact-list'); preview.sections.forEach((section) => sections.append(element('li', '', `${section.label} · ${section.required ? 'Required' : 'Optional'} · ${section.file}`))); const fields = element('ul', 'compact-list'); preview.fields.forEach((field) => fields.append(element('li', '', `${field.label} · ${field.type}${field.source ? ` · ${field.source}` : field.default !== null && field.default !== undefined ? ' · Pack default' : ' · Team value'}`))); const tree = element('ul', 'template-file-tree'); preview.files.forEach((fileEntry) => tree.append(element('li', '', `${fileEntry.path} · ${fileEntry.size_bytes} bytes`))); previewHost.replaceChildren(element('strong', '', `Entry: ${preview.entry_file}`), element('h3', '', 'Sections'), sections, element('h3', '', 'Fields'), fields, element('h3', '', 'Files'), tree); };
   form.elements.archive.addEventListener('change', () => { preview = null; form.querySelector('button[type="submit"]').disabled = true; previewHost.replaceChildren(); });
@@ -200,7 +351,7 @@ async function renderFrontMatterPacks(packs) {
   content.append(intro, form, previewHost);
   if (!packs.length) return content.append(element('p', 'empty-copy', 'No Front Matter Packs yet.'));
   const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Pack</th><th>Sections</th><th>Fields</th><th>Created</th><th>Usage</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody');
-  packs.forEach((pack) => { const row = document.createElement('tr'); const identity = element('td'); const name = document.createElement('input'); name.value = pack.name; name.maxLength = 200; name.setAttribute('aria-label', `Name for ${pack.name}`); const description = document.createElement('input'); description.value = pack.description || ''; description.maxLength = 2000; description.placeholder = 'Optional description'; identity.append(name, description); const actions = element('td'); actions.append(buttonAction('View', async () => { const detail = await api(`/api/admin/v2/front-matter-packs/${pack.id}`); const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody'); const sectionList = element('ul', 'compact-list'); detail.pack.manifest_json.sections.forEach((section) => sectionList.append(element('li', '', `${section.label} · ${section.required ? 'Required' : 'Optional'} · ${section.file}`))); const fieldList = element('ul', 'compact-list'); detail.pack.manifest_json.fields.forEach((field) => fieldList.append(element('li', '', `${field.label} · ${field.type}${field.source ? ` · ${field.source}` : ''}`))); const fileList = element('ul', 'template-file-tree'); detail.files.forEach((file) => fileList.append(element('li', '', `${file.path} · ${file.media_type}`))); host.replaceChildren(element('h2', '', detail.pack.name), element('p', '', detail.pack.description || 'No description'), element('p', '', `Entry file: ${detail.pack.manifest_json.entry_file}`), element('h3', '', 'Section order'), sectionList, element('h3', '', 'Fields and automatic sources'), fieldList, element('h3', '', 'Asset / file tree'), fileList); dialog.showModal(); }), buttonAction('Edit metadata', async () => { await api(`/api/admin/v2/front-matter-packs/${pack.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.value, description: description.value || null }) }); announce(`Updated ${name.value}. Pack content was not changed.`); await showSection('Templates'); }), buttonAction('Remove', async () => { if (!confirm(`Remove Front Matter Pack “${pack.name}”?`)) return; await api(`/api/admin/v2/front-matter-packs/${pack.id}`, { method: 'DELETE' }); await showSection('Templates'); }, 'danger')); row.append(identity, element('td', '', String(pack.manifest_json.sections.length)), element('td', '', String(pack.manifest_json.fields.length)), element('td', '', new Date(pack.created_at).toLocaleString()), element('td', '', pack.usage_count ? `${pack.usage_count} Team${pack.usage_count === 1 ? '' : 's'}` : 'Unused'), actions); body.append(row); });
+  packs.forEach((pack) => { const row = document.createElement('tr'); const identity = element('td'); const name = document.createElement('input'); name.value = pack.name; name.maxLength = 200; name.setAttribute('aria-label', `Name for ${pack.name}`); const description = document.createElement('input'); description.value = pack.description || ''; description.maxLength = 2000; description.placeholder = 'Optional description'; identity.append(name, description); const actions = element('td'); actions.append(buttonAction('View', async () => { const detail = await api(`/api/admin/v2/front-matter-packs/${pack.id}`); const host = document.querySelector('#adminDialogBody'); const sectionList = element('ul', 'compact-list'); detail.pack.manifest_json.sections.forEach((section) => sectionList.append(element('li', '', `${section.label} · ${section.required ? 'Required' : 'Optional'} · ${section.file}`))); const fieldList = element('ul', 'compact-list'); detail.pack.manifest_json.fields.forEach((field) => fieldList.append(element('li', '', `${field.label} · ${field.type}${field.source ? ` · ${field.source}` : ''}`))); const fileList = element('ul', 'template-file-tree'); detail.files.forEach((file) => fileList.append(element('li', '', `${file.path} · ${file.media_type}`))); host.replaceChildren(element('p', '', detail.pack.description || 'No description'), element('p', '', `Entry file: ${detail.pack.manifest_json.entry_file}`), element('h3', '', 'Section order'), sectionList, element('h3', '', 'Fields and automatic sources'), fieldList, element('h3', '', 'Asset / file tree'), fileList); openAdminDialog(detail.pack.name); }), buttonAction('Edit metadata', async () => { await api(`/api/admin/v2/front-matter-packs/${pack.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.value, description: description.value || null }) }); announce(`Updated ${name.value}. Pack content was not changed.`); await showSection('Templates'); }), buttonAction('Remove', async () => { if (!confirm(`Remove Front Matter Pack “${pack.name}”?`)) return; await api(`/api/admin/v2/front-matter-packs/${pack.id}`, { method: 'DELETE' }); await showSection('Templates'); }, 'danger')); row.append(identity, element('td', '', String(pack.manifest_json.sections.length)), element('td', '', String(pack.manifest_json.fields.length)), element('td', '', new Date(pack.created_at).toLocaleString()), element('td', '', pack.usage_count ? `${pack.usage_count} Team${pack.usage_count === 1 ? '' : 's'}` : 'Unused'), actions); body.append(row); });
   table.append(body); wrap.append(table); content.append(wrap);
 }
 
@@ -324,7 +475,7 @@ function renderV2Users(users) {
   });
   const wrap = element('div', 'admin-table-wrap');
   const table = element('table', 'admin-table');
-  table.innerHTML = '<thead><tr><th>Email</th><th>V2 role</th><th>Status</th><th>Account state</th><th>Actions</th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Account state</th><th>Email delivery</th><th>Actions</th></tr></thead>';
   const body = document.createElement('tbody');
   users.forEach((user) => {
     const row = document.createElement('tr');
@@ -341,18 +492,29 @@ function renderV2Users(users) {
       option.selected = role === user.v2_role;
       select.append(option);
     });
-    const actions = element('div', 'admin-actions');
-    select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError)); actions.append(select);
-    const toggle = buttonAction(user.enabled ? 'Disable' : 'Enable', async () => { await api(`/api/admin/users/${encodeURIComponent(user.email)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !user.enabled }) }); await showSection('V2 Users'); }); actions.append(toggle);
-    if (user.v2_role === 'writer' || user.v2_role === 'mentor') actions.append(buttonAction('Generate new temporary password', async () => { if (!confirm(`Replace the current password for ${user.email}? Current sessions will end.`)) return; const reset = await api(`/api/admin/v2/users/${encodeURIComponent(user.user_id)}/temporary-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); showCredentialHandoff({ created: 1, credential_emails_queued: reset.credential_email_queued ? 1 : 0, reused: 0, needs_attention: 0, credentials: [{ email: reset.email, temporary_password: reset.temporary_password, credential_role: user.v2_role === 'writer' ? 'student' : 'mentor' }] }, `reset-${user.user_id}`); await showSection('V2 Users'); }));
-    if (user.email_delivery_status === 'FAILED' && !user.email_delivery_expired && user.email_delivery_id) actions.append(buttonAction('Retry email', async () => { await api(`/api/admin/v2/credential-emails/${encodeURIComponent(user.email_delivery_id)}/retry`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`Credential email retry queued for ${user.email}.`); await showSection('V2 Users'); }));
-    const details = element('details'); details.append(element('summary', '', 'Details'), element('p', 'muted-note', `Legacy type: ${user.legacy_account_type} · Migration: ${user.migration_state} · Created: ${new Date(user.created_at).toLocaleString()}`));
-    const actionCell = element('td'); actionCell.append(actions, details);
+    select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError));
+    const toggle = buttonAction(user.enabled ? 'Disable' : 'Enable', async () => { await api(`/api/admin/users/${encodeURIComponent(user.email)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !user.enabled }) }); await showSection('V2 Users'); });
+    const temporaryPassword = (user.v2_role === 'writer' || user.v2_role === 'mentor') ? buttonAction('Generate temporary password', async () => { if (!confirm(`Replace the current password for ${user.email}? Current sessions will end.`)) return; const reset = await api(`/api/admin/v2/users/${encodeURIComponent(user.user_id)}/temporary-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); showCredentialHandoff({ created: 1, credential_emails_queued: reset.credential_email_queued ? 1 : 0, reused: 0, needs_attention: 0, credentials: [{ email: reset.email, temporary_password: reset.temporary_password, credential_role: user.v2_role === 'writer' ? 'student' : 'mentor' }] }, `reset-${user.user_id}`); await showSection('V2 Users'); }) : null;
+    const retry = user.email_delivery_status === 'FAILED' && !user.email_delivery_expired && user.email_delivery_id ? buttonAction('Retry email', async () => { await api(`/api/admin/v2/credential-emails/${encodeURIComponent(user.email_delivery_id)}/retry`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`Credential email retry queued for ${user.email}.`); await showSection('V2 Users'); }) : null;
+    const details = buttonAction('Details', () => {
+      const host = document.querySelector('#adminDialogBody');
+      host.replaceChildren(
+        element('p', '', user.email),
+        element('p', '', `Created ${new Date(user.created_at).toLocaleString()}`),
+        element('p', 'muted-note', `Legacy account type: ${user.legacy_account_type || 'None'}`),
+        element('p', 'muted-note', `Migration state: ${humanLabel(user.migration_state || 'Not recorded')}`),
+      );
+      openAdminDialog('User details');
+    });
+    const roleCell = element('td'); roleCell.append(select);
+    const actionCell = element('td'); actionCell.append(rowMenu(`Actions for ${user.email}`, [temporaryPassword, retry, toggle, details]));
+    const emailDelivery = !user.must_change_password ? 'Not required' : user.email_delivery_status === 'SENT' ? 'Email sent' : user.email_delivery_status === 'SENDING' ? 'Sending' : user.email_delivery_status === 'PENDING' ? 'Pending' : user.email_delivery_status === 'FAILED' ? (user.email_delivery_expired ? 'Expired' : 'Failed') : user.email_delivery_status === 'EXPIRED' ? 'Expired' : 'Unavailable';
     row.append(
       element('td', '', user.email),
-      element('td', '', user.v2_role ? user.v2_role[0].toUpperCase() + user.v2_role.slice(1) : 'Unassigned'),
+      roleCell,
       element('td', '', user.enabled ? 'Enabled' : 'Disabled'),
-      element('td', '', user.must_change_password ? `Temporary password · ${user.email_delivery_status === 'SENT' ? 'Email sent' : user.email_delivery_status === 'SENDING' ? 'Sending' : user.email_delivery_status === 'PENDING' ? 'Email pending' : user.email_delivery_status === 'FAILED' ? (user.email_delivery_expired ? 'Email expired' : 'Email failed') : user.email_delivery_status === 'EXPIRED' ? 'Email expired' : 'Email unavailable'}` : 'Active'),
+      element('td', '', user.must_change_password ? 'Setup required' : 'Active'),
+      element('td', '', emailDelivery),
       actionCell,
     );
     body.append(row);
@@ -379,10 +541,10 @@ function pager(page, reload) {
 
 function filterForm(fields, onSubmit) {
   const form = element('form', 'admin-filters');
-  fields.forEach(({ name, label, type = 'text', options = [] }) => {
+  fields.forEach(({ name, label, type = 'text', options = [], placeholder = '' }) => {
     const field = element('label', '', label); let input;
     if (type === 'select') { input = document.createElement('select'); input.append(new Option('All', '')); options.forEach(([text, value = text]) => input.append(new Option(text, value))); }
-    else { input = document.createElement('input'); input.type = type; }
+    else { input = document.createElement('input'); input.type = type; input.placeholder = placeholder; }
     input.name = name; field.append(input); form.append(field);
   });
   const apply = element('button', 'primary', 'Apply filters'); apply.type = 'submit'; form.append(apply);
@@ -416,7 +578,7 @@ function peopleBuilder(role, ordered, changed) {
 }
 
 async function renderManualTeamForm(templates, frontMatterPacks) {
-  const details = element('details', 'admin-section'); const summary = element('summary', '', 'Create Team Manually'); details.append(summary);
+  const details = element('details', 'admin-section'); const summary = element('summary', 'admin-section-summary', '+ Create Team'); details.append(summary);
   const form = element('form', 'manual-team-form'); form.innerHTML = '<label>Team name<input name="name" required maxlength="200"></label>';
   const leader = element('label', '', 'Leader'); const leaderSelect = document.createElement('select'); leaderSelect.required = true; leader.append(leaderSelect);
   const template = element('label', '', 'Template'); const templateSelect = document.createElement('select'); templateSelect.append(new Option('Use suggested template automatically', '')); templates.forEach((item) => templateSelect.append(new Option(`Override: ${item.name}`, item.id))); template.append(templateSelect);
@@ -439,38 +601,43 @@ async function openTeamDetail(team, templates, frontMatterPacks) {
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody');
   if (team.unresolved) {
     host.replaceChildren(element('h2', '', `${team.name} · unresolved`), element('p', 'danger-box', `${team.error_code || 'TEAM_UNRESOLVED'}: ${team.error_message || 'Resolve linked identities and template defaults, then re-apply the source import job.'}`), element('p', '', `Students: ${(team.unresolved_student_ids || []).join(', ') || 'None'} · Faculty: ${(team.unresolved_faculty_ids || []).join(', ') || 'None'}`));
-    const links = buttonAction('Open Identity Links', () => { dialog.close(); showSection('Institution Data', { tab: 'Identity Links' }); }); const defaults = buttonAction('Open Templates', () => { dialog.close(); showSection('Templates'); }); const job = buttonAction('Open Import Job', () => { dialog.close(); showSection('Imports', { jobId: team.source_import_job_id }); }); host.append(element('p', 'muted-note', 'Imports are additive; missing rows do not remove existing members.'), links, defaults, job); dialog.showModal(); return;
+    const links = buttonAction('Open Identity Links', () => { dialog.close(); showSection('Institution Data', { tab: 'Identity Links' }); }); const defaults = buttonAction('Open Templates', () => { dialog.close(); showSection('Templates'); }); const job = buttonAction('Open Import Job', () => { dialog.close(); showSection('Imports', { jobId: team.source_import_job_id }); }); host.append(element('p', 'muted-note', 'Imports are additive; missing rows do not remove existing members.'), links, defaults, job); openAdminDialog(team.name); return;
   }
   const detail = await api(`/api/admin/v2/paper-teams/${team.id}`); const leader = detail.members.find((member) => member.is_leader); const writers = detail.members.filter((member) => member.role === 'writer'); const mentors = detail.members.filter((member) => member.role === 'mentor');
   const sourceLabel = detail.summary.resolution_method === 'MANUAL_OVERRIDE' ? 'Admin override' : detail.summary.resolution_method === 'GLOBAL_FALLBACK' ? 'Global fallback' : detail.summary.dominant_programme_code || 'Programme default';
   const sourcePrefix = detail.summary.resolution_method === 'MANUAL_OVERRIDE' ? 'Selected by:' : 'Selected automatically from:';
-  host.replaceChildren(element('h2', '', detail.team.name), element('p', '', `${detail.team.status} · ${team.source} · updated ${new Date(detail.team.updated_at).toLocaleString()}`), element('p', '', `Writers: ${writers.map((member) => `${member.writer_order}. ${member.email}`).join(', ') || 'None'}`), element('p', '', `Leader: ${leader?.email || 'Missing'} · Mentors: ${mentors.map((member) => member.email).join(', ') || 'None'}`), element('h3', '', 'Template'), element('p', '', detail.template_pin?.template_name || 'None'), element('p', 'muted-note', `${sourcePrefix} ${sourceLabel}`));
-  const advanced = element('details'); advanced.append(element('summary', '', 'Details'), element('p', 'muted-note', `Dominant programme: ${detail.summary.dominant_programme_code || '—'} · Resolution: ${detail.summary.resolution_method || 'unrecorded'} · Review: ${detail.summary.review_state} · Files: ${detail.summary.file_count} · Build: ${detail.summary.current_build.status || 'none'}`));
-  if (team.source === 'imported') advanced.append(element('p', 'muted-note', `External key ${team.external_team_key} · source import ${team.source_import_job_id} · last imported ${team.last_imported_at || 'unknown'}.`)); host.append(advanced);
-  const management = element('section', 'admin-section'); management.append(element('h2', '', 'Team management'));
+  const summary = element('div', 'admin-summary-grid');
+  [['Programme', detail.summary.dominant_programme_code || '—'], ['Main Template', detail.template_pin?.template_name || 'None'], ['Front Matter', detail.front_matter.pack_name || 'None'], ['Review', humanLabel(detail.summary.review_state)]].forEach(([label, value]) => { const item = element('div'); item.append(element('small', '', label), element('strong', '', value)); summary.append(item); });
+  const badges = element('p', 'admin-actions'); badges.append(statusChip(humanLabel(detail.team.status)), statusChip(team.source === 'imported' ? 'Imported' : 'Manual'));
+  const membersSummary = element('section', 'admin-section'); membersSummary.append(element('h2', '', 'Members'), element('p', '', `Writers: ${writers.map((member) => `${member.writer_order}. ${member.email}${member.is_leader ? ' (Leader)' : ''}`).join(', ') || 'None'}`), element('p', '', `Leader: ${leader?.email || 'Missing'}`), element('p', '', `Mentors: ${mentors.map((member) => member.email).join(', ') || 'None'}`));
+  host.replaceChildren(badges, summary, membersSummary);
+  const advanced = element('details', 'admin-section'); advanced.append(element('summary', 'admin-section-summary', 'Advanced details'), element('p', 'muted-note', `Dominant programme: ${detail.summary.dominant_programme_code || '—'} · Resolution: ${detail.summary.resolution_method || 'unrecorded'} · Files: ${detail.summary.file_count} · Build: ${detail.summary.current_build.status || 'none'} · Updated: ${new Date(detail.team.updated_at).toLocaleString()}`));
+  if (team.source === 'imported') advanced.append(element('p', 'muted-note', `External key ${team.external_team_key} · source import ${team.source_import_job_id} · last imported ${team.last_imported_at || 'unknown'}.`));
+  const management = element('section', 'admin-section'); management.append(element('h2', '', 'Edit Team'));
   const edit = element('details'); edit.append(element('summary', '', 'Edit Team')); const editForm = element('form', 'manual-team-form'); const nameLabel = element('label', '', 'Team name'); const nameInput = document.createElement('input'); nameInput.name = 'name'; nameInput.required = true; nameInput.maxLength = 200; nameInput.value = detail.team.name; nameLabel.append(nameInput);
   const leaderLabel = element('label', '', 'Team Leader'); const leaderSelect = document.createElement('select'); leaderSelect.required = true; leaderLabel.append(leaderSelect);
   const updateLeaderChoices = (people) => { const previous = leaderSelect.value || leader?.user_id; leaderSelect.replaceChildren(new Option('Select one Writer…', '')); people.forEach((person) => leaderSelect.append(new Option(person.email, person.user_id))); if (people.some((person) => person.user_id === previous)) leaderSelect.value = previous; };
   const editWriters = peopleBuilder('writer', true, updateLeaderChoices); editWriters.selected.push(...writers.map(({ user_id, email }) => ({ user_id, email }))); editWriters.draw(); updateLeaderChoices(editWriters.selected);
   const editMentors = peopleBuilder('mentor', false, () => {}); editMentors.selected.push(...mentors.map(({ user_id, email }) => ({ user_id, email }))); editMentors.draw();
   const saveTeam = element('button', 'primary', 'Save Team'); saveTeam.type = 'submit'; editForm.append(nameLabel, editWriters.section, leaderLabel, editMentors.section, saveTeam); editForm.addEventListener('submit', async (event) => { event.preventDefault(); try { if (!editWriters.selected.length) throw new Error('Team must retain at least one Writer.'); if (!editWriters.selected.some((person) => person.user_id === leaderSelect.value)) throw new Error('Leader must be a selected Writer.'); await api(`/api/admin/v2/paper-teams/${team.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: nameInput.value, writer_ids: editWriters.selected.map((person) => person.user_id), leader_writer_id: leaderSelect.value, mentor_ids: editMentors.selected.map((person) => person.user_id) }) }); announce(`Saved ${nameInput.value}.`); dialog.close(); await showSection('Paper Teams'); } catch (error) { showError(error); } }); edit.append(editForm); management.append(edit);
+  management.append(element('h3', '', 'Lifecycle'));
   [['Freeze', 'frozen'], ['Activate', 'active'], ['Archive', 'archived']].forEach(([label, value]) => management.append(buttonAction(label, async () => { await api(`/api/admin/v2/paper-teams/${team.id}/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: value }) }); dialog.close(); await showSection('Paper Teams'); }, value === 'archived' ? 'danger' : ''))); host.append(management);
-  const section = element('section', 'admin-section'); section.append(element('h2', '', 'Change template'), element('p', '', `Current: ${detail.template_pin?.template_name || 'None'}`));
+  const section = element('section', 'admin-section'); section.append(element('h2', '', 'Document setup'), element('h3', '', 'Main Template'), element('p', '', `Current: ${detail.template_pin?.template_name || 'None'}`), element('p', 'muted-note', `${sourcePrefix} ${sourceLabel}`));
   const select = document.createElement('select'); select.setAttribute('aria-label', 'New template'); templates.filter((item) => item.id !== detail.template_pin?.template_id).forEach((item) => select.append(new Option(item.name, item.id)));
   const confirmation = element('div'); const change = buttonAction('Change template', async () => { if (!select.value) throw new Error('No alternative template is available.'); const preview = await api(`/api/admin/v2/paper-teams/${team.id}/template-change/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, confirm_main_file_change: false }) }); const fileConflicts = preview.writer_modified_conflicts.filter((item) => !String(item.reason).startsWith('Main file change')); if (fileConflicts.length) { const list = element('ul', 'compact-list'); fileConflicts.forEach((item) => list.append(element('li', '', item.path))); confirmation.replaceChildren(element('h3', '', 'Template cannot be changed yet.'), element('p', 'danger-box', 'Writer-edited files conflict:'), list, element('p', '', 'No files were changed.')); return; } const selectedTemplate = templates.find((item) => item.id === select.value); const mainChanged = preview.main_file_change.changed; const confirmBox = element('div', 'template-change-confirmation'); confirmBox.append(element('h3', '', 'Change template?'), element('p', '', `${detail.template_pin?.template_name || 'None'} → ${selectedTemplate?.name || 'Selected template'}`), element('p', '', `${preview.template_managed_files_to_update.length + preview.unchanged_old_template_files_to_update.length} files will update`), element('p', '', `${preview.files_to_add.length} files will be added`), element('p', '', 'Paper history will be preserved')); let mainConfirm = null; if (mainChanged) { const label = element('label', '', ` Confirm Main document change (${preview.main_file_change.from} → ${preview.main_file_change.to})`); mainConfirm = document.createElement('input'); mainConfirm.type = 'checkbox'; label.prepend(mainConfirm); confirmBox.append(label); } const apply = buttonAction('Change', async () => { const confirmedMain = Boolean(mainConfirm?.checked); if (mainChanged && !confirmedMain) return; const ready = mainChanged ? await api(`/api/admin/v2/paper-teams/${team.id}/template-change/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, confirm_main_file_change: true }) }) : preview; await api(`/api/admin/v2/paper-teams/${team.id}/template-change/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, preview_token: ready.preview_token, confirm_main_file_change: confirmedMain }) }); announce('Template changed. Paper history was preserved.'); dialog.close(); await showSection('Paper Teams'); }, 'primary'); if (mainConfirm) { apply.disabled = true; mainConfirm.addEventListener('change', () => { apply.disabled = !mainConfirm.checked; }); } confirmBox.append(buttonAction('Cancel', () => confirmation.replaceChildren()), apply); confirmation.replaceChildren(confirmBox); });
   section.append(select, change, confirmation); host.append(section);
-  const frontSection = element('section', 'admin-section'); frontSection.append(element('h2', '', 'Front Matter'), element('p', '', `Current: ${detail.front_matter.pack_name || 'None'}`), element('p', 'muted-note', `Status: ${detail.front_matter.status === 'READY' ? 'Ready' : detail.front_matter.status.replaceAll('_', ' ')}`));
+  const frontSection = element('section', 'admin-section'); frontSection.append(element('h2', '', 'Front Matter'), element('p', '', `Current: ${detail.front_matter.pack_name || 'None'}`), element('p', 'muted-note', `Status: ${detail.front_matter.status === 'READY' ? 'Ready' : detail.front_matter.status === 'INCOMPATIBLE' ? 'Incompatible' : 'Needs information'}`));
   if ((detail.front_matter.missing_required_fields || []).length) frontSection.append(element('p', 'danger-box', `Needs information: ${detail.front_matter.missing_required_fields.join(', ')}`));
   const frontSelect = document.createElement('select'); frontSelect.setAttribute('aria-label', 'Front Matter Pack'); frontSelect.append(new Option('None', '')); frontMatterPacks.forEach((pack) => frontSelect.append(new Option(pack.name, pack.id, false, pack.id === detail.front_matter.pack_id)));
   frontSection.append(frontSelect, buttonAction('Change', async () => { if (!confirm(`Change Front Matter to ${frontSelect.selectedOptions[0].textContent}? Writer files will be preserved.`)) return; await api(`/api/admin/v2/paper-teams/${team.id}/front-matter`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ front_matter_pack_id: frontSelect.value || null }) }); announce('Front Matter changed. A safety checkpoint preserved paper history.'); dialog.close(); await showSection('Paper Teams'); }, 'primary'));
-  host.insertBefore(frontSection, section); dialog.showModal();
+  host.insertBefore(frontSection, section); host.append(advanced); openAdminDialog(detail.team.name);
 }
 
 async function renderPaperTeamGrid() {
   const [templates, frontMatterPacks] = await Promise.all([api('/api/admin/templates'), api('/api/admin/v2/front-matter-packs')]); await renderManualTeamForm(templates, frontMatterPacks);
   const state = { page: 1, limit: 25, search: '', status: '', programme_code: '', mentor_user_id: '', leader_user_id: '', template_id: '', review_state: '', source: '', unresolved: '' };
   const filters = filterForm([
-    { name: 'search', label: 'Search' }, { name: 'status', label: 'Status', type: 'select', options: [['Active', 'active'], ['Frozen', 'frozen'], ['Submitted', 'submitted'], ['Archived', 'archived']] },
+    { name: 'search', label: 'Search Teams', type: 'search', placeholder: 'Search Teams…' }, { name: 'status', label: 'Status', type: 'select', options: [['Active', 'active'], ['Frozen', 'frozen'], ['Submitted', 'submitted'], ['Archived', 'archived']] },
     { name: 'programme_code', label: 'Programme' }, { name: 'mentor_user_id', label: 'Mentor user ID' }, { name: 'leader_user_id', label: 'Leader user ID' },
     { name: 'template_id', label: 'Template', type: 'select', options: templates.map((item) => [item.name, item.id]) }, { name: 'review_state', label: 'Review state' }, { name: 'source', label: 'Source', type: 'select', options: [['Manual', 'manual'], ['Imported', 'imported']] }, { name: 'unresolved', label: 'Unresolved', type: 'select', options: [['Only unresolved', 'true'], ['Resolved only', 'false']] },
   ], (values) => { Object.assign(state, values, { page: 1 }); load(); });
@@ -480,8 +647,8 @@ async function renderPaperTeamGrid() {
     const runBulk = async (statusValue) => { if (!selected.size || !confirm(`${statusValue} ${selected.size} selected Teams?`)) return; const result = await api('/api/admin/v2/paper-teams/bulk-lifecycle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ team_ids: [...selected], status: statusValue, confirmed: true }) }); announce(`Bulk lifecycle: ${result.succeeded} succeeded, ${result.failed} failed.`, result.failed > 0); await load(); };
     bulk.replaceChildren(element('strong', '', 'Selected rows:'), buttonAction('Freeze', () => runBulk('frozen')), buttonAction('Activate', () => runBulk('active')), buttonAction('Archive', () => runBulk('archived'), 'danger'));
     if (!data.items.length) { gridHost.replaceChildren(element('p', 'empty-copy', state.unresolved === 'true' ? 'No unresolved imported Teams.' : 'No Paper Teams match these server-side filters.'), pager(data, load)); return; }
-    const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Select</th><th>Team</th><th>Status</th><th>Writers</th><th>Leader</th><th>Mentors</th><th>Programme</th><th>Template / resolution</th><th>Review</th><th>Updated</th><th>Source</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody');
-    data.items.forEach((team) => { const row = document.createElement('tr'); const selection = document.createElement('input'); selection.type = 'checkbox'; selection.disabled = !team.id; selection.setAttribute('aria-label', `Select ${team.name}`); selection.addEventListener('change', () => { if (selection.checked) selected.add(team.id); else selected.delete(team.id); row.classList.toggle('row-selected', selection.checked); }); const selectCell = element('td'); selectCell.append(selection); const source = team.source === 'imported' ? `Imported${team.external_team_key ? ` · ${team.external_team_key}` : ''}` : 'Manual'; const action = element('td'); action.append(buttonAction('View / Manage', () => openTeamDetail(team, templates, frontMatterPacks))); row.append(selectCell, element('td', '', team.name), element('td', '', team.status), element('td', '', (team.writers || []).map((writer) => `${writer.writer_order}. ${writer.email}`).join(', ') || String(team.writer_count)), element('td', '', team.leader?.email || 'Missing'), element('td', '', (team.mentors || []).map((mentor) => mentor.email).join(', ') || 'None'), element('td', '', team.dominant_programme_code || '—'), element('td', '', `${team.template?.name || '—'} · ${team.template_resolution_method || '—'}`), element('td', '', team.review_state), element('td', '', new Date(team.updated_at).toLocaleString()), element('td', '', source), action); body.append(row); }); table.append(body); wrap.append(table); gridHost.replaceChildren(wrap, pager(data, load));
+    const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Select</th><th>Team</th><th>Status</th><th>Writers</th><th>Leader</th><th>Mentor</th><th>Programme</th><th>Template</th><th>Review</th><th>Source</th><th>Updated</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody');
+    data.items.forEach((team) => { const row = document.createElement('tr'); const selection = document.createElement('input'); selection.type = 'checkbox'; selection.disabled = !team.id; selection.setAttribute('aria-label', `Select ${team.name}`); selection.addEventListener('change', () => { if (selection.checked) selected.add(team.id); else selected.delete(team.id); row.classList.toggle('row-selected', selection.checked); }); const selectCell = element('td'); selectCell.append(selection); const source = team.source === 'imported' ? 'Imported' : 'Manual'; const action = element('td'); action.append(rowMenu(`Actions for ${team.name}`, [buttonAction('View / Manage', () => openTeamDetail(team, templates, frontMatterPacks))])); const statusCell = element('td'); statusCell.append(statusChip(humanLabel(team.status))); row.append(selectCell, element('td', '', team.name), statusCell, element('td', '', (team.writers || []).map((writer) => `${writer.writer_order}. ${writer.email}`).join(', ') || String(team.writer_count)), element('td', '', team.leader?.email || 'Missing'), element('td', '', (team.mentors || []).map((mentor) => mentor.email).join(', ') || 'None'), element('td', '', team.dominant_programme_code || '—'), element('td', '', team.template?.name || '—'), element('td', '', humanLabel(team.review_state)), element('td', '', source), element('td', '', new Date(team.updated_at).toLocaleString()), action); body.append(row); }); table.append(body); wrap.append(table); gridHost.replaceChildren(wrap, pager(data, load));
   };
   await load();
 }
@@ -645,7 +812,7 @@ async function renderImports(options = {}) {
   content.append(element('p', 'muted-note', 'Add new records, edit known records, or delete only the exact keys you provide. File order and database dependency order are handled automatically.'));
   const form = element('form', 'batch-import-form'); form.enctype = 'multipart/form-data'; const operations = element('fieldset', 'operation-control'); operations.innerHTML = '<legend>Operation</legend><label><input type="radio" name="operation" value="ADD" checked>Add</label><label><input type="radio" name="operation" value="EDIT">Edit</label><label><input type="radio" name="operation" value="DELETE">Delete</label>';
   const drop = element('div', 'import-dropzone'); drop.tabIndex = 0; drop.setAttribute('role', 'button'); drop.setAttribute('aria-label', 'Browse for CSV or XLSX files'); drop.append(element('strong', '', 'Drop CSV or XLSX files here'), element('span', '', 'or browse · multiple files supported')); const fileInput = document.createElement('input'); fileInput.type = 'file'; fileInput.multiple = true; fileInput.accept = '.csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'; fileInput.hidden = true; drop.append(fileInput); const fileHost = element('div', 'import-file-list'); const submit = element('button', 'primary', 'Review changes'); submit.type = 'submit'; submit.disabled = true; const selected = [];
-  const drawFiles = () => { fileHost.replaceChildren(); selected.forEach((entry, index) => { const chip = element('div', 'import-file-chip'); chip.append(element('strong', '', entry.file.name)); if (entry.file.name.toLowerCase().endsWith('.xlsx')) chip.append(element('span', '', entry.status)); else if (entry.dataset) chip.append(element('span', '', datasetLabel(entry.dataset))); else { const select = document.createElement('select'); select.setAttribute('aria-label', `What data is ${entry.file.name}?`); select.append(new Option('What data is this?', '')); institutionTargets.forEach((target) => select.append(new Option(datasetLabel(target), target))); select.addEventListener('change', () => { entry.dataset = select.value; entry.status = entry.dataset ? 'Ready' : 'Choose dataset'; drawFiles(); }); chip.append(select); } chip.append(element('span', entry.status === 'Ready' ? 'ready' : 'muted-note', entry.status), buttonAction('Remove', async () => { selected.splice(index, 1); drawFiles(); }, 'danger')); fileHost.append(chip); }); submit.disabled = !selected.length || selected.some((entry) => !entry.file.name.toLowerCase().endsWith('.xlsx') && !entry.dataset); };
+  const drawFiles = () => { fileHost.replaceChildren(); selected.forEach((entry, index) => { const chip = element('div', 'import-file-chip'); chip.append(element('strong', '', entry.file.name)); if (entry.file.name.toLowerCase().endsWith('.xlsx')) chip.append(element('span', '', entry.status)); else if (entry.dataset) chip.append(element('span', '', datasetLabel(entry.dataset))); else { const select = document.createElement('select'); select.setAttribute('aria-label', `What data is ${entry.file.name}?`); select.append(new Option('What data is this?', '')); institutionTargets.forEach((target) => select.append(new Option(datasetLabel(target), target))); select.addEventListener('change', () => { entry.dataset = select.value; entry.status = entry.dataset ? 'Ready' : 'Choose dataset'; drawFiles(); }); chip.append(select); } chip.append(element('span', entry.status === 'Ready' ? 'ready' : 'muted-note', entry.status), iconAction(`Remove ${entry.file.name}`, 'delete', async () => { selected.splice(index, 1); drawFiles(); }, 'danger')); fileHost.append(chip); }); submit.disabled = !selected.length || selected.some((entry) => !entry.file.name.toLowerCase().endsWith('.xlsx') && !entry.dataset); };
   const addFiles = async (files) => { for (const file of files) { if (!/\.(csv|xlsx)$/i.test(file.name)) { announce(`${file.name} is not a supported CSV or XLSX file.`, true); continue; } if (selected.some((entry) => entry.file.name.toLowerCase() === file.name.toLowerCase() && entry.file.size === file.size && entry.file.lastModified === file.lastModified)) { announce(`${file.name} is already in this batch.`, true); continue; } selected.push({ file, ...(await detectInstitutionDataset(file)) }); } drawFiles(); };
   drop.addEventListener('click', () => fileInput.click()); drop.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInput.click(); } }); fileInput.addEventListener('change', () => addFiles(fileInput.files).catch(showError)); let dragDepth = 0; drop.addEventListener('dragenter', (event) => { event.preventDefault(); dragDepth += 1; drop.classList.add('drag-active'); }); drop.addEventListener('dragover', (event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }); drop.addEventListener('dragleave', (event) => { event.preventDefault(); dragDepth -= 1; if (dragDepth <= 0) { dragDepth = 0; drop.classList.remove('drag-active'); } }); drop.addEventListener('drop', (event) => { event.preventDefault(); dragDepth = 0; drop.classList.remove('drag-active'); addFiles(event.dataTransfer.files).catch(showError); });
   form.append(drop, fileHost, operations, submit); form.addEventListener('submit', async (event) => { event.preventDefault(); try { const body = new FormData(); body.set('operation', new FormData(form).get('operation')); selected.forEach((entry) => { body.append('files[]', entry.file, entry.file.name); if (entry.dataset && !entry.file.name.toLowerCase().endsWith('.xlsx')) body.append('target_table', entry.dataset); }); const detail = await api('/api/admin/v2/institution/import-batches/validate', { method: 'POST', body }); announce(detail.batch.error_rows ? `${detail.batch.error_rows} records need attention.` : 'Batch is ready to apply.', detail.batch.error_rows > 0); await showSection('Imports', { batchId: detail.batch.id }); } catch (error) { showError(error); } }); content.append(form);
@@ -672,7 +839,7 @@ function canonicalRecord(config, item) { return Object.fromEntries(config.fields
 
 async function manualInstitutionRecord(config, operation, item, reload) {
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody'); const form = element('form', 'manual-record-form'); const title = `${operation[0]}${operation.slice(1).toLowerCase()} ${config.label.replace(/s$/, '')}`; host.replaceChildren(element('h2', '', title)); const source = canonicalRecord(config, item || {}); const shownFields = operation === 'DELETE' ? config.keys : config.fields;
-  shownFields.forEach((field) => { const label = element('label', '', field.replaceAll('_', ' ')); let input; if (field === 'is_leader') { input = document.createElement('select'); input.append(new Option('False', 'false'), new Option('True', 'true')); } else { input = document.createElement('input'); input.type = field === 'email' ? 'email' : 'text'; } input.name = field; input.value = source[field] ?? ''; input.readOnly = operation !== 'ADD' && config.keys.includes(field); label.append(input); form.append(label); }); const result = element('div'); const submit = element('button', operation === 'DELETE' ? 'danger' : 'primary', operation === 'DELETE' ? 'Check dependencies' : `Review ${operation.toLowerCase()}`); submit.type = 'submit'; form.append(submit, result); host.append(form); dialog.showModal();
+  shownFields.forEach((field) => { const label = element('label', '', field.replaceAll('_', ' ')); let input; if (field === 'is_leader') { input = document.createElement('select'); input.append(new Option('False', 'false'), new Option('True', 'true')); } else { input = document.createElement('input'); input.type = field === 'email' ? 'email' : 'text'; } input.name = field; input.value = source[field] ?? ''; input.readOnly = operation !== 'ADD' && config.keys.includes(field); label.append(input); form.append(label); }); const result = element('div'); const submit = element('button', operation === 'DELETE' ? 'danger' : 'primary', operation === 'DELETE' ? 'Check dependencies' : `Review ${operation.toLowerCase()}`); submit.type = 'submit'; form.append(submit, result); host.append(form); openAdminDialog(title);
   form.addEventListener('submit', async (event) => { event.preventDefault(); try { const payload = {}; new FormData(form).forEach((value, key) => { payload[key] = value === '' ? null : value; }); const detail = await api(`/api/admin/v2/institution/data/${config.dataset}/validate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation, payload }) }); if (detail.batch.error_rows) { result.replaceChildren(element('p', 'danger-box', detail.issues.map((issue) => issue.problem).join('; '))); submit.disabled = true; return; } const question = operation === 'DELETE' ? `Delete this ${config.label.replace(/s$/, '')}? LaTeX Core users and paper history are retained.` : `${title}?`; if (!confirm(question)) return; const applied = await api(`/api/admin/v2/institution/import-batches/${detail.batch.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); dialog.close(); announce(`${title} complete.`); await reload(); if (operation === 'ADD') showCredentialHandoff(applied.account_provisioning, detail.batch.id); } catch (error) { result.replaceChildren(element('p', 'danger-box', error.message)); } });
 }
 
@@ -690,82 +857,107 @@ async function renderInstitutionData(options = {}) {
 }
 
 async function renderAutomaticDefaults(templates, frontMatterPacks) {
-  const [mappings, fallback] = await Promise.all([api('/api/admin/v2/institution/template-defaults/programmes'), api('/api/admin/v2/institution/template-defaults/global-fallback')]); content.append(element('h2', '', 'Automatic Defaults'), element('p', 'muted-note', 'These mappings affect future Teams only. Existing template pins remain unchanged.'));
+  const [mappings, fallback] = await Promise.all([api('/api/admin/v2/institution/template-defaults/programmes'), api('/api/admin/v2/institution/template-defaults/global-fallback')]); const heading = element('h2', 'admin-section-anchor', 'Automatic defaults'); heading.id = 'automatic-defaults'; content.append(heading, element('p', 'muted-note', 'Defaults affect future Teams only. Existing template pins remain unchanged.'));
   const fallbackSection = element('section', 'admin-section'); fallbackSection.append(element('h3', '', 'Global fallback')); const fallbackSelect = document.createElement('select'); templates.forEach((item) => fallbackSelect.append(new Option(item.name, item.id, false, item.id === fallback.template_id))); const fallbackFrontMatter = document.createElement('select'); fallbackFrontMatter.append(new Option('None', '')); frontMatterPacks.forEach((item) => fallbackFrontMatter.append(new Option(item.name, item.id, false, item.id === fallback.front_matter_pack_id))); fallbackSection.append(element('span', '', 'Main template: '), fallbackSelect, buttonAction('Save main fallback', async () => { if (!fallbackSelect.value) throw new Error('Select a template.'); await api('/api/admin/v2/institution/template-defaults/global-fallback', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template_id: fallbackSelect.value }) }); announce('Global Main template fallback saved for future Teams.'); await showSection('Templates'); }, 'primary'), element('span', '', 'Front Matter: '), fallbackFrontMatter, buttonAction('Save Front Matter fallback', async () => { await api('/api/admin/v2/institution/template-defaults/global-front-matter', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ front_matter_pack_id: fallbackFrontMatter.value || null }) }); announce('Global Front Matter fallback saved for future Teams.'); await showSection('Templates'); }, 'primary')); content.append(fallbackSection);
   const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Programme</th><th>Main Content Template</th><th>Front Matter Pack</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody'); mappings.forEach((mapping) => { const row = document.createElement('tr'); const select = document.createElement('select'); select.append(new Option('No programme default', '')); templates.forEach((item) => select.append(new Option(item.name, item.id, false, item.id === mapping.template_id))); const frontSelect = document.createElement('select'); frontSelect.append(new Option('None', '')); frontMatterPacks.forEach((item) => frontSelect.append(new Option(item.name, item.id, false, item.id === mapping.front_matter_pack_id))); const actions = element('td'); actions.append(buttonAction('Save', async () => { if (select.value) await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template_id: select.value }) }); await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}/front-matter`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ front_matter_pack_id: frontSelect.value || null }) }); announce(`${mapping.programme_code} defaults saved for future Teams.`); await showSection('Templates'); }), buttonAction('Remove mapping', async () => { if ((!mapping.template_id && !mapping.front_matter_pack_id) || !confirm(`Remove ${mapping.programme_code} defaults?`)) return; await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}`, { method: 'DELETE' }); await showSection('Templates'); }, 'danger')); const templateCell = element('td'); templateCell.append(select); const frontCell = element('td'); frontCell.append(frontSelect); row.append(element('td', '', mapping.programme_code), templateCell, frontCell, actions); body.append(row); }); table.append(body); wrap.append(table); content.append(wrap);
 }
 
 function buttonAction(label, handler, className = '') {
   const action = element('button', className, label); action.type = 'button';
-  action.addEventListener('click', () => handler().catch(showError)); return action;
+  action.addEventListener('click', () => Promise.resolve().then(handler).catch(showError)); return action;
 }
 
 async function renderFilePolicies(teams) {
   if (!teams.length) return content.append(element('p', 'empty-copy', 'No Paper Teams yet.'));
+  const descriptions = {
+    EDITABLE: 'Writers can change content and file structure.',
+    CONTENT_READ_ONLY: 'Content is visible but cannot be edited.',
+    STRUCTURE_LOCKED: 'Content can change, but the file cannot be moved or removed.',
+    TEMPLATE_MANAGED: 'Safe template updates manage this file.',
+    HIDDEN_SYSTEM: 'Reserved system content, hidden from ordinary lists.',
+  };
+  const guide = element('div', 'policy-guide'); Object.entries(descriptions).forEach(([policy, description]) => { const item = element('div'); item.append(element('strong', '', humanLabel(policy)), element('small', '', description)); guide.append(item); }); content.append(guide);
   const selector = document.createElement('select'); selector.setAttribute('aria-label', 'Paper Team');
   teams.forEach((team) => selector.append(new Option(team.name, team.id)));
   const tableHost = element('div', 'admin-table-wrap'); content.append(selector, tableHost);
   const load = async () => {
     const files = await api(`/api/admin/v2/paper-teams/${selector.value}/file-policies`);
-    const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Path / stable file ID</th><th>Policy</th></tr></thead>';
+    const visibleFiles = files.filter((file) => file.policy !== 'HIDDEN_SYSTEM');
+    if (!visibleFiles.length) { tableHost.replaceChildren(element('p', 'empty-copy', 'No ordinary Team files are available.')); return; }
+    const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>File</th><th>Current policy</th><th>Change</th></tr></thead>';
     const body = document.createElement('tbody');
-    files.forEach((file) => {
-      const row = document.createElement('tr'); const identity = element('td', '', file.path); identity.append(element('small', '', ` ${file.file_id}`));
+    visibleFiles.forEach((file) => {
+      const row = document.createElement('tr'); const identity = element('td', '', file.path);
       const select = document.createElement('select');
-      ['EDITABLE', 'CONTENT_READ_ONLY', 'STRUCTURE_LOCKED', 'TEMPLATE_MANAGED', 'HIDDEN_SYSTEM'].forEach((policy) => { const option = new Option(policy.replaceAll('_', ' '), policy); option.selected = file.policy === policy; select.append(option); });
-      select.disabled = file.policy === 'HIDDEN_SYSTEM';
+      ['EDITABLE', 'CONTENT_READ_ONLY', 'STRUCTURE_LOCKED', 'TEMPLATE_MANAGED'].forEach((policy) => { const option = new Option(humanLabel(policy), policy); option.selected = file.policy === policy; select.append(option); });
+      select.setAttribute('aria-label', `Change policy for ${file.path}`);
       select.addEventListener('change', async () => { try { await api(`/api/admin/v2/paper-teams/${selector.value}/file-policies/${file.file_id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: select.value }) }); announce(`Policy updated for ${file.path}. Active rooms were revalidated.`); } catch (error) { showError(error); } });
-      const policyCell = document.createElement('td'); policyCell.append(select); row.append(identity, policyCell); body.append(row);
+      const changeCell = document.createElement('td'); changeCell.append(select); row.append(identity, element('td', '', humanLabel(file.policy)), changeCell); body.append(row);
     }); table.append(body); tableHost.replaceChildren(table);
   };
   selector.addEventListener('change', () => load().catch(showError)); await load();
 }
 
+function templateTabs() {
+  const tabs = element('nav', 'admin-tabs'); tabs.setAttribute('aria-label', 'Template sections');
+  [['Main templates', 'main-templates'], ['Front Matter', 'front-matter'], ['Automatic defaults', 'automatic-defaults']].forEach(([label, id], index) => {
+    const action = buttonAction(label, () => document.querySelector(`#${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+    if (index === 0) action.setAttribute('aria-current', 'page'); tabs.append(action);
+  });
+  return tabs;
+}
+
 async function showSection(section, options = {}) {
   setActive(section);
-  content.replaceChildren(element('h1', '', section.toUpperCase()), element('p', 'empty-copy', 'Loading operational data…'));
+  content.replaceChildren(element('h1', '', section), element('p', 'empty-copy', `Loading ${section}…`));
   content.focus();
   try {
     if (section === 'V2 Users') {
       const users = await api('/api/admin/v2/users');
-      content.replaceChildren(element('h1', '', 'V2 USERS'));
+      content.replaceChildren(element('h1', '', 'V2 Users'));
       renderV2Users(users);
       return;
     }
     if (section === 'Paper Teams') {
-      content.replaceChildren(element('h1', '', 'PAPER TEAMS'));
+      content.replaceChildren(element('h1', '', 'Paper Teams'));
       await renderPaperTeamGrid();
       return;
     }
     if (section === 'Imports') {
-      content.replaceChildren(element('h1', '', 'DATA IMPORT'));
+      content.replaceChildren(element('h1', '', 'Imports'));
       await renderImports(options);
       return;
     }
     if (section === 'Institution Data') {
-      content.replaceChildren(element('h1', '', 'INSTITUTION DATA'));
+      content.replaceChildren(element('h1', '', 'Institution Data'));
       await renderInstitutionData(options);
       return;
     }
     if (section === 'Templates') {
       const [templates, frontMatterPacks] = await Promise.all([api('/api/admin/templates'), api('/api/admin/v2/front-matter-packs')]);
-      content.replaceChildren(element('h1', '', 'TEMPLATES'));
+      content.replaceChildren(element('h1', '', 'Templates'), templateTabs());
       await renderTemplates(templates, frontMatterPacks);
       return;
     }
     if (section === 'File Policies') {
-      const page = await api('/api/admin/v2/paper-teams/query?page=1&limit=100'); content.replaceChildren(element('h1', '', 'FILE POLICIES')); await renderFilePolicies(page.items);
+      const page = await api('/api/admin/v2/paper-teams/query?page=1&limit=25'); content.replaceChildren(element('h1', '', 'File Policies')); await renderFilePolicies(page.items);
       return;
     }
+    if (section === 'System') {
+      const [data, overview] = await Promise.all([api(endpoints.System), api(endpoints.Overview)]);
+      content.replaceChildren(element('h1', '', 'System')); renderSystem(data, overview); return;
+    }
     const data = await api(endpoints[section]);
-    content.replaceChildren(element('h1', '', section.toUpperCase()));
+    content.replaceChildren(element('h1', '', section));
     if (section === 'Overview') renderOverview(data);
     else if (section === 'Reviews') renderAdminReviews(data);
-    else if (section === 'System') { content.append(element('p', 'empty-copy', 'Host-level operational actions remain CLI-only in this release candidate.')); content.append(renderJson(data)); }
-    else if (Array.isArray(data) && data.length === 0) content.append(element('p', 'empty-copy', 'No records available.'));
+    else if (section === 'Versions') renderVersions(data);
+    else if (section === 'Build Queue') renderBuildQueue(data);
+    else if (section === 'Audit') renderAudit(data);
+    else if (Array.isArray(data) && data.length === 0) content.append(element('p', 'empty-copy', `No ${section.toLowerCase()} records are available.`));
     else content.append(renderJson(data));
   } catch (error) {
-    content.replaceChildren(element('h1', '', section.toUpperCase()), element('p', 'danger', error.message || 'Unable to load this section.'));
+    content.replaceChildren(element('h1', '', section), element('p', 'danger-box', error.message || `Unable to load ${section}. Retry or check System status.`), buttonAction('Retry', () => showSection(section, options), 'primary'));
   }
 }
 
