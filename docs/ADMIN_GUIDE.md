@@ -5,12 +5,11 @@ Admins use `/admin` as the V2 governance control plane. Admin inspection does no
 ## Control-plane sections
 
 - **OVERVIEW** — product and queue summary.
-- **V2 USERS** — provision users and assign one exclusive Writer, Mentor, or Admin role.
+- **V2 USERS** — manually provision users, inspect account state, and generate one-time temporary passwords for Writers or Mentors.
 - **INSTITUTION DATA** — server-paginated institutional datasets with manual Add, Edit, dependency-previewed Delete, and Paper Assignment membership management.
 - **IMPORTS** — multi-file CSV/XLSX drag/drop, automatic dataset detection, one batch review/apply action, and concise paginated history.
-- **PAPER TEAMS** — server-paginated Team grid, manual creation, unresolved imports, safe template override, and lifecycle actions.
-- **PROGRAMME TEMPLATES** — programme mappings, global fallback, and ordered-Writer resolution preview.
-- **TEMPLATES** — inspect the existing immutable library and select a template at Team creation.
+- **PAPER TEAMS** — server-paginated Team grid, manual creation, full membership editing, unresolved imports, safe template changes, and lifecycle actions.
+- **TEMPLATES** — immutable template library, import, global fallback, and programme defaults in one page.
 - **FILE POLICIES** — inspect stable file IDs and set server-enforced policies.
 - **VERSIONS** — inspect immutable Team Paper history.
 - **REVIEWS**, **BUILD QUEUE**, **AUDIT**, and **SYSTEM** — operational inspection using existing bounded APIs.
@@ -19,7 +18,7 @@ Admins use `/admin` as the V2 governance control plane. Admin inspection does no
 
 Selecting a template during Paper Team creation clones its immutable blobs into a new workspace, registers stable files, sets the declared main file, and records a truthful template identity hash. Template default policy is applied to every cloned file. With no template, the normal `main.tex` bootstrap is used.
 
-Existing-Team changes are a separate two-step operation. Preview compares the exact current workspace with the old and new immutable templates. Apply is refused if a Writer-created or Writer-modified file would be replaced, if Main changes without confirmation, if the Team is archived, or if the preview token is stale. A successful apply creates `PRE_TEMPLATE_CHANGE`, adds or updates only safe files, preserves all other files, changes the pin to `MANUAL_OVERRIDE`, and creates `TEMPLATE_UPDATE`.
+Existing-Team changes appear as one **Change template** action. Internally, the server still previews the exact current workspace and validates a short-lived state token before apply. The Admin sees a plain file-count confirmation or a list of conflicting Writer-edited paths; a Main-document checkbox appears only when Main changes. A successful apply still creates `PRE_TEMPLATE_CHANGE`, updates only safe files, preserves all other files/history, changes the pin to `MANUAL_OVERRIDE`, and creates `TEMPLATE_UPDATE`.
 
 Policies are `EDITABLE`, `CONTENT_READ_ONLY`, `STRUCTURE_LOCKED`, `TEMPLATE_MANAGED`, and `HIDDEN_SYSTEM`. Changes take effect for open collaboration rooms; rejected edits return a policy/reload error rather than being silently discarded.
 
@@ -27,7 +26,7 @@ Policies are `EDITABLE`, `CONTENT_READ_ONLY`, `STRUCTURE_LOCKED`, `TEMPLATE_MANA
 
 An Active Team may be frozen, submitted, or archived. A Frozen Team can return to Active or be archived. Submitted may be archived. Archived is terminal and retained rather than deleted. Frozen and Archived papers deny source and structural mutation.
 
-Team creation requires exactly one Leader selected from the assigned Writers. Reassignment is transactional and cannot select a Mentor, Admin, or unassigned Writer or leave an active Team leaderless. Admin may inspect historical governance data under Audit, but ordinary Team revert decisions belong to the Team Leader.
+Team creation and **Edit Team** require at least one ordered Writer and exactly one Leader selected from those Writers. Writers and Mentors come from server-side role-filtered account search. An imported Team edit transaction updates its institutional assignment metadata/members and canonical runtime membership together without recreating its Team, workspace, versions, comments, or builds.
 
 The Writer toolbar exposes review/checkpoint/revert controls only to that selected Leader. Admin does not open review rounds or approve ordinary Team reverts; it manages membership and leadership from Paper Teams and may inspect retained history under Audit.
 
@@ -37,9 +36,11 @@ The primary operations are Add, Edit, and Delete. Add never changes an existing 
 
 Manual forms use the same authoritative server validation. A manual Delete always checks dependencies first. Institutional deletion never removes a V2 account or paper history, and a materialized Paper Assignment is blocked pending explicit Team lifecycle handling. Existing standalone VALIDATE_ONLY/MERGE/ADD_ONLY jobs remain available under Legacy single-file imports.
 
-Manual links require a compatible existing V2 role: Student to Writer and Faculty to Mentor. Admin identity linkage grants no role. Automatic reconciliation preserves `MANUAL` links. An identity used by a non-archived imported Team cannot be unlinked.
+During Add, each valid imported Student receives or reuses a V2 Writer account. Only Faculty referenced by `paper_team_mentors` receive or reuse a V2 Mentor account. Existing compatible accounts retain their password; incompatible roles are reported and never changed. `vcap.admins` never provisions or grants V2 Admin. Automatic reconciliation preserves `MANUAL` links, and an identity used by a non-archived imported Team cannot be unlinked.
 
-Manual Team creation searches accounts server-side, preserves Writer order, restricts Leader to those Writers, and previews programme resolution. An explicit template is recorded as `MANUAL_OVERRIDE`; otherwise MODE, TIE_FIRST_WRITER, or GLOBAL_FALLBACK provenance is retained.
+New automatic accounts receive an eight-character temporary password and `must_change_password=true`. Apply returns those new credentials once; the browser immediately downloads `email,password,role` CSV and does not persist the plaintext. In that CSV, `role=student` means V2 `WRITER`. A temporary login can reach only **Set your password** until the user chooses a 12–256 character permanent password. Admin can generate a replacement temporary password once for an existing Writer or Mentor; current sessions are revoked and the old password is never shown.
+
+Manual Team creation searches accounts server-side, preserves Writer order, restricts Leader to those Writers, and shows the resolved template contextually. An explicit template is recorded as `MANUAL_OVERRIDE`; otherwise MODE, TIE_FIRST_WRITER, or GLOBAL_FALLBACK provenance is retained. The diagnostic resolution endpoint remains available, but there is no permanent resolution-calculator panel.
 
 ## Operator boundary
 

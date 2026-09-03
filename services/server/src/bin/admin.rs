@@ -250,6 +250,7 @@ mod tests {
             v2_role: Some(persistence::GlobalRole::Writer),
             migration_state: "ASSIGNED".into(),
             created_at: "now".into(),
+            must_change_password: false,
         };
         assert_eq!(
             user_list_line(&assigned),

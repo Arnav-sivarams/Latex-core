@@ -183,6 +183,7 @@ pub struct V2User {
     pub v2_role: Option<GlobalRole>,
     pub migration_state: String,
     pub created_at: String,
+    pub must_change_password: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -282,7 +283,7 @@ impl V2Repository {
 
     pub async fn list_v2_users(&self) -> Result<Vec<V2User>, V2Error> {
         let rows = sqlx::query(
-            "SELECT u.id,c.email,c.enabled,c.account_type,g.role,u.created_at::text AS created_at \
+            "SELECT u.id,c.email,c.enabled,c.account_type,c.must_change_password,g.role,u.created_at::text AS created_at \
              FROM latex_core.users u \
              JOIN latex_core.user_credentials c ON c.user_id=u.id \
              LEFT JOIN latex_core.global_user_roles g ON g.user_id=u.id \
@@ -2549,6 +2550,9 @@ fn decode_v2_user(row: PgRow) -> Result<V2User, V2Error> {
         },
         v2_role,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
+        must_change_password: row
+            .try_get("must_change_password")
+            .map_err(V2Error::Database)?,
     })
 }
 

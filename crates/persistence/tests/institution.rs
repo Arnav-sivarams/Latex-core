@@ -48,6 +48,7 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
         .unwrap();
 
     identity_linking_is_safe(&pool, &repository, actor).await;
+    automatic_account_provisioning_is_one_time_and_role_safe(&pool, &repository, actor).await;
     resolver_is_deterministic_and_pins_are_immutable(
         &pool,
         &repository,
@@ -72,6 +73,160 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
 
     pool.close().await;
     database.close().await;
+}
+
+async fn automatic_account_provisioning_is_one_time_and_role_safe(
+    pool: &PgPool,
+    repository: &InstitutionRepository,
+    actor: UserId,
+) {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let new_student_email = format!("newstudent-{suffix}@example.edu");
+    let mentor_email = format!("newmentor-{suffix}@example.edu");
+    let unassigned_email = format!("unassigned-{suffix}@example.edu");
+    let institutional_admin_email = format!("vcap-admin-{suffix}@example.edu");
+    let reused_email = format!("existing-{suffix}@example.edu");
+    let (existing_writer, _) = insert_user(pool, &reused_email, "writer").await;
+    let existing_hash: String = sqlx::query_scalar(
+        "SELECT password_hash FROM latex_core.user_credentials WHERE user_id=$1",
+    )
+    .bind(existing_writer.as_uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let team_key = format!("AUTO-{suffix}");
+    let student_reg = format!("NEW-{suffix}");
+    let reused_reg = format!("REUSED-{suffix}");
+    let mentor_id = format!("MENTOR-{suffix}");
+    let unassigned_id = format!("UNASSIGNED-{suffix}");
+    let admin_id = format!("ADMIN-{suffix}");
+    let uploads = vec![
+        InstitutionBatchUpload {
+            filename: "students.csv".into(),
+            target_table: None,
+            bytes: format!(
+                "reg_no,name,email,programme_code\n{student_reg},New Student,{new_student_email},CSE\n{reused_reg},Existing Student,{reused_email},CSE\n"
+            )
+            .into_bytes(),
+        },
+        InstitutionBatchUpload {
+            filename: "faculty.csv".into(),
+            target_table: None,
+            bytes: format!(
+                "faculty_id,name,email\n{mentor_id},New Mentor,{mentor_email}\n{unassigned_id},Unassigned Faculty,{unassigned_email}\n"
+            )
+            .into_bytes(),
+        },
+        InstitutionBatchUpload {
+            filename: "admins.csv".into(),
+            target_table: None,
+            bytes: format!("admin_id,email,name,pfp\n{admin_id},{institutional_admin_email},VCAP Admin,\n").into_bytes(),
+        },
+        InstitutionBatchUpload {
+            filename: "paper_teams.csv".into(),
+            target_table: None,
+            bytes: format!("external_team_key,team_name,academic_year,semester,status\n{team_key},Automatic Team,2026,1,ACTIVE\n").into_bytes(),
+        },
+        InstitutionBatchUpload {
+            filename: "paper_team_writers.csv".into(),
+            target_table: None,
+            bytes: format!("external_team_key,student_reg_no,writer_order,is_leader\n{team_key},{student_reg},1,true\n").into_bytes(),
+        },
+        InstitutionBatchUpload {
+            filename: "paper_team_mentors.csv".into(),
+            target_table: None,
+            bytes: format!("external_team_key,faculty_id\n{team_key},{mentor_id}\n").into_bytes(),
+        },
+    ];
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Add,
+            &uploads,
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail["batch"]["status"], "VALIDATED");
+    let batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    let applied = repository.apply_batch(batch_id, actor).await.unwrap();
+    let accounts = &applied["account_provisioning"];
+    assert_eq!(accounts["created"], 2);
+    assert_eq!(accounts["reused"], 1);
+    assert_eq!(accounts["needs_attention"], 0);
+    let credentials = accounts["credentials"].as_array().unwrap();
+    assert_eq!(credentials.len(), 2);
+    for credential in credentials {
+        let password = credential["temporary_password"].as_str().unwrap();
+        assert_eq!(password.len(), 8);
+        assert!(password.chars().any(|value| value.is_ascii_uppercase()));
+        assert!(password.chars().any(|value| value.is_ascii_lowercase()));
+        assert!(password.chars().any(|value| value.is_ascii_digit()));
+        let stored: (String, String, bool) = sqlx::query_as(
+            "SELECT role.role,credentials.password_hash,credentials.must_change_password \
+             FROM latex_core.user_credentials credentials JOIN latex_core.global_user_roles role USING(user_id) \
+             WHERE credentials.email=$1",
+        )
+        .bind(credential["email"].as_str().unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(stored.1.starts_with("$argon2"));
+        assert!(!stored.1.contains(password));
+        assert!(stored.2);
+        assert_eq!(
+            stored.0,
+            if credential["credential_role"] == "student" {
+                "writer"
+            } else {
+                "mentor"
+            }
+        );
+        let leaked_to_audit: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.audit_events WHERE metadata::text LIKE '%' || $1 || '%')",
+        )
+        .bind(password)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(!leaked_to_audit);
+    }
+    let unchanged_hash: String = sqlx::query_scalar(
+        "SELECT password_hash FROM latex_core.user_credentials WHERE user_id=$1",
+    )
+    .bind(existing_writer.as_uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged_hash, existing_hash);
+    for email in [&unassigned_email, &institutional_admin_email] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.user_credentials WHERE lower(email)=lower($1))",
+        )
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(!exists);
+    }
+    let primary_job = repository.batch_primary_job(batch_id).await.unwrap();
+    let plans = repository.pending_team_plans(primary_job).await.unwrap();
+    let plan = plans
+        .iter()
+        .find(|value| value.external_team_key == team_key)
+        .unwrap();
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(plan.writer_user_ids.len(), 1);
+    assert_eq!(plan.mentor_user_ids.len(), 1);
+
+    let repeated = repository.apply_batch(batch_id, actor).await.unwrap();
+    assert_eq!(repeated["account_provisioning"]["created"], 0);
+    assert!(
+        repeated["account_provisioning"]["credentials"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 async fn legacy_history_cleanup_preserves_canonical_data(pool: &PgPool, actor: UserId) {
@@ -784,6 +939,75 @@ async fn imported_team_materialization_is_ordered_atomic_and_isolated(
     assert_eq!(merged_members[3], (*mentor.as_uuid(), None, false));
     let pinned_after_merge: Uuid = sqlx::query_scalar("SELECT selected_template_id FROM latex_core.paper_template_resolutions WHERE paper_team_id=$1").bind(team.id).fetch_one(pool).await.unwrap();
     assert_eq!(pinned_after_merge, template_id);
+    let (mentor_two, _) = insert_user(pool, "team-mentor-two@example.edu", "mentor").await;
+    sqlx::query("INSERT INTO vcap.faculty (faculty_id,email) VALUES ('TEAM-MENTOR-TWO','team-mentor-two@example.edu')")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.faculty_user_links (faculty_id,user_id,match_method,status,linked_at) VALUES ('TEAM-MENTOR-TWO',$1,'TEST','LINKED',now())")
+        .bind(mentor_two.as_uuid()).execute(pool).await.unwrap();
+    let workspace_before: Uuid =
+        sqlx::query_scalar("SELECT workspace_id FROM latex_core.paper_teams WHERE id=$1")
+            .bind(team.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    repository
+        .update_paper_team(
+            actor,
+            team.id,
+            "Admin edited imported Team",
+            &[*writer_c.as_uuid(), *writer_b.as_uuid()],
+            *writer_b.as_uuid(),
+            &[*mentor_two.as_uuid()],
+        )
+        .await
+        .unwrap();
+    let runtime_members: Vec<(Uuid, Option<i32>, bool)> = sqlx::query_as(
+        "SELECT user_id,writer_order,is_leader FROM latex_core.paper_team_members \
+         WHERE paper_team_id=$1 ORDER BY writer_order NULLS LAST",
+    )
+    .bind(team.id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(runtime_members[0], (*writer_c.as_uuid(), Some(1), false));
+    assert_eq!(runtime_members[1], (*writer_b.as_uuid(), Some(2), true));
+    assert_eq!(runtime_members[2], (*mentor_two.as_uuid(), None, false));
+    let assignment_writers: Vec<(String, i32, bool)> = sqlx::query_as(
+        "SELECT student_reg_no,writer_order,is_leader FROM vcap.paper_assignment_students \
+         WHERE external_team_key='EXT-VALID' ORDER BY writer_order",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        assignment_writers,
+        vec![("TEAM-C".into(), 1, false), ("TEAM-B".into(), 2, true)]
+    );
+    let assignment_mentors: Vec<String> = sqlx::query_scalar(
+        "SELECT faculty_id FROM vcap.paper_assignment_mentors WHERE external_team_key='EXT-VALID'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(assignment_mentors, vec!["TEAM-MENTOR-TWO"]);
+    let edited_team: (String, Uuid) =
+        sqlx::query_as("SELECT name,workspace_id FROM latex_core.paper_teams WHERE id=$1")
+            .bind(team.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        edited_team,
+        ("Admin edited imported Team".into(), workspace_before)
+    );
+    let pinned_after_edit: Uuid = sqlx::query_scalar(
+        "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1",
+    )
+    .bind(team.id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(pinned_after_edit, template_id);
     repository
         .mark_team_unresolved(job, "EXT-BLOCKED", &["UNRESOLVED_WRITER".into()])
         .await
@@ -859,11 +1083,7 @@ async fn import_modes_and_ten_thousand_rows(
 
     let mut csv = String::from("reg_no,name,email,programme_code\n");
     for index in 0..10_000 {
-        writeln!(
-            csv,
-            "SCALE{index:05},Student {index},scale{index}@example.edu,SCALE"
-        )
-        .unwrap();
+        writeln!(csv, "SCALE{index:05},Student {index},,SCALE").unwrap();
     }
     let job = repository
         .validate_upload(
@@ -878,8 +1098,8 @@ async fn import_modes_and_ten_thousand_rows(
         .unwrap();
     assert_eq!(job.total_rows, 10_000);
     let applied = repository.apply_import(job.id, actor).await.unwrap();
-    assert_eq!(applied.status, "APPLIED");
-    assert_eq!(applied.inserted_rows, 10_000);
+    assert_eq!(applied.job.status, "APPLIED");
+    assert_eq!(applied.job.inserted_rows, 10_000);
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM vcap.students WHERE reg_no LIKE 'SCALE%'")
             .fetch_one(pool)
@@ -966,7 +1186,7 @@ async fn import_modes_and_ten_thousand_rows(
         .await
         .unwrap();
     let applied = repository.apply_import(job.id, actor).await.unwrap();
-    assert_eq!(applied.skipped_rows, 1);
+    assert_eq!(applied.job.skipped_rows, 1);
     let name: Option<String> =
         sqlx::query_scalar("SELECT name FROM vcap.students WHERE reg_no='SCALE00000'")
             .fetch_one(pool)

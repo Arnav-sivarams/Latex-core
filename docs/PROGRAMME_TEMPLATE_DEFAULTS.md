@@ -14,7 +14,7 @@ For ordered Writer user IDs, the resolver:
 6. uses `latex_core.programme_template_defaults` for that programme; and
 7. uses the configured global fallback if the programme is unmapped or every Writer is unresolved.
 
-Provenance methods are `MODE`, `TIE_FIRST_WRITER`, `GLOBAL_FALLBACK`, and `MANUAL_OVERRIDE`. The preview API returns counts, the chosen programme, tie-break information, template ID, and warnings.
+Provenance methods are `MODE`, `TIE_FIRST_WRITER`, `GLOBAL_FALLBACK`, and `MANUAL_OVERRIDE`. The diagnostic preview API still returns counts, the chosen programme, tie-break information, template ID, and warnings. Normal administration shows only contextual language such as “Automatically selected from CSE” or “Selected using Writer-order tie-break”; there is no permanent resolution-calculator panel.
 
 ## Immutability and overrides
 
@@ -22,7 +22,7 @@ Materialization clones the selected template into one V2 workspace and writes th
 
 An explicit template on manual Team creation is recorded as `MANUAL_OVERRIDE` and always wins. The Admin UI also supports a separate existing-Team preview/apply workflow. It never propagates programme-default changes to pinned Teams, never performs a line merge, never deletes a Writer file, and blocks when current content differs from the old template unless the file is explicitly `TEMPLATE_MANAGED`.
 
-The global fallback and every programme default must point to an existing immutable template whose configured Main path exists in its template files. The UI always states that mapping changes affect future Teams only.
+The global fallback and every programme default must point to an existing immutable template whose configured Main path exists in its template files. Both the Template Library and Automatic Defaults are managed from the single **Templates** page. The UI always states that mapping changes affect future Teams only.
 
 ## Admin endpoints
 

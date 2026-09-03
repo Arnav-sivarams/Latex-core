@@ -101,11 +101,12 @@ test('Writer surface uses Save semantics and inline historical review highlights
   assert.match(writer, /ui\.createCheckpoint\.hidden = paper\.kind === 'team' && !teamLeader/);
 });
 
-test('Admin Team UI requires and can reassign an assigned Writer Leader', () => {
+test('Admin Team UI requires and can persist an assigned Writer Leader', () => {
   const admin = readFileSync(new URL('../static/admin.js', import.meta.url), 'utf8');
   const html = readFileSync(new URL('../src/admin.html', import.meta.url), 'utf8');
   assert.match(admin, /leader_writer_id/);
-  assert.match(admin, /\/paper-teams\/\$\{team\.id\}\/leader/);
+  assert.match(admin, /method: 'PUT'/);
+  assert.match(admin, /Edit Team/);
   assert.match(admin, /Leader: \$\{leader\?\.email/);
   assert.doesNotMatch(html, /data-section="Restoration Requests"/);
 });

@@ -30,6 +30,38 @@ function showError(error) {
   announce(error.message || 'The administrative request failed.', true);
 }
 
+function csvCell(value) {
+  const text = String(value ?? '');
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function credentialsCsv(credentials) {
+  return ['email,password,role', ...credentials.map((item) => [item.email, item.temporary_password, item.credential_role].map(csvCell).join(','))].join('\r\n') + '\r\n';
+}
+
+function downloadCredentials(credentials, batchId) {
+  const blob = new Blob([credentialsCsv(credentials)], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob); const link = document.createElement('a');
+  link.href = url; link.download = `latex-core-generated-credentials-${batchId}.csv`;
+  document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+}
+
+function showCredentialHandoff(provisioning, batchId) {
+  if (!provisioning) return;
+  const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody');
+  const credentials = provisioning.credentials || [];
+  host.replaceChildren(
+    element('h2', '', 'Accounts'),
+    element('p', '', `${provisioning.created || 0} created`),
+    element('p', '', `${provisioning.reused || 0} existing accounts reused`),
+    element('p', '', `${provisioning.needs_attention || 0} need attention`),
+    element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again.'),
+  );
+  const download = buttonAction('Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
+  download.disabled = credentials.length === 0; host.append(download); dialog.showModal();
+  if (credentials.length) downloadCredentials(credentials, batchId);
+}
+
 function setActive(section) {
   nav.querySelectorAll('button[data-section]').forEach((button) => {
     if (button.dataset.section === section) button.setAttribute('aria-current', 'page');
@@ -71,7 +103,8 @@ function renderAdminReviews(reviews) {
   table.append(body); wrap.append(table); content.append(wrap);
 }
 
-function renderTemplates(templates) {
+async function renderTemplates(templates) {
+  content.append(element('h2', '', 'Template Library'));
   const intro = element('p', 'empty-copy', 'Import a bounded local ZIP, inspect its safe file tree, select Main when detection is ambiguous, then save an immutable template. Existing-Team changes use the separate conflict-safe preview workflow.');
   const form = element('form', 'admin-template-form');
   form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>Import Template</button>';
@@ -120,7 +153,7 @@ function renderTemplates(templates) {
     } catch (error) { showError(error); }
   });
   content.append(intro, form, previewHost);
-  if (!templates.length) return content.append(element('p', 'empty-copy', 'No templates yet.'));
+  if (!templates.length) { content.append(element('p', 'empty-copy', 'No templates yet.')); await renderAutomaticDefaults(templates); return; }
   const wrap = element('div', 'admin-table-wrap');
   const table = element('table', 'admin-table');
   table.innerHTML = '<thead><tr><th>Name / description</th><th>Main file</th><th>Imported</th><th>Usage</th><th>Actions</th></tr></thead>';
@@ -148,7 +181,7 @@ function renderTemplates(templates) {
     row.append(metadata, mainCell, element('td', '', new Date(template.created_at).toLocaleString()), element('td', '', usage), actions);
     body.append(row);
   });
-  table.append(body); wrap.append(table); content.append(wrap);
+  table.append(body); wrap.append(table); content.append(wrap); await renderAutomaticDefaults(templates);
 }
 
 async function patchUser(email, values) {
@@ -249,24 +282,29 @@ async function patchV2Role(user, role) {
 }
 
 function renderV2Users(users) {
-  const intro = element('p', 'empty-copy', 'Writer, Mentor, and Admin are mutually exclusive global V2 roles. Institutional compatibility fields do not authorize V2 access.');
+  const intro = element('p', 'empty-copy', 'Writer, Mentor, and Admin are mutually exclusive V2 roles. Manual provisioning remains available.');
   const form = element('form', 'admin-user-form');
-  form.innerHTML = '<label>Email<input name="email" type="email" required></label><label>Password<input name="password" type="password" minlength="12" maxlength="256" required></label><label>Exclusive V2 role<select name="role"><option value="writer">Writer</option><option value="mentor">Mentor</option><option value="admin">Admin</option></select></label><button class="primary" type="submit">Create V2 user</button>';
+  form.innerHTML = '<label>Email<input name="email" type="email" required></label><label>Password<input name="password" type="password" minlength="12" maxlength="256"></label><label>V2 role<select name="role"><option value="writer">Writer</option><option value="mentor">Mentor</option><option value="admin">Admin</option></select></label><label><input name="generate_temporary_password" type="checkbox"> Generate temporary password</label><button class="primary" type="submit">Create V2 user</button>';
+  const generated = form.elements.generate_temporary_password; const password = form.elements.password;
+  generated.addEventListener('change', () => { password.disabled = generated.checked; password.required = !generated.checked; }); password.required = true;
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     try {
-      await api('/api/admin/v2/users', {
+      const payload = Object.fromEntries(new FormData(form)); payload.generate_temporary_password = generated.checked;
+      if (generated.checked) delete payload.password;
+      const created = await api('/api/admin/v2/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+        body: JSON.stringify(payload),
       });
+      if (created.temporary_password) showCredentialHandoff({ created: 1, reused: 0, needs_attention: 0, credentials: [{ email: created.email, temporary_password: created.temporary_password, credential_role: created.role === 'writer' ? 'student' : 'mentor' }] }, created.user_id);
       announce('V2 user created.');
       await showSection('V2 Users');
     } catch (error) { showError(error); }
   });
   const wrap = element('div', 'admin-table-wrap');
   const table = element('table', 'admin-table');
-  table.innerHTML = '<thead><tr><th>Email</th><th>Legacy type</th><th>Exclusive V2 role</th><th>Migration</th><th>Status</th><th>Created</th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Email</th><th>V2 role</th><th>Status</th><th>Account state</th><th>Actions</th></tr></thead>';
   const body = document.createElement('tbody');
   users.forEach((user) => {
     const row = document.createElement('tr');
@@ -283,16 +321,18 @@ function renderV2Users(users) {
       option.selected = role === user.v2_role;
       select.append(option);
     });
-    select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError));
-    const roleCell = document.createElement('td');
-    roleCell.append(select);
+    const actions = element('div', 'admin-actions');
+    select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError)); actions.append(select);
+    const toggle = buttonAction(user.enabled ? 'Disable' : 'Enable', async () => { await api(`/api/admin/users/${encodeURIComponent(user.email)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !user.enabled }) }); await showSection('V2 Users'); }); actions.append(toggle);
+    if (user.v2_role === 'writer' || user.v2_role === 'mentor') actions.append(buttonAction('Generate new temporary password', async () => { if (!confirm(`Replace the current password for ${user.email}? Current sessions will end.`)) return; const reset = await api(`/api/admin/v2/users/${encodeURIComponent(user.user_id)}/temporary-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); showCredentialHandoff({ created: 1, reused: 0, needs_attention: 0, credentials: [{ email: reset.email, temporary_password: reset.temporary_password, credential_role: user.v2_role === 'writer' ? 'student' : 'mentor' }] }, `reset-${user.user_id}`); await showSection('V2 Users'); }));
+    const details = element('details'); details.append(element('summary', '', 'Details'), element('p', 'muted-note', `Legacy type: ${user.legacy_account_type} · Migration: ${user.migration_state} · Created: ${new Date(user.created_at).toLocaleString()}`));
+    const actionCell = element('td'); actionCell.append(actions, details);
     row.append(
       element('td', '', user.email),
-      element('td', '', user.legacy_account_type),
-      roleCell,
-      element('td', '', user.migration_state),
-      element('td', '', user.enabled ? 'enabled' : 'disabled'),
-      element('td', '', user.created_at),
+      element('td', '', user.v2_role ? user.v2_role[0].toUpperCase() + user.v2_role.slice(1) : 'Unassigned'),
+      element('td', '', user.enabled ? 'Enabled' : 'Disabled'),
+      element('td', '', user.must_change_password ? 'Temporary password' : 'Active'),
+      actionCell,
     );
     body.append(row);
   });
@@ -344,8 +384,9 @@ function peopleBuilder(role, ordered, changed) {
     host.replaceChildren(); selected.forEach((person, index) => {
       const row = element('div', 'ordered-person'); row.append(element('strong', '', ordered ? `${index + 1}.` : '•'), element('span', '', person.email));
       const up = buttonAction('Up', () => { if (index) [selected[index - 1], selected[index]] = [selected[index], selected[index - 1]]; draw(); changed(selected); }); up.disabled = !ordered || index === 0; up.title = 'Move up'; up.setAttribute('aria-label', `Move ${person.email} up`);
+      const down = buttonAction('Down', () => { if (index < selected.length - 1) [selected[index], selected[index + 1]] = [selected[index + 1], selected[index]]; draw(); changed(selected); }); down.disabled = !ordered || index === selected.length - 1; down.title = 'Move down'; down.setAttribute('aria-label', `Move ${person.email} down`);
       const remove = buttonAction('Remove', () => { selected.splice(index, 1); draw(); changed(selected); }, 'danger'); remove.title = 'Remove account'; remove.setAttribute('aria-label', `Remove ${person.email}`);
-      row.append(up, remove); host.append(row);
+      row.append(up, down, remove); host.append(row);
     });
   };
   const add = buttonAction('Add', () => { const option = results.selectedOptions[0]; if (!option?.value || selected.some((person) => person.user_id === option.value)) return; selected.push({ user_id: option.value, email: option.textContent }); draw(); changed(selected); });
@@ -363,12 +404,12 @@ async function renderManualTeamForm(templates) {
   const writers = peopleBuilder('writer', true, (people) => {
     const previous = leaderSelect.value; leaderSelect.replaceChildren(new Option('Select one of the ordered Writers…', ''));
     people.forEach((person) => leaderSelect.append(new Option(person.email, person.user_id))); if (people.some((person) => person.user_id === previous)) leaderSelect.value = previous;
-    clearTimeout(timer); timer = setTimeout(async () => { if (!people.length) return; try { const preview = await api('/api/admin/v2/institution/template-defaults/resolve-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ordered_writer_user_ids: people.map((person) => person.user_id) }) }); const found = templates.find((item) => item.id === preview.selected_template_id); suggestion.textContent = `Suggested: ${found?.name || preview.selected_template_id} · ${preview.dominant_programme_code || 'no linked programme'} · ${preview.resolution_method}${preview.warnings.length ? ` · ${preview.warnings.join('; ')}` : ''}`; } catch (error) { suggestion.textContent = error.message; } }, 300);
+    clearTimeout(timer); timer = setTimeout(async () => { if (!people.length) return; try { const preview = await api('/api/admin/v2/institution/template-defaults/resolve-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ordered_writer_user_ids: people.map((person) => person.user_id) }) }); const found = templates.find((item) => item.id === preview.selected_template_id); const context = preview.resolution_method === 'TIE_FIRST_WRITER' ? `Selected using Writer-order tie-break (${preview.dominant_programme_code})` : preview.resolution_method === 'GLOBAL_FALLBACK' ? 'Automatically selected from Global fallback' : `Automatically selected from ${preview.dominant_programme_code}`; suggestion.textContent = `${found?.name || preview.selected_template_id} · ${context}`; } catch (error) { suggestion.textContent = error.message; } }, 300);
   });
   const mentors = peopleBuilder('mentor', false, () => {});
   form.append(leader, template, suggestion);
   const submit = element('button', 'primary', 'Create Paper Team'); submit.type = 'submit'; form.append(submit);
-  form.addEventListener('submit', async (event) => { event.preventDefault(); if (!writers.selected.some((person) => person.user_id === leaderSelect.value)) return showError(new Error('Leader must be one of the selected Writers.')); try { await api('/api/admin/v2/paper-teams', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: form.elements.name.value, writer_ids: writers.selected.map((person) => person.user_id), leader_writer_id: leaderSelect.value, mentor_ids: mentors.selected.map((person) => person.user_id), template_id: templateSelect.value || null }) }); announce(`Paper Team created with ${templateSelect.value ? 'MANUAL_OVERRIDE' : 'automatic template resolution'}.`); await showSection('Paper Teams'); } catch (error) { showError(error); } });
+  form.addEventListener('submit', async (event) => { event.preventDefault(); if (!writers.selected.some((person) => person.user_id === leaderSelect.value)) return showError(new Error('Leader must be one of the selected Writers.')); try { await api('/api/admin/v2/paper-teams', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: form.elements.name.value, writer_ids: writers.selected.map((person) => person.user_id), leader_writer_id: leaderSelect.value, mentor_ids: mentors.selected.map((person) => person.user_id), template_id: templateSelect.value || null }) }); announce(`Paper Team created with ${templateSelect.value ? 'an Admin template override' : 'automatic template selection'}.`); await showSection('Paper Teams'); } catch (error) { showError(error); } });
   details.append(writers.section, mentors.section, form); content.append(details);
 }
 
@@ -376,22 +417,26 @@ async function openTeamDetail(team, templates) {
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody');
   if (team.unresolved) {
     host.replaceChildren(element('h2', '', `${team.name} · unresolved`), element('p', 'danger-box', `${team.error_code || 'TEAM_UNRESOLVED'}: ${team.error_message || 'Resolve linked identities and template defaults, then re-apply the source import job.'}`), element('p', '', `Students: ${(team.unresolved_student_ids || []).join(', ') || 'None'} · Faculty: ${(team.unresolved_faculty_ids || []).join(', ') || 'None'}`));
-    const links = buttonAction('Open Identity Links', () => { dialog.close(); showSection('Institution Data', { tab: 'Identity Links' }); }); const defaults = buttonAction('Open Programme Templates', () => { dialog.close(); showSection('Programme Templates'); }); const job = buttonAction('Open Import Job', () => { dialog.close(); showSection('Imports', { jobId: team.source_import_job_id }); }); host.append(element('p', 'muted-note', 'Imports are additive; missing rows do not remove existing members.'), links, defaults, job); dialog.showModal(); return;
+    const links = buttonAction('Open Identity Links', () => { dialog.close(); showSection('Institution Data', { tab: 'Identity Links' }); }); const defaults = buttonAction('Open Templates', () => { dialog.close(); showSection('Templates'); }); const job = buttonAction('Open Import Job', () => { dialog.close(); showSection('Imports', { jobId: team.source_import_job_id }); }); host.append(element('p', 'muted-note', 'Imports are additive; missing rows do not remove existing members.'), links, defaults, job); dialog.showModal(); return;
   }
   const detail = await api(`/api/admin/v2/paper-teams/${team.id}`); const leader = detail.members.find((member) => member.is_leader); const writers = detail.members.filter((member) => member.role === 'writer'); const mentors = detail.members.filter((member) => member.role === 'mentor');
-  host.replaceChildren(element('h2', '', detail.team.name), element('p', '', `${detail.team.status} · ${team.source} · updated ${new Date(detail.team.updated_at).toLocaleString()}`), element('p', '', `Writers: ${writers.map((member) => `${member.writer_order}. ${member.email}`).join(', ') || 'None'}`), element('p', '', `Leader: ${leader?.email || 'Missing'} · Mentors: ${mentors.map((member) => member.email).join(', ') || 'None'}`), element('p', '', `Dominant programme: ${detail.summary.dominant_programme_code || '—'} · Review: ${detail.summary.review_state} · Files: ${detail.summary.file_count} · Build: ${detail.summary.current_build.status || 'none'}`), element('p', '', `Team pinned template: ${detail.template_pin?.template_name || 'None'} · Team source: ${detail.summary.resolution_method || 'unrecorded'}`));
-  if (team.source === 'imported') host.append(element('p', 'muted-note', `External key ${team.external_team_key} · source import ${team.source_import_job_id} · last imported ${team.last_imported_at || 'unknown'}. Imports are additive; missing rows do not remove existing members.`));
+  const sourceLabel = detail.summary.resolution_method === 'MANUAL_OVERRIDE' ? 'Admin override' : detail.summary.resolution_method === 'GLOBAL_FALLBACK' ? 'Global fallback' : detail.summary.dominant_programme_code || 'Programme default';
+  const sourcePrefix = detail.summary.resolution_method === 'MANUAL_OVERRIDE' ? 'Selected by:' : 'Selected automatically from:';
+  host.replaceChildren(element('h2', '', detail.team.name), element('p', '', `${detail.team.status} · ${team.source} · updated ${new Date(detail.team.updated_at).toLocaleString()}`), element('p', '', `Writers: ${writers.map((member) => `${member.writer_order}. ${member.email}`).join(', ') || 'None'}`), element('p', '', `Leader: ${leader?.email || 'Missing'} · Mentors: ${mentors.map((member) => member.email).join(', ') || 'None'}`), element('h3', '', 'Template'), element('p', '', detail.template_pin?.template_name || 'None'), element('p', 'muted-note', `${sourcePrefix} ${sourceLabel}`));
+  const advanced = element('details'); advanced.append(element('summary', '', 'Details'), element('p', 'muted-note', `Dominant programme: ${detail.summary.dominant_programme_code || '—'} · Resolution: ${detail.summary.resolution_method || 'unrecorded'} · Review: ${detail.summary.review_state} · Files: ${detail.summary.file_count} · Build: ${detail.summary.current_build.status || 'none'}`));
+  if (team.source === 'imported') advanced.append(element('p', 'muted-note', `External key ${team.external_team_key} · source import ${team.source_import_job_id} · last imported ${team.last_imported_at || 'unknown'}.`)); host.append(advanced);
   const management = element('section', 'admin-section'); management.append(element('h2', '', 'Team management'));
-  const leaderChoice = document.createElement('select'); leaderChoice.setAttribute('aria-label', 'Assigned Writer Leader'); writers.forEach((member) => leaderChoice.append(new Option(member.email, member.user_id, false, member.is_leader)));
-  management.append(leaderChoice, buttonAction('Change Leader', async () => { await api(`/api/admin/v2/paper-teams/${team.id}/leader`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: leaderChoice.value }) }); announce(`Leader changed for ${team.name}.`); dialog.close(); await showSection('Paper Teams'); }));
+  const edit = element('details'); edit.append(element('summary', '', 'Edit Team')); const editForm = element('form', 'manual-team-form'); const nameLabel = element('label', '', 'Team name'); const nameInput = document.createElement('input'); nameInput.name = 'name'; nameInput.required = true; nameInput.maxLength = 200; nameInput.value = detail.team.name; nameLabel.append(nameInput);
+  const leaderLabel = element('label', '', 'Team Leader'); const leaderSelect = document.createElement('select'); leaderSelect.required = true; leaderLabel.append(leaderSelect);
+  const updateLeaderChoices = (people) => { const previous = leaderSelect.value || leader?.user_id; leaderSelect.replaceChildren(new Option('Select one Writer…', '')); people.forEach((person) => leaderSelect.append(new Option(person.email, person.user_id))); if (people.some((person) => person.user_id === previous)) leaderSelect.value = previous; };
+  const editWriters = peopleBuilder('writer', true, updateLeaderChoices); editWriters.selected.push(...writers.map(({ user_id, email }) => ({ user_id, email }))); editWriters.draw(); updateLeaderChoices(editWriters.selected);
+  const editMentors = peopleBuilder('mentor', false, () => {}); editMentors.selected.push(...mentors.map(({ user_id, email }) => ({ user_id, email }))); editMentors.draw();
+  const saveTeam = element('button', 'primary', 'Save Team'); saveTeam.type = 'submit'; editForm.append(nameLabel, editWriters.section, leaderLabel, editMentors.section, saveTeam); editForm.addEventListener('submit', async (event) => { event.preventDefault(); try { if (!editWriters.selected.length) throw new Error('Team must retain at least one Writer.'); if (!editWriters.selected.some((person) => person.user_id === leaderSelect.value)) throw new Error('Leader must be a selected Writer.'); await api(`/api/admin/v2/paper-teams/${team.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: nameInput.value, writer_ids: editWriters.selected.map((person) => person.user_id), leader_writer_id: leaderSelect.value, mentor_ids: editMentors.selected.map((person) => person.user_id) }) }); announce(`Saved ${nameInput.value}.`); dialog.close(); await showSection('Paper Teams'); } catch (error) { showError(error); } }); edit.append(editForm); management.append(edit);
   [['Freeze', 'frozen'], ['Activate', 'active'], ['Archive', 'archived']].forEach(([label, value]) => management.append(buttonAction(label, async () => { await api(`/api/admin/v2/paper-teams/${team.id}/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: value }) }); dialog.close(); await showSection('Paper Teams'); }, value === 'archived' ? 'danger' : ''))); host.append(management);
-  const section = element('section', 'admin-section'); section.append(element('h2', '', 'Safe Template Override'));
+  const section = element('section', 'admin-section'); section.append(element('h2', '', 'Change template'), element('p', '', `Current: ${detail.template_pin?.template_name || 'None'}`));
   const select = document.createElement('select'); select.setAttribute('aria-label', 'New template'); templates.filter((item) => item.id !== detail.template_pin?.template_id).forEach((item) => select.append(new Option(item.name, item.id)));
-  const confirmMain = element('label', '', ' Confirm Main file change'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; confirmMain.prepend(checkbox);
-  const previewHost = element('div'); let preview;
-  const previewButton = buttonAction('Preview Template Change', async () => { preview = await api(`/api/admin/v2/paper-teams/${team.id}/template-change/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, confirm_main_file_change: checkbox.checked }) }); previewHost.replaceChildren(renderJson(preview)); apply.disabled = !preview.can_apply; });
-  const apply = buttonAction('Apply Template Change', async () => { if (!preview || !confirm('Apply this safe template change and create checkpoints?')) return; const result = await api(`/api/admin/v2/paper-teams/${team.id}/template-change/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, preview_token: preview.preview_token, confirm_main_file_change: checkbox.checked }) }); announce(`Template changed; PRE_TEMPLATE_CHANGE and TEMPLATE_UPDATE retained (${result.template_update_version_id}).`); dialog.close(); await showSection('Paper Teams'); }, 'primary'); apply.disabled = true;
-  section.append(select, confirmMain, previewButton, apply, previewHost); host.append(section); dialog.showModal();
+  const confirmation = element('div'); const change = buttonAction('Change template', async () => { if (!select.value) throw new Error('No alternative template is available.'); const preview = await api(`/api/admin/v2/paper-teams/${team.id}/template-change/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, confirm_main_file_change: false }) }); const fileConflicts = preview.writer_modified_conflicts.filter((item) => !String(item.reason).startsWith('Main file change')); if (fileConflicts.length) { const list = element('ul', 'compact-list'); fileConflicts.forEach((item) => list.append(element('li', '', item.path))); confirmation.replaceChildren(element('h3', '', 'Template cannot be changed yet.'), element('p', 'danger-box', 'Writer-edited files conflict:'), list, element('p', '', 'No files were changed.')); return; } const selectedTemplate = templates.find((item) => item.id === select.value); const mainChanged = preview.main_file_change.changed; const confirmBox = element('div', 'template-change-confirmation'); confirmBox.append(element('h3', '', 'Change template?'), element('p', '', `${detail.template_pin?.template_name || 'None'} → ${selectedTemplate?.name || 'Selected template'}`), element('p', '', `${preview.template_managed_files_to_update.length + preview.unchanged_old_template_files_to_update.length} files will update`), element('p', '', `${preview.files_to_add.length} files will be added`), element('p', '', 'Paper history will be preserved')); let mainConfirm = null; if (mainChanged) { const label = element('label', '', ` Confirm Main document change (${preview.main_file_change.from} → ${preview.main_file_change.to})`); mainConfirm = document.createElement('input'); mainConfirm.type = 'checkbox'; label.prepend(mainConfirm); confirmBox.append(label); } const apply = buttonAction('Change', async () => { const confirmedMain = Boolean(mainConfirm?.checked); if (mainChanged && !confirmedMain) return; const ready = mainChanged ? await api(`/api/admin/v2/paper-teams/${team.id}/template-change/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, confirm_main_file_change: true }) }) : preview; await api(`/api/admin/v2/paper-teams/${team.id}/template-change/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_template_id: select.value, preview_token: ready.preview_token, confirm_main_file_change: confirmedMain }) }); announce('Template changed. Paper history was preserved.'); dialog.close(); await showSection('Paper Teams'); }, 'primary'); if (mainConfirm) { apply.disabled = true; mainConfirm.addEventListener('change', () => { apply.disabled = !mainConfirm.checked; }); } confirmBox.append(buttonAction('Cancel', () => confirmation.replaceChildren()), apply); confirmation.replaceChildren(confirmBox); });
+  section.append(select, change, confirmation); host.append(section); dialog.showModal();
 }
 
 async function renderPaperTeamGrid() {
@@ -421,7 +466,7 @@ async function renderImportDetail(jobId) {
   const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Sheet / table</th><th>Total</th><th>Insert</th><th>Update</th><th>Skip</th><th>Error</th></tr></thead>'; const body = document.createElement('tbody'); detail.summaries.forEach((item) => { const row = document.createElement('tr'); row.append(element('td', '', item.source), element('td', '', item.total), element('td', '', item.insert), element('td', '', item.update), element('td', '', item.skip), element('td', item.error ? 'danger' : '', item.error)); body.append(row); }); table.append(body); wrap.append(table); section.append(wrap);
   const errors = detail.rows.filter((row) => row.status === 'ERROR' || row.status === 'UNRESOLVED'); if (errors.length) { const errorBox = element('div', 'danger-box', `${errors.length} blocking/unresolved rows shown in the bounded preview.`); const list = element('ul', 'compact-list'); errors.slice(0, 100).forEach((row) => list.append(element('li', '', `${row.source_table_or_sheet}:${row.row_number} · ${row.error_code} · ${row.error_message}`))); errorBox.append(list); section.append(errorBox); }
   const actions = element('div', 'admin-actions'); const download = element('a', 'shell-link', 'Download errors.csv'); download.href = `/api/admin/v2/institution/imports/${job.id}/errors.csv`; download.download = 'errors.csv';
-  const apply = buttonAction('Apply validated import', async () => { if (!confirm(`Apply ${job.mode} import ${job.original_filename}? Imports never remove absent rows.`)) return; const result = await api(`/api/admin/v2/institution/imports/${job.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`Import applied: ${result.materialized_teams} Teams created, ${result.merged_teams} merged, ${result.unresolved_teams} unresolved.`); await showSection('Imports', { jobId: job.id }); }, 'primary'); apply.disabled = job.mode === 'VALIDATE_ONLY' || job.status !== 'VALIDATED' || job.error_rows > 0;
+  const apply = buttonAction('Apply validated import', async () => { if (!confirm(`Apply ${job.mode} import ${job.original_filename}? Imports never remove absent rows.`)) return; const result = await api(`/api/admin/v2/institution/imports/${job.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`Import applied: ${result.materialized_teams} Teams created, ${result.merged_teams} merged, ${result.unresolved_teams} unresolved.`); await showSection('Imports', { jobId: job.id }); showCredentialHandoff(result.account_provisioning, job.id); }, 'primary'); apply.disabled = job.mode === 'VALIDATE_ONLY' || job.status !== 'VALIDATED' || job.error_rows > 0;
   const retry = buttonAction('Retry Team Materialization', async () => { const result = await api(`/api/admin/v2/institution/imports/${job.id}/retry-teams`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`Retry: ${result.succeeded} succeeded, ${result.failed} remain unresolved.`, result.failed > 0); await showSection('Imports', { jobId: job.id }); }); retry.disabled = job.status !== 'PARTIAL';
   actions.append(download, apply, retry); section.append(actions); content.append(section);
 }
@@ -486,9 +531,9 @@ function createImportGuide() {
   prerequisites.append(
     element('h3', '', 'Before Teams can be created'),
     element('h4', '', 'Student account link'),
-    element('p', '', 'Student.email must resolve to an existing V2 WRITER account for that Student to become a Team Writer. Importing a Student does NOT create a privileged Writer account.'),
+    element('p', '', 'A valid Student.email automatically creates or reuses a V2 WRITER account. Newly created accounts receive a one-time temporary password in the credentials CSV.'),
     element('h4', '', 'Faculty account link'),
-    element('p', '', 'Faculty.email must resolve to an existing V2 MENTOR account for that Faculty member to become a Paper Team Mentor.'),
+    element('p', '', 'Faculty assigned in paper_team_mentors automatically receive or reuse a V2 MENTOR account. Unassigned Faculty and institutional Admins are never provisioned.'),
     element('h4', '', 'Team Leader'),
     element('p', '', 'Exactly one paper_team_writers row per Team must be marked is_leader = true.'),
     element('h4', '', 'Template'),
@@ -560,7 +605,7 @@ async function renderBatchDetail(batchId) {
   detail.summaries.forEach((item) => { const card = element('article', 'import-summary-card'); const actionCount = batch.operation === 'ADD' ? item.add : batch.operation === 'EDIT' ? item.edit : item.delete; const action = batch.operation === 'ADD' ? 'to add' : batch.operation === 'EDIT' ? 'to edit' : 'to delete'; card.append(element('strong', '', item.dataset), element('span', '', `${Number(actionCount).toLocaleString()} ${action}`)); if (item.skip) card.append(element('small', '', `${item.skip} already exist`)); if (item.error) card.append(element('small', 'danger', `${item.error} need attention`)); cards.append(card); }); section.append(cards);
   if (detail.issues.length) { const issues = element('section', 'issue-list'); issues.append(element('h3', '', `${batch.error_rows} records need attention`)); detail.issues.forEach((issue) => { const item = element('article', 'issue-card'); item.append(element('strong', '', `${issue.dataset} · row ${issue.row}`), element('span', '', issue.problem || issue.code), element('small', '', `${issue.file}${issue.suggested_action ? ` · ${issue.suggested_action}` : ''}`)); issues.append(item); }); section.append(issues); }
   if (detail.changes?.length) { const changes = element('section', 'change-list'); changes.append(element('h3', '', 'Field changes')); detail.changes.forEach((change) => { const item = element('article', 'change-card'); item.append(element('strong', '', `${change.dataset} ${change.display_key}`)); Object.entries(change.fields).forEach(([field, values]) => item.append(element('p', '', `${field.replaceAll('_', ' ')}: ${values.old ?? '—'} → ${values.new ?? '—'}`))); if (change.template_effect) item.append(element('small', 'muted-note', change.template_effect)); changes.append(item); }); section.append(changes); }
-  const actions = element('div', 'admin-actions'); const actionLabel = batch.operation === 'ADD' ? 'Add records' : batch.operation === 'EDIT' ? 'Edit records' : 'Delete records'; const apply = buttonAction(actionLabel, async () => { if (!confirm(`${actionLabel} from this reviewed batch? Only explicit rows are affected.`)) return; const result = await api(`/api/admin/v2/institution/import-batches/${batch.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`${actionLabel}: ${Number(result.batch.total_rows).toLocaleString()} records processed.`); await showSection('Imports', { batchId: batch.id }); }, batch.operation === 'DELETE' ? 'danger' : 'primary'); apply.disabled = batch.status !== 'VALIDATED' || batch.error_rows > 0; actions.append(apply); section.append(actions);
+  const actions = element('div', 'admin-actions'); const actionLabel = batch.operation === 'ADD' ? 'Add records' : batch.operation === 'EDIT' ? 'Edit records' : 'Delete records'; const apply = buttonAction(actionLabel, async () => { if (!confirm(`${actionLabel} from this reviewed batch? Only explicit rows are affected.`)) return; const result = await api(`/api/admin/v2/institution/import-batches/${batch.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`${actionLabel}: ${Number(result.batch.total_rows).toLocaleString()} records processed.`); await showSection('Imports', { batchId: batch.id }); if (batch.operation === 'ADD') showCredentialHandoff(result.account_provisioning, batch.id); }, batch.operation === 'DELETE' ? 'danger' : 'primary'); apply.disabled = batch.status !== 'VALIDATED' || batch.error_rows > 0; actions.append(apply); section.append(actions);
   const technical = element('details', 'technical-details'); technical.append(element('summary', '', 'Technical details'), element('p', '', `Batch ID: ${batch.id}`)); detail.files.forEach((file) => { const row = element('p', '', `${file.filename} · ${file.file_type} · ${file.status} · SHA-256 ${file.checksum}`); const errors = element('a', 'shell-link', ' Error CSV'); errors.href = `/api/admin/v2/institution/imports/${file.id}/errors.csv`; row.append(errors); technical.append(row); }); section.append(technical); content.append(section);
 }
 
@@ -601,7 +646,7 @@ function canonicalRecord(config, item) { return Object.fromEntries(config.fields
 async function manualInstitutionRecord(config, operation, item, reload) {
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody'); const form = element('form', 'manual-record-form'); const title = `${operation[0]}${operation.slice(1).toLowerCase()} ${config.label.replace(/s$/, '')}`; host.replaceChildren(element('h2', '', title)); const source = canonicalRecord(config, item || {}); const shownFields = operation === 'DELETE' ? config.keys : config.fields;
   shownFields.forEach((field) => { const label = element('label', '', field.replaceAll('_', ' ')); let input; if (field === 'is_leader') { input = document.createElement('select'); input.append(new Option('False', 'false'), new Option('True', 'true')); } else { input = document.createElement('input'); input.type = field === 'email' ? 'email' : 'text'; } input.name = field; input.value = source[field] ?? ''; input.readOnly = operation !== 'ADD' && config.keys.includes(field); label.append(input); form.append(label); }); const result = element('div'); const submit = element('button', operation === 'DELETE' ? 'danger' : 'primary', operation === 'DELETE' ? 'Check dependencies' : `Review ${operation.toLowerCase()}`); submit.type = 'submit'; form.append(submit, result); host.append(form); dialog.showModal();
-  form.addEventListener('submit', async (event) => { event.preventDefault(); try { const payload = {}; new FormData(form).forEach((value, key) => { payload[key] = value === '' ? null : value; }); const detail = await api(`/api/admin/v2/institution/data/${config.dataset}/validate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation, payload }) }); if (detail.batch.error_rows) { result.replaceChildren(element('p', 'danger-box', detail.issues.map((issue) => issue.problem).join('; '))); submit.disabled = true; return; } const question = operation === 'DELETE' ? `Delete this ${config.label.replace(/s$/, '')}? LaTeX Core users and paper history are retained.` : `${title}?`; if (!confirm(question)) return; await api(`/api/admin/v2/institution/import-batches/${detail.batch.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); dialog.close(); announce(`${title} complete.`); await reload(); } catch (error) { result.replaceChildren(element('p', 'danger-box', error.message)); } });
+  form.addEventListener('submit', async (event) => { event.preventDefault(); try { const payload = {}; new FormData(form).forEach((value, key) => { payload[key] = value === '' ? null : value; }); const detail = await api(`/api/admin/v2/institution/data/${config.dataset}/validate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation, payload }) }); if (detail.batch.error_rows) { result.replaceChildren(element('p', 'danger-box', detail.issues.map((issue) => issue.problem).join('; '))); submit.disabled = true; return; } const question = operation === 'DELETE' ? `Delete this ${config.label.replace(/s$/, '')}? LaTeX Core users and paper history are retained.` : `${title}?`; if (!confirm(question)) return; const applied = await api(`/api/admin/v2/institution/import-batches/${detail.batch.id}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); dialog.close(); announce(`${title} complete.`); await reload(); if (operation === 'ADD') showCredentialHandoff(applied.account_provisioning, detail.batch.id); } catch (error) { result.replaceChildren(element('p', 'danger-box', error.message)); } });
 }
 
 async function renderIdentityLinkManager(host) {
@@ -617,11 +662,10 @@ async function renderInstitutionData(options = {}) {
   await load(active);
 }
 
-async function renderProgrammeTemplates() {
-  const [mappings, fallback, templates] = await Promise.all([api('/api/admin/v2/institution/template-defaults/programmes'), api('/api/admin/v2/institution/template-defaults/global-fallback'), api('/api/admin/templates')]); content.append(element('p', 'muted-note', 'Changing a programme default or global fallback affects future Teams only. Existing pinned Teams never change.'));
-  const fallbackSection = element('section', 'admin-section'); fallbackSection.append(element('h2', '', 'Global fallback'), element('p', '', `Current fallback: ${fallback.template_name || 'Not configured'}`)); const fallbackSelect = document.createElement('select'); templates.forEach((item) => fallbackSelect.append(new Option(item.name, item.id, false, item.id === fallback.template_id))); fallbackSection.append(fallbackSelect, buttonAction('Change global fallback', async () => { if (!confirm('Change fallback for future Teams only?')) return; await api('/api/admin/v2/institution/template-defaults/global-fallback', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template_id: fallbackSelect.value }) }); announce('Global fallback changed for future Teams only.'); await showSection('Programme Templates'); }, 'primary')); content.append(fallbackSection);
-  const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Programme</th><th>Students</th><th>Current default</th><th>Last updated</th><th>Updated by</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody'); mappings.forEach((mapping) => { const row = document.createElement('tr'); const select = document.createElement('select'); select.append(new Option('No programme default', '')); templates.forEach((item) => select.append(new Option(item.name, item.id, false, item.id === mapping.template_id))); const actions = element('td'); actions.append(buttonAction(mapping.template_id ? 'Change default' : 'Set default', async () => { if (!select.value) throw new Error('Select a template.'); await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template_id: select.value }) }); announce(`${mapping.programme_code} default saved for future Teams.`); await showSection('Programme Templates'); }), buttonAction('Remove mapping', async () => { if (!mapping.template_id || !confirm(`Remove ${mapping.programme_code} default?`)) return; await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}`, { method: 'DELETE' }); await showSection('Programme Templates'); }, 'danger')); const templateCell = element('td'); templateCell.append(select); row.append(element('td', '', mapping.programme_code), element('td', '', mapping.student_count), templateCell, element('td', '', mapping.updated_at ? new Date(mapping.updated_at).toLocaleString() : '—'), element('td', '', mapping.updated_by || '—'), actions); body.append(row); }); table.append(body); wrap.append(table); content.append(wrap);
-  const preview = element('section', 'admin-section'); preview.append(element('h2', '', 'Resolution preview'), element('p', 'muted-note', 'Writer order controls tie-breaking. Preview never mutates a Team.')); const result = element('div'); const writers = peopleBuilder('writer', true, () => {}); preview.append(writers.section, buttonAction('Resolve preview', async () => { if (!writers.selected.length) throw new Error('Add at least one Writer.'); const data = await api('/api/admin/v2/institution/template-defaults/resolve-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ordered_writer_user_ids: writers.selected.map((person) => person.user_id) }) }); const selected = templates.find((item) => item.id === data.selected_template_id); result.replaceChildren(element('p', '', `Writer order: ${writers.selected.map((person, index) => `${index + 1}. ${person.email}`).join(' · ')}`), element('p', '', `Programme counts: ${JSON.stringify(data.counts)} · dominant ${data.dominant_programme_code || 'none'}`), element('p', '', `Selected: ${selected?.name || data.selected_template_id} · ${data.resolution_method}${data.tie_break ? ` · ${data.tie_break}` : ''}`), element('p', 'muted-note', data.warnings.join('; ') || 'No warnings.')); }), result); content.append(preview);
+async function renderAutomaticDefaults(templates) {
+  const [mappings, fallback] = await Promise.all([api('/api/admin/v2/institution/template-defaults/programmes'), api('/api/admin/v2/institution/template-defaults/global-fallback')]); content.append(element('h2', '', 'Automatic Defaults'), element('p', 'muted-note', 'These mappings affect future Teams only. Existing template pins remain unchanged.'));
+  const fallbackSection = element('section', 'admin-section'); fallbackSection.append(element('h3', '', 'Global fallback')); const fallbackSelect = document.createElement('select'); templates.forEach((item) => fallbackSelect.append(new Option(item.name, item.id, false, item.id === fallback.template_id))); fallbackSection.append(fallbackSelect, buttonAction('Save', async () => { if (!fallbackSelect.value) throw new Error('Select a template.'); await api('/api/admin/v2/institution/template-defaults/global-fallback', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template_id: fallbackSelect.value }) }); announce('Global fallback saved for future Teams.'); await showSection('Templates'); }, 'primary')); content.append(fallbackSection);
+  const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Programme</th><th>Default template</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody'); mappings.forEach((mapping) => { const row = document.createElement('tr'); const select = document.createElement('select'); select.append(new Option('No programme default', '')); templates.forEach((item) => select.append(new Option(item.name, item.id, false, item.id === mapping.template_id))); const actions = element('td'); actions.append(buttonAction('Save', async () => { if (!select.value) throw new Error('Select a template.'); await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template_id: select.value }) }); announce(`${mapping.programme_code} default saved for future Teams.`); await showSection('Templates'); }), buttonAction('Remove mapping', async () => { if (!mapping.template_id || !confirm(`Remove ${mapping.programme_code} default?`)) return; await api(`/api/admin/v2/institution/template-defaults/programmes/${encodeURIComponent(mapping.programme_code)}`, { method: 'DELETE' }); await showSection('Templates'); }, 'danger')); const templateCell = element('td'); templateCell.append(select); row.append(element('td', '', mapping.programme_code), templateCell, actions); body.append(row); }); table.append(body); wrap.append(table); content.append(wrap);
 }
 
 function buttonAction(label, handler, className = '') {
@@ -675,15 +719,10 @@ async function showSection(section, options = {}) {
       await renderInstitutionData(options);
       return;
     }
-    if (section === 'Programme Templates') {
-      content.replaceChildren(element('h1', '', 'PROGRAMME TEMPLATES'));
-      await renderProgrammeTemplates();
-      return;
-    }
     if (section === 'Templates') {
       const templates = await api('/api/admin/templates');
       content.replaceChildren(element('h1', '', 'TEMPLATES'));
-      renderTemplates(templates);
+      await renderTemplates(templates);
       return;
     }
     if (section === 'File Policies') {

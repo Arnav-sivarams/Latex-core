@@ -21,10 +21,24 @@ The complete batch is validated together against the canonical database plus sta
 1. Departments, Schools, Admins
 2. Faculty, Programmes, Students
 3. Registrations, capacity, and role metadata
-4. Paper assignment groups, ordered Writers/Leader, and Mentors
-5. Identity reconciliation and Paper Team materialization
+4. Automatic Writer accounts for imported Students and Mentor accounts for assigned Faculty
+5. Identity links
+6. Paper assignment groups, ordered Writers/Leader, and Mentors
+7. Template resolution and Paper Team materialization
 
 No compilation is triggered. For fully valid assignment batches, Team materialization is part of the one Apply action; Retry Team Materialization remains recovery-only.
+
+## Automatic accounts and credential handoff
+
+Add accepts a completely new Student/Faculty/assignment set in one batch. Students with valid unique email addresses are created as enabled V2 Writers when no account exists. Faculty are created as V2 Mentors only when referenced by `paper_team_mentors`; unassigned Faculty and `admins` rows do not gain accounts or roles. A normalized-email match reuses a compatible account without changing its password. A missing/invalid/ambiguous email or incompatible existing role leaves the assignment unresolved with an actionable issue.
+
+Every new automatic account receives a cryptographically random eight-character temporary password containing uppercase, lowercase, and a digit. PostgreSQL stores only its Argon2 hash and `must_change_password=true`. The Add response hands the plaintext to the Admin once, and the browser downloads `latex-core-generated-credentials-<batch-id>.csv` with exactly:
+
+```text
+email,password,role
+```
+
+Only newly generated credentials appear. `role=student` means V2 `WRITER`; `role=mentor` means V2 `MENTOR`. Save the file immediately because plaintext credentials are not stored for later download or sent by email. The user must set a permanent password before `/write` or `/review` access.
 
 ## Supported datasets and canonical keys
 
@@ -51,6 +65,8 @@ Add files must contain the dataset’s required fields. Edit and Delete files ma
 INSTITUTION DATA provides server-side search and pagination for every dataset. **+ Add**, **Edit**, and **Delete** open compact forms generated from the same schema. Delete first creates a dependency preview; blocked references are named before any mutation. Paper Assignments expand to ordered Writers, the explicit Leader, Mentors, and materialization state.
 
 Changing a Student programme can affect resolution for future Teams. Existing Team template pins never change automatically and the Edit preview says so.
+
+Materialized Teams are edited from **Paper Teams → View / Manage → Edit Team**. Team name, ordered Writers, Leader, and Mentors are updated transactionally. For imported Teams, `vcap.paper_assignment_groups`, `paper_assignment_students`, `paper_assignment_mentors`, and `latex_core.paper_team_members` remain coherent while the existing workspace and paper history are retained.
 
 ## Backward compatibility
 

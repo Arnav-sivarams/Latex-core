@@ -39,6 +39,7 @@ pub struct AppUserRecord {
     pub password_hash: String,
     pub enabled: bool,
     pub account_type: String,
+    pub must_change_password: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AppSessionRecord {
@@ -47,6 +48,7 @@ pub struct AppSessionRecord {
     pub email: String,
     pub account_type: String,
     pub global_role: Option<GlobalRole>,
+    pub must_change_password: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AppProjectRecord {
@@ -166,6 +168,7 @@ impl AppRepository {
             password_hash: password_hash.to_owned(),
             enabled: true,
             account_type: "student".to_owned(),
+            must_change_password: false,
         })
     }
 
@@ -177,6 +180,7 @@ impl AppRepository {
         email: &str,
         password_hash: &str,
         role: GlobalRole,
+        must_change_password: bool,
     ) -> Result<AppUserRecord, AppError> {
         let mut tx = self
             .database
@@ -198,12 +202,13 @@ impl AppRepository {
             .await
             .map_err(AppError::Database)?;
         let insert = sqlx::query(
-            "INSERT INTO latex_core.user_credentials (user_id,email,password_hash,account_type) \
-             VALUES ($1,$2,$3,'student')",
+            "INSERT INTO latex_core.user_credentials (user_id,email,password_hash,account_type,must_change_password) \
+             VALUES ($1,$2,$3,'student',$4)",
         )
         .bind(user.as_uuid())
         .bind(email)
         .bind(password_hash)
+        .bind(must_change_password)
         .execute(&mut *tx)
         .await;
         match insert {
@@ -228,10 +233,11 @@ impl AppRepository {
             password_hash: password_hash.to_owned(),
             enabled: true,
             account_type: "student".to_owned(),
+            must_change_password,
         })
     }
     pub async fn user_by_email(&self, email: &str) -> Result<Option<AppUserRecord>, AppError> {
-        let row = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash,c.enabled,c.account_type FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id WHERE c.email=$1").bind(email).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
+        let row = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash,c.enabled,c.account_type,c.must_change_password FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id WHERE c.email=$1").bind(email).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
         row.map(decode_user).transpose()
     }
     pub async fn create_session(
@@ -244,7 +250,7 @@ impl AppRepository {
         Ok(())
     }
     pub async fn session(&self, digest: &str) -> Result<Option<AppSessionRecord>, AppError> {
-        let row=sqlx::query("SELECT u.id,u.tenant_id,c.email,c.account_type,g.role AS global_role FROM latex_core.sessions s JOIN latex_core.users u ON u.id=s.user_id JOIN latex_core.user_credentials c ON c.user_id=u.id LEFT JOIN latex_core.global_user_roles g ON g.user_id=u.id WHERE s.token_digest=$1 AND s.expires_at>statement_timestamp() AND c.enabled=TRUE") .bind(digest).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
+        let row=sqlx::query("SELECT u.id,u.tenant_id,c.email,c.account_type,c.must_change_password,g.role AS global_role FROM latex_core.sessions s JOIN latex_core.users u ON u.id=s.user_id JOIN latex_core.user_credentials c ON c.user_id=u.id LEFT JOIN latex_core.global_user_roles g ON g.user_id=u.id WHERE s.token_digest=$1 AND s.expires_at>statement_timestamp() AND c.enabled=TRUE") .bind(digest).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
         row.map(|r| {
             let global_role = r
                 .try_get::<Option<String>, _>("global_role")
@@ -260,6 +266,9 @@ impl AppRepository {
                 email: r.try_get("email").map_err(AppError::Database)?,
                 account_type: r.try_get("account_type").map_err(AppError::Database)?,
                 global_role,
+                must_change_password: r
+                    .try_get("must_change_password")
+                    .map_err(AppError::Database)?,
             })
         })
         .transpose()
@@ -273,7 +282,7 @@ impl AppRepository {
         Ok(())
     }
     pub async fn list_users(&self) -> Result<Vec<AppUserRecord>, AppError> {
-        let rows = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash,c.enabled,c.account_type FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id ORDER BY c.email").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        let rows = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash,c.enabled,c.account_type,c.must_change_password FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id ORDER BY c.email").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_user).collect()
     }
     pub async fn set_user_enabled(&self, email: &str, enabled: bool) -> Result<(), AppError> {
@@ -340,7 +349,7 @@ impl AppRepository {
             .await
             .map_err(AppError::Database)?;
         let result =
-            sqlx::query("UPDATE latex_core.user_credentials SET password_hash=$2 WHERE email=$1")
+            sqlx::query("UPDATE latex_core.user_credentials SET password_hash=$2,must_change_password=TRUE WHERE email=$1")
                 .bind(email)
                 .bind(password_hash)
                 .execute(&mut *tx)
@@ -350,6 +359,79 @@ impl AppRepository {
             return Err(AppError::NotFound);
         }
         sqlx::query("DELETE FROM latex_core.sessions WHERE user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1)").bind(email).execute(&mut *tx).await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::Database)
+    }
+
+    pub async fn reset_v2_temporary_password(
+        &self,
+        actor: UserId,
+        user: UserId,
+        password_hash: &str,
+    ) -> Result<String, AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let email: Option<String> = sqlx::query_scalar(
+            "UPDATE latex_core.user_credentials credentials SET password_hash=$2,must_change_password=TRUE \
+             FROM latex_core.global_user_roles role WHERE credentials.user_id=$1 AND role.user_id=credentials.user_id \
+             AND role.role IN ('writer','mentor') RETURNING credentials.email",
+        )
+        .bind(user.as_uuid())
+        .bind(password_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        let email = email.ok_or(AppError::Forbidden)?;
+        sqlx::query("DELETE FROM latex_core.sessions WHERE user_id=$1")
+            .bind(user.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        sqlx::query(
+            "INSERT INTO latex_core.audit_events \
+             (id,actor_user_id,event_type,resource_type,resource_id,metadata) \
+             VALUES ($1,$2,'account.temporary_password.generated','user',$3,'{}'::jsonb)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(actor.as_uuid())
+        .bind(user.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::Database)?;
+        Ok(email)
+    }
+
+    pub async fn complete_password_change(
+        &self,
+        user: UserId,
+        password_hash: &str,
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(AppError::Database)?;
+        let result = sqlx::query(
+            "UPDATE latex_core.user_credentials SET password_hash=$2,must_change_password=FALSE WHERE user_id=$1 AND must_change_password",
+        )
+        .bind(user.as_uuid())
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::Conflict);
+        }
+        sqlx::query("DELETE FROM latex_core.sessions WHERE user_id=$1")
+            .bind(user.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
         tx.commit().await.map_err(AppError::Database)
     }
     pub async fn create_project(
@@ -941,6 +1023,9 @@ fn decode_user(r: sqlx::postgres::PgRow) -> Result<AppUserRecord, AppError> {
         password_hash: r.try_get("password_hash").map_err(AppError::Database)?,
         enabled: r.try_get("enabled").map_err(AppError::Database)?,
         account_type: r.try_get("account_type").map_err(AppError::Database)?,
+        must_change_password: r
+            .try_get("must_change_password")
+            .map_err(AppError::Database)?,
     })
 }
 fn decode_project(r: sqlx::postgres::PgRow) -> Result<AppProjectRecord, AppError> {

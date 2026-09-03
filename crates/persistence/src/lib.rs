@@ -11,6 +11,7 @@ mod collaboration;
 )]
 mod compile_queue;
 mod config;
+pub mod credentials;
 mod database;
 mod error;
 #[allow(
@@ -73,10 +74,11 @@ pub use governance::{
     TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile, V2FilePolicy, V2FilePolicyRecord,
 };
 pub use institution::{
-    ImportFileType, ImportJobPageFilter, ImportLimits, ImportMode, ImportedTeamPlan,
-    InstitutionBatchUpload, InstitutionError, InstitutionImportBatch, InstitutionImportJob,
-    InstitutionImportRow, InstitutionOperation, InstitutionPageFilter, InstitutionRepository,
-    PaperTeamPage, PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
+    AccountProvisioningResult, AppliedInstitutionImport, GeneratedCredential, ImportFileType,
+    ImportJobPageFilter, ImportLimits, ImportMode, ImportedTeamPlan, InstitutionBatchUpload,
+    InstitutionError, InstitutionImportBatch, InstitutionImportJob, InstitutionImportRow,
+    InstitutionOperation, InstitutionPageFilter, InstitutionRepository, PaperTeamPage,
+    PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
 };
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{

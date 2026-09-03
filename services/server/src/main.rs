@@ -80,6 +80,11 @@ struct Credentials {
     password: String,
 }
 #[derive(Deserialize)]
+struct PasswordChangeInput {
+    new_password: String,
+    confirm_password: String,
+}
+#[derive(Deserialize)]
 struct NewProject {
     name: String,
 }
@@ -118,8 +123,10 @@ struct AdminPasswordInput {
 #[derive(Deserialize)]
 struct V2AdminUserInput {
     email: String,
-    password: String,
+    password: Option<String>,
     role: String,
+    #[serde(default)]
+    generate_temporary_password: bool,
 }
 #[derive(Deserialize)]
 struct V2RoleInput {
@@ -129,6 +136,15 @@ struct V2RoleInput {
 struct V2PaperTeamInput {
     name: String,
     template_id: Option<uuid::Uuid>,
+    leader_writer_id: String,
+    #[serde(default)]
+    writer_ids: Vec<String>,
+    #[serde(default)]
+    mentor_ids: Vec<String>,
+}
+#[derive(Deserialize)]
+struct V2PaperTeamUpdateInput {
+    name: String,
     leader_writer_id: String,
     #[serde(default)]
     writer_ids: Vec<String>,
@@ -346,6 +362,7 @@ struct UserWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     v2_role: Option<String>,
     capabilities: IdentityCapabilitiesWire,
+    must_change_password: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -584,6 +601,10 @@ fn router(state: AppState) -> Router {
         .route("/", get(ui))
         .route("/login", post(browser_login))
         .route("/logout", post(browser_logout))
+        .route(
+            "/change-password",
+            get(change_password_ui).post(browser_change_password),
+        )
         .route("/admin", get(admin_ui))
         .route("/write", get(writer_ui))
         .route("/review", get(mentor_ui))
@@ -599,6 +620,7 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
+        .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/me", get(me))
         .route("/api/v2/me", get(v2_me))
         .route(
@@ -608,6 +630,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/users/{user_id}/role",
             axum::routing::patch(admin_v2_change_role),
+        )
+        .route(
+            "/api/admin/v2/users/{user_id}/temporary-password",
+            post(admin_v2_reset_temporary_password),
         )
         .route(
             "/api/admin/v2/templates/preview",
@@ -722,7 +748,10 @@ fn router(state: AppState) -> Router {
             "/api/admin/v2/institution/template-defaults/global-fallback",
             get(admin_v2_global_fallback).put(admin_v2_set_global_fallback),
         )
-        .route("/api/admin/v2/paper-teams/{id}", get(admin_v2_paper_team))
+        .route(
+            "/api/admin/v2/paper-teams/{id}",
+            get(admin_v2_paper_team).put(admin_v2_update_paper_team),
+        )
         .route(
             "/api/admin/v2/paper-teams/{id}/template-change/preview",
             post(admin_v2_template_change_preview),
@@ -993,7 +1022,7 @@ async fn register(
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure"),
     };
     match state.repo.create_account(&email, &hash).await {
-        Ok(user) => session_response(&state, &headers, user.user_id, user.email).await,
+        Ok(user) => session_response(&state, &headers, user.user_id, user.email, false).await,
         Err(AppError::Conflict) => error(StatusCode::CONFLICT, "account exists"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
     }
@@ -1006,13 +1035,13 @@ async fn login(
     if let Err(r) = csrf(&headers) {
         return r;
     };
-    let Some((user, email)) = (match valid_credentials(&state, &input).await {
+    let Some((user, email, must_change_password)) = (match valid_credentials(&state, &input).await {
         Ok(value) => value,
         Err(response) => return response,
     }) else {
         return error(StatusCode::UNAUTHORIZED, "invalid credentials");
     };
-    session_response(&state, &headers, user, email).await
+    session_response(&state, &headers, user, email, must_change_password).await
 }
 
 async fn browser_login(
@@ -1023,7 +1052,8 @@ async fn browser_login(
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    let Some((user, _email)) = (match valid_credentials(&state, &input).await {
+    let Some((user, _email, must_change_password)) = (match valid_credentials(&state, &input).await
+    {
         Ok(value) => value,
         Err(response) => return response,
     }) else {
@@ -1038,7 +1068,7 @@ async fn browser_login(
         Err(response) => return response,
     };
     let location = match principal_kind_for_user(&state, user).await {
-        Ok(kind) => landing_path(kind),
+        Ok(kind) => landing_path_for(kind, must_change_password),
         Err(response) => return response,
     };
     redirect_with_cookies(location, cookies)
@@ -1047,7 +1077,7 @@ async fn browser_login(
 async fn valid_credentials(
     state: &AppState,
     input: &Credentials,
-) -> Result<Option<(UserId, String)>, Response> {
+) -> Result<Option<(UserId, String, bool)>, Response> {
     let email = match auth::normalized_email(&input.email) {
         Ok(value) => value,
         Err(_) => return Ok(None),
@@ -1069,7 +1099,81 @@ async fn valid_credentials(
     }
     let valid = auth::verify_password(&input.password, &user.password_hash)
         .map_err(|()| error(StatusCode::INTERNAL_SERVER_ERROR, "authentication failure"))?;
-    Ok(valid.then_some((user.user_id, user.email)))
+    Ok(valid.then_some((user.user_id, user.email, user.must_change_password)))
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PasswordChangeInput>,
+) -> Response {
+    complete_password_change(&state, &headers, &input, false).await
+}
+
+async fn browser_change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(input): Form<PasswordChangeInput>,
+) -> Response {
+    complete_password_change(&state, &headers, &input, true).await
+}
+
+async fn complete_password_change(
+    state: &AppState,
+    headers: &HeaderMap,
+    input: &PasswordChangeInput,
+    browser: bool,
+) -> Response {
+    if let Err(response) = csrf(headers) {
+        return response;
+    }
+    let principal = match principal_auth_allow_temporary(state, headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !principal.session.must_change_password {
+        return error(StatusCode::CONFLICT, "password change is not required");
+    }
+    if input.new_password != input.confirm_password {
+        return password_change_error(browser, "Passwords do not match.");
+    }
+    let hash = match auth::hash_password(&input.new_password) {
+        Ok(value) => value,
+        Err(_) => {
+            return password_change_error(browser, "Password must be 12–256 characters.");
+        }
+    };
+    if let Err(error_value) = state
+        .repo
+        .complete_password_change(principal.user_id(), &hash)
+        .await
+    {
+        return match error_value {
+            AppError::Conflict => error(StatusCode::CONFLICT, "password already changed"),
+            _ => error(StatusCode::INTERNAL_SERVER_ERROR, "password change failed"),
+        };
+    }
+    let cookies = match create_session_headers(state, headers, principal.user_id()).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if browser {
+        redirect_with_cookies(landing_path(principal.kind), cookies)
+    } else {
+        (StatusCode::NO_CONTENT, cookies).into_response()
+    }
+}
+
+fn password_change_error(browser: bool, message: &'static str) -> Response {
+    if browser {
+        (
+            StatusCode::BAD_REQUEST,
+            Html(change_password_html(Some(message))),
+        )
+            .into_response()
+    } else {
+        error(StatusCode::BAD_REQUEST, message)
+    }
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1158,7 +1262,24 @@ async fn admin_v2_create_user(
         Ok(value) => value,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid V2 role"),
     };
-    let password_hash = match auth::hash_password(&input.password) {
+    if role == GlobalRole::Admin && input.generate_temporary_password {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "temporary-password provisioning is limited to Writer and Mentor",
+        );
+    }
+    let temporary_password = input
+        .generate_temporary_password
+        .then(auth::temporary_password);
+    let password_hash_result = match temporary_password.as_deref() {
+        Some(value) => auth::hash_temporary_password(value),
+        None => input
+            .password
+            .as_deref()
+            .ok_or(())
+            .and_then(auth::hash_password),
+    };
+    let password_hash = match password_hash_result {
         Ok(value) => value,
         Err(_) => {
             return error(
@@ -1169,7 +1290,7 @@ async fn admin_v2_create_user(
     };
     match state
         .repo
-        .create_v2_account(&email, &password_hash, role)
+        .create_v2_account(&email, &password_hash, role, temporary_password.is_some())
         .await
     {
         Ok(user) => (
@@ -1178,12 +1299,60 @@ async fn admin_v2_create_user(
                 "user_id": user.user_id,
                 "email": user.email,
                 "enabled": user.enabled,
-                "role": role
+                "role": role,
+                "must_change_password": user.must_change_password,
+                "temporary_password": temporary_password
             })),
         )
             .into_response(),
         Err(AppError::Conflict) => error(StatusCode::CONFLICT, "email already exists"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "account creation failed"),
+    }
+}
+
+async fn admin_v2_reset_temporary_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let user_id = match parse_user_id(&user_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let temporary_password = auth::temporary_password();
+    let password_hash = match auth::hash_temporary_password(&temporary_password) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential generation failed",
+            );
+        }
+    };
+    match state
+        .repo
+        .reset_v2_temporary_password(principal.user_id(), user_id, &password_hash)
+        .await
+    {
+        Ok(email) => Json(serde_json::json!({
+            "email":email,
+            "temporary_password":temporary_password,
+            "must_change_password":true
+        }))
+        .into_response(),
+        Err(AppError::Forbidden) => error(
+            StatusCode::FORBIDDEN,
+            "temporary passwords can only be generated for Writer or Mentor",
+        ),
+        Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "account not found"),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "password reset failed"),
     }
 }
 
@@ -1539,16 +1708,23 @@ async fn admin_v2_institution_batch_apply(
         Ok(value) => value,
         Err(error_value) => return institution_error(error_value),
     };
+    let account_provisioning = detail["account_provisioning"].clone();
     if detail["batch"]["operation"] != "DELETE" {
         let job_id = match state.institution.batch_primary_job(batch_id).await {
             Ok(value) => value,
             Err(error_value) => return institution_error(error_value),
         };
-        let _materialization =
+        let materialization =
             admin_v2_institution_apply(State(state.clone()), headers.clone(), Path(job_id)).await;
+        if materialization.status().is_server_error() {
+            return materialization;
+        }
     }
     match state.institution.batch_detail(batch_id, 100).await {
-        Ok(batch) => Json(batch).into_response(),
+        Ok(mut current) => {
+            current["account_provisioning"] = account_provisioning;
+            Json(current).into_response()
+        }
         Err(error_value) => institution_error(error_value),
     }
 }
@@ -1622,7 +1798,7 @@ async fn admin_v2_institution_apply(
     let mut unresolved = 0_u64;
     for plan in plans {
         if plan.existing_paper_team_id.is_some() {
-            if applied_job.mode == "ADD_ONLY" {
+            if applied_job.job.mode == "ADD_ONLY" {
                 continue;
             }
             if !plan.unresolved.is_empty() {
@@ -1761,6 +1937,7 @@ async fn admin_v2_institution_apply(
     match state.institution.job(job_id).await {
         Ok(job) => Json(serde_json::json!({
             "job": job,
+            "account_provisioning": applied_job.account_provisioning,
             "materialized_teams": materialized,
             "merged_teams": merged,
             "unresolved_teams": unresolved,
@@ -2304,6 +2481,54 @@ async fn admin_v2_paper_team(
             v2_error(error_value)
         }
         (_, _, _, Err(error_value)) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_update_paper_team(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<V2PaperTeamUpdateInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let writers = match parse_user_ids(&input.writer_ids) {
+        Ok(value) => value
+            .into_iter()
+            .map(|value| *value.as_uuid())
+            .collect::<Vec<_>>(),
+        Err(response) => return response,
+    };
+    let mentors = match parse_user_ids(&input.mentor_ids) {
+        Ok(value) => value
+            .into_iter()
+            .map(|value| *value.as_uuid())
+            .collect::<Vec<_>>(),
+        Err(response) => return response,
+    };
+    let leader = match parse_user_id(&input.leader_writer_id) {
+        Ok(value) => *value.as_uuid(),
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .update_paper_team(
+            principal.user_id(),
+            id,
+            &input.name,
+            &writers,
+            leader,
+            &mentors,
+        )
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error_value) => institution_error(error_value),
     }
 }
 
@@ -4810,8 +5035,13 @@ async fn admin_create_user(
             "invalid institutional account type",
         );
     }
+    let generated = input.password.is_none();
     let password = input.password.unwrap_or_else(auth::temporary_password);
-    let hash = match auth::hash_password(&password) {
+    let hash = match if generated {
+        auth::hash_temporary_password(&password)
+    } else {
+        auth::hash_password(&password)
+    } {
         Ok(value) => value,
         Err(_) => {
             return error(
@@ -4895,8 +5125,13 @@ async fn admin_reset_password(
         Ok(value) => value,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
     };
+    let generated = input.password.is_none();
     let password = input.password.unwrap_or_else(auth::temporary_password);
-    let hash = match auth::hash_password(&password) {
+    let hash = match if generated {
+        auth::hash_temporary_password(&password)
+    } else {
+        auth::hash_password(&password)
+    } {
         Ok(value) => value,
         Err(_) => {
             return error(
@@ -7365,6 +7600,20 @@ async fn principal_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedPrincipal, Response> {
+    let principal = principal_auth_allow_temporary(state, headers).await?;
+    if principal.session.must_change_password {
+        return Err(error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "password change required",
+        ));
+    }
+    Ok(principal)
+}
+
+async fn principal_auth_allow_temporary(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedPrincipal, Response> {
     let token = cookie(headers)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "authentication required"))?;
     let session = state
@@ -7381,6 +7630,7 @@ async fn session_response(
     headers: &HeaderMap,
     user: UserId,
     email: String,
+    must_change_password: bool,
 ) -> Response {
     let cookies = match create_session_headers(state, headers, user).await {
         Ok(value) => value,
@@ -7389,10 +7639,12 @@ async fn session_response(
     (
         StatusCode::CREATED,
         cookies,
-        Json(match identity_for_user(state, user, email).await {
-            Ok(identity) => identity,
-            Err(response) => return response,
-        }),
+        Json(
+            match identity_for_user(state, user, email, must_change_password).await {
+                Ok(identity) => identity,
+                Err(response) => return response,
+            },
+        ),
     )
         .into_response()
 }
@@ -7429,6 +7681,7 @@ async fn identity_response(state: &AppState, principal: AuthenticatedPrincipal) 
         principal.user_id(),
         principal.email().to_owned(),
         principal.kind,
+        principal.session.must_change_password,
     )
     .await
     {
@@ -7441,6 +7694,7 @@ async fn identity_for_user(
     state: &AppState,
     user: UserId,
     email: String,
+    must_change_password: bool,
 ) -> Result<UserWire, Response> {
     let kind = if let Some(assignment) = state
         .v2
@@ -7458,7 +7712,7 @@ async fn identity_for_user(
                 .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session failure"))?,
         )
     };
-    identity_for_kind(state, user, email, kind).await
+    identity_for_kind(state, user, email, kind, must_change_password).await
 }
 
 async fn identity_for_kind(
@@ -7466,12 +7720,13 @@ async fn identity_for_kind(
     user: UserId,
     email: String,
     kind: PrincipalKind,
+    must_change_password: bool,
 ) -> Result<UserWire, Response> {
     let (account_type, persona, landing_path, v2_role, is_admin, has_mentor_projects) = match kind {
         PrincipalKind::V2(role) => (
             role.as_str(),
             role.as_str(),
-            landing_path(kind),
+            landing_path_for(kind, must_change_password),
             Some(role.as_str().to_owned()),
             role == GlobalRole::Admin,
             false,
@@ -7497,7 +7752,7 @@ async fn identity_for_kind(
             (
                 account_type.as_str(),
                 persona,
-                landing_path(kind),
+                landing_path_for(kind, must_change_password),
                 None,
                 is_admin,
                 has_mentor_projects,
@@ -7515,6 +7770,7 @@ async fn identity_for_kind(
             can_open_admin: is_admin,
             has_mentor_projects,
         },
+        must_change_password,
     })
 }
 
@@ -7546,6 +7802,14 @@ const fn landing_path(kind: PrincipalKind) -> &'static str {
             "/admin"
         }
         PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => "/account-setup",
+    }
+}
+
+const fn landing_path_for(kind: PrincipalKind, must_change_password: bool) -> &'static str {
+    if must_change_password {
+        "/change-password"
+    } else {
+        landing_path(kind)
     }
 }
 
@@ -7743,6 +8007,13 @@ fn account_setup_html() -> &'static str {
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Account setup required — LaTeX Core</title><link rel=\"stylesheet\" href=\"/static/styles.css?v=cutover\"></head><body><main class=\"login-view\"><section class=\"login-card\"><div class=\"wordmark\">LaTeX Core</div><h1>Account setup required</h1><p>This account has not yet been assigned a Writer, Mentor, or Admin role.</p><form method=\"post\" action=\"/logout\"><button class=\"primary\" type=\"submit\">Log out</button></form></section></main></body></html>"
 }
 
+fn change_password_html(error_message: Option<&str>) -> String {
+    let error = error_message.unwrap_or("");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Set your password — LaTeX Core</title><link rel=\"stylesheet\" href=\"/static/styles.css?v=v2-2-password\"></head><body><main class=\"login-view\"><section class=\"login-card\"><div class=\"wordmark\">LaTeX Core</div><h1>Set your password</h1><p>Your temporary password worked. Choose a new password before continuing.</p><p class=\"danger\" role=\"alert\">{error}</p><form method=\"post\" action=\"/change-password\"><label>New password<input name=\"new_password\" type=\"password\" minlength=\"12\" maxlength=\"256\" required autocomplete=\"new-password\"></label><label>Confirm password<input name=\"confirm_password\" type=\"password\" minlength=\"12\" maxlength=\"256\" required autocomplete=\"new-password\"></label><button class=\"primary\" type=\"submit\">Set password</button></form><form method=\"post\" action=\"/logout\"><button type=\"submit\">Log out</button></form></section></main></body></html>"
+    )
+}
+
 fn redirect_with_cookies(location: &'static str, cookies: HeaderMap) -> Response {
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response();
     response.headers_mut().extend(cookies);
@@ -7750,24 +8021,30 @@ fn redirect_with_cookies(location: &'static str, cookies: HeaderMap) -> Response
 }
 
 async fn ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let principal = match principal_auth(&state, &headers).await {
+    let principal = match principal_auth_allow_temporary(&state, &headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             return Html(login_html(None)).into_response();
         }
         Err(response) => return response,
     };
-    redirect_with_cookies(landing_path(principal.kind), HeaderMap::new())
+    redirect_with_cookies(
+        landing_path_for(principal.kind, principal.session.must_change_password),
+        HeaderMap::new(),
+    )
 }
 
 async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let principal = match principal_auth(&state, &headers).await {
+    let principal = match principal_auth_allow_temporary(&state, &headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             return Html(login_html(None)).into_response();
         }
         Err(response) => return response,
     };
+    if principal.session.must_change_password {
+        return redirect_with_cookies("/change-password", HeaderMap::new());
+    }
     match principal.kind {
         PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => {
             Html(admin_html()).into_response()
@@ -7787,13 +8064,16 @@ async fn mentor_ui(State(state): State<AppState>, headers: HeaderMap) -> Respons
 }
 
 async fn account_setup_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let principal = match principal_auth(&state, &headers).await {
+    let principal = match principal_auth_allow_temporary(&state, &headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             return Html(login_html(None)).into_response();
         }
         Err(response) => return response,
     };
+    if principal.session.must_change_password {
+        return redirect_with_cookies("/change-password", HeaderMap::new());
+    }
     match principal.kind {
         PrincipalKind::Legacy(AccountType::Student | AccountType::Professor) => {
             Html(account_setup_html()).into_response()
@@ -7810,18 +8090,36 @@ async fn role_ui(
     required: GlobalRole,
     html: &'static str,
 ) -> Response {
-    let principal = match principal_auth(state, headers).await {
+    let principal = match principal_auth_allow_temporary(state, headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             return Html(login_html(None)).into_response();
         }
         Err(response) => return response,
     };
+    if principal.session.must_change_password {
+        return redirect_with_cookies("/change-password", HeaderMap::new());
+    }
     match principal.kind {
         PrincipalKind::V2(role) if role == required => Html(html).into_response(),
         PrincipalKind::V2(_) | PrincipalKind::Legacy(_) => {
             error(StatusCode::FORBIDDEN, "role-specific access required")
         }
+    }
+}
+
+async fn change_password_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match principal_auth_allow_temporary(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
+        Err(response) => return response,
+    };
+    if principal.session.must_change_password {
+        Html(change_password_html(None)).into_response()
+    } else {
+        redirect_with_cookies(landing_path(principal.kind), HeaderMap::new())
     }
 }
 
@@ -8109,7 +8407,6 @@ mod tests {
             "INSTITUTION DATA",
             "IMPORTS",
             "PAPER TEAMS",
-            "PROGRAMME TEMPLATES",
             "TEMPLATES",
             "FILE POLICIES",
             "VERSIONS",
@@ -8121,6 +8418,7 @@ mod tests {
             assert!(admin.contains(required), "missing Admin section {required}");
         }
         assert!(!admin.contains("LEGACY RESEARCH GROUPS"));
+        assert!(!admin.contains("PROGRAMME TEMPLATES"));
     }
 
     #[test]
@@ -8413,6 +8711,273 @@ mod database_tests {
             get(&app, "/api/v2/me", Some(&mentor.cookie)).await.status(),
             StatusCode::UNAUTHORIZED
         );
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn temporary_password_requires_first_login_change_before_role_access() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
+        let repo = AppRepository::new(database.clone());
+        let email = format!("{}@temporary.example", uuid::Uuid::new_v4());
+        let temporary_password = auth::temporary_password();
+        let temporary_hash = auth::hash_temporary_password(&temporary_password).unwrap();
+        repo.create_v2_account(&email, &temporary_hash, GlobalRole::Writer, true)
+            .await
+            .unwrap();
+
+        let login = login_request(&app, &email, &temporary_password).await;
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        assert_eq!(login.headers()[header::LOCATION], "/change-password");
+        let temporary_cookie = response_cookie(&login);
+        let write = get(&app, "/write", Some(&temporary_cookie)).await;
+        assert_eq!(write.status(), StatusCode::SEE_OTHER);
+        assert_eq!(write.headers()[header::LOCATION], "/change-password");
+        assert_eq!(
+            get(&app, "/api/v2/writer/papers", Some(&temporary_cookie))
+                .await
+                .status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            get(&app, "/change-password", Some(&temporary_cookie))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let new_password = "A-New-Permanent-Password-2026";
+        let changed = request(
+            &app,
+            Method::POST,
+            "/change-password",
+            Some(&temporary_cookie),
+            &format!("new_password={new_password}&confirm_password={new_password}"),
+            Some("application/x-www-form-urlencoded"),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(changed.headers()[header::LOCATION], "/write");
+        let active_cookie = response_cookie(&changed);
+        assert_eq!(
+            get(&app, "/write", Some(&active_cookie)).await.status(),
+            StatusCode::OK
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT must_change_password FROM latex_core.user_credentials WHERE email=$1",
+            )
+            .bind(&email)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            login_request(&app, &email, &temporary_password)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let permanent_login = login_request(&app, &email, new_password).await;
+        assert_eq!(permanent_login.status(), StatusCode::SEE_OTHER);
+        assert_eq!(permanent_login.headers()[header::LOCATION], "/write");
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn one_add_batch_provisions_accounts_and_materializes_a_team() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+        let template_id = uuid::Uuid::new_v4();
+        let main = state
+            .blobs
+            .put(Bytes::from_static(b"\\documentclass{article}\n"))
+            .await
+            .unwrap();
+        state
+            .repo
+            .create_template(
+                template_id,
+                "Institution default",
+                None,
+                Some("main.tex"),
+                &[AppTemplateFileRecord {
+                    path: "main.tex".into(),
+                    blob_hash: main.hash(),
+                    size_bytes: main.size_bytes(),
+                }],
+            )
+            .await
+            .unwrap();
+        state
+            .institution
+            .set_global_fallback(admin_id, template_id)
+            .await
+            .unwrap();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let department_id = uuid::Uuid::new_v4();
+        let programme = format!("P{suffix}");
+        let faculty_id = format!("F{suffix}");
+        let reg_no = format!("S{suffix}");
+        let external_team_key = format!("T{suffix}");
+        let student_email = format!("newstudent-{suffix}@example.edu");
+        let mentor_email = format!("newmentor-{suffix}@example.edu");
+        let files = vec![
+            ("departments.csv", format!("department_id\n{department_id}\n").into_bytes()),
+            ("faculty.csv", format!("faculty_id,name,email,dept_id,honorific,designation,status\n{faculty_id},New Mentor,{mentor_email},{department_id},Dr,Mentor,ACTIVE\n").into_bytes()),
+            ("programmes.csv", format!("programme_code,hod_id\n{programme},{faculty_id}\n").into_bytes()),
+            ("students.csv", format!("reg_no,name,email,programme_code\n{reg_no},New Student,{student_email},{programme}\n").into_bytes()),
+            ("paper_teams.csv", format!("external_team_key,team_name,academic_year,semester,status\n{external_team_key},Imported Team,2026,1,ACTIVE\n").into_bytes()),
+            ("paper_team_writers.csv", format!("external_team_key,student_reg_no,writer_order,is_leader\n{external_team_key},{reg_no},1,true\n").into_bytes()),
+            ("paper_team_mentors.csv", format!("external_team_key,faculty_id\n{external_team_key},{faculty_id}\n").into_bytes()),
+        ];
+        let (multipart, content_type) = institution_batch_multipart(&files);
+        let validated = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/institution/import-batches/validate",
+                Some(&admin.cookie),
+                multipart,
+                Some(&content_type),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(validated["batch"]["status"], "VALIDATED");
+        let batch_id = validated["batch"]["id"].as_str().unwrap();
+        let applied = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/institution/import-batches/{batch_id}/apply"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let credentials = applied["account_provisioning"]["credentials"]
+            .as_array()
+            .unwrap();
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(applied["account_provisioning"]["created"], 2);
+        let paper_team_id: uuid::Uuid = sqlx::query_scalar("SELECT paper_team_id FROM latex_core.external_paper_team_links WHERE external_team_key=$1").bind(&external_team_key).fetch_one(&pool).await.unwrap();
+        let members: Vec<(String, String, bool, Option<i32>)> = sqlx::query_as("SELECT credentials.email,role.role,member.is_leader,member.writer_order FROM latex_core.paper_team_members member JOIN latex_core.user_credentials credentials ON credentials.user_id=member.user_id JOIN latex_core.global_user_roles role ON role.user_id=member.user_id WHERE member.paper_team_id=$1 ORDER BY member.writer_order NULLS LAST").bind(paper_team_id).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            members,
+            vec![
+                (student_email.clone(), "writer".into(), true, Some(1)),
+                (mentor_email.clone(), "mentor".into(), false, None)
+            ]
+        );
+        let pinned: uuid::Uuid = sqlx::query_scalar(
+            "SELECT template_id FROM latex_core.paper_template_pins WHERE paper_id=$1",
+        )
+        .bind(paper_team_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pinned, template_id);
+
+        for credential in credentials {
+            let email = credential["email"].as_str().unwrap();
+            let temporary = credential["temporary_password"].as_str().unwrap();
+            assert_eq!(temporary.len(), 8);
+            let login = login_request(&app, email, temporary).await;
+            assert_eq!(login.headers()[header::LOCATION], "/change-password");
+            let temporary_cookie = response_cookie(&login);
+            let new_password = format!(
+                "Permanent-{suffix}-{}",
+                credential["credential_role"].as_str().unwrap()
+            );
+            let changed = request(
+                &app,
+                Method::POST,
+                "/change-password",
+                Some(&temporary_cookie),
+                &format!("new_password={new_password}&confirm_password={new_password}"),
+                Some("application/x-www-form-urlencoded"),
+            )
+            .await;
+            let expected_path = if credential["credential_role"] == "student" {
+                "/write"
+            } else {
+                "/review"
+            };
+            assert_eq!(changed.headers()[header::LOCATION], expected_path);
+            let active_cookie = response_cookie(&changed);
+            let papers_path = if credential["credential_role"] == "student" {
+                "/api/v2/writer/papers"
+            } else {
+                "/api/v2/mentor/papers"
+            };
+            let papers = test_json(get(&app, papers_path, Some(&active_cookie)).await).await;
+            assert!(papers.to_string().contains(&paper_team_id.to_string()));
+        }
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn admin_temporary_password_reset_is_one_time_and_revokes_sessions() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
+        let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let reset = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/users/{writer_id}/temporary-password"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let temporary = reset["temporary_password"].as_str().unwrap();
+        assert_eq!(temporary.len(), 8);
+        assert_eq!(reset["must_change_password"], true);
+        assert_eq!(
+            get(&app, "/api/v2/writer/papers", Some(&writer.cookie))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let stored: (String, bool) = sqlx::query_as(
+            "SELECT password_hash,must_change_password FROM latex_core.user_credentials WHERE user_id=$1",
+        )
+        .bind(writer_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stored.0.starts_with("$argon2"));
+        assert!(!stored.0.contains(temporary));
+        assert!(stored.1);
+        let audit: (String, String) = sqlx::query_as(
+            "SELECT event_type,metadata::text FROM latex_core.audit_events \
+             WHERE resource_id=$1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(writer_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.0, "account.temporary_password.generated");
+        assert!(!audit.1.contains(temporary));
+        let login = login_request(&app, &writer.email, temporary).await;
+        assert_eq!(login.headers()[header::LOCATION], "/change-password");
 
         pool.close().await;
         database.close().await;
@@ -11974,6 +12539,26 @@ mod database_tests {
 
     async fn get(app: &Router, path: &str, cookie: Option<&str>) -> Response {
         request(app, Method::GET, path, cookie, "", None).await
+    }
+
+    fn institution_batch_multipart(files: &[(&str, Vec<u8>)]) -> (Vec<u8>, String) {
+        const BOUNDARY: &str = "latex-core-institution-batch-test-boundary";
+        let mut body = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"operation\"\r\n\r\nADD\r\n"
+        )
+        .into_bytes();
+        for (filename, bytes) in files {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"files[]\"; filename=\"{filename}\"\r\nContent-Type: text/csv\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        (body, format!("multipart/form-data; boundary={BOUNDARY}"))
     }
 
     async fn request(

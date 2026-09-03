@@ -13,6 +13,7 @@ default = []
 database-tests = []
 
 [dependencies]
+argon2.workspace = true
 calamine.workspace = true
 core-types.workspace = true
 csv.workspace = true

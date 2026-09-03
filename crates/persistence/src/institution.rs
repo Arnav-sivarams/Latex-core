@@ -1,6 +1,6 @@
 //! V2.2 institutional source-of-record, bounded file parsing, and import application.
 
-use crate::Database;
+use crate::{Database, credentials};
 use calamine::{Data, Reader, Xlsx};
 use core_types::UserId;
 use csv::StringRecord;
@@ -47,6 +47,22 @@ const APPLY_ORDER: [&str; 13] = [
     "paper_team_writers",
     "paper_team_mentors",
 ];
+
+const PEOPLE_APPLY_ORDER: [&str; 10] = [
+    "departments",
+    "schools",
+    "admins",
+    "faculty",
+    "programmes",
+    "students",
+    "student_course_registrations",
+    "faculty_guide_capacity",
+    "department_roles",
+    "faculty_roles",
+];
+
+const ASSIGNMENT_APPLY_ORDER: [&str; 3] =
+    ["paper_teams", "paper_team_writers", "paper_team_mentors"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -214,6 +230,27 @@ pub struct InstitutionImportBatch {
     pub created_at: String,
     pub validated_at: Option<String>,
     pub applied_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GeneratedCredential {
+    pub email: String,
+    pub temporary_password: String,
+    pub credential_role: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AccountProvisioningResult {
+    pub created: u64,
+    pub reused: u64,
+    pub needs_attention: u64,
+    pub credentials: Vec<GeneratedCredential>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppliedInstitutionImport {
+    pub job: InstitutionImportJob,
+    pub account_provisioning: AccountProvisioningResult,
 }
 
 #[derive(Clone, Debug)]
@@ -687,7 +724,7 @@ impl InstitutionRepository {
         &self,
         job_id: Uuid,
         actor: UserId,
-    ) -> Result<InstitutionImportJob, InstitutionError> {
+    ) -> Result<AppliedInstitutionImport, InstitutionError> {
         let mut tx = self
             .database
             .pool()
@@ -714,7 +751,10 @@ impl InstitutionRepository {
         }
         if status == "APPLIED" || status == "PARTIAL" {
             tx.rollback().await.map_err(InstitutionError::Database)?;
-            return self.job(job_id).await;
+            return Ok(AppliedInstitutionImport {
+                job: self.job(job_id).await?,
+                account_provisioning: AccountProvisioningResult::default(),
+            });
         }
         if status != "VALIDATED" || error_rows != 0 {
             return Err(InstitutionError::Conflict(
@@ -728,12 +768,12 @@ impl InstitutionRepository {
             .map_err(InstitutionError::Database)?;
 
         let import_mode = mode.parse::<ImportMode>()?;
-        let order = if import_mode == ImportMode::DeleteOnly {
+        let first_order = if import_mode == ImportMode::DeleteOnly {
             APPLY_ORDER.iter().rev().copied().collect::<Vec<_>>()
         } else {
-            APPLY_ORDER.to_vec()
+            PEOPLE_APPLY_ORDER.to_vec()
         };
-        for table in order {
+        for table in first_order {
             let payloads: Vec<Value> = sqlx::query_scalar(
                 "SELECT payload FROM latex_core.institution_import_rows \
                  WHERE job_id=$1 AND source_table_or_sheet=$2 AND status='VALID' ORDER BY row_number",
@@ -747,7 +787,29 @@ impl InstitutionRepository {
                 apply_table(&mut tx, table, import_mode, Value::Array(payloads)).await?;
             }
         }
+        let account_provisioning = if matches!(import_mode, ImportMode::AddOnly | ImportMode::Merge)
+        {
+            provision_import_accounts_tx(&mut tx, actor, &[job_id]).await?
+        } else {
+            AccountProvisioningResult::default()
+        };
         reconcile_identity_links_tx(&mut tx, actor).await?;
+        if import_mode != ImportMode::DeleteOnly {
+            for table in ASSIGNMENT_APPLY_ORDER {
+                let payloads: Vec<Value> = sqlx::query_scalar(
+                    "SELECT payload FROM latex_core.institution_import_rows \
+                     WHERE job_id=$1 AND source_table_or_sheet=$2 AND status='VALID' ORDER BY row_number",
+                )
+                .bind(job_id)
+                .bind(table)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+                if !payloads.is_empty() {
+                    apply_table(&mut tx, table, import_mode, Value::Array(payloads)).await?;
+                }
+            }
+        }
         let inserted: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM latex_core.institution_import_rows WHERE job_id=$1 AND action='INSERT'",
         )
@@ -796,7 +858,10 @@ impl InstitutionRepository {
         )
         .await?;
         tx.commit().await.map_err(InstitutionError::Database)?;
-        self.job(job_id).await
+        Ok(AppliedInstitutionImport {
+            job: self.job(job_id).await?,
+            account_provisioning,
+        })
     }
 
     pub async fn apply_batch(
@@ -827,7 +892,11 @@ impl InstitutionRepository {
             .map_err(InstitutionError::Database)?;
         if status == "APPLIED" || status == "PARTIAL" {
             tx.rollback().await.map_err(InstitutionError::Database)?;
-            return self.batch_detail(batch_id, 100).await;
+            let mut detail = self.batch_detail(batch_id, 100).await?;
+            detail["account_provisioning"] =
+                serde_json::to_value(AccountProvisioningResult::default())
+                    .map_err(|error| InstitutionError::InvalidInput(error.to_string()))?;
+            return Ok(detail);
         }
         if status != "VALIDATED" || error_rows != 0 {
             return Err(InstitutionError::Conflict(
@@ -849,12 +918,12 @@ impl InstitutionRepository {
         .execute(&mut *tx)
         .await
         .map_err(InstitutionError::Database)?;
-        let order = if mode == ImportMode::DeleteOnly {
+        let first_order = if mode == ImportMode::DeleteOnly {
             APPLY_ORDER.iter().rev().copied().collect::<Vec<_>>()
         } else {
-            APPLY_ORDER.to_vec()
+            PEOPLE_APPLY_ORDER.to_vec()
         };
-        for table in order {
+        for table in first_order {
             let payloads: Vec<Value> = sqlx::query_scalar(
                 "SELECT row.payload FROM latex_core.institution_import_rows row \
                  JOIN latex_core.institution_import_jobs job ON job.id=row.job_id \
@@ -870,7 +939,37 @@ impl InstitutionRepository {
                 apply_table(&mut tx, table, mode, Value::Array(payloads)).await?;
             }
         }
+        let job_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM latex_core.institution_import_jobs WHERE batch_id=$1 ORDER BY created_at,id",
+        )
+        .bind(batch_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        let account_provisioning = if mode == ImportMode::AddOnly {
+            provision_import_accounts_tx(&mut tx, actor, &job_ids).await?
+        } else {
+            AccountProvisioningResult::default()
+        };
         reconcile_identity_links_tx(&mut tx, actor).await?;
+        if mode != ImportMode::DeleteOnly {
+            for table in ASSIGNMENT_APPLY_ORDER {
+                let payloads: Vec<Value> = sqlx::query_scalar(
+                    "SELECT row.payload FROM latex_core.institution_import_rows row \
+                     JOIN latex_core.institution_import_jobs job ON job.id=row.job_id \
+                     WHERE job.batch_id=$1 AND row.source_table_or_sheet=$2 AND row.status='VALID' \
+                     AND row.action IN ('INSERT','UPDATE') ORDER BY row.row_number",
+                )
+                .bind(batch_id)
+                .bind(table)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+                if !payloads.is_empty() {
+                    apply_table(&mut tx, table, mode, Value::Array(payloads)).await?;
+                }
+            }
+        }
         sqlx::query(
             r"UPDATE latex_core.institution_import_jobs job SET
                  status='APPLIED',
@@ -909,7 +1008,10 @@ impl InstitutionRepository {
         )
         .await?;
         tx.commit().await.map_err(InstitutionError::Database)?;
-        self.batch_detail(batch_id, 100).await
+        let mut detail = self.batch_detail(batch_id, 100).await?;
+        detail["account_provisioning"] = serde_json::to_value(account_provisioning)
+            .map_err(|error| InstitutionError::InvalidInput(error.to_string()))?;
+        Ok(detail)
     }
 
     pub async fn batch_primary_job(&self, batch_id: Uuid) -> Result<Uuid, InstitutionError> {
@@ -2416,6 +2518,226 @@ impl InstitutionRepository {
         tx.commit().await.map_err(InstitutionError::Database)
     }
 
+    pub async fn update_paper_team(
+        &self,
+        actor: UserId,
+        paper_team_id: Uuid,
+        name: &str,
+        writer_user_ids: &[Uuid],
+        leader_user_id: Uuid,
+        mentor_user_ids: &[Uuid],
+    ) -> Result<Value, InstitutionError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 200 {
+            return Err(InstitutionError::InvalidInput(
+                "Team name must contain between 1 and 200 characters".into(),
+            ));
+        }
+        if writer_user_ids.is_empty() || !writer_user_ids.contains(&leader_user_id) {
+            return Err(InstitutionError::InvalidInput(
+                "Team must have at least one Writer and exactly one selected Writer Leader".into(),
+            ));
+        }
+        let mut unique = HashSet::new();
+        if writer_user_ids
+            .iter()
+            .chain(mentor_user_ids)
+            .any(|user_id| !unique.insert(*user_id))
+        {
+            return Err(InstitutionError::InvalidInput(
+                "a Team member cannot be assigned more than once".into(),
+            ));
+        }
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        let admin_role: Option<String> =
+            sqlx::query_scalar("SELECT role FROM latex_core.global_user_roles WHERE user_id=$1")
+                .bind(actor.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+        if admin_role.as_deref() != Some("admin") {
+            return Err(InstitutionError::Conflict("V2 Admin required".into()));
+        }
+        sqlx::query("SELECT id FROM latex_core.paper_teams WHERE id=$1 FOR UPDATE")
+            .bind(paper_team_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?
+            .ok_or(InstitutionError::NotFound)?;
+        let writer_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.global_user_roles WHERE user_id=ANY($1) AND role='writer'",
+        )
+        .bind(writer_user_ids)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        let mentor_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.global_user_roles WHERE user_id=ANY($1) AND role='mentor'",
+        )
+        .bind(mentor_user_ids)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        if usize::try_from(writer_count).ok() != Some(writer_user_ids.len())
+            || usize::try_from(mentor_count).ok() != Some(mentor_user_ids.len())
+        {
+            return Err(InstitutionError::Conflict(
+                "Writers must have global WRITER and Mentors must have global MENTOR".into(),
+            ));
+        }
+        let external_team_key: Option<String> = sqlx::query_scalar(
+            "SELECT external_team_key FROM latex_core.external_paper_team_links WHERE paper_team_id=$1",
+        )
+        .bind(paper_team_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        let mut writer_external_ids = Vec::new();
+        let mut mentor_external_ids = Vec::new();
+        if let Some(external_key) = &external_team_key {
+            for user_id in writer_user_ids {
+                let reg_no: Option<String> = sqlx::query_scalar(
+                    "SELECT reg_no FROM vcap.student_user_links WHERE user_id=$1 AND status='LINKED'",
+                )
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+                writer_external_ids.push(reg_no.ok_or_else(|| {
+                    InstitutionError::Conflict(format!(
+                        "Writer {user_id} needs a linked Student identity before editing imported Team {external_key}"
+                    ))
+                })?);
+            }
+            for user_id in mentor_user_ids {
+                let faculty_id: Option<String> = sqlx::query_scalar(
+                    "SELECT faculty_id FROM vcap.faculty_user_links WHERE user_id=$1 AND status='LINKED'",
+                )
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+                mentor_external_ids.push(faculty_id.ok_or_else(|| {
+                    InstitutionError::Conflict(format!(
+                        "Mentor {user_id} needs a linked Faculty identity before editing imported Team {external_key}"
+                    ))
+                })?);
+            }
+            sqlx::query(
+                "UPDATE vcap.paper_assignment_groups SET team_name=$2 WHERE external_team_key=$1",
+            )
+            .bind(external_key)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+            sqlx::query("DELETE FROM vcap.paper_assignment_students WHERE external_team_key=$1")
+                .bind(external_key)
+                .execute(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+            sqlx::query("DELETE FROM vcap.paper_assignment_mentors WHERE external_team_key=$1")
+                .bind(external_key)
+                .execute(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+            for (position, reg_no) in writer_external_ids.iter().enumerate() {
+                let writer_order = i32::try_from(position + 1)
+                    .map_err(|_| InstitutionError::InvalidInput("too many Team Writers".into()))?;
+                sqlx::query(
+                    "INSERT INTO vcap.paper_assignment_students \
+                     (external_team_key,student_reg_no,writer_order,is_leader) VALUES ($1,$2,$3,$4)",
+                )
+                .bind(external_key)
+                .bind(reg_no)
+                .bind(writer_order)
+                .bind(writer_user_ids[position] == leader_user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+            }
+            for faculty_id in &mentor_external_ids {
+                sqlx::query(
+                    "INSERT INTO vcap.paper_assignment_mentors (external_team_key,faculty_id) VALUES ($1,$2)",
+                )
+                .bind(external_key)
+                .bind(faculty_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+            }
+        }
+        sqlx::query("DELETE FROM latex_core.paper_team_members WHERE paper_team_id=$1")
+            .bind(paper_team_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+        for (position, user_id) in writer_user_ids.iter().enumerate() {
+            let writer_order = i32::try_from(position + 1)
+                .map_err(|_| InstitutionError::InvalidInput("too many Team Writers".into()))?;
+            sqlx::query(
+                "INSERT INTO latex_core.paper_team_members \
+                 (paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order) VALUES ($1,$2,$3,$4,$5)",
+            )
+            .bind(paper_team_id)
+            .bind(user_id)
+            .bind(actor.as_uuid())
+            .bind(*user_id == leader_user_id)
+            .bind(writer_order)
+            .execute(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+        }
+        for user_id in mentor_user_ids {
+            sqlx::query(
+                "INSERT INTO latex_core.paper_team_members \
+                 (paper_team_id,user_id,assigned_by_user_id,is_leader,writer_order) VALUES ($1,$2,$3,FALSE,NULL)",
+            )
+            .bind(paper_team_id)
+            .bind(user_id)
+            .bind(actor.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+        }
+        sqlx::query(
+            "UPDATE latex_core.paper_teams SET name=$2,updated_at=statement_timestamp() WHERE id=$1",
+        )
+        .bind(paper_team_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.team.edited",
+            "paper_team",
+            paper_team_id,
+            json!({
+                "external_team_key":external_team_key,
+                "writer_count":writer_user_ids.len(),
+                "mentor_count":mentor_user_ids.len(),
+                "leader_user_id":leader_user_id
+            }),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)?;
+        Ok(json!({
+            "paper_team_id":paper_team_id,
+            "name":name,
+            "writer_user_ids":writer_user_ids,
+            "leader_user_id":leader_user_id,
+            "mentor_user_ids":mentor_user_ids,
+            "external_team_key":external_team_key
+        }))
+    }
+
     pub async fn paginated_paper_teams(
         &self,
         filter: &PaperTeamPageFilter,
@@ -3795,6 +4117,175 @@ fn apply_query(table: &str, merge: bool) -> &'static str {
         }
         _ => unreachable!("apply table is fixed"),
     }
+}
+
+async fn provision_import_accounts_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    actor: UserId,
+    job_ids: &[Uuid],
+) -> Result<AccountProvisioningResult, InstitutionError> {
+    sqlx::query("LOCK TABLE latex_core.user_credentials IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+    let students = sqlx::query(
+        r"SELECT DISTINCT student.reg_no AS external_id,student.email
+           FROM vcap.students student
+           WHERE EXISTS (
+               SELECT 1 FROM latex_core.institution_import_rows row
+               WHERE row.job_id=ANY($1) AND row.status='VALID' AND (
+                   (row.source_table_or_sheet='students' AND row.payload->>'reg_no'=student.reg_no) OR
+                   (row.source_table_or_sheet='paper_team_writers' AND row.payload->>'student_reg_no'=student.reg_no)
+               )
+           ) ORDER BY student.reg_no",
+    )
+    .bind(job_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(InstitutionError::Database)?;
+    let faculty = sqlx::query(
+        r"SELECT DISTINCT faculty.faculty_id AS external_id,faculty.email
+           FROM vcap.faculty faculty
+           WHERE EXISTS (
+               SELECT 1 FROM latex_core.institution_import_rows row
+               WHERE row.job_id=ANY($1) AND row.status='VALID'
+                 AND row.source_table_or_sheet='paper_team_mentors'
+                 AND row.payload->>'faculty_id'=faculty.faculty_id
+           ) ORDER BY faculty.faculty_id",
+    )
+    .bind(job_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(InstitutionError::Database)?;
+    let mut result = AccountProvisioningResult::default();
+    provision_people_rows(tx, &students, "students", "writer", "student", &mut result).await?;
+    provision_people_rows(tx, &faculty, "faculty", "mentor", "mentor", &mut result).await?;
+    audit_tx(
+        tx,
+        actor,
+        "institution.accounts.provisioned",
+        "institution_import",
+        Uuid::nil(),
+        json!({
+            "created":result.created,
+            "reused":result.reused,
+            "needs_attention":result.needs_attention
+        }),
+    )
+    .await?;
+    Ok(result)
+}
+
+async fn provision_people_rows(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    rows: &[PgRow],
+    people_table: &str,
+    required_role: &str,
+    credential_role: &str,
+    result: &mut AccountProvisioningResult,
+) -> Result<(), InstitutionError> {
+    for row in rows {
+        let email: Option<String> = row.try_get("email").map_err(InstitutionError::Database)?;
+        let Some(email) = email.and_then(|value| normalized_institution_email(&value)) else {
+            result.needs_attention = result.needs_attention.saturating_add(1);
+            continue;
+        };
+        let duplicate_query = format!(
+            "SELECT count(*) FROM vcap.{people_table} WHERE email IS NOT NULL AND lower(btrim(email))=$1"
+        );
+        let people_matches: i64 = sqlx::query_scalar(&duplicate_query)
+            .bind(&email)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+        if people_matches != 1 {
+            result.needs_attention = result.needs_attention.saturating_add(1);
+            continue;
+        }
+        let accounts = sqlx::query(
+            r"SELECT credentials.user_id,role.role
+               FROM latex_core.user_credentials credentials
+               LEFT JOIN latex_core.global_user_roles role ON role.user_id=credentials.user_id
+               WHERE lower(btrim(credentials.email))=$1 ORDER BY credentials.user_id",
+        )
+        .bind(&email)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        match accounts.as_slice() {
+            [] => {
+                let temporary_password = credentials::temporary_password();
+                let password_hash = credentials::hash_temporary_password(&temporary_password)
+                    .map_err(|_| {
+                        InstitutionError::Conflict("temporary credential hashing failed".into())
+                    })?;
+                let tenant_id = Uuid::new_v4();
+                let user_id = Uuid::new_v4();
+                sqlx::query("INSERT INTO latex_core.tenants (id) VALUES ($1)")
+                    .bind(tenant_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(InstitutionError::Database)?;
+                sqlx::query("INSERT INTO latex_core.users (id,tenant_id) VALUES ($1,$2)")
+                    .bind(user_id)
+                    .bind(tenant_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(InstitutionError::Database)?;
+                sqlx::query(
+                    "INSERT INTO latex_core.user_credentials \
+                     (user_id,email,password_hash,enabled,account_type,must_change_password) \
+                     VALUES ($1,$2,$3,TRUE,$4,TRUE)",
+                )
+                .bind(user_id)
+                .bind(&email)
+                .bind(password_hash)
+                .bind(if required_role == "mentor" {
+                    "professor"
+                } else {
+                    "student"
+                })
+                .execute(&mut **tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+                sqlx::query(
+                    "INSERT INTO latex_core.global_user_roles (user_id,role) VALUES ($1,$2)",
+                )
+                .bind(user_id)
+                .bind(required_role)
+                .execute(&mut **tx)
+                .await
+                .map_err(InstitutionError::Database)?;
+                result.created = result.created.saturating_add(1);
+                result.credentials.push(GeneratedCredential {
+                    email,
+                    temporary_password,
+                    credential_role: credential_role.to_owned(),
+                });
+            }
+            [account] => {
+                let role: Option<String> = account
+                    .try_get("role")
+                    .map_err(InstitutionError::Database)?;
+                if role.as_deref() == Some(required_role) {
+                    result.reused = result.reused.saturating_add(1);
+                } else {
+                    result.needs_attention = result.needs_attention.saturating_add(1);
+                }
+            }
+            _ => result.needs_attention = result.needs_attention.saturating_add(1),
+        }
+    }
+    Ok(())
+}
+
+fn normalized_institution_email(value: &str) -> Option<String> {
+    let email = value.trim().to_ascii_lowercase();
+    (email.len() >= 3
+        && email.len() <= 320
+        && email.contains('@')
+        && !email.chars().any(char::is_whitespace))
+    .then_some(email)
 }
 
 async fn reconcile_identity_links_tx(

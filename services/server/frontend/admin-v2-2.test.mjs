@@ -7,9 +7,10 @@ const js = readFileSync(new URL('../static/admin.js', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../static/shells.css', import.meta.url), 'utf8');
 
 test('Admin navigation exposes the scalable V2.2 control plane', () => {
-  for (const section of ['INSTITUTION DATA', 'IMPORTS', 'PAPER TEAMS', 'PROGRAMME TEMPLATES']) {
+  for (const section of ['INSTITUTION DATA', 'IMPORTS', 'PAPER TEAMS', 'TEMPLATES']) {
     assert.match(html, new RegExp(section));
   }
+  assert.doesNotMatch(html, /PROGRAMME TEMPLATES/);
   assert.doesNotMatch(html, /RESEARCH GROUPS/);
 });
 
@@ -17,6 +18,17 @@ test('long overview values wrap inside adaptive metric cards', () => {
   assert.match(css, /\.admin-metrics\s*\{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*repeat\(auto-fit/s);
   assert.match(css, /\.admin-metric\s*\{[^}]*min-width:\s*0/s);
   assert.match(css, /\.admin-metric strong\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*word-break:\s*break-word/s);
+});
+
+test('Admin desktop layouts remain bounded at 1366x768 and 1920x1080', () => {
+  assert.match(css, /\.admin-layout\s*\{[^}]*width:\s*min\(1240px, 100%\)[^}]*grid-template-columns:\s*240px minmax\(0, 1fr\)/s);
+  assert.match(css, /\.admin-content\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*auto/s);
+  assert.match(css, /\.admin-table-wrap\s*\{[^}]*width:\s*100%[^}]*overflow-x:\s*auto/s);
+  assert.match(css, /\.admin-dialog\s*\{[^}]*width:\s*min\(980px, calc\(100vw - 32px\)\)[^}]*max-height:\s*calc\(100vh - 32px\)[^}]*overflow:\s*auto/s);
+  for (const [width, height] of [[1366, 768], [1920, 1080]]) {
+    assert.ok(Math.min(980, width - 32) <= width - 32);
+    assert.ok(height - 32 >= 736);
+  }
 });
 
 test('data import supports multi-file drag/drop and Add Edit Delete batches', () => {
@@ -59,9 +71,9 @@ test('data import guide documents Team creation without exposing legacy history'
     'student_reg_no', 'writer_order', 'is_leader',
   ]) assert.match(js, new RegExp(`['"]${field}['"]`));
 
-  assert.match(js, /Student\.email must resolve to an existing V2 WRITER account/);
-  assert.match(js, /does NOT create a privileged Writer account/);
-  assert.match(js, /Faculty\.email must resolve to an existing V2 MENTOR account/);
+  assert.match(js, /valid Student\.email automatically creates or reuses a V2 WRITER account/);
+  assert.match(js, /Faculty assigned in paper_team_mentors automatically receive or reuse a V2 MENTOR account/);
+  assert.match(js, /Unassigned Faculty and institutional Admins are never provisioned/);
   assert.match(js, /Exactly one paper_team_writers row per Team must be marked is_leader = true/);
   assert.match(js, /programme mapping is available, the configured global fallback template is used/);
   assert.match(js, /Existing Team template pins do not silently change later/);
@@ -89,12 +101,22 @@ test('institution data manager uses server pagination and authoritative manual o
   assert.doesNotMatch(js, /team-card/);
 });
 
-test('manual Team and safe template override workflows remain explicit', () => {
+test('account, Team, and template workflows expose the simplified V2.2 UX', () => {
   assert.match(js, /Create Team Manually/);
   assert.match(js, /ordered_writer_user_ids/);
   assert.match(js, /Leader must be one of the selected Writers/);
-  assert.match(js, /MANUAL_OVERRIDE/);
-  assert.match(js, /Preview Template Change/);
+  assert.match(js, /Edit Team/);
+  assert.match(js, /Move \$\{person\.email\} down/);
+  assert.match(js, /method: 'PUT'/);
+  assert.match(js, /Team must retain at least one Writer/);
+  assert.match(js, /Change template\?/);
   assert.match(js, /preview_token/);
-  assert.match(js, /PRE_TEMPLATE_CHANGE/);
+  assert.doesNotMatch(js, /renderJson\(preview\)/);
+  assert.doesNotMatch(js, /Resolution preview/);
+  assert.match(js, /Confirm Main document change/);
+  assert.match(js, /Template Library/);
+  assert.match(js, /Automatic Defaults/);
+  assert.match(js, /email,password,role/);
+  assert.match(js, /Save this file now\. Temporary passwords cannot be viewed again/);
+  assert.match(js, /operation === 'ADD'\) showCredentialHandoff\(applied\.account_provisioning/);
 });

@@ -30,13 +30,17 @@ Link statuses are:
 - `AMBIGUOUS`: multiple normalized account or institutional identity matches exist.
 - `ROLE_INCOMPATIBLE`: the unique account has the wrong existing V2 global role.
 
-Students require an existing global Writer role and faculty require an existing global Mentor role before they can be materialized into a Team. Automatic Admin email reconciliation requires an existing V2 Admin, while a manual Admin identity link is informational and grants no authority. Importing or linking never changes a global role. Passwords and authentication secrets are never imported. Automatic reconciliation does not overwrite `MANUAL` links, and unlink is blocked while the identity is used by a non-archived imported Team.
+An Add operation provisions a missing enabled V2 Writer for each imported Student with a valid unique email. Faculty are provisioned as V2 Mentors only when referenced by `paper_assignment_mentors`. Existing compatible accounts are reused without changing password hashes; incompatible roles are `ROLE_INCOMPATIBLE`. `vcap.admins` never provisions or grants V2 Admin, and unassigned Faculty do not gain Mentor accounts. Automatic reconciliation does not overwrite `MANUAL` links, and unlink is blocked while the identity is used by a non-archived imported Team.
+
+`latex_core.user_credentials.must_change_password` is an application-owned account state. New automatic credentials store an Argon2 hash and set this flag; the temporary plaintext exists only in the immediate apply response. It is not stored in VCAP, import rows, audit metadata, or PostgreSQL credential columns.
 
 ## Paper assignments
 
 `vcap.paper_assignment_groups` stores an external Team key and metadata. Ordered Writers live in `vcap.paper_assignment_students`; `writer_order` is positive and unique per Team, and a partial unique index permits at most one imported Leader. `vcap.paper_assignment_mentors` stores faculty assignments.
 
 `latex_core.external_paper_team_links` gives an external key exactly one existing V2 Paper Team. Runtime access continues to come only from `latex_core.paper_team_members`. Imported assignments never create a second Team architecture.
+
+Admin edits of a linked Team update the three `vcap.paper_assignment_*` relations and `latex_core.paper_team_members` in one transaction. The external key, Paper Team ID, workspace, immutable versions, comments, and builds remain unchanged.
 
 ## Import and template provenance
 

@@ -280,7 +280,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .compact-list { margin: 4px 0; padding-left: 18px; }
 .compact-list li { margin: 3px 0; }
 .ordered-people { display: grid; gap: 5px; margin: 8px 0; }
-.ordered-person { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 6px; border: 1px solid var(--border); border-radius: 5px; }
+.ordered-person { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto; align-items: center; gap: 6px; padding: 6px; border: 1px solid var(--border); border-radius: 5px; }
 .admin-dialog { width: min(980px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: inherit; }
 .admin-dialog::backdrop { background: #15191388; }
 .admin-dialog form[method="dialog"] { position: sticky; bottom: 0; display: flex; justify-content: flex-end; padding-top: 8px; background: var(--surface); }
