@@ -184,6 +184,9 @@ pub struct V2User {
     pub migration_state: String,
     pub created_at: String,
     pub must_change_password: bool,
+    pub email_delivery_id: Option<Uuid>,
+    pub email_delivery_status: Option<String>,
+    pub email_delivery_expired: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -283,10 +286,11 @@ impl V2Repository {
 
     pub async fn list_v2_users(&self) -> Result<Vec<V2User>, V2Error> {
         let rows = sqlx::query(
-            "SELECT u.id,c.email,c.enabled,c.account_type,c.must_change_password,g.role,u.created_at::text AS created_at \
+            "SELECT u.id,c.email,c.enabled,c.account_type,c.must_change_password,g.role,u.created_at::text AS created_at,delivery.id AS email_delivery_id,delivery.status AS email_delivery_status,COALESCE(delivery.expires_at<=statement_timestamp(),FALSE) AS email_delivery_expired \
              FROM latex_core.users u \
              JOIN latex_core.user_credentials c ON c.user_id=u.id \
              LEFT JOIN latex_core.global_user_roles g ON g.user_id=u.id \
+             LEFT JOIN LATERAL (SELECT id,status,expires_at FROM latex_core.email_outbox WHERE account_user_id=u.id ORDER BY created_at DESC,id DESC LIMIT 1) delivery ON TRUE \
              ORDER BY c.email",
         )
         .fetch_all(self.database.pool())
@@ -2552,6 +2556,15 @@ fn decode_v2_user(row: PgRow) -> Result<V2User, V2Error> {
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
         must_change_password: row
             .try_get("must_change_password")
+            .map_err(V2Error::Database)?,
+        email_delivery_id: row
+            .try_get("email_delivery_id")
+            .map_err(V2Error::Database)?,
+        email_delivery_status: row
+            .try_get("email_delivery_status")
+            .map_err(V2Error::Database)?,
+        email_delivery_expired: row
+            .try_get("email_delivery_expired")
             .map_err(V2Error::Database)?,
     })
 }

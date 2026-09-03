@@ -11,6 +11,11 @@
 mod archive;
 mod auth;
 mod collaboration;
+#[allow(
+    dead_code,
+    reason = "API shares mail configuration with the worker transport module"
+)]
+mod mail;
 mod review_api;
 use axum::{
     Json, Router,
@@ -32,9 +37,10 @@ use persistence::{
     ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState,
     FilePolicy, GlobalRole, GroupType, ImportJobPageFilter, ImportLimits, ImportMode,
     InstitutionBatchUpload, InstitutionError, InstitutionOperation, InstitutionPageFilter,
-    InstitutionRepository, PaperTeamPageFilter, PostgresCompileQueue, ProjectAccess, ProjectRoles,
-    PublishResult, QueueLimits, TeamFileRecord, TeamTemplateResolutionInput, TemplateChangeFile,
-    TemplateChangeRequest, TemplateSeedFile, V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
+    InstitutionRepository, MailOutboxRepository, PaperTeamPageFilter, PostgresCompileQueue,
+    ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord,
+    TeamTemplateResolutionInput, TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile,
+    V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -73,6 +79,8 @@ struct AppState {
     cookie_secure: bool,
     allow_registration: bool,
     session_seconds: i64,
+    mail_outbox: Option<MailOutboxRepository>,
+    mail_enabled: bool,
 }
 #[derive(Deserialize)]
 struct Credentials {
@@ -559,6 +567,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let environment = TexEnvironmentId::parse(&required("TEX_ENVIRONMENT_ID")?)?;
     let database = Database::connect(DatabaseConfig::development(database_url)?).await?;
     database.migrate().await?;
+    let mail_settings = mail::MailSettings::from_env()?;
+    let mail_config = mail_settings.outbox_config();
     let blobs =
         Arc::new(FsBlobStore::open(storage, FsBlobStoreConfig::development_default()).await?);
     let queue = PostgresCompileQueue::new(database.clone(), queue_limits()?);
@@ -570,8 +580,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collaboration =
         collaboration::CollaborationHub::new(v2.clone(), workspaces.clone(), blobs.clone());
     let state = AppState {
-        repo: AppRepository::new(database.clone()),
-        institution: InstitutionRepository::new(database.clone()),
+        repo: mail_config.clone().map_or_else(
+            || AppRepository::new(database.clone()),
+            |config| AppRepository::new(database.clone()).with_mail(config),
+        ),
+        institution: mail_config.clone().map_or_else(
+            || InstitutionRepository::new(database.clone()),
+            |config| InstitutionRepository::new(database.clone()).with_mail(config),
+        ),
         v2,
         workspaces,
         queue,
@@ -581,6 +597,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cookie_secure: bool_env("SESSION_COOKIE_SECURE", false),
         allow_registration: bool_env("ALLOW_REGISTRATION", false),
         session_seconds: int_env("SESSION_TTL_SECONDS", 60 * 60 * 24 * 7)?,
+        mail_outbox: mail_settings.repository(database.clone()),
+        mail_enabled: mail_settings.enabled,
     };
     let app = router(state);
     let address: SocketAddr = env::var("BIND_ADDR")
@@ -634,6 +652,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/users/{user_id}/temporary-password",
             post(admin_v2_reset_temporary_password),
+        )
+        .route(
+            "/api/admin/v2/credential-emails/{delivery_id}/retry",
+            post(admin_v2_retry_credential_email),
         )
         .route(
             "/api/admin/v2/templates/preview",
@@ -1251,9 +1273,10 @@ async fn admin_v2_create_user(
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    if let Err(response) = admin_session(&state, &headers).await {
-        return response;
-    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let email = match auth::normalized_email(&input.email) {
         Ok(value) => value,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid email"),
@@ -1288,12 +1311,27 @@ async fn admin_v2_create_user(
             );
         }
     };
-    match state
-        .repo
-        .create_v2_account(&email, &password_hash, role, temporary_password.is_some())
-        .await
-    {
-        Ok(user) => (
+    let created = match temporary_password.as_deref() {
+        Some(password) => {
+            state
+                .repo
+                .create_v2_temporary_account(
+                    principal.user_id(),
+                    &email,
+                    &password_hash,
+                    role,
+                    password,
+                )
+                .await
+        }
+        None => state
+            .repo
+            .create_v2_account(&email, &password_hash, role, false)
+            .await
+            .map(|user| (user, false)),
+    };
+    match created {
+        Ok((user, credential_email_queued)) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "user_id": user.user_id,
@@ -1301,7 +1339,8 @@ async fn admin_v2_create_user(
                 "enabled": user.enabled,
                 "role": role,
                 "must_change_password": user.must_change_password,
-                "temporary_password": temporary_password
+                "temporary_password": temporary_password,
+                "credential_email_queued": credential_email_queued
             })),
         )
             .into_response(),
@@ -1338,13 +1377,19 @@ async fn admin_v2_reset_temporary_password(
     };
     match state
         .repo
-        .reset_v2_temporary_password(principal.user_id(), user_id, &password_hash)
+        .reset_v2_temporary_password_and_enqueue(
+            principal.user_id(),
+            user_id,
+            &password_hash,
+            &temporary_password,
+        )
         .await
     {
-        Ok(email) => Json(serde_json::json!({
+        Ok((email, credential_email_queued)) => Json(serde_json::json!({
             "email":email,
             "temporary_password":temporary_password,
-            "must_change_password":true
+            "must_change_password":true,
+            "credential_email_queued":credential_email_queued
         }))
         .into_response(),
         Err(AppError::Forbidden) => error(
@@ -1353,6 +1398,34 @@ async fn admin_v2_reset_temporary_password(
         ),
         Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "account not found"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "password reset failed"),
+    }
+}
+
+async fn admin_v2_retry_credential_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(delivery_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Some(outbox) = &state.mail_outbox else {
+        return error(StatusCode::CONFLICT, "mail delivery is disabled");
+    };
+    match outbox.retry(delivery_id, principal.user_id()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(persistence::MailOutboxError::NotFound) => {
+            error(StatusCode::NOT_FOUND, "email delivery not found")
+        }
+        Err(persistence::MailOutboxError::PayloadUnavailable) => error(
+            StatusCode::CONFLICT,
+            "credential email expired; generate a new temporary password",
+        ),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "email retry failed"),
     }
 }
 
@@ -4942,7 +5015,7 @@ fn institution_error(error_value: InstitutionError) -> Response {
         InstitutionError::InvalidInput(message) => error(StatusCode::BAD_REQUEST, message),
         InstitutionError::NotFound => error(StatusCode::NOT_FOUND, "institution record not found"),
         InstitutionError::Conflict(message) => error(StatusCode::CONFLICT, message),
-        InstitutionError::Database(_) => error(
+        InstitutionError::Database(_) | InstitutionError::Mail(_) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "institution persistence failure",
         ),
@@ -5000,6 +5073,19 @@ async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Re
         Ok(mut overview) => {
             overview["version"] = serde_json::Value::String("latex-core 0.1.0".into());
             overview["current_admin"] = serde_json::Value::String(session.email().to_owned());
+            overview["mail_delivery_enabled"] = serde_json::Value::Bool(state.mail_enabled);
+            if let Some(outbox) = &state.mail_outbox {
+                match outbox.summary().await {
+                    Ok(summary) => {
+                        overview["pending_email_count"] = summary.pending.into();
+                        overview["sent_email_count"] = summary.sent.into();
+                        overview["failed_email_count"] = summary.failed.into();
+                    }
+                    Err(_) => {
+                        return error(StatusCode::INTERNAL_SERVER_ERROR, "mail outbox unavailable");
+                    }
+                }
+            }
             Json(overview).into_response()
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "persistence failure"),
@@ -8870,6 +8956,18 @@ mod database_tests {
             .unwrap();
         assert_eq!(credentials.len(), 2);
         assert_eq!(applied["account_provisioning"]["created"], 2);
+        assert_eq!(
+            applied["account_provisioning"]["credential_emails_queued"],
+            2
+        );
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.email_outbox WHERE recipient_email=ANY($1)",
+        )
+        .bind(vec![student_email.clone(), mentor_email.clone()])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queued, 2);
         let paper_team_id: uuid::Uuid = sqlx::query_scalar("SELECT paper_team_id FROM latex_core.external_paper_team_links WHERE external_team_key=$1").bind(&external_team_key).fetch_one(&pool).await.unwrap();
         let members: Vec<(String, String, bool, Option<i32>)> = sqlx::query_as("SELECT credentials.email,role.role,member.is_leader,member.writer_order FROM latex_core.paper_team_members member JOIN latex_core.user_credentials credentials ON credentials.user_id=member.user_id JOIN latex_core.global_user_roles role ON role.user_id=member.user_id WHERE member.paper_team_id=$1 ORDER BY member.writer_order NULLS LAST").bind(paper_team_id).fetch_all(&pool).await.unwrap();
         assert_eq!(
@@ -8950,6 +9048,7 @@ mod database_tests {
         let temporary = reset["temporary_password"].as_str().unwrap();
         assert_eq!(temporary.len(), 8);
         assert_eq!(reset["must_change_password"], true);
+        assert_eq!(reset["credential_email_queued"], true);
         assert_eq!(
             get(&app, "/api/v2/writer/papers", Some(&writer.cookie))
                 .await
@@ -8966,6 +9065,18 @@ mod database_tests {
         assert!(stored.0.starts_with("$argon2"));
         assert!(!stored.0.contains(temporary));
         assert!(stored.1);
+        let delivery: (String, bool, bool) = sqlx::query_as(
+            "SELECT status,secret_ciphertext IS NOT NULL,encode(secret_ciphertext,'escape') LIKE '%' || $2 || '%' \
+             FROM latex_core.email_outbox WHERE account_user_id=$1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(writer_id.as_uuid())
+        .bind(temporary)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(delivery.0, "PENDING");
+        assert!(delivery.1);
+        assert!(!delivery.2);
         let audit: (String, String) = sqlx::query_as(
             "SELECT event_type,metadata::text FROM latex_core.audit_events \
              WHERE resource_id=$1 ORDER BY created_at DESC LIMIT 1",
@@ -12449,10 +12560,19 @@ mod database_tests {
         );
         let collaboration =
             collaboration::CollaborationHub::new(v2.clone(), workspaces.clone(), blobs.clone());
+        let mail_config = persistence::MailOutboxConfig::new(
+            persistence::MailSecretCipher::from_base64(
+                "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=",
+            )
+            .unwrap(),
+            Duration::from_secs(72 * 60 * 60),
+        )
+        .unwrap();
         let state = AppState {
-            repo: AppRepository::new(database.clone()),
+            repo: AppRepository::new(database.clone()).with_mail(mail_config.clone()),
             v2,
-            institution: InstitutionRepository::new(database.clone()),
+            institution: InstitutionRepository::new(database.clone())
+                .with_mail(mail_config.clone()),
             workspaces,
             queue: PostgresCompileQueue::new(
                 database.clone(),
@@ -12464,6 +12584,8 @@ mod database_tests {
             cookie_secure: false,
             allow_registration: false,
             session_seconds: 3600,
+            mail_outbox: Some(MailOutboxRepository::new(database.clone(), mail_config, 5)),
+            mail_enabled: true,
         };
         (database, pool, router(state.clone()), storage, state)
     }

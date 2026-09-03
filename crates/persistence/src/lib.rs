@@ -28,6 +28,11 @@ mod governance;
     reason = "bounded import parsing and dependency-ordered application remain auditable in one service module"
 )]
 mod institution;
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "outbox methods share the module's structured MailOutboxError contract"
+)]
+mod mail_outbox;
 mod permissions;
 #[allow(
     clippy::missing_errors_doc,
@@ -79,6 +84,11 @@ pub use institution::{
     InstitutionError, InstitutionImportBatch, InstitutionImportJob, InstitutionImportRow,
     InstitutionOperation, InstitutionPageFilter, InstitutionRepository, PaperTeamPage,
     PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
+};
+pub use mail_outbox::{
+    ClaimedCredentialEmail, MailOutboxConfig, MailOutboxError, MailOutboxRepository,
+    MailOutboxSummary, MailSecretCipher, expire_credential_email_payloads,
+    recover_stale_credential_email_claims,
 };
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{

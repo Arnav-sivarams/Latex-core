@@ -8,8 +8,9 @@
 use core_types::{BlobHash, LogicalPath, TenantId, UserId, WorkspaceId};
 use persistence::{
     Database, DatabaseConfig, ImportLimits, ImportMode, InstitutionBatchUpload,
-    InstitutionOperation, InstitutionPageFilter, InstitutionRepository, PaperTeamPageFilter,
-    TeamTemplateResolutionInput, TemplateSeedFile, V2FilePolicy, V2Repository,
+    InstitutionOperation, InstitutionPageFilter, InstitutionRepository, MailOutboxConfig,
+    MailSecretCipher, PaperTeamPageFilter, TeamTemplateResolutionInput, TemplateSeedFile,
+    V2FilePolicy, V2Repository,
 };
 use sqlx::PgPool;
 use std::{env, fmt::Write as _, time::Duration};
@@ -29,7 +30,13 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
     database.migrate().await.expect("migration succeeds");
     let pool = PgPool::connect(&url).await.expect("test pool connects");
     let (actor, tenant) = insert_user(&pool, "v22-admin@example.edu", "admin").await;
-    let repository = InstitutionRepository::new(database.clone());
+    let mail = MailOutboxConfig::new(
+        MailSecretCipher::from_base64("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=")
+            .expect("test mail key"),
+        Duration::from_secs(72 * 60 * 60),
+    )
+    .expect("test mail configuration");
+    let repository = InstitutionRepository::new(database.clone()).with_mail(mail);
     let v2 = V2Repository::new(database.clone());
 
     verify_vcap_schema_and_department_role_guard(&pool).await;
@@ -49,6 +56,7 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
 
     identity_linking_is_safe(&pool, &repository, actor).await;
     automatic_account_provisioning_is_one_time_and_role_safe(&pool, &repository, actor).await;
+    bulk_hundred_accounts_queue_exactly_once(&pool, &repository, actor).await;
     resolver_is_deterministic_and_pins_are_immutable(
         &pool,
         &repository,
@@ -73,6 +81,60 @@ async fn institutional_schema_import_identity_template_and_scale_contract() {
 
     pool.close().await;
     database.close().await;
+}
+
+async fn bulk_hundred_accounts_queue_exactly_once(
+    pool: &PgPool,
+    repository: &InstitutionRepository,
+    actor: UserId,
+) {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let mut csv = String::from("reg_no,name,email,programme_code\n");
+    for index in 0..100 {
+        writeln!(
+            csv,
+            "MAIL-{suffix}-{index},Student {index},mail-{suffix}-{index}@example.edu,CSE"
+        )
+        .unwrap();
+    }
+    let detail = repository
+        .validate_batch(
+            actor,
+            InstitutionOperation::Add,
+            &[InstitutionBatchUpload {
+                filename: "students.csv".into(),
+                target_table: None,
+                bytes: csv.into_bytes(),
+            }],
+            ImportLimits::default(),
+        )
+        .await
+        .unwrap();
+    let batch_id = Uuid::parse_str(detail["batch"]["id"].as_str().unwrap()).unwrap();
+    let applied = repository.apply_batch(batch_id, actor).await.unwrap();
+    assert_eq!(applied["account_provisioning"]["created"], 100);
+    assert_eq!(
+        applied["account_provisioning"]["credential_emails_queued"],
+        100
+    );
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.email_outbox WHERE recipient_email LIKE $1",
+    )
+    .bind(format!("mail-{suffix}-%@example.edu"))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(queued, 100);
+    let repeated = repository.apply_batch(batch_id, actor).await.unwrap();
+    assert_eq!(repeated["account_provisioning"]["created"], 0);
+    let still_queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.email_outbox WHERE recipient_email LIKE $1",
+    )
+    .bind(format!("mail-{suffix}-%@example.edu"))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(still_queued, 100);
 }
 
 async fn automatic_account_provisioning_is_one_time_and_role_safe(
@@ -152,6 +214,7 @@ async fn automatic_account_provisioning_is_one_time_and_role_safe(
     let applied = repository.apply_batch(batch_id, actor).await.unwrap();
     let accounts = &applied["account_provisioning"];
     assert_eq!(accounts["created"], 2);
+    assert_eq!(accounts["credential_emails_queued"], 2);
     assert_eq!(accounts["reused"], 1);
     assert_eq!(accounts["needs_attention"], 0);
     let credentials = accounts["credentials"].as_array().unwrap();
@@ -190,6 +253,19 @@ async fn automatic_account_provisioning_is_one_time_and_role_safe(
         .await
         .unwrap();
         assert!(!leaked_to_audit);
+        let outbox: (String, i32, bool, bool) = sqlx::query_as(
+            "SELECT status,attempts,secret_ciphertext IS NOT NULL,encode(secret_ciphertext,'escape') LIKE '%' || $2 || '%' \
+             FROM latex_core.email_outbox WHERE recipient_email=$1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(credential["email"].as_str().unwrap())
+        .bind(password)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(outbox.0, "PENDING");
+        assert_eq!(outbox.1, 0);
+        assert!(outbox.2);
+        assert!(!outbox.3);
     }
     let unchanged_hash: String = sqlx::query_scalar(
         "SELECT password_hash FROM latex_core.user_credentials WHERE user_id=$1",
@@ -221,6 +297,10 @@ async fn automatic_account_provisioning_is_one_time_and_role_safe(
 
     let repeated = repository.apply_batch(batch_id, actor).await.unwrap();
     assert_eq!(repeated["account_provisioning"]["created"], 0);
+    assert_eq!(
+        repeated["account_provisioning"]["credential_emails_queued"],
+        0
+    );
     assert!(
         repeated["account_provisioning"]["credentials"]
             .as_array()

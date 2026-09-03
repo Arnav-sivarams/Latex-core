@@ -71,3 +71,13 @@ Materialized Teams are edited from **Paper Teams → View / Manage → Edit Team
 ## Backward compatibility
 
 Existing standalone jobs and their error downloads remain readable as **Legacy single-file imports**. Internally, `ADD_ONLY`, `UPDATE_ONLY`, and `DELETE_ONLY` implement the three user operations. The older `VALIDATE_ONLY` and `MERGE` endpoints remain available for compatibility; absent rows still never imply deletion.
+
+## Credential email behavior
+
+Applying Add or Merge data auto-provisions accounts under the existing rules. Each newly created
+Student Writer or assigned Faculty Mentor produces exactly one encrypted credential-email outbox
+job. Reused accounts, unassigned Faculty, and institutional Admin records produce no credential
+email. SMTP delivery happens after the database transaction and never blocks Team materialization.
+
+The Apply result reports accounts created, credential emails queued, and existing accounts reused.
+The generated credentials CSV remains a one-time fallback even when email is enabled.

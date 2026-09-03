@@ -6,8 +6,8 @@
 )]
 
 use crate::{
-    AccountType, Database, GlobalRole, GroupRoles, OverrideEffect, Permission, PermissionResolver,
-    ProjectRoles,
+    AccountType, Database, GlobalRole, GroupRoles, MailOutboxConfig, OverrideEffect, Permission,
+    PermissionResolver, ProjectRoles, mail_outbox::enqueue_temporary_credential_tx,
 };
 use core_types::{ArtifactId, BlobHash, JobId, TenantId, UserId, WorkspaceId};
 use serde_json::json;
@@ -29,6 +29,8 @@ pub enum AppError {
     Database(#[source] sqlx::Error),
     #[error("persistent data is invalid: {message}")]
     Integrity { message: String },
+    #[error("credential email outbox operation failed")]
+    Mail(#[source] crate::MailOutboxError),
 }
 
 #[derive(Clone, Debug)]
@@ -119,12 +121,22 @@ pub struct AdminUserRecord {
 #[derive(Clone, Debug)]
 pub struct AppRepository {
     pub(crate) database: Database,
+    mail: Option<MailOutboxConfig>,
 }
 
 impl AppRepository {
     #[must_use]
     pub const fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            mail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_mail(mut self, config: MailOutboxConfig) -> Self {
+        self.mail = Some(config);
+        self
     }
 
     pub async fn create_account(
@@ -182,6 +194,37 @@ impl AppRepository {
         role: GlobalRole,
         must_change_password: bool,
     ) -> Result<AppUserRecord, AppError> {
+        self.create_v2_account_inner(email, password_hash, role, must_change_password, None)
+            .await
+            .map(|(user, _queued)| user)
+    }
+
+    pub async fn create_v2_temporary_account(
+        &self,
+        actor: UserId,
+        email: &str,
+        password_hash: &str,
+        role: GlobalRole,
+        temporary_password: &str,
+    ) -> Result<(AppUserRecord, bool), AppError> {
+        self.create_v2_account_inner(
+            email,
+            password_hash,
+            role,
+            true,
+            Some((actor, temporary_password)),
+        )
+        .await
+    }
+
+    async fn create_v2_account_inner(
+        &self,
+        email: &str,
+        password_hash: &str,
+        role: GlobalRole,
+        must_change_password: bool,
+        temporary: Option<(UserId, &str)>,
+    ) -> Result<(AppUserRecord, bool), AppError> {
         let mut tx = self
             .database
             .pool()
@@ -225,16 +268,39 @@ impl AppRepository {
             .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
+        let mut queued = false;
+        if let (Some(mail), Some((actor, password))) = (self.mail.as_ref(), temporary) {
+            let credential_role = if role == GlobalRole::Writer {
+                "student"
+            } else {
+                "mentor"
+            };
+            enqueue_temporary_credential_tx(
+                &mut tx,
+                mail,
+                actor,
+                user,
+                email,
+                credential_role,
+                password,
+            )
+            .await
+            .map_err(AppError::Mail)?;
+            queued = true;
+        }
         tx.commit().await.map_err(AppError::Database)?;
-        Ok(AppUserRecord {
-            user_id: user,
-            tenant_id: tenant,
-            email: email.to_owned(),
-            password_hash: password_hash.to_owned(),
-            enabled: true,
-            account_type: "student".to_owned(),
-            must_change_password,
-        })
+        Ok((
+            AppUserRecord {
+                user_id: user,
+                tenant_id: tenant,
+                email: email.to_owned(),
+                password_hash: password_hash.to_owned(),
+                enabled: true,
+                account_type: "student".to_owned(),
+                must_change_password,
+            },
+            queued,
+        ))
     }
     pub async fn user_by_email(&self, email: &str) -> Result<Option<AppUserRecord>, AppError> {
         let row = sqlx::query("SELECT u.id,u.tenant_id,c.email,c.password_hash,c.enabled,c.account_type,c.must_change_password FROM latex_core.user_credentials c JOIN latex_core.users u ON u.id=c.user_id WHERE c.email=$1").bind(email).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?;
@@ -368,6 +434,29 @@ impl AppRepository {
         user: UserId,
         password_hash: &str,
     ) -> Result<String, AppError> {
+        self.reset_v2_temporary_password_inner(actor, user, password_hash, None)
+            .await
+            .map(|(email, _queued)| email)
+    }
+
+    pub async fn reset_v2_temporary_password_and_enqueue(
+        &self,
+        actor: UserId,
+        user: UserId,
+        password_hash: &str,
+        temporary_password: &str,
+    ) -> Result<(String, bool), AppError> {
+        self.reset_v2_temporary_password_inner(actor, user, password_hash, Some(temporary_password))
+            .await
+    }
+
+    async fn reset_v2_temporary_password_inner(
+        &self,
+        actor: UserId,
+        user: UserId,
+        password_hash: &str,
+        temporary_password: Option<&str>,
+    ) -> Result<(String, bool), AppError> {
         let mut tx = self
             .database
             .pool()
@@ -401,8 +490,34 @@ impl AppRepository {
         .execute(&mut *tx)
         .await
         .map_err(AppError::Database)?;
+        let mut queued = false;
+        if let (Some(mail), Some(password)) = (self.mail.as_ref(), temporary_password) {
+            let role: String = sqlx::query_scalar(
+                "SELECT role FROM latex_core.global_user_roles WHERE user_id=$1",
+            )
+            .bind(user.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+            enqueue_temporary_credential_tx(
+                &mut tx,
+                mail,
+                actor,
+                user,
+                &email,
+                if role == "writer" {
+                    "student"
+                } else {
+                    "mentor"
+                },
+                password,
+            )
+            .await
+            .map_err(AppError::Mail)?;
+            queued = true;
+        }
         tx.commit().await.map_err(AppError::Database)?;
-        Ok(email)
+        Ok((email, queued))
     }
 
     pub async fn complete_password_change(

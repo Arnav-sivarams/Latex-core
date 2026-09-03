@@ -1,6 +1,13 @@
 //! Worker-only compiler entry point. Deploy this binary with Docker socket access, never the API.
 #![forbid(unsafe_code)]
 
+#[path = "../mail.rs"]
+#[allow(
+    dead_code,
+    reason = "worker does not construct API repository wrappers"
+)]
+mod mail;
+
 use blob_store::{FsBlobStore, FsBlobStoreConfig};
 use compiler::{CompileLimits, CompilerConfig, CompilerService, DockerCliRuntime};
 use core_types::TexEnvironmentId;
@@ -16,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database =
         Database::connect(DatabaseConfig::development(required("DATABASE_URL")?)?).await?;
     database.migrate().await?;
+    let mail_settings = mail::MailSettings::from_env()?;
     let blobs = Arc::new(
         FsBlobStore::open(
             required("BLOB_STORAGE_ROOT")?,
@@ -41,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let queue = PostgresCompileQueue::new(database, queue_limits()?);
+    let queue = PostgresCompileQueue::new(database.clone(), queue_limits()?);
     let recovered = queue.recover_expired_leases().await?;
     tracing::info!(recovered, "recovered expired compile leases");
     let worker = CompilationWorker::new(
@@ -60,7 +68,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::signal::ctrl_c().await;
         signal.request();
     });
-    worker.run_until_shutdown(shutdown).await?;
+    let mail_task = if mail_settings.enabled {
+        let repository = mail_settings
+            .repository(database.clone())
+            .ok_or("mail outbox configuration is missing")?;
+        let transport = Arc::new(mail::SmtpMailTransport::new(&mail_settings)?);
+        let mail_shutdown = shutdown.clone();
+        tokio::spawn(mail::run_mail_worker(
+            repository,
+            transport,
+            mail_settings,
+            mail_shutdown,
+        ))
+    } else {
+        tracing::info!("mail delivery disabled");
+        let mail_shutdown = shutdown.clone();
+        tokio::spawn(mail::run_disabled_mail_maintenance(database, mail_shutdown))
+    };
+    let compile_result = worker.run_until_shutdown(shutdown.clone()).await;
+    shutdown.request();
+    mail_task.await??;
+    compile_result?;
     Ok(())
 }
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {

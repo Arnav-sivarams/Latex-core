@@ -51,10 +51,12 @@ function showCredentialHandoff(provisioning, batchId) {
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody');
   const credentials = provisioning.credentials || [];
   host.replaceChildren(
-    element('h2', '', 'Accounts'),
-    element('p', '', `${provisioning.created || 0} created`),
+    element('h2', '', 'Account setup'),
+    element('p', '', `${provisioning.created || 0} accounts created`),
+    element('p', '', `${provisioning.credential_emails_queued || 0} credential emails queued`),
     element('p', '', `${provisioning.reused || 0} existing accounts reused`),
     element('p', '', `${provisioning.needs_attention || 0} need attention`),
+    element('p', 'muted-note', 'Email is the primary credential delivery method. The CSV is an administrator fallback.'),
     element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again.'),
   );
   const download = buttonAction('Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
@@ -297,7 +299,7 @@ function renderV2Users(users) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (created.temporary_password) showCredentialHandoff({ created: 1, reused: 0, needs_attention: 0, credentials: [{ email: created.email, temporary_password: created.temporary_password, credential_role: created.role === 'writer' ? 'student' : 'mentor' }] }, created.user_id);
+      if (created.temporary_password) showCredentialHandoff({ created: 1, credential_emails_queued: created.credential_email_queued ? 1 : 0, reused: 0, needs_attention: 0, credentials: [{ email: created.email, temporary_password: created.temporary_password, credential_role: created.role === 'writer' ? 'student' : 'mentor' }] }, created.user_id);
       announce('V2 user created.');
       await showSection('V2 Users');
     } catch (error) { showError(error); }
@@ -324,14 +326,15 @@ function renderV2Users(users) {
     const actions = element('div', 'admin-actions');
     select.addEventListener('change', () => patchV2Role(user, select.value).catch(showError)); actions.append(select);
     const toggle = buttonAction(user.enabled ? 'Disable' : 'Enable', async () => { await api(`/api/admin/users/${encodeURIComponent(user.email)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !user.enabled }) }); await showSection('V2 Users'); }); actions.append(toggle);
-    if (user.v2_role === 'writer' || user.v2_role === 'mentor') actions.append(buttonAction('Generate new temporary password', async () => { if (!confirm(`Replace the current password for ${user.email}? Current sessions will end.`)) return; const reset = await api(`/api/admin/v2/users/${encodeURIComponent(user.user_id)}/temporary-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); showCredentialHandoff({ created: 1, reused: 0, needs_attention: 0, credentials: [{ email: reset.email, temporary_password: reset.temporary_password, credential_role: user.v2_role === 'writer' ? 'student' : 'mentor' }] }, `reset-${user.user_id}`); await showSection('V2 Users'); }));
+    if (user.v2_role === 'writer' || user.v2_role === 'mentor') actions.append(buttonAction('Generate new temporary password', async () => { if (!confirm(`Replace the current password for ${user.email}? Current sessions will end.`)) return; const reset = await api(`/api/admin/v2/users/${encodeURIComponent(user.user_id)}/temporary-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); showCredentialHandoff({ created: 1, credential_emails_queued: reset.credential_email_queued ? 1 : 0, reused: 0, needs_attention: 0, credentials: [{ email: reset.email, temporary_password: reset.temporary_password, credential_role: user.v2_role === 'writer' ? 'student' : 'mentor' }] }, `reset-${user.user_id}`); await showSection('V2 Users'); }));
+    if (user.email_delivery_status === 'FAILED' && !user.email_delivery_expired && user.email_delivery_id) actions.append(buttonAction('Retry email', async () => { await api(`/api/admin/v2/credential-emails/${encodeURIComponent(user.email_delivery_id)}/retry`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); announce(`Credential email retry queued for ${user.email}.`); await showSection('V2 Users'); }));
     const details = element('details'); details.append(element('summary', '', 'Details'), element('p', 'muted-note', `Legacy type: ${user.legacy_account_type} · Migration: ${user.migration_state} · Created: ${new Date(user.created_at).toLocaleString()}`));
     const actionCell = element('td'); actionCell.append(actions, details);
     row.append(
       element('td', '', user.email),
       element('td', '', user.v2_role ? user.v2_role[0].toUpperCase() + user.v2_role.slice(1) : 'Unassigned'),
       element('td', '', user.enabled ? 'Enabled' : 'Disabled'),
-      element('td', '', user.must_change_password ? 'Temporary password' : 'Active'),
+      element('td', '', user.must_change_password ? `Temporary password · ${user.email_delivery_status === 'SENT' ? 'Email sent' : user.email_delivery_status === 'SENDING' ? 'Sending' : user.email_delivery_status === 'PENDING' ? 'Email pending' : user.email_delivery_status === 'FAILED' ? (user.email_delivery_expired ? 'Email expired' : 'Email failed') : user.email_delivery_status === 'EXPIRED' ? 'Email expired' : 'Email unavailable'}` : 'Active'),
       actionCell,
     );
     body.append(row);
@@ -531,7 +534,7 @@ function createImportGuide() {
   prerequisites.append(
     element('h3', '', 'Before Teams can be created'),
     element('h4', '', 'Student account link'),
-    element('p', '', 'A valid Student.email automatically creates or reuses a V2 WRITER account. Newly created accounts receive a one-time temporary password in the credentials CSV.'),
+    element('p', '', 'A valid Student.email automatically creates or reuses a V2 WRITER account. Newly created accounts receive their temporary password by email; the one-time credentials CSV remains available as a fallback.'),
     element('h4', '', 'Faculty account link'),
     element('p', '', 'Faculty assigned in paper_team_mentors automatically receive or reuse a V2 MENTOR account. Unassigned Faculty and institutional Admins are never provisioned.'),
     element('h4', '', 'Team Leader'),

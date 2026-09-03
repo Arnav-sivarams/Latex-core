@@ -19,6 +19,10 @@ This is the Professor V2 release candidate. The retired V1 workspace and Researc
 ./latex-core doctor
 ```
 
+Temporary credentials can be delivered through provider-neutral SMTP using a durable encrypted
+outbox. Mail is disabled by default; see [installation](docs/INSTALL.md) for configuration. The
+administrator credentials CSV remains a one-time fallback.
+
 Open the URL printed by `./latex-core url`. Accounts and roles are created by an operator; the browser login is server controlled.
 
 ## Guides

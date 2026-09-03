@@ -1028,6 +1028,14 @@ async fn queue_fixture() -> (
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO latex_core.user_credentials (user_id,email,password_hash,account_type) VALUES ($1,$2,'test-hash','student')",
+    )
+    .bind(user.as_uuid())
+    .bind(format!("queue-{user}@example.test"))
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")
         .bind(workspace.as_uuid())
         .bind(tenant.as_uuid())
@@ -1035,6 +1043,14 @@ async fn queue_fixture() -> (
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO latex_core.projects (workspace_id,owner_user_id,name) VALUES ($1,$2,'Queue fixture')",
+    )
+    .bind(workspace.as_uuid())
+    .bind(user.as_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
     let snapshot: SnapshotId = digest(format!("queue snapshot {workspace}").as_bytes())
         .parse()
         .unwrap();

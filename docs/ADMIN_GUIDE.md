@@ -45,3 +45,17 @@ Manual Team creation searches accounts server-side, preserves Writer order, rest
 ## Operator boundary
 
 SYSTEM health is read-only. BUILD QUEUE uses only existing allow-listed actions. Host-level operational actions remain CLI-only in this release candidate. The API has no Docker-socket mount and no arbitrary shell endpoint.
+
+## Temporary credential delivery
+
+New institutional Students and assigned Faculty receive Writer/Student and Mentor temporary
+credentials by email. Existing compatible accounts are reused without a password change or email.
+Generating a new temporary password revokes existing sessions and queues a fresh email; explicit
+permanent passwords are never emailed.
+
+The V2 Users table reports pending, sending, sent, failed, and expired delivery states. A failed
+delivery can be retried while its encrypted payload remains valid. After expiry, generate a new
+temporary password. Successful and expired jobs immediately discard their encrypted payload.
+
+The one-time `credentials.csv` download remains available as an administrator fallback. Save it
+when offered: temporary passwords cannot be viewed again.

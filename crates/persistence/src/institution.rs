@@ -1,6 +1,8 @@
 //! V2.2 institutional source-of-record, bounded file parsing, and import application.
 
-use crate::{Database, credentials};
+use crate::{
+    Database, MailOutboxConfig, credentials, mail_outbox::enqueue_temporary_credential_tx,
+};
 use calamine::{Data, Reader, Xlsx};
 use core_types::UserId;
 use csv::StringRecord;
@@ -192,6 +194,8 @@ pub enum InstitutionError {
     Conflict(String),
     #[error("institution import database operation failed")]
     Database(#[source] sqlx::Error),
+    #[error("credential email outbox operation failed")]
+    Mail(#[source] crate::MailOutboxError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +246,7 @@ pub struct GeneratedCredential {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountProvisioningResult {
     pub created: u64,
+    pub credential_emails_queued: u64,
     pub reused: u64,
     pub needs_attention: u64,
     pub credentials: Vec<GeneratedCredential>,
@@ -363,12 +368,22 @@ struct SourceRow {
 #[derive(Clone, Debug)]
 pub struct InstitutionRepository {
     database: Database,
+    mail: Option<MailOutboxConfig>,
 }
 
 impl InstitutionRepository {
     #[must_use]
     pub const fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            mail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_mail(mut self, config: MailOutboxConfig) -> Self {
+        self.mail = Some(config);
+        self
     }
 
     pub async fn validate_upload(
@@ -789,7 +804,7 @@ impl InstitutionRepository {
         }
         let account_provisioning = if matches!(import_mode, ImportMode::AddOnly | ImportMode::Merge)
         {
-            provision_import_accounts_tx(&mut tx, actor, &[job_id]).await?
+            provision_import_accounts_tx(&mut tx, actor, &[job_id], self.mail.as_ref()).await?
         } else {
             AccountProvisioningResult::default()
         };
@@ -947,7 +962,7 @@ impl InstitutionRepository {
         .await
         .map_err(InstitutionError::Database)?;
         let account_provisioning = if mode == ImportMode::AddOnly {
-            provision_import_accounts_tx(&mut tx, actor, &job_ids).await?
+            provision_import_accounts_tx(&mut tx, actor, &job_ids, self.mail.as_ref()).await?
         } else {
             AccountProvisioningResult::default()
         };
@@ -4123,6 +4138,7 @@ async fn provision_import_accounts_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     actor: UserId,
     job_ids: &[Uuid],
+    mail: Option<&MailOutboxConfig>,
 ) -> Result<AccountProvisioningResult, InstitutionError> {
     sqlx::query("LOCK TABLE latex_core.user_credentials IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut **tx)
@@ -4158,8 +4174,28 @@ async fn provision_import_accounts_tx(
     .await
     .map_err(InstitutionError::Database)?;
     let mut result = AccountProvisioningResult::default();
-    provision_people_rows(tx, &students, "students", "writer", "student", &mut result).await?;
-    provision_people_rows(tx, &faculty, "faculty", "mentor", "mentor", &mut result).await?;
+    provision_people_rows(
+        tx,
+        &students,
+        "students",
+        "writer",
+        "student",
+        actor,
+        mail,
+        &mut result,
+    )
+    .await?;
+    provision_people_rows(
+        tx,
+        &faculty,
+        "faculty",
+        "mentor",
+        "mentor",
+        actor,
+        mail,
+        &mut result,
+    )
+    .await?;
     audit_tx(
         tx,
         actor,
@@ -4168,6 +4204,7 @@ async fn provision_import_accounts_tx(
         Uuid::nil(),
         json!({
             "created":result.created,
+            "credential_emails_queued":result.credential_emails_queued,
             "reused":result.reused,
             "needs_attention":result.needs_attention
         }),
@@ -4176,12 +4213,18 @@ async fn provision_import_accounts_tx(
     Ok(result)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provisioning keeps role, actor, mail, and one-time result state explicit"
+)]
 async fn provision_people_rows(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     rows: &[PgRow],
     people_table: &str,
     required_role: &str,
     credential_role: &str,
+    actor: UserId,
+    mail: Option<&MailOutboxConfig>,
     result: &mut AccountProvisioningResult,
 ) -> Result<(), InstitutionError> {
     for row in rows {
@@ -4257,6 +4300,21 @@ async fn provision_people_rows(
                 .await
                 .map_err(InstitutionError::Database)?;
                 result.created = result.created.saturating_add(1);
+                if let Some(mail) = mail {
+                    enqueue_temporary_credential_tx(
+                        tx,
+                        mail,
+                        actor,
+                        UserId::from_uuid(user_id),
+                        &email,
+                        credential_role,
+                        &temporary_password,
+                    )
+                    .await
+                    .map_err(InstitutionError::Mail)?;
+                    result.credential_emails_queued =
+                        result.credential_emails_queued.saturating_add(1);
+                }
                 result.credentials.push(GeneratedCredential {
                     email,
                     temporary_password,

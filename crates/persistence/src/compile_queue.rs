@@ -594,6 +594,9 @@ fn map_permission_error(error: AppError) -> QueueError {
             message: error.to_string(),
         },
         AppError::Integrity { message } => QueueError::Integrity { message },
+        AppError::Mail(error) => QueueError::Integrity {
+            message: error.to_string(),
+        },
         AppError::Database(error) => QueueError::Database(error),
     }
 }

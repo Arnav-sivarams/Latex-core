@@ -251,6 +251,9 @@ mod tests {
             migration_state: "ASSIGNED".into(),
             created_at: "now".into(),
             must_change_password: false,
+            email_delivery_id: None,
+            email_delivery_status: None,
+            email_delivery_expired: false,
         };
         assert_eq!(
             user_list_line(&assigned),

@@ -22,6 +22,7 @@ name = "latex-core-admin"
 path = "src/bin/admin.rs"
 
 [dependencies]
+async-trait.workspace = true
 argon2.workspace = true
 axum.workspace = true
 blob-store.workspace = true
@@ -31,6 +32,7 @@ core-types.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 latex-parser.workspace = true
+lettre.workspace = true
 persistence.workspace = true
 queue.workspace = true
 rand.workspace = true
