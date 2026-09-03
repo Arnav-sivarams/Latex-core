@@ -829,6 +829,37 @@ async fn resolver_is_deterministic_and_pins_are_immutable(
     assert_eq!(missing.selected_template_id, fallback);
     assert!(!missing.warnings.is_empty());
 
+    let front_matter_pack = Uuid::new_v4();
+    sqlx::query("INSERT INTO latex_core.front_matter_packs (id,name,manifest_json,content_hash,created_by_user_id) VALUES ($1,$2,'{}',$3,$4)")
+        .bind(front_matter_pack)
+        .bind(format!("Resolver pack {front_matter_pack}"))
+        .bind("c".repeat(64))
+        .bind(actor.as_uuid())
+        .execute(pool)
+        .await
+        .unwrap();
+    repository
+        .set_programme_front_matter_default(actor, "ECE", Some(front_matter_pack))
+        .await
+        .unwrap();
+    let independent_defaults: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT template_id,front_matter_pack_id FROM latex_core.programme_template_defaults WHERE programme_code='ECE'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(independent_defaults, (None, Some(front_matter_pack)));
+    let ece_defaults = repository
+        .resolve_default_template_for_writers(&[ece])
+        .await
+        .unwrap();
+    assert_eq!(ece_defaults.selected_template_id, fallback);
+    assert_eq!(ece_defaults.front_matter_pack_id, Some(front_matter_pack));
+    assert_eq!(
+        ece_defaults.front_matter_resolution_method.as_deref(),
+        Some("PROGRAMME_DEFAULT")
+    );
+
     let workspace = Uuid::new_v4();
     let paper = Uuid::new_v4();
     sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")

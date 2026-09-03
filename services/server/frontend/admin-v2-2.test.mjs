@@ -114,7 +114,8 @@ test('account, Team, and template workflows expose the simplified V2.2 UX', () =
   assert.doesNotMatch(js, /renderJson\(preview\)/);
   assert.doesNotMatch(js, /Resolution preview/);
   assert.match(js, /Confirm Main document change/);
-  assert.match(js, /Template Library/);
+  assert.match(js, /Main Content Templates/);
+  assert.match(js, /Front Matter Packs/);
   assert.match(js, /Automatic Defaults/);
   assert.match(js, /email,password,role/);
   assert.match(js, /Save this file now\. Temporary passwords cannot be viewed again/);

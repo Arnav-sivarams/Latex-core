@@ -1,5 +1,11 @@
 # Writer guide
 
+## Document details
+
+For a Team paper, use the compact **Document details** toolbar action to view its Front Matter Pack, status, section choices, automatic metadata, and custom fields. The Team Leader can toggle optional sections and save fields permitted by the pack. Required sections stay enabled. Regular Team Writers have the same view without editing controls; institution-assigned Front Matter cannot be removed by a Writer.
+
+Saving document details flushes current collaboration, safely escapes all entered text, atomically rebuilds hidden Front Matter files, adds one workspace revision/history boundary, and requests a normal automatic build. These generated files never appear in the file tree or enter an editable Yjs room. See [Front Matter Packs](FRONT_MATTER_PACKS.md).
+
 Writers use `/write` for personal papers and assigned Team Papers.
 
 ## Papers and files

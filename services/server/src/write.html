@@ -42,6 +42,7 @@
       <button id="problemsToggle" class="icon-button badge-button" type="button" aria-label="Problems" title="Problems"><span aria-hidden="true">△</span><small id="problemsCount">0</small></button>
       <button id="historyToggle" class="icon-button" type="button" aria-label="History" title="Version history"><span aria-hidden="true">◷</span></button>
       <button id="commentsToggle" class="icon-button" type="button" aria-label="Comments and review" title="Comments and review"><span aria-hidden="true">◰</span></button>
+      <button id="documentDetails" class="icon-button" type="button" disabled aria-label="Document details" title="Document details"><span aria-hidden="true">▤</span></button>
       <button id="showInPdf" class="icon-button" type="button" disabled aria-label="Show source in PDF" title="Show source in PDF"><span aria-hidden="true">⇥</span></button>
       <button id="moreActions" class="icon-button" type="button" aria-label="More actions" title="More actions"><span aria-hidden="true">⋯</span></button>
     </div>
@@ -92,6 +93,7 @@
     <section id="problems" class="drawer-panel" hidden aria-labelledby="problems-heading"><h3 id="problems-heading">Problems</h3><div id="problemsList"><p class="empty-copy">Choose a paper to analyze it.</p></div></section>
     <section id="reviews" class="drawer-panel" hidden aria-labelledby="writer-reviews-heading"><div class="drawer-section-heading"><h3 id="writer-reviews-heading">Comments</h3><span id="reviewCounts"></span></div><div id="writerReviewFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Active</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="all">All</button></div><div id="writerReviewList"><p class="empty-copy">No review comments.</p></div></section>
     <section id="history" class="drawer-panel" hidden aria-labelledby="history-heading"><div class="drawer-section-heading"><h3 id="history-heading">History</h3><button id="createCheckpoint" type="button" disabled>Create checkpoint</button></div><div id="versionHistory" class="version-history"><p class="empty-copy">Choose a paper to view history.</p></div><pre id="versionDiff" class="version-diff">Select two versions to compare.</pre></section>
+    <section id="documentDetailsPanel" class="drawer-panel" hidden aria-labelledby="document-details-heading"><h3 id="document-details-heading">Document details</h3><div id="documentDetailsBody"><p class="empty-copy">Choose a Team paper to view its Front Matter.</p></div></section>
   </aside>
 
   <dialog id="productivityDialog" class="productivity-dialog"><form method="dialog" class="dialog-shell"><div class="dialog-heading"><h2 id="dialogTitle">Writer tool</h2><button value="cancel" aria-label="Close" title="Close">Close</button></div><input id="dialogSearch" type="search" placeholder="Type to filter" hidden><div id="dialogBody"></div><pre id="dialogPreview" hidden></pre><div id="dialogActions" class="dialog-actions"></div></form></dialog>

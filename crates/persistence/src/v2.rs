@@ -1284,6 +1284,7 @@ impl V2Repository {
         blob_hash: BlobHash,
         size_bytes: u64,
     ) -> Result<(PaperFile, u64), V2Error> {
+        reject_front_matter_managed_path(&path)?;
         let mut tx = self
             .database
             .pool()
@@ -1374,6 +1375,7 @@ impl V2Repository {
         expected_version: u64,
         path: LogicalPath,
     ) -> Result<(PaperFile, u64), V2Error> {
+        reject_front_matter_managed_path(&path)?;
         let mut tx = self
             .database
             .pool()
@@ -2182,6 +2184,10 @@ async fn lock_any_file(
     decode_paper_file(row)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "all structural operation variants share one locked authorization and replay boundary"
+)]
 async fn apply_structural_payload(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: WorkspaceId,
@@ -2197,6 +2203,7 @@ async fn apply_structural_payload(
         "delete_file" => {
             let file_id = payload_field(payload, "file_id")?;
             let path: LogicalPath = payload_field(payload, "path")?;
+            reject_front_matter_managed_path(&path)?;
             let expected_revision: u64 = payload_field(payload, "expected_revision")?;
             let current = lock_any_file(tx, file_id).await?;
             if current.workspace_id != workspace_id
@@ -2215,6 +2222,7 @@ async fn apply_structural_payload(
         "create_file" | "restore_file" => {
             let file_id = payload_field(payload, "file_id")?;
             let path: LogicalPath = payload_field(payload, "path")?;
+            reject_front_matter_managed_path(&path)?;
             let blob_hash: BlobHash = payload_field(payload, "blob_hash")?;
             let size_bytes: u64 = payload_field(payload, "size_bytes")?;
             let current = lock_any_file(tx, file_id).await?;
@@ -2248,6 +2256,8 @@ async fn apply_structural_payload(
             let file_id = payload_field(payload, "file_id")?;
             let from: LogicalPath = payload_field(payload, "from")?;
             let to: LogicalPath = payload_field(payload, "to")?;
+            reject_front_matter_managed_path(&from)?;
+            reject_front_matter_managed_path(&to)?;
             let expected_revision: u64 = payload_field(payload, "expected_revision")?;
             let current = lock_any_file(tx, file_id).await?;
             if current.workspace_id != workspace_id
@@ -2266,6 +2276,8 @@ async fn apply_structural_payload(
         "set_main" => {
             let from: LogicalPath = payload_field(payload, "from")?;
             let to: LogicalPath = payload_field(payload, "to")?;
+            reject_front_matter_managed_path(&from)?;
+            reject_front_matter_managed_path(&to)?;
             if current_main_path(tx, workspace_id).await?.as_ref() != Some(&from) {
                 return Err(V2Error::Conflict {
                     entity: "main file changed since structural operation",
@@ -2690,6 +2702,17 @@ fn map_file_conflict(error: sqlx::Error, workspace_id: WorkspaceId, path: &Logic
     } else {
         V2Error::Database(error)
     }
+}
+
+fn reject_front_matter_managed_path(path: &LogicalPath) -> Result<(), V2Error> {
+    if path.as_str() == ".latex-core/frontmatter"
+        || path.as_str().starts_with(".latex-core/frontmatter/")
+    {
+        return Err(V2Error::InvalidPath {
+            message: "Front Matter files are system managed".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

@@ -130,6 +130,122 @@ async fn s6_representative_builder_output_compiles_on_frozen_m7() {
 }
 
 #[tokio::test]
+async fn v2_3_front_matter_pack_compiles_in_document_order_on_frozen_m7() {
+    let main = include_str!(
+        "../../../services/server/tests/fixtures/front-matter-compatible-main/main.tex"
+    )
+    .replace(
+        "\\section{Main content}",
+        "\\typeout{LATEX_CORE_ORDER:08-main-content}\n\\section{Main content}",
+    );
+    let entry =
+        include_str!("../../../services/server/tests/fixtures/front-matter-uat/frontmatter.tex");
+    let cover = include_str!("../../../services/server/tests/fixtures/front-matter-uat/cover.tex")
+        .replace("{{institution_name}}", "VIT UAT")
+        .replace("{{paper_title}}", "Front Matter Compile Proof")
+        .replace("{{author_names}}", "Author One\\\\Author Two")
+        .replace("{{programme_code}}", "CSE")
+        .replace("{{academic_year}}", "2026--2027");
+    let certificate =
+        include_str!("../../../services/server/tests/fixtures/front-matter-uat/certificate.tex")
+            .replace("{{paper_title}}", "Front Matter Compile Proof")
+            .replace("{{mentor_name}}", "Dr Mentor");
+    let declaration =
+        include_str!("../../../services/server/tests/fixtures/front-matter-uat/declaration.tex")
+            .replace("{{submission_date}}", "2026-09-03");
+    let acknowledgements = include_str!(
+        "../../../services/server/tests/fixtures/front-matter-uat/acknowledgements.tex"
+    )
+    .replace("{{acknowledgement}}", "Thank you.");
+    let abstract_page =
+        include_str!("../../../services/server/tests/fixtures/front-matter-uat/abstract.tex")
+            .replace("{{abstract}}", "A safe disposable abstract.");
+    let ordered = [
+        ("01-cover", "cover.tex", cover),
+        ("02-certificate", "certificate.tex", certificate),
+        ("03-declaration", "declaration.tex", declaration),
+        (
+            "04-acknowledgements",
+            "acknowledgements.tex",
+            acknowledgements,
+        ),
+        ("05-abstract", "abstract.tex", abstract_page),
+        (
+            "06-list-of-figures",
+            "list_of_figures.tex",
+            include_str!(
+                "../../../services/server/tests/fixtures/front-matter-uat/list_of_figures.tex"
+            )
+            .to_owned(),
+        ),
+        (
+            "07-list-of-tables",
+            "list_of_tables.tex",
+            include_str!(
+                "../../../services/server/tests/fixtures/front-matter-uat/list_of_tables.tex"
+            )
+            .to_owned(),
+        ),
+    ];
+    let marked = ordered
+        .iter()
+        .map(|(marker, path, source)| {
+            (
+                *marker,
+                *path,
+                format!("\\typeout{{LATEX_CORE_ORDER:{marker}}}\n{source}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut files = vec![
+        ("main.tex", main.as_bytes()),
+        (".latex-core/frontmatter/frontmatter.tex", entry.as_bytes()),
+    ];
+    files.extend(marked.iter().map(|(_, path, source)| {
+        let managed_path = match *path {
+            "cover.tex" => ".latex-core/frontmatter/cover.tex",
+            "certificate.tex" => ".latex-core/frontmatter/certificate.tex",
+            "declaration.tex" => ".latex-core/frontmatter/declaration.tex",
+            "acknowledgements.tex" => ".latex-core/frontmatter/acknowledgements.tex",
+            "abstract.tex" => ".latex-core/frontmatter/abstract.tex",
+            "list_of_figures.tex" => ".latex-core/frontmatter/list_of_figures.tex",
+            "list_of_tables.tex" => ".latex-core/frontmatter/list_of_tables.tex",
+            _ => unreachable!("closed disposable fixture set"),
+        };
+        (managed_path, source.as_bytes())
+    }));
+    let (execution, _) = compile(
+        &files,
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        execution.status(),
+        CompileStatus::Succeeded,
+        "Front Matter proof: {}",
+        String::from_utf8_lossy(execution.stderr())
+    );
+    pdf(&execution);
+    let log = execution
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::Log)
+        .expect("Front Matter compile log");
+    let log = String::from_utf8_lossy(log.bytes());
+    let mut cursor = 0;
+    for (marker, _, _) in &ordered {
+        let needle = format!("LATEX_CORE_ORDER:{marker}");
+        let relative = log[cursor..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing or out-of-order Front Matter section {marker}"));
+        cursor += relative + needle.len();
+    }
+    assert!(log[cursor..].contains("LATEX_CORE_ORDER:08-main-content"));
+}
+
+#[tokio::test]
 async fn representative_v2_pdf_log_and_nonempty_synctex() {
     let source = b"\\documentclass{article}\n\\begin{document}\n\nS5 representative paragraph for linked review.\n\\end{document}\n";
     let (execution, _) = compile(

@@ -418,6 +418,10 @@ html:has(body.workspace-shell), body.workspace-shell { overflow: hidden; }
 .workspace-drawer h2, .workspace-drawer h3 { margin: 0; }
 .workspace-drawer h2 { font-size: 16px; }
 .workspace-drawer h3 { font-size: 13px; }
+.document-details-form { display: grid; gap: 12px; }
+.document-details-form label { display: grid; gap: 5px; color: var(--muted); }
+.document-details-form input, .document-details-form textarea { width: 100%; }
+.document-details-form textarea { min-height: 92px; resize: vertical; }
 .drawer-panel { padding: 12px; }
 .drawer-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .workspace-drawer .version-history { grid-template-columns: 1fr; }

@@ -86,6 +86,7 @@ pub struct AppTemplateRecord {
     pub description: Option<String>,
     pub main_file: Option<String>,
     pub policy_default: String,
+    pub front_matter_compatible: bool,
     pub created_at: String,
 }
 #[derive(Clone, Debug)]
@@ -811,19 +812,31 @@ impl AppRepository {
         main_file: Option<&str>,
         files: &[AppTemplateFileRecord],
     ) -> Result<(), AppError> {
+        self.create_template_with_compatibility(id, name, description, main_file, false, files)
+            .await
+    }
+
+    pub async fn create_template_with_compatibility(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        description: Option<&str>,
+        main_file: Option<&str>,
+        front_matter_compatible: bool,
+        files: &[AppTemplateFileRecord],
+    ) -> Result<(), AppError> {
         let mut tx = self
             .database
             .pool()
             .begin()
             .await
             .map_err(AppError::Database)?;
-        sqlx::query(
-            "INSERT INTO latex_core.templates (id,name,description,main_file) VALUES ($1,$2,$3,$4)",
-        )
+        sqlx::query("INSERT INTO latex_core.templates (id,name,description,main_file,front_matter_compatible) VALUES ($1,$2,$3,$4,$5)")
         .bind(id)
         .bind(name)
         .bind(description)
         .bind(main_file)
+        .bind(front_matter_compatible)
         .execute(&mut *tx)
         .await
         .map_err(map_conflict)?;
@@ -841,7 +854,7 @@ impl AppRepository {
         tx.commit().await.map_err(AppError::Database)
     }
     pub async fn list_templates(&self) -> Result<Vec<AppTemplateRecord>, AppError> {
-        let rows = sqlx::query("SELECT id,name,description,main_file,policy_default,created_at::text FROM latex_core.templates ORDER BY name")
+        let rows = sqlx::query("SELECT id,name,description,main_file,policy_default,front_matter_compatible,created_at::text FROM latex_core.templates ORDER BY name")
             .fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_template).collect()
     }
@@ -849,7 +862,7 @@ impl AppRepository {
         &self,
         user: UserId,
     ) -> Result<Vec<AppTemplateRecord>, AppError> {
-        let rows = sqlx::query("SELECT DISTINCT t.id,t.name,t.description,t.main_file,t.policy_default,t.created_at::text FROM latex_core.templates t JOIN latex_core.user_credentials c ON c.user_id=$1 LEFT JOIN latex_core.template_account_types a ON a.template_id=t.id AND a.account_type=c.account_type LEFT JOIN latex_core.template_user_grants g ON g.template_id=t.id AND g.user_id=$1 WHERE a.template_id IS NOT NULL OR g.user_id IS NOT NULL ORDER BY t.name")
+        let rows = sqlx::query("SELECT DISTINCT t.id,t.name,t.description,t.main_file,t.policy_default,t.front_matter_compatible,t.created_at::text FROM latex_core.templates t JOIN latex_core.user_credentials c ON c.user_id=$1 LEFT JOIN latex_core.template_account_types a ON a.template_id=t.id AND a.account_type=c.account_type LEFT JOIN latex_core.template_user_grants g ON g.template_id=t.id AND g.user_id=$1 WHERE a.template_id IS NOT NULL OR g.user_id IS NOT NULL ORDER BY t.name")
             .bind(user.as_uuid()).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_template).collect()
     }
@@ -906,7 +919,7 @@ impl AppRepository {
         }
     }
     pub async fn template(&self, id: uuid::Uuid) -> Result<AppTemplateRecord, AppError> {
-        let row = sqlx::query("SELECT id,name,description,main_file,policy_default,created_at::text FROM latex_core.templates WHERE id=$1")
+        let row = sqlx::query("SELECT id,name,description,main_file,policy_default,front_matter_compatible,created_at::text FROM latex_core.templates WHERE id=$1")
             .bind(id).fetch_optional(self.database.pool()).await.map_err(AppError::Database)?.ok_or(AppError::NotFound)?;
         decode_template(row)
     }
@@ -917,6 +930,25 @@ impl AppRepository {
         let rows = sqlx::query("SELECT path,blob_hash,size_bytes FROM latex_core.template_files WHERE template_id=$1 ORDER BY path")
             .bind(id).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
         rows.into_iter().map(decode_template_file).collect()
+    }
+
+    pub async fn set_template_front_matter_compatible(
+        &self,
+        id: uuid::Uuid,
+        compatible: bool,
+    ) -> Result<(), AppError> {
+        let result =
+            sqlx::query("UPDATE latex_core.templates SET front_matter_compatible=$2 WHERE id=$1")
+                .bind(id)
+                .bind(compatible)
+                .execute(self.database.pool())
+                .await
+                .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            Err(AppError::NotFound)
+        } else {
+            Ok(())
+        }
     }
     pub async fn template_paper_team_usage(&self, id: uuid::Uuid) -> Result<u64, AppError> {
         let count: i64 = sqlx::query_scalar(
@@ -936,6 +968,7 @@ impl AppRepository {
         name: &str,
         description: Option<&str>,
         main_file: &str,
+        front_matter_compatible: bool,
     ) -> Result<(), AppError> {
         let valid_main: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM latex_core.template_files WHERE template_id=$1 AND path=$2)",
@@ -949,12 +982,13 @@ impl AppRepository {
             return Err(AppError::NotFound);
         }
         let result = sqlx::query(
-            "UPDATE latex_core.templates SET name=$2,description=$3,main_file=$4 WHERE id=$1",
+            "UPDATE latex_core.templates SET name=$2,description=$3,main_file=$4,front_matter_compatible=$5 WHERE id=$1",
         )
         .bind(id)
         .bind(name)
         .bind(description)
         .bind(main_file)
+        .bind(front_matter_compatible)
         .execute(self.database.pool())
         .await
         .map_err(map_conflict)?;
@@ -1209,6 +1243,9 @@ fn decode_template(r: sqlx::postgres::PgRow) -> Result<AppTemplateRecord, AppErr
         description: r.try_get("description").map_err(AppError::Database)?,
         main_file: r.try_get("main_file").map_err(AppError::Database)?,
         policy_default: r.try_get("policy_default").map_err(AppError::Database)?,
+        front_matter_compatible: r
+            .try_get("front_matter_compatible")
+            .map_err(AppError::Database)?,
         created_at: r.try_get("created_at").map_err(AppError::Database)?,
     })
 }

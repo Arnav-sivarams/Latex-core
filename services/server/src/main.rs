@@ -11,6 +11,7 @@
 mod archive;
 mod auth;
 mod collaboration;
+mod front_matter;
 #[allow(
     dead_code,
     reason = "API shares mail configuration with the worker transport module"
@@ -34,10 +35,12 @@ use core_types::{
 use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLevel};
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, AppTemplateFileRecord,
-    ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1, ExactRestoreState,
-    FilePolicy, GlobalRole, GroupType, ImportJobPageFilter, ImportLimits, ImportMode,
-    InstitutionBatchUpload, InstitutionError, InstitutionOperation, InstitutionPageFilter,
-    InstitutionRepository, MailOutboxRepository, PaperTeamPageFilter, PostgresCompileQueue,
+    ApplyFrontMatterRequest, ChangeSetPublishResult, Database, DatabaseConfig, EnqueueCompileJobV1,
+    ExactRestoreState, ExactStateRecord, FilePolicy, FrontMatterPackFileRecord,
+    FrontMatterRepository, FrontMatterRepositoryError, FrontMatterValueRecord, GlobalRole,
+    GroupType, ImportJobPageFilter, ImportLimits, ImportMode, InstitutionBatchUpload,
+    InstitutionError, InstitutionOperation, InstitutionPageFilter, InstitutionRepository,
+    MailOutboxRepository, ManagedFrontMatterFile, PaperTeamPageFilter, PostgresCompileQueue,
     ProjectAccess, ProjectRoles, PublishResult, QueueLimits, TeamFileRecord,
     TeamTemplateResolutionInput, TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile,
     V2BuildRequest, V2Error, V2FilePolicy, V2Repository,
@@ -71,6 +74,7 @@ struct AppState {
     repo: AppRepository,
     v2: V2Repository,
     institution: InstitutionRepository,
+    front_matter: FrontMatterRepository,
     workspaces: WorkspaceService,
     queue: PostgresCompileQueue,
     blobs: Arc<FsBlobStore>,
@@ -144,6 +148,9 @@ struct V2RoleInput {
 struct V2PaperTeamInput {
     name: String,
     template_id: Option<uuid::Uuid>,
+    front_matter_pack_id: Option<uuid::Uuid>,
+    #[serde(default = "default_true")]
+    use_front_matter_default: bool,
     leader_writer_id: String,
     #[serde(default)]
     writer_ids: Vec<String>,
@@ -167,6 +174,30 @@ struct V2PaperTeamMemberInput {
 #[derive(Deserialize)]
 struct ProgrammeTemplateInput {
     template_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+struct FrontMatterDefaultInput {
+    front_matter_pack_id: Option<uuid::Uuid>,
+}
+
+#[derive(Deserialize)]
+struct FrontMatterPackEditInput {
+    name: String,
+    description: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct FrontMatterDetailsInput {
+    #[serde(default)]
+    values: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    sections: BTreeMap<String, bool>,
+}
+
+#[derive(Deserialize)]
+struct FrontMatterAssignmentInput {
+    front_matter_pack_id: Option<uuid::Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -588,6 +619,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || InstitutionRepository::new(database.clone()),
             |config| InstitutionRepository::new(database.clone()).with_mail(config),
         ),
+        front_matter: FrontMatterRepository::new(database.clone()),
         v2,
         workspaces,
         queue,
@@ -600,6 +632,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mail_outbox: mail_settings.repository(database.clone()),
         mail_enabled: mail_settings.enabled,
     };
+    let maintenance_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            drain_front_matter_rerenders(maintenance_state.clone(), 20).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
     let app = router(state);
     let address: SocketAddr = env::var("BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
@@ -668,6 +707,24 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/templates/{id}",
             axum::routing::patch(admin_v2_template_edit).delete(admin_v2_template_remove),
+        )
+        .route(
+            "/api/admin/v2/front-matter-packs",
+            get(admin_v2_front_matter_packs),
+        )
+        .route(
+            "/api/admin/v2/front-matter-packs/preview",
+            post(admin_v2_front_matter_preview),
+        )
+        .route(
+            "/api/admin/v2/front-matter-packs/import",
+            post(admin_v2_front_matter_import),
+        )
+        .route(
+            "/api/admin/v2/front-matter-packs/{id}",
+            get(admin_v2_front_matter_pack)
+                .patch(admin_v2_front_matter_edit)
+                .delete(admin_v2_front_matter_remove),
         )
         .route(
             "/api/admin/v2/paper-teams",
@@ -771,6 +828,14 @@ fn router(state: AppState) -> Router {
             get(admin_v2_global_fallback).put(admin_v2_set_global_fallback),
         )
         .route(
+            "/api/admin/v2/institution/template-defaults/programmes/{programme_code}/front-matter",
+            axum::routing::put(admin_v2_set_programme_front_matter_default),
+        )
+        .route(
+            "/api/admin/v2/institution/template-defaults/global-front-matter",
+            axum::routing::put(admin_v2_set_global_front_matter_fallback),
+        )
+        .route(
             "/api/admin/v2/paper-teams/{id}",
             get(admin_v2_paper_team).put(admin_v2_update_paper_team),
         )
@@ -781,6 +846,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/paper-teams/{id}/template-change/apply",
             post(admin_v2_template_change_apply),
+        )
+        .route(
+            "/api/admin/v2/paper-teams/{id}/front-matter",
+            axum::routing::put(admin_v2_assign_front_matter).delete(admin_v2_remove_front_matter),
         )
         .route(
             "/api/admin/v2/paper-teams/{id}/members",
@@ -826,6 +895,10 @@ fn router(state: AppState) -> Router {
             post(v2_create_personal_paper),
         )
         .route("/api/v2/papers/{paper_id}", get(v2_paper))
+        .route(
+            "/api/v2/papers/{paper_id}/document-details",
+            get(v2_document_details).put(v2_save_document_details),
+        )
         .route(
             "/api/v2/papers/{paper_id}/files",
             get(v2_paper_files).post(v2_create_file),
@@ -1890,7 +1963,12 @@ async fn admin_v2_institution_apply(
                 .merge_existing_team(principal.user_id(), &plan)
                 .await
             {
-                Ok(()) => merged += 1,
+                Ok(()) => {
+                    if let Some(paper_id) = plan.existing_paper_team_id {
+                        refresh_existing_front_matter(&state, principal.user_id(), paper_id).await;
+                    }
+                    merged += 1;
+                }
                 Err(error_value) => {
                     unresolved += 1;
                     let reasons = vec![error_value.to_string()];
@@ -1991,7 +2069,15 @@ async fn admin_v2_institution_apply(
             )
             .await
         {
-            Ok((_team, _)) => {
+            Ok((team, _)) => {
+                materialize_automatic_front_matter(
+                    &state,
+                    principal.user_id(),
+                    team.id,
+                    resolution.selected_template_id,
+                    &resolution,
+                )
+                .await;
                 materialized += 1;
             }
             Err(error_value) => {
@@ -2005,6 +2091,12 @@ async fn admin_v2_institution_apply(
                     return institution_error(mark_error);
                 }
             }
+        }
+    }
+    if let Ok(enqueued) = state.front_matter.enqueue_affected_for_import(job_id).await {
+        if enqueued > 0 {
+            let maintenance = state.clone();
+            tokio::spawn(async move { drain_front_matter_rerenders(maintenance, 20).await });
         }
     }
     match state.institution.job(job_id).await {
@@ -2088,12 +2180,14 @@ async fn admin_v2_institution_retry_teams(
                             Err(_) => Err("selected template is not materializable".into()),
                             Ok((main_path, seeds, source_identity)) => {
                                 let imported = TeamTemplateResolutionInput {
-                                    dominant_programme_code: resolution.dominant_programme_code,
-                                    resolution_method: resolution.resolution_method,
+                                    dominant_programme_code: resolution
+                                        .dominant_programme_code
+                                        .clone(),
+                                    resolution_method: resolution.resolution_method.clone(),
                                     external_team_key: Some(plan.external_team_key.clone()),
                                     source_import_job_id: Some(job_id),
                                 };
-                                state
+                                match state
                                     .v2
                                     .create_template_paper_team(
                                         principal.user_id(),
@@ -2110,8 +2204,20 @@ async fn admin_v2_institution_retry_teams(
                                         Some(&imported),
                                     )
                                     .await
-                                    .map(|_| ())
-                                    .map_err(|error_value| error_value.to_string())
+                                {
+                                    Ok((team, _)) => {
+                                        materialize_automatic_front_matter(
+                                            &state,
+                                            principal.user_id(),
+                                            team.id,
+                                            resolution.selected_template_id,
+                                            &resolution,
+                                        )
+                                        .await;
+                                        Ok(())
+                                    }
+                                    Err(error_value) => Err(error_value.to_string()),
+                                }
                             }
                         }
                     }
@@ -2531,6 +2637,55 @@ async fn admin_v2_set_global_fallback(
     }
 }
 
+async fn admin_v2_set_programme_front_matter_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(programme_code): Path<String>,
+    Json(input): Json<FrontMatterDefaultInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .set_programme_front_matter_default(
+            principal.user_id(),
+            &programme_code,
+            input.front_matter_pack_id,
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
+async fn admin_v2_set_global_front_matter_fallback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<FrontMatterDefaultInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match institution_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .institution
+        .set_global_front_matter_fallback(principal.user_id(), input.front_matter_pack_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => institution_error(error_value),
+    }
+}
+
 async fn admin_v2_paper_team(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2545,15 +2700,19 @@ async fn admin_v2_paper_team(
         state.v2.list_paper_team_member_views(id).await,
         state.v2.paper_template_pin(principal.user_id(), id).await,
         state.institution.paper_team_admin_summary(id).await,
+        state.front_matter.team_detail(principal.user_id(), id).await,
     ) {
-        (Ok(team), Ok(members), Ok(template_pin), Ok(summary)) => {
-            Json(serde_json::json!({"team":team,"members":members,"template_pin":template_pin,"summary":summary}))
+        (Ok(team), Ok(members), Ok(template_pin), Ok(summary), Ok(front_matter)) => {
+            Json(serde_json::json!({"team":team,"members":members,"template_pin":template_pin,"summary":summary,"front_matter":front_matter}))
                 .into_response()
         }
-        (Err(error_value), _, _, _) | (_, Err(error_value), _, _) | (_, _, Err(error_value), _) => {
+        (Err(error_value), _, _, _, _)
+        | (_, Err(error_value), _, _, _)
+        | (_, _, Err(error_value), _, _) => {
             v2_error(error_value)
         }
-        (_, _, _, Err(error_value)) => institution_error(error_value),
+        (_, _, _, Err(error_value), _) => institution_error(error_value),
+        (_, _, _, _, Err(error_value)) => front_matter_repository_error(error_value),
     }
 }
 
@@ -2600,7 +2759,10 @@ async fn admin_v2_update_paper_team(
         )
         .await
     {
-        Ok(value) => Json(value).into_response(),
+        Ok(value) => {
+            refresh_existing_front_matter(&state, principal.user_id(), id).await;
+            Json(value).into_response()
+        }
         Err(error_value) => institution_error(error_value),
     }
 }
@@ -2650,6 +2812,25 @@ async fn prepare_template_change(
         return Err(error(
             StatusCode::CONFLICT,
             "selected template is already pinned",
+        ));
+    }
+    let has_front_matter = state
+        .front_matter
+        .team_detail(admin, paper_id)
+        .await
+        .ok()
+        .and_then(|detail| detail.get("pack_id").cloned())
+        .is_some_and(|value| !value.is_null());
+    if has_front_matter
+        && !state
+            .repo
+            .template(input.new_template_id)
+            .await
+            .is_ok_and(|template| template.front_matter_compatible)
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "This template is not configured for Front Matter.",
         ));
     }
     let paper = persistence::WriterPaper {
@@ -2932,6 +3113,525 @@ async fn admin_v2_template_change_apply(
     Json(serde_json::json!({"paper_id":id,"template_id":input.new_template_id,"resolution_method":"MANUAL_OVERRIDE","workspace_version":next,"template_update_version_id":version_id,"safety_checkpoint":"PRE_TEMPLATE_CHANGE"})).into_response()
 }
 
+async fn v2_document_details(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .front_matter
+        .team_detail(principal.user_id(), paper_id)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error_value) => front_matter_repository_error(error_value),
+    }
+}
+
+async fn v2_save_document_details(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Json(input): Json<FrontMatterDetailsInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let detail = match state
+        .front_matter
+        .team_detail(principal.user_id(), paper_id)
+        .await
+    {
+        Ok(value) if value.get("can_edit").and_then(serde_json::Value::as_bool) == Some(true) => {
+            value
+        }
+        Ok(_) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "Only the Team Leader can save Team document details.",
+            );
+        }
+        Err(error_value) => return front_matter_repository_error(error_value),
+    };
+    let Some(pack_id) = detail
+        .get("pack_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+    else {
+        return error(StatusCode::CONFLICT, "This paper has no Front Matter Pack.");
+    };
+    match render_team_front_matter(
+        &state,
+        principal.user_id(),
+        paper_id,
+        pack_id,
+        input.values,
+        input.sections,
+        "MANUAL_OVERRIDE",
+        detail
+            .get("dominant_programme_code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    )
+    .await
+    {
+        Ok(version) => Json(serde_json::json!({
+            "paper_team_id":paper_id,"workspace_version":version,"auto_build_required":false
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn admin_v2_assign_front_matter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+    Json(input): Json<FrontMatterAssignmentInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Some(pack_id) = input.front_matter_pack_id else {
+        return admin_remove_front_matter(&state, principal.user_id(), paper_id).await;
+    };
+    let automatic = match state.front_matter.automatic_values(paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return front_matter_repository_error(error_value),
+    };
+    let dominant = automatic
+        .get("team.dominant_programme_code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    match render_team_front_matter(
+        &state,
+        principal.user_id(),
+        paper_id,
+        pack_id,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        "MANUAL_OVERRIDE",
+        dominant,
+    )
+    .await
+    {
+        Ok(version) => Json(serde_json::json!({
+            "paper_team_id":paper_id,"front_matter_pack_id":pack_id,
+            "workspace_version":version,"auto_build_required":false
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn admin_v2_remove_front_matter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    admin_remove_front_matter(&state, principal.user_id(), paper_id).await
+}
+
+async fn admin_remove_front_matter(
+    state: &AppState,
+    actor: UserId,
+    paper_id: uuid::Uuid,
+) -> Response {
+    let team = match state.v2.paper_team(paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let paper = persistence::WriterPaper {
+        id: team.id,
+        workspace_id: team.workspace_id,
+        name: team.name,
+        kind: persistence::PaperKind::Team,
+        status: team.status,
+        is_team_leader: false,
+        updated_at: team.updated_at,
+    };
+    let exact = match capture_exact_v2_state(state, &paper).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let empty = match state.blobs.put(Bytes::new()).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    let safety = ExactStateRecord {
+        document_epoch: exact.document_epoch,
+        workspace_version: exact.source_sequence,
+        snapshot_id: exact.snapshot_id.to_hex(),
+        manifest: exact.manifest,
+        state_hash: exact.state_hash,
+    };
+    match state
+        .front_matter
+        .remove_render(
+            actor,
+            paper_id,
+            paper.workspace_id,
+            exact.source_sequence,
+            empty.hash(),
+            Some(safety),
+        )
+        .await
+    {
+        Ok(version) => {
+            schedule_front_matter_auto_build(state, paper_id).await;
+            Json(serde_json::json!({
+                "paper_team_id":paper_id,"front_matter_pack_id":null,
+                "workspace_version":version,"auto_build_required":false
+            }))
+            .into_response()
+        }
+        Err(error_value) => front_matter_repository_error(error_value),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_team_front_matter(
+    state: &AppState,
+    actor: UserId,
+    paper_id: uuid::Uuid,
+    pack_id: uuid::Uuid,
+    overrides: BTreeMap<String, serde_json::Value>,
+    sections: BTreeMap<String, bool>,
+    resolution_method: &str,
+    dominant_programme_code: Option<String>,
+) -> Result<u64, Response> {
+    let pack = load_front_matter_pack(state, pack_id).await?;
+    let automatic = state
+        .front_matter
+        .automatic_values(paper_id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let rendered = front_matter::resolve_and_render(&pack, &automatic, &overrides, &sections)
+        .map_err(|error_value| match error_value {
+            front_matter::FrontMatterError::MissingRequired(labels) => error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Needs information: {}", labels.join(", ")),
+            ),
+            other => error(StatusCode::BAD_REQUEST, other.to_string()),
+        })?;
+    let mut files = Vec::with_capacity(rendered.files.len());
+    for file in rendered.files {
+        let stored = state.blobs.put(file.bytes).await.map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Front Matter blob storage failed",
+            )
+        })?;
+        files.push(ManagedFrontMatterFile {
+            path: file.path.to_string(),
+            blob_hash: stored.hash(),
+            size_bytes: stored.size_bytes(),
+        });
+    }
+    let team = state.v2.paper_team(paper_id).await.map_err(v2_error)?;
+    let paper = persistence::WriterPaper {
+        id: team.id,
+        workspace_id: team.workspace_id,
+        name: team.name,
+        kind: persistence::PaperKind::Team,
+        status: team.status,
+        is_team_leader: false,
+        updated_at: team.updated_at,
+    };
+    let exact = capture_exact_v2_state(state, &paper).await?;
+    let values = rendered
+        .resolved
+        .into_iter()
+        .map(|(field_key, value)| FrontMatterValueRecord {
+            field_key,
+            value_json: value.value,
+            value_source: value.source.to_owned(),
+        })
+        .collect();
+    let version = state
+        .front_matter
+        .apply_render(
+            actor,
+            &ApplyFrontMatterRequest {
+                paper_team_id: paper_id,
+                workspace_id: paper.workspace_id,
+                expected_workspace_version: exact.source_sequence,
+                pack_id,
+                dominant_programme_code,
+                resolution_method: resolution_method.to_owned(),
+                files,
+                values,
+                sections: rendered.enabled_sections,
+                safety: Some(ExactStateRecord {
+                    document_epoch: exact.document_epoch,
+                    workspace_version: exact.source_sequence,
+                    snapshot_id: exact.snapshot_id.to_hex(),
+                    manifest: exact.manifest,
+                    state_hash: exact.state_hash,
+                }),
+            },
+        )
+        .await
+        .map_err(front_matter_repository_error)?;
+    schedule_front_matter_auto_build(state, paper_id).await;
+    Ok(version)
+}
+
+async fn schedule_front_matter_auto_build(state: &AppState, paper_id: uuid::Uuid) {
+    let result = async {
+        let (user_id, tenant_id) = state
+            .front_matter
+            .team_build_identity(paper_id)
+            .await
+            .map_err(front_matter_repository_error)?;
+        let paper = state
+            .v2
+            .writer_paper(user_id, paper_id)
+            .await
+            .map_err(v2_error)?;
+        let exact = capture_exact_v2_state(state, &paper).await?;
+        let engine = TexEngine::PdfLatex;
+        let profile = LatexmkProfileId::parse("safe-v1")
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "profile failure"))?;
+        let compile_key = CompileKeyMaterialV1::new(
+            exact.snapshot_id,
+            engine,
+            state.environment.clone(),
+            profile.clone(),
+            ShellPolicy::Safe,
+            true,
+        )
+        .compile_key()
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "compile key failure"))?;
+        state
+            .v2
+            .submit_v2_build(&V2BuildRequest {
+                paper_id,
+                workspace_id: paper.workspace_id,
+                document_epoch: exact.document_epoch,
+                source_sequence: exact.source_sequence,
+                snapshot_id: exact.snapshot_id,
+                manifest: exact.manifest,
+                state_hash: exact.state_hash,
+                tenant_id,
+                user_id,
+                trigger_type: "auto".to_owned(),
+                compile_key,
+                engine,
+                tex_environment_id: state.environment.clone(),
+                latexmk_profile: profile,
+                shell_policy: ShellPolicy::Safe,
+                synctex: true,
+            })
+            .await
+            .map_err(v2_error)?;
+        Ok::<(), Response>(())
+    }
+    .await;
+    if result.is_err() {
+        tracing::warn!(%paper_id, "Front Matter was saved but its automatic build could not be queued");
+    }
+}
+
+async fn load_front_matter_pack(
+    state: &AppState,
+    pack_id: uuid::Uuid,
+) -> Result<front_matter::ValidatedPack, Response> {
+    let records = state
+        .front_matter
+        .pack_files(pack_id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let mut files = Vec::with_capacity(records.len());
+    for record in records {
+        let path = LogicalPath::parse(&record.path)
+            .map_err(|_| error(StatusCode::CONFLICT, "Front Matter Pack path is invalid"))?;
+        let bytes = state
+            .blobs
+            .get(record.blob_hash)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"))?;
+        files.push(archive::ImportedFile { path, bytes });
+    }
+    front_matter::validate_archive(archive::ImportedArchive {
+        files,
+        detected_main: None,
+    })
+    .map_err(|error_value| error(StatusCode::CONFLICT, error_value.to_string()))
+}
+
+async fn materialize_automatic_front_matter(
+    state: &AppState,
+    actor: UserId,
+    team_id: uuid::Uuid,
+    template_id: uuid::Uuid,
+    resolution: &persistence::TemplateResolution,
+) {
+    let Some(pack_id) = resolution.front_matter_pack_id else {
+        return;
+    };
+    let compatible = state
+        .repo
+        .template(template_id)
+        .await
+        .is_ok_and(|template| template.front_matter_compatible);
+    if !compatible {
+        let _ = state
+            .front_matter
+            .record_materialization_warning(
+                team_id,
+                "FRONT_MATTER_TEMPLATE_INCOMPATIBLE",
+                "The automatically selected main template is not configured for Front Matter.",
+            )
+            .await;
+        tracing::warn!(%team_id, %template_id, %pack_id, "automatic Front Matter skipped for incompatible template");
+        return;
+    }
+    let method = resolution
+        .front_matter_resolution_method
+        .as_deref()
+        .unwrap_or("GLOBAL_FALLBACK");
+    if render_team_front_matter(
+        state,
+        actor,
+        team_id,
+        pack_id,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        method,
+        resolution.dominant_programme_code.clone(),
+    )
+    .await
+    .is_err()
+    {
+        let _ = state
+            .front_matter
+            .record_materialization_warning(
+                team_id,
+                "FRONT_MATTER_RENDER_FAILED",
+                "Automatic Front Matter needs information or could not be rendered; assign it from Team management after correcting the details.",
+            )
+            .await;
+        tracing::warn!(%team_id, %pack_id, "automatic Front Matter render failed without rolling back Team creation");
+    }
+}
+
+async fn refresh_existing_front_matter(
+    state: &AppState,
+    actor: UserId,
+    paper_id: uuid::Uuid,
+) -> bool {
+    let Ok(detail) = state.front_matter.team_detail(actor, paper_id).await else {
+        return false;
+    };
+    let Some(pack_id) = detail
+        .get("pack_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+    else {
+        return true;
+    };
+    let overrides = detail
+        .get("values")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|value| {
+            value
+                .get("value_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("TEAM_OVERRIDE")
+        })
+        .filter_map(|value| {
+            Some((
+                value.get("field_key")?.as_str()?.to_owned(),
+                value.get("value")?.clone(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let sections = detail
+        .get("sections")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            Some((
+                value.get("section_key")?.as_str()?.to_owned(),
+                value.get("enabled")?.as_bool()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let method = detail
+        .get("resolution_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("MANUAL_OVERRIDE");
+    let dominant = detail
+        .get("dominant_programme_code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if render_team_front_matter(
+        state, actor, paper_id, pack_id, overrides, sections, method, dominant,
+    )
+    .await
+    .is_err()
+    {
+        let _ = state
+            .front_matter
+            .record_materialization_warning(
+                paper_id,
+                "FRONT_MATTER_RENDER_FAILED",
+                "Automatic metadata refresh failed; existing rendered Front Matter was preserved.",
+            )
+            .await;
+        return false;
+    }
+    true
+}
+
+async fn drain_front_matter_rerenders(state: AppState, limit: usize) {
+    for _ in 0..limit {
+        let paper_id = match state.front_matter.claim_rerender().await {
+            Ok(Some(value)) => value,
+            Ok(None) => break,
+            Err(error_value) => {
+                tracing::warn!(error=%error_value, "Front Matter maintenance claim failed");
+                break;
+            }
+        };
+        let succeeded = match state.front_matter.team_build_identity(paper_id).await {
+            Ok((leader, _)) => refresh_existing_front_matter(&state, leader, paper_id).await,
+            Err(_) => false,
+        };
+        if let Err(error_value) = state
+            .front_matter
+            .finish_rerender(paper_id, succeeded)
+            .await
+        {
+            tracing::warn!(%paper_id, error=%error_value, "Front Matter maintenance completion failed");
+            break;
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn admin_v2_create_paper_team(
     State(state): State<AppState>,
@@ -2960,42 +3660,40 @@ async fn admin_v2_create_paper_team(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let automatic_resolution = if input.template_id.is_none() {
-        match state
-            .institution
-            .resolve_default_template_for_writers(&writer_ids)
-            .await
-        {
-            Ok(value) => Some(value),
-            Err(error_value) => return institution_error(error_value),
-        }
-    } else {
-        None
+    let resolved_defaults = match state
+        .institution
+        .resolve_template_for_writers(&writer_ids, input.template_id)
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => return institution_error(error_value),
     };
-    let template_id = input.template_id.unwrap_or_else(|| {
-        automatic_resolution
-            .as_ref()
-            .expect("automatic resolution is present")
-            .selected_template_id
-    });
+    let template_id = resolved_defaults.selected_template_id;
     let (main_path, seeds, source_identity) = match template_seeds(&state, template_id).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let resolution_input = automatic_resolution.as_ref().map_or_else(
-        || TeamTemplateResolutionInput {
-            dominant_programme_code: None,
-            resolution_method: "MANUAL_OVERRIDE".to_owned(),
-            external_team_key: None,
-            source_import_job_id: None,
-        },
-        |resolution| TeamTemplateResolutionInput {
-            dominant_programme_code: resolution.dominant_programme_code.clone(),
-            resolution_method: resolution.resolution_method.clone(),
-            external_team_key: None,
-            source_import_job_id: None,
-        },
-    );
+    if let Some(pack_id) = input.front_matter_pack_id {
+        let template = match state.repo.template(template_id).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::NOT_FOUND, "template not found"),
+        };
+        if !template.front_matter_compatible {
+            return error(
+                StatusCode::CONFLICT,
+                "This template is not configured for Front Matter.",
+            );
+        }
+        if let Err(response) = load_front_matter_pack(&state, pack_id).await {
+            return response;
+        }
+    }
+    let resolution_input = TeamTemplateResolutionInput {
+        dominant_programme_code: resolved_defaults.dominant_programme_code.clone(),
+        resolution_method: resolved_defaults.resolution_method.clone(),
+        external_team_key: None,
+        source_import_job_id: None,
+    };
     match state
         .v2
         .create_template_paper_team(
@@ -3014,16 +3712,56 @@ async fn admin_v2_create_paper_team(
         )
         .await
     {
-        Ok((team, files)) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "team":team,"files":files,
-                "template_pin":{"template_id":template_id,"source_identity":source_identity},
-                "template_resolution":automatic_resolution,
-                "manual_override":input.template_id.is_some(),
-            })),
-        )
-            .into_response(),
+        Ok((team, files)) => {
+            let mut front_matter_warning = None;
+            if let Some(pack_id) = input.front_matter_pack_id {
+                if render_team_front_matter(
+                    &state,
+                    principal.user_id(),
+                    team.id,
+                    pack_id,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    "MANUAL_OVERRIDE",
+                    resolved_defaults.dominant_programme_code.clone(),
+                )
+                .await
+                .is_err()
+                {
+                    let warning = "The selected Front Matter Pack could not be rendered; the Team was created without a partial Front Matter assignment.";
+                    let _ = state
+                        .front_matter
+                        .record_materialization_warning(
+                            team.id,
+                            "FRONT_MATTER_RENDER_FAILED",
+                            warning,
+                        )
+                        .await;
+                    front_matter_warning = Some(warning);
+                }
+            } else if input.use_front_matter_default {
+                materialize_automatic_front_matter(
+                    &state,
+                    principal.user_id(),
+                    team.id,
+                    template_id,
+                    &resolved_defaults,
+                )
+                .await;
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "team":team,"files":files,
+                    "template_pin":{"template_id":template_id,"source_identity":source_identity},
+                    "template_resolution":resolved_defaults,
+                    "manual_override":input.template_id.is_some(),
+                    "front_matter_manual_override":input.front_matter_pack_id.is_some(),
+                    "front_matter_warning":front_matter_warning,
+                })),
+            )
+                .into_response()
+        }
         Err(value) => v2_error(value),
     }
 }
@@ -3050,7 +3788,10 @@ async fn admin_v2_change_paper_team_leader(
         .change_paper_team_leader(id, leader_writer_id, principal.user_id())
         .await
     {
-        Ok(member) => Json(member).into_response(),
+        Ok(member) => {
+            refresh_existing_front_matter(&state, principal.user_id(), id).await;
+            Json(member).into_response()
+        }
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -3077,7 +3818,10 @@ async fn admin_v2_add_paper_team_member(
         .add_paper_team_member(id, user_id, principal.user_id())
         .await
     {
-        Ok(member) => (StatusCode::CREATED, Json(member)).into_response(),
+        Ok(member) => {
+            refresh_existing_front_matter(&state, principal.user_id(), id).await;
+            (StatusCode::CREATED, Json(member)).into_response()
+        }
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -3103,7 +3847,10 @@ async fn admin_v2_remove_paper_team_member(
         .remove_paper_team_member(id, user_id, principal.user_id())
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            refresh_existing_front_matter(&state, principal.user_id(), id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -4221,7 +4968,7 @@ async fn capture_exact_v2_state(
         file_identities.push(serde_json::json!({"file_id":file.file_id,"path":file.path}));
         file_policies.push(serde_json::json!({"file_id":file.file_id,"policy":policy}));
     }
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema_version": 1,
         "paper_id": paper.id,
         "workspace_id": paper.workspace_id,
@@ -4235,6 +4982,19 @@ async fn capture_exact_v2_state(
         "workspace": workspace_manifest,
         "template_policy_provenance": {"file_policies":file_policies},
     });
+    if paper.kind == persistence::PaperKind::Team {
+        let front_matter_state = state
+            .front_matter
+            .version_state(paper.id)
+            .await
+            .map_err(front_matter_repository_error)?;
+        if let Some(object) = manifest.as_object_mut() {
+            object.insert(
+                "front_matter".to_owned(),
+                front_matter_state.unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
     let state_hash = checkpoint.snapshot_id().to_hex();
     Ok(ExactV2State {
         document_epoch,
@@ -4881,6 +5641,10 @@ fn default_manual_trigger() -> String {
     "manual".to_owned()
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 async fn authorized_file(
     state: &AppState,
     writer: UserId,
@@ -5019,6 +5783,39 @@ fn institution_error(error_value: InstitutionError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "institution persistence failure",
         ),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Axum error adapters and Result::map_err consume repository errors by convention"
+)]
+fn front_matter_repository_error(error_value: FrontMatterRepositoryError) -> Response {
+    match error_value {
+        FrontMatterRepositoryError::NotFound => {
+            error(StatusCode::NOT_FOUND, "Front Matter record not found")
+        }
+        FrontMatterRepositoryError::Forbidden => error(
+            StatusCode::FORBIDDEN,
+            "Front Matter operation is not authorized",
+        ),
+        FrontMatterRepositoryError::InUse => {
+            error(StatusCode::CONFLICT, "Front Matter Pack is in use")
+        }
+        FrontMatterRepositoryError::IncompatibleTemplate => error(
+            StatusCode::CONFLICT,
+            "This template is not configured for Front Matter.",
+        ),
+        FrontMatterRepositoryError::VersionConflict => error(
+            StatusCode::CONFLICT,
+            "Paper changed during Front Matter rendering; try again.",
+        ),
+        FrontMatterRepositoryError::Integrity(_) | FrontMatterRepositoryError::Database(_) => {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Front Matter persistence failure",
+            )
+        }
     }
 }
 
@@ -5314,6 +6111,7 @@ async fn admin_templates(State(state): State<AppState>, headers: HeaderMap) -> R
         response.push(serde_json::json!({
             "id":template.id.to_string(),"name":template.name,"description":template.description,
             "main_file":template.main_file,"policy_default":template.policy_default,
+            "front_matter_compatible":template.front_matter_compatible,
             "created_at":template.created_at,"usage_count":usage_count,"pinned":usage_count > 0,
             "tex_files":files.iter().filter(|file| std::path::Path::new(&file.path).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("tex"))).map(|file| &file.path).collect::<Vec<_>>(),
             "update_status":"Template source is immutable; metadata and Main selection may be edited"
@@ -5357,6 +6155,8 @@ async fn admin_v2_template_preview(
             "path": file.path.as_str(),
             "size_bytes": file.bytes.len(),
             "is_tex": file.path.extension() == Some("tex"),
+            "front_matter_compatible": file.path.extension() == Some("tex")
+                && front_matter::main_template_compatible(&file.bytes),
         })).collect::<Vec<_>>(),
     }))
     .into_response()
@@ -5404,6 +6204,16 @@ async fn admin_v2_template_import(
         Ok(value) => value,
         Err(error_value) => return import_error(error_value),
     };
+    if imported
+        .files
+        .iter()
+        .any(|file| is_front_matter_managed_path(&file.path))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "template archives cannot own the managed Front Matter subtree",
+        );
+    }
     let main = match upload.main.as_deref().filter(|value| !value.is_empty()) {
         Some(value) => match LogicalPath::parse(value) {
             Ok(path) => path,
@@ -5436,6 +6246,11 @@ async fn admin_v2_template_import(
             "template main must name an archived TeX file",
         );
     }
+    let front_matter_compatible = imported
+        .files
+        .iter()
+        .find(|file| file.path == main)
+        .is_some_and(|file| front_matter::main_template_compatible(&file.bytes));
     let mut records = Vec::with_capacity(imported.files.len());
     for file in imported.files {
         let stored = match state.blobs.put(file.bytes).await {
@@ -5451,7 +6266,14 @@ async fn admin_v2_template_import(
     let id = uuid::Uuid::new_v4();
     match state
         .repo
-        .create_template(id, name, description, Some(main.as_str()), &records)
+        .create_template_with_compatibility(
+            id,
+            name,
+            description,
+            Some(main.as_str()),
+            front_matter_compatible,
+            &records,
+        )
         .await
     {
         Ok(()) => {
@@ -5472,6 +6294,7 @@ async fn admin_v2_template_import(
                     "name": name,
                     "description": description,
                     "main_file": main.as_str(),
+                    "front_matter_compatible": front_matter_compatible,
                     "source_identity": digest(&identity_material),
                     "files": records.iter().map(|file| serde_json::json!({
                         "path": file.path,
@@ -5564,6 +6387,11 @@ async fn template_import_fields(
     Ok(upload)
 }
 
+fn is_front_matter_managed_path(path: &LogicalPath) -> bool {
+    path.as_str() == ".latex-core/frontmatter"
+        || path.as_str().starts_with(".latex-core/frontmatter/")
+}
+
 async fn admin_v2_template_edit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5594,9 +6422,24 @@ async fn admin_v2_template_edit(
     if name.is_empty() || name.len() > 200 || description.is_some_and(|value| value.len() > 2_000) {
         return error(StatusCode::BAD_REQUEST, "invalid template metadata");
     }
+    let main_record = match state.repo.template_files(id).await {
+        Ok(files) => files.into_iter().find(|file| file.path == main.as_str()),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "template lookup failed"),
+    };
+    let Some(main_record) = main_record else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Main must be an existing .tex file",
+        );
+    };
+    let main_bytes = match state.blobs.get(main_record.blob_hash).await {
+        Ok(bytes) => bytes,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+    };
+    let compatible = front_matter::main_template_compatible(&main_bytes);
     match state
         .repo
-        .update_template_metadata(id, name, description, main.as_str())
+        .update_template_metadata(id, name, description, main.as_str(), compatible)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -5629,6 +6472,243 @@ async fn admin_v2_template_remove(
         Err(AppError::NotFound) => error(StatusCode::NOT_FOUND, "template not found"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "template removal failed"),
     }
+}
+
+async fn admin_v2_front_matter_packs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.front_matter.list_packs().await {
+        Ok(packs) => Json(packs).into_response(),
+        Err(error_value) => front_matter_repository_error(error_value),
+    }
+}
+
+async fn admin_v2_front_matter_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let pack = match state.front_matter.pack(id).await {
+        Ok(value) => value,
+        Err(error_value) => return front_matter_repository_error(error_value),
+    };
+    let files = match state.front_matter.pack_files(id).await {
+        Ok(value) => value,
+        Err(error_value) => return front_matter_repository_error(error_value),
+    };
+    Json(serde_json::json!({
+        "pack":pack,
+        "files":files.into_iter().map(|file| serde_json::json!({
+            "path":file.path,"blob_hash":file.blob_hash,"size_bytes":file.size_bytes,
+            "media_type":file.media_type
+        })).collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+async fn admin_v2_front_matter_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let body = match template_archive_field(multipart).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let archive = match archive::read_archive(&body) {
+        Ok(value) => value,
+        Err(error_value) => return import_error(error_value),
+    };
+    match front_matter::validate_archive(archive) {
+        Ok(pack) => Json(front_matter_preview_json(&pack)).into_response(),
+        Err(error_value) => error(StatusCode::BAD_REQUEST, error_value.to_string()),
+    }
+}
+
+async fn admin_v2_front_matter_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let upload = match template_import_fields(multipart).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = upload.name.trim();
+    let description = upload
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if name.is_empty() || name.len() > 200 || description.is_some_and(|value| value.len() > 2_000) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid Front Matter Pack metadata",
+        );
+    }
+    let archive = match archive::read_archive(&upload.archive) {
+        Ok(value) => value,
+        Err(error_value) => return import_error(error_value),
+    };
+    let validated = match front_matter::validate_archive(archive) {
+        Ok(value) => value,
+        Err(error_value) => return error(StatusCode::BAD_REQUEST, error_value.to_string()),
+    };
+    let mut records = Vec::with_capacity(validated.files.len());
+    let mut identity = String::new();
+    for file in &validated.files {
+        let stored = match state.blobs.put(file.bytes.clone()).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
+        };
+        let _ = write!(identity, "{}:{};", file.path, stored.hash());
+        records.push(FrontMatterPackFileRecord {
+            path: file.path.to_string(),
+            blob_hash: stored.hash(),
+            size_bytes: stored.size_bytes(),
+            media_type: front_matter_media_type(file.path.extension()),
+        });
+    }
+    let content_hash = digest(&identity);
+    let manifest_json = match serde_json::to_value(&validated.manifest) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "manifest encoding failed",
+            );
+        }
+    };
+    let id = uuid::Uuid::new_v4();
+    match state
+        .front_matter
+        .create_pack(
+            principal.user_id(),
+            id,
+            name,
+            description,
+            &manifest_json,
+            &content_hash,
+            &records,
+        )
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id":id,"name":name,"description":description,"content_hash":content_hash,
+                "manifest":validated.manifest,"files":records.len()
+            })),
+        )
+            .into_response(),
+        Err(error_value) => front_matter_repository_error(error_value),
+    }
+}
+
+async fn admin_v2_front_matter_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(input): Json<FrontMatterPackEditInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = input.name.trim();
+    let description = input
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if name.is_empty() || name.len() > 200 || description.is_some_and(|value| value.len() > 2_000) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid Front Matter Pack metadata",
+        );
+    }
+    match state
+        .front_matter
+        .update_pack_metadata(principal.user_id(), id, name, description)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error_value) => front_matter_repository_error(error_value),
+    }
+}
+
+async fn admin_v2_front_matter_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .front_matter
+        .delete_pack_if_unused(principal.user_id(), id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(FrontMatterRepositoryError::InUse) => error(
+            StatusCode::CONFLICT,
+            "Front Matter Pack is in use and cannot be removed.",
+        ),
+        Err(error_value) => front_matter_repository_error(error_value),
+    }
+}
+
+fn front_matter_preview_json(pack: &front_matter::ValidatedPack) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version":pack.manifest.schema_version,
+        "entry_file":pack.manifest.entry_file,
+        "sections":pack.manifest.sections,
+        "fields":pack.manifest.fields,
+        "files":pack.files.iter().map(|file| serde_json::json!({
+            "path":file.path,"size_bytes":file.bytes.len(),"media_type":front_matter_media_type(file.path.extension())
+        })).collect::<Vec<_>>()
+    })
+}
+
+fn front_matter_media_type(extension: Option<&str>) -> String {
+    match extension.map(str::to_ascii_lowercase).as_deref() {
+        Some("tex") => "application/x-tex",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("pdf") => "application/pdf",
+        Some("bib") => "application/x-bibtex",
+        _ => "application/octet-stream",
+    }
+    .to_owned()
 }
 async fn admin_system(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = admin_session(&state, &headers).await {
@@ -12431,6 +13511,303 @@ mod database_tests {
     }
 
     #[tokio::test]
+    async fn v2_3_front_matter_render_policy_and_history_are_exact() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let leader = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let leader_id = test_user_id(&pool, &leader.email).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+
+        let template_id = uuid::Uuid::new_v4();
+        let template_bytes = Bytes::from_static(
+            b"\\documentclass{article}\n\\begin{document}\n\\input{.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER\nMain content\n\\end{document}\n",
+        );
+        let template_blob = state.blobs.put(template_bytes).await.unwrap();
+        state
+            .repo
+            .create_template_with_compatibility(
+                template_id,
+                &format!("Front Matter compatible {template_id}"),
+                None,
+                Some("main.tex"),
+                true,
+                &[AppTemplateFileRecord {
+                    path: "main.tex".into(),
+                    blob_hash: template_blob.hash(),
+                    size_bytes: template_blob.size_bytes(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let manifest = serde_json::json!({
+            "schema_version":1,
+            "entry_file":"frontmatter.tex",
+            "sections":[{"key":"cover","label":"Cover page","file":"cover.tex","required":true,"default_enabled":true}],
+            "fields":[
+                {"key":"paper_title","label":"Paper title","type":"TEXT","required":true,"source":"team.name","allow_team_override":true},
+                {"key":"acknowledgement","label":"Acknowledgements","type":"MULTILINE","required":true,"default":"Initial acknowledgement","allow_team_override":true}
+            ]
+        });
+        let pack_sources = [
+            (
+                "frontmatter.json",
+                serde_json::to_vec(&manifest).unwrap(),
+                "application/json",
+            ),
+            (
+                "frontmatter.tex",
+                b"\\input{cover.tex}\n".to_vec(),
+                "text/x-tex",
+            ),
+            (
+                "cover.tex",
+                b"TITLE: {{paper_title}}\nACK: {{acknowledgement}}\n".to_vec(),
+                "text/x-tex",
+            ),
+        ];
+        let mut pack_files = Vec::new();
+        for (path, bytes, media_type) in pack_sources {
+            let stored = state.blobs.put(Bytes::from(bytes)).await.unwrap();
+            pack_files.push(FrontMatterPackFileRecord {
+                path: path.into(),
+                blob_hash: stored.hash(),
+                size_bytes: stored.size_bytes(),
+                media_type: media_type.into(),
+            });
+        }
+        let pack_id = uuid::Uuid::new_v4();
+        state
+            .front_matter
+            .create_pack(
+                admin_id,
+                pack_id,
+                &format!("VIT B.Tech Project UAT {pack_id}"),
+                Some("Disposable Front Matter integration fixture"),
+                &manifest,
+                &"a".repeat(64),
+                &pack_files,
+            )
+            .await
+            .unwrap();
+
+        let create_response = request(
+            &app,
+            Method::POST,
+            "/api/admin/v2/paper-teams",
+            Some(&admin.cookie),
+            &serde_json::json!({
+                "name":"Front Matter Team",
+                "writer_ids":[leader_id,writer_id],
+                "leader_writer_id":leader_id,
+                "mentor_ids":[mentor_id],
+                "template_id":template_id,
+                "front_matter_pack_id":pack_id
+            })
+            .to_string(),
+            Some("application/json"),
+        )
+        .await;
+        let create_status = create_response.status();
+        let created = test_json(create_response).await;
+        assert_eq!(
+            create_status,
+            StatusCode::CREATED,
+            "Front Matter Team creation failed: {created}"
+        );
+        let paper_id = created["team"]["id"].as_str().unwrap();
+        let workspace_id = WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap(),
+        );
+        let details_path = format!("/api/v2/papers/{paper_id}/document-details");
+
+        let leader_detail = test_json(get(&app, &details_path, Some(&leader.cookie)).await).await;
+        assert_eq!(leader_detail["pack_id"], pack_id.to_string());
+        assert_eq!(leader_detail["can_edit"], true);
+        assert_eq!(
+            test_json(get(&app, &details_path, Some(&writer.cookie)).await).await["can_edit"],
+            false
+        );
+        assert_eq!(
+            test_json(get(&app, &details_path, Some(&mentor.cookie)).await).await["can_edit"],
+            false
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &details_path,
+                Some(&writer.cookie),
+                r#"{"values":{},"sections":{}}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let value_a = "A & 50% _ \\input{/etc/passwd} \\write18 <script>";
+        let saved_a = test_json(
+            request(
+                &app,
+                Method::PUT,
+                &details_path,
+                Some(&leader.cookie),
+                &serde_json::json!({"values":{"paper_title":"Version A","acknowledgement":value_a},"sections":{"cover":true}}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(saved_a["auto_build_required"], false);
+        let cover_path = LogicalPath::parse(".latex-core/frontmatter/cover.tex").unwrap();
+        let rendered_a = String::from_utf8(
+            state
+                .workspaces
+                .read_file(workspace_id, &cover_path)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(rendered_a.contains("Version A"));
+        assert!(rendered_a.contains(r"A \& 50\% \_ \textbackslash{}input\{/etc/passwd\}"));
+        assert!(!rendered_a.contains(r"\input{/etc/passwd}"));
+        assert!(!rendered_a.contains(r"\write18"));
+
+        let hidden_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT file_id FROM latex_core.paper_files WHERE workspace_id=$1 AND path=$2 AND NOT tombstoned",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(cover_path.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let listed = test_json(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&leader.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["file_id"] != hidden_id.to_string())
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/files/{hidden_id}"),
+                Some(&leader.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&leader.cookie),
+                r#"{"path":".latex-core/frontmatter/attack.tex","content":"x","version":99}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            state
+                .v2
+                .collaboration_access(
+                    leader_id,
+                    uuid::Uuid::parse_str(paper_id).unwrap(),
+                    hidden_id
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .v2
+                .set_file_policy(
+                    admin_id,
+                    uuid::Uuid::parse_str(paper_id).unwrap(),
+                    hidden_id,
+                    V2FilePolicy::Editable,
+                )
+                .await
+                .is_err(),
+            "managed Front Matter policy must not be downgraded"
+        );
+
+        let _saved_b = test_json(
+            request(
+                &app,
+                Method::PUT,
+                &details_path,
+                Some(&leader.cookie),
+                r#"{"values":{"paper_title":"Version B","acknowledgement":"B"},"sections":{"cover":true}}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let version_a_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM latex_core.paper_versions WHERE paper_id=$1 AND version_type='front_matter_update' AND name='PRE_FRONT_MATTER_UPDATE' ORDER BY version_number DESC LIMIT 1",
+        )
+        .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let restored = request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/papers/{paper_id}/versions/{version_a_id}/revert"),
+            Some(&leader.cookie),
+            r#"{"confirmed":true}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(restored.status(), StatusCode::OK);
+        let after = test_json(get(&app, &details_path, Some(&leader.cookie)).await).await;
+        let restored_title = after["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["field_key"] == "paper_title")
+            .unwrap();
+        assert_eq!(restored_title["value"], "Version A");
+        let rendered_restored = String::from_utf8(
+            state
+                .workspaces
+                .read_file(workspace_id, &cover_path)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(rendered_restored, rendered_a);
+        let historical_b: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.paper_versions WHERE paper_id=$1 AND version_type='pre_restore_safety'")
+            .bind(uuid::Uuid::parse_str(paper_id).unwrap()).fetch_one(&pool).await.unwrap();
+        assert_eq!(historical_b, 1);
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
     async fn s7_bounded_concurrency_smoke_12_websocket_clients() {
         use futures_util::{SinkExt, StreamExt};
         use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update, updates::decoder::Decode};
@@ -12573,6 +13950,7 @@ mod database_tests {
             v2,
             institution: InstitutionRepository::new(database.clone())
                 .with_mail(mail_config.clone()),
+            front_matter: FrontMatterRepository::new(database.clone()),
             workspaces,
             queue: PostgresCompileQueue::new(
                 database.clone(),

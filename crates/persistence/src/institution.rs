@@ -281,6 +281,8 @@ pub struct InstitutionImportRow {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemplateResolution {
     pub selected_template_id: Uuid,
+    pub front_matter_pack_id: Option<Uuid>,
+    pub front_matter_resolution_method: Option<String>,
     pub dominant_programme_code: Option<String>,
     pub resolution_method: String,
     pub counts: BTreeMap<String, usize>,
@@ -294,6 +296,8 @@ pub struct ProgrammeTemplateDefault {
     pub student_count: i64,
     pub template_id: Option<Uuid>,
     pub template_name: Option<String>,
+    pub front_matter_pack_id: Option<Uuid>,
+    pub front_matter_pack_name: Option<String>,
     pub updated_at: Option<String>,
     pub updated_by: Option<String>,
 }
@@ -1393,6 +1397,17 @@ impl InstitutionRepository {
         &self,
         ordered_writer_user_ids: &[UserId],
     ) -> Result<TemplateResolution, InstitutionError> {
+        self.resolve_template_for_writers(ordered_writer_user_ids, None)
+            .await
+    }
+
+    /// Resolves the existing dominant-programme data while allowing an Admin's
+    /// explicit main-template choice to bypass the global main fallback.
+    pub async fn resolve_template_for_writers(
+        &self,
+        ordered_writer_user_ids: &[UserId],
+        selected_template_id: Option<Uuid>,
+    ) -> Result<TemplateResolution, InstitutionError> {
         let mut counts = BTreeMap::<String, usize>::new();
         let mut first = HashMap::<String, usize>::new();
         let mut warnings = Vec::new();
@@ -1427,7 +1442,7 @@ impl InstitutionRepository {
             .iter()
             .min_by_key(|programme| first.get(*programme).copied().unwrap_or(usize::MAX))
             .cloned();
-        let mapped = if let Some(programme) = dominant.as_deref() {
+        let mapped: Option<Uuid> = if let Some(programme) = dominant.as_deref() {
             sqlx::query_scalar(
                 "SELECT template_id FROM latex_core.programme_template_defaults WHERE programme_code=$1",
             )
@@ -1435,11 +1450,15 @@ impl InstitutionRepository {
             .fetch_optional(self.database.pool())
             .await
             .map_err(InstitutionError::Database)?
+            .flatten()
         } else {
             None
         };
         let tie = candidates.len() > 1;
-        let (selected_template_id, resolution_method) = if let Some(template) = mapped {
+        let (selected_template_id, resolution_method) = if let Some(template) = selected_template_id
+        {
+            (template, "MANUAL_OVERRIDE".to_owned())
+        } else if let Some(template) = mapped {
             (
                 template,
                 if tie { "TIE_FIRST_WRITER" } else { "MODE" }.to_owned(),
@@ -1463,8 +1482,35 @@ impl InstitutionRepository {
             })?;
             (template, "GLOBAL_FALLBACK".to_owned())
         };
+        let programme_front_matter: Option<Uuid> = if let Some(programme) = dominant.as_deref() {
+            sqlx::query_scalar(
+                "SELECT front_matter_pack_id FROM latex_core.programme_template_defaults WHERE programme_code=$1",
+            )
+            .bind(programme)
+            .fetch_optional(self.database.pool())
+            .await
+            .map_err(InstitutionError::Database)?
+            .flatten()
+        } else {
+            None
+        };
+        let (front_matter_pack_id, front_matter_resolution_method) = if let Some(pack) =
+            programme_front_matter
+        {
+            (Some(pack), Some("PROGRAMME_DEFAULT".to_owned()))
+        } else {
+            let fallback: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT global_fallback_front_matter_pack_id FROM latex_core.institution_template_config WHERE singleton",
+                )
+                .fetch_one(self.database.pool())
+                .await
+                .map_err(InstitutionError::Database)?;
+            (fallback, fallback.map(|_| "GLOBAL_FALLBACK".to_owned()))
+        };
         Ok(TemplateResolution {
             selected_template_id,
+            front_matter_pack_id,
+            front_matter_resolution_method,
             dominant_programme_code: dominant,
             resolution_method,
             counts,
@@ -1477,12 +1523,13 @@ impl InstitutionRepository {
         &self,
     ) -> Result<Vec<ProgrammeTemplateDefault>, InstitutionError> {
         let rows = sqlx::query(
-            "SELECT p.programme_code,count(s.reg_no) AS student_count,d.template_id,t.name AS template_name,d.updated_at::text,u.email AS updated_by \
+            "SELECT p.programme_code,count(s.reg_no) AS student_count,d.template_id,t.name AS template_name,d.front_matter_pack_id,f.name AS front_matter_pack_name,d.updated_at::text,u.email AS updated_by \
              FROM vcap.programmes p LEFT JOIN vcap.students s USING(programme_code) \
              LEFT JOIN latex_core.programme_template_defaults d USING(programme_code) \
              LEFT JOIN latex_core.templates t ON t.id=d.template_id \
+             LEFT JOIN latex_core.front_matter_packs f ON f.id=d.front_matter_pack_id \
              LEFT JOIN latex_core.user_credentials u ON u.user_id=d.updated_by_user_id \
-             GROUP BY p.programme_code,d.template_id,t.name,d.updated_at,u.email ORDER BY p.programme_code",
+             GROUP BY p.programme_code,d.template_id,t.name,d.front_matter_pack_id,f.name,d.updated_at,u.email ORDER BY p.programme_code",
         )
         .fetch_all(self.database.pool())
         .await
@@ -1501,6 +1548,12 @@ impl InstitutionRepository {
                         .map_err(InstitutionError::Database)?,
                     template_name: row
                         .try_get("template_name")
+                        .map_err(InstitutionError::Database)?,
+                    front_matter_pack_id: row
+                        .try_get("front_matter_pack_id")
+                        .map_err(InstitutionError::Database)?,
+                    front_matter_pack_name: row
+                        .try_get("front_matter_pack_name")
                         .map_err(InstitutionError::Database)?,
                     updated_at: row
                         .try_get("updated_at")
@@ -1579,6 +1632,53 @@ impl InstitutionRepository {
         tx.commit().await.map_err(InstitutionError::Database)
     }
 
+    pub async fn set_programme_front_matter_default(
+        &self,
+        actor: UserId,
+        programme_code: &str,
+        pack_id: Option<Uuid>,
+    ) -> Result<(), InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        if let Some(pack_id) = pack_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM latex_core.front_matter_packs WHERE id=$1 AND archived_at IS NULL)",
+            )
+            .bind(pack_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+            if !exists {
+                return Err(InstitutionError::NotFound);
+            }
+        }
+        sqlx::query(
+            "INSERT INTO latex_core.programme_template_defaults (programme_code,template_id,front_matter_pack_id,updated_by_user_id) \
+             VALUES ($1,$2,$3,$4) ON CONFLICT(programme_code) DO UPDATE SET front_matter_pack_id=EXCLUDED.front_matter_pack_id,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=statement_timestamp()",
+        )
+        .bind(programme_code)
+        .bind(Option::<Uuid>::None)
+        .bind(pack_id)
+        .bind(actor.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.programme_front_matter.changed",
+            "programme",
+            Uuid::nil(),
+            json!({"programme_code":programme_code,"front_matter_pack_id":pack_id}),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
     pub async fn set_global_fallback(
         &self,
         actor: UserId,
@@ -1617,9 +1717,11 @@ impl InstitutionRepository {
     pub async fn global_fallback_detail(&self) -> Result<Value, InstitutionError> {
         let row = sqlx::query(
             r"SELECT c.global_fallback_template_id,t.name AS template_name,
+                     c.global_fallback_front_matter_pack_id,f.name AS front_matter_pack_name,
                      c.updated_at::text AS updated_at,u.email AS updated_by
               FROM latex_core.institution_template_config c
               LEFT JOIN latex_core.templates t ON t.id=c.global_fallback_template_id
+              LEFT JOIN latex_core.front_matter_packs f ON f.id=c.global_fallback_front_matter_pack_id
               LEFT JOIN latex_core.user_credentials u ON u.user_id=c.updated_by_user_id
               WHERE c.singleton",
         )
@@ -1629,9 +1731,48 @@ impl InstitutionRepository {
         Ok(json!({
             "template_id":row.try_get::<Option<Uuid>,_>("global_fallback_template_id").map_err(InstitutionError::Database)?,
             "template_name":row.try_get::<Option<String>,_>("template_name").map_err(InstitutionError::Database)?,
+            "front_matter_pack_id":row.try_get::<Option<Uuid>,_>("global_fallback_front_matter_pack_id").map_err(InstitutionError::Database)?,
+            "front_matter_pack_name":row.try_get::<Option<String>,_>("front_matter_pack_name").map_err(InstitutionError::Database)?,
             "updated_at":row.try_get::<Option<String>,_>("updated_at").map_err(InstitutionError::Database)?,
             "updated_by":row.try_get::<Option<String>,_>("updated_by").map_err(InstitutionError::Database)?,
         }))
+    }
+
+    pub async fn set_global_front_matter_fallback(
+        &self,
+        actor: UserId,
+        pack_id: Option<Uuid>,
+    ) -> Result<(), InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        if let Some(pack_id) = pack_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM latex_core.front_matter_packs WHERE id=$1 AND archived_at IS NULL)",
+            )
+            .bind(pack_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(InstitutionError::Database)?;
+            if !exists {
+                return Err(InstitutionError::NotFound);
+            }
+        }
+        sqlx::query("UPDATE latex_core.institution_template_config SET global_fallback_front_matter_pack_id=$1,updated_by_user_id=$2,updated_at=statement_timestamp() WHERE singleton")
+            .bind(pack_id).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.global_front_matter.changed",
+            "global_fallback",
+            Uuid::nil(),
+            json!({"front_matter_pack_id":pack_id}),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)
     }
 
     pub async fn paginated_students(

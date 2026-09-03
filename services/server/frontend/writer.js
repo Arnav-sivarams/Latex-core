@@ -80,6 +80,8 @@ class PaperApi {
   reviewState(paperId, threadId, state) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/state`, 'POST', { state }); }
   acceptSuggestion(paperId, threadId, durableSequence) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/accept`, 'POST', { durable_sequence: durableSequence }); }
   rejectSuggestion(paperId, threadId, rejectionReason) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/reject`, 'POST', { rejection_reason: rejectionReason || null }); }
+  documentDetails(paperId) { return this.request(`/api/v2/papers/${paperId}/document-details`); }
+  saveDocumentDetails(paperId, body) { return this.json(`/api/v2/papers/${paperId}/document-details`, 'PUT', body); }
 
   json(path, method, body) {
     return this.request(path, {
@@ -105,7 +107,7 @@ const ui = Object.fromEntries([
   'reviewStateBadge', 'undoText', 'redoText', 'mathPalette', 'tableBuilder', 'figureBuilder',
   'plotBuilder', 'problemsToggle', 'historyToggle', 'commentsToggle', 'fileActionsToggle',
   'fileActionsMenu', 'workspaceDrawer', 'drawerTitle', 'drawerClose', 'problems', 'reviews', 'history',
-  'moreActions',
+  'moreActions', 'documentDetails', 'documentDetailsPanel', 'documentDetailsBody',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -549,6 +551,7 @@ async function openPaper(paper) {
   ui.structuralRedo.disabled = !model.paperDetail.editable;
   ui.compilePaper.disabled = !model.paperDetail.editable;
   ui.fileActionsToggle.disabled = false;
+  ui.documentDetails.disabled = paper.kind !== 'team';
   const teamLeader = paper.kind === 'team' && paper.is_team_leader;
   ui.createCheckpoint.hidden = paper.kind === 'team' && !teamLeader;
   ui.sendReview.hidden = !teamLeader;
@@ -1297,15 +1300,40 @@ function openSymbols() {
 
 function closeDrawer() {
   ui.workspaceDrawer.hidden = true;
-  [ui.problems, ui.reviews, ui.history].forEach((panel) => { panel.hidden = true; });
+  [ui.problems, ui.reviews, ui.history, ui.documentDetailsPanel].forEach((panel) => { panel.hidden = true; });
 }
 
 function openDrawer(kind) {
-  const panels = { problems: ui.problems, reviews: ui.reviews, history: ui.history };
-  const titles = { problems: 'Problems', reviews: 'Comments', history: 'History' };
+  const panels = { problems: ui.problems, reviews: ui.reviews, history: ui.history, documentDetails: ui.documentDetailsPanel };
+  const titles = { problems: 'Problems', reviews: 'Comments', history: 'History', documentDetails: 'Document details' };
   Object.values(panels).forEach((panel) => { panel.hidden = panel !== panels[kind]; });
   ui.drawerTitle.textContent = titles[kind];
   ui.workspaceDrawer.hidden = false;
+}
+
+async function openDocumentDetails() {
+  if (!model.paper || model.paper.kind !== 'team') return;
+  try {
+    const detail = await api.documentDetails(model.paper.id);
+    ui.documentDetailsBody.replaceChildren();
+    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: `Front Matter Pack: ${detail.pack_name || 'None'}` }));
+    if (!detail.pack_id) {
+      ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter is assigned to this Team.' }));
+      openDrawer('documentDetails'); return;
+    }
+    const status = Object.assign(document.createElement('p'), { textContent: `Status: ${detail.status === 'READY' ? 'Ready' : detail.status.replaceAll('_', ' ')}` }); ui.documentDetailsBody.append(status);
+    if ((detail.missing_required_fields || []).length) ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'danger', textContent: `Needs information: ${detail.missing_required_fields.join(', ')}` }));
+    const currentValues = Object.fromEntries((detail.values || []).map((item) => [item.field_key, item.value]));
+    const currentSections = Object.fromEntries((detail.sections || []).map((item) => [item.section_key, item.enabled]));
+    const form = document.createElement('form'); form.className = 'document-details-form';
+    const sectionsHeading = document.createElement('h4'); sectionsHeading.textContent = 'Sections'; form.append(sectionsHeading);
+    (detail.manifest.sections || []).forEach((section) => { const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.name = `section:${section.key}`; checkbox.checked = section.required || (currentSections[section.key] ?? section.default_enabled); checkbox.disabled = section.required || !detail.can_edit; label.append(checkbox, document.createTextNode(` ${section.label}${section.required ? ' · Required' : ' · Optional'}`)); form.append(label); });
+    const fieldsHeading = document.createElement('h4'); fieldsHeading.textContent = 'Metadata'; form.append(fieldsHeading);
+    (detail.manifest.fields || []).forEach((field) => { const label = document.createElement('label'); label.textContent = field.label; const multiline = field.type === 'MULTILINE' || Array.isArray(currentValues[field.key]); const input = document.createElement(multiline ? 'textarea' : 'input'); input.name = `field:${field.key}`; if (field.type === 'DATE') input.type = 'date'; if (field.type === 'BOOLEAN') input.type = 'checkbox'; const value = currentValues[field.key]; if (field.type === 'BOOLEAN') input.checked = Boolean(value); else input.value = Array.isArray(value) ? value.join('\n') : value ?? ''; const editable = detail.can_edit && (!field.source || field.allow_team_override); input.disabled = !editable; if (field.required) input.required = true; label.append(input); if (field.source) label.append(Object.assign(document.createElement('small'), { textContent: ` Automatic: ${field.source}${field.allow_team_override ? ' · override permitted' : ''}` })); form.append(label); });
+    if (detail.can_edit) { const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save document details'; form.append(save); }
+    form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); if (result.auto_build_required) await requestBuild('auto'); notice('Document details saved. Front Matter was rebuilt.'); } catch (error) { notice(error.message, true); } });
+    ui.documentDetailsBody.append(form); openDrawer('documentDetails');
+  } catch (error) { notice(error.message, true); }
 }
 
 function closeTransientMenus() {
@@ -1340,6 +1368,7 @@ function commandItems() {
     ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
     ['Open Table Builder', () => openBuilder('table')], ['Open Figure Builder', () => openBuilder('figure')], ['Open Math Palette', openMathPalette], ['Open Equation Builder', () => openBuilder('equation')], ['Open Plot Builder', () => openBuilder('plot')],
     ['Open Problems', () => openDrawer('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
+    ['Document details', openDocumentDetails],
     ['Insert Citation', openCitationPalette], ['Insert Reference', openReferencePalette], ['Show in PDF', showInPdf],
   ];
   if (model.paper?.kind !== 'team' || model.paper?.is_team_leader) items.push(['Create Checkpoint', () => ui.createCheckpoint.click()]);
@@ -1433,6 +1462,7 @@ ui.redoText.addEventListener('click', () => model.undoManager?.redo());
 ui.problemsToggle.addEventListener('click', () => openDrawer('problems'));
 ui.historyToggle.addEventListener('click', () => openDrawer('history'));
 ui.commentsToggle.addEventListener('click', () => openDrawer('reviews'));
+ui.documentDetails.addEventListener('click', openDocumentDetails);
 ui.drawerClose.addEventListener('click', closeDrawer);
 ui.fileActionsToggle.addEventListener('click', (event) => {
   event.stopPropagation();

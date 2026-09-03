@@ -18,6 +18,13 @@ mod error;
     clippy::missing_errors_doc,
     clippy::needless_pass_by_value,
     clippy::too_many_lines,
+    reason = "Front Matter mutation transactions keep authorization, version safety, and managed-file replacement auditable"
+)]
+mod front_matter;
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
     reason = "governed restoration keeps its authorization and append-only cutover transaction auditable"
 )]
 mod governance;
@@ -74,6 +81,11 @@ pub use compile_queue::{
 pub use config::DatabaseConfig;
 pub use database::Database;
 pub use error::PersistenceError;
+pub use front_matter::{
+    ApplyFrontMatterRequest, ExactStateRecord, FrontMatterPackFileRecord, FrontMatterPackRecord,
+    FrontMatterRepository, FrontMatterRepositoryError, FrontMatterValueRecord,
+    ManagedFrontMatterFile,
+};
 pub use governance::{
     ExactRestoreState, RestorationApplied, RestorationRequest, TeamTemplateResolutionInput,
     TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile, V2FilePolicy, V2FilePolicyRecord,

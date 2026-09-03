@@ -1,5 +1,11 @@
 # Institution data management
 
+## Front Matter during Team materialization
+
+After the existing Writer-order dominant-programme resolution, automatic Team creation independently resolves the Main Content Template and Front Matter Pack from the same programme row, with independent global fallbacks. A nullable global Front Matter fallback means no pack. Existing Team pins never change when defaults change.
+
+When configured and compatible, Team creation pins and renders the pack after provisioning identities, membership, and the main workspace. If the selected Main Content Template lacks the explicit integration marker, Team creation continues with the main template, Front Matter remains unassigned, and the actionable warning `FRONT_MATTER_TEMPLATE_INCOMPATIBLE` is recorded. Updates to linked institutional people enqueue affected Front-Matter-enabled Teams for bounded PostgreSQL rerender rather than synchronously rebuilding every paper during import.
+
 V2 Admins manage institutional source records from **INSTITUTION DATA** or **DATA IMPORT**. Both paths use the same server-side parser, validation, dependency checks, and apply operations. Writer and Mentor accounts cannot use these endpoints.
 
 ## Add, Edit, and Delete

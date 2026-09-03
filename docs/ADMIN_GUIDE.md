@@ -1,5 +1,11 @@
 # Admin guide
 
+## Front Matter Packs and document metadata
+
+The single **Templates** navigation item contains Main Content Templates, Front Matter Packs, and Automatic Defaults. Import a pack ZIP only after its preview confirms the ordered sections, fields, allowed automatic sources, entry file, and safe file tree. Pack content is immutable; only its name and description can be edited, and an in-use pack cannot be removed.
+
+The Automatic Defaults table maps each programme independently to a Main Content Template and a Front Matter Pack. The global Front Matter fallback may be **None**. Defaults apply only to future Teams. Team **View / Manage** shows the current Front Matter status and permits an independent change or removal. Assignment is blocked when the pinned Main Content Template is reported as **Front Matter not enabled**. See [Front Matter Packs](FRONT_MATTER_PACKS.md).
+
 Admins use `/admin` as the V2 governance control plane. Admin inspection does not add the Admin as a paper member and does not permit joining a collaborative source-editing room.
 
 ## Control-plane sections

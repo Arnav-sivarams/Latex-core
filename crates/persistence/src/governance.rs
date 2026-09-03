@@ -422,8 +422,11 @@ impl V2Repository {
             .await
             .map_err(V2Error::Database)?;
         require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
-        let workspace_id: Uuid = sqlx::query_scalar(
-            "SELECT f.workspace_id FROM latex_core.paper_files f JOIN latex_core.paper_teams t ON t.workspace_id=f.workspace_id WHERE t.id=$1 AND f.file_id=$2 AND NOT f.tombstoned FOR UPDATE OF f",
+        let file = sqlx::query(
+            "SELECT f.workspace_id,f.path,COALESCE(p.policy,'EDITABLE') AS policy \
+             FROM latex_core.paper_files f JOIN latex_core.paper_teams t ON t.workspace_id=f.workspace_id \
+             LEFT JOIN latex_core.paper_file_policies p ON p.file_id=f.file_id \
+             WHERE t.id=$1 AND f.file_id=$2 AND NOT f.tombstoned FOR UPDATE OF f",
         )
         .bind(paper_id)
         .bind(file_id)
@@ -431,6 +434,16 @@ impl V2Repository {
         .await
         .map_err(V2Error::Database)?
         .ok_or(V2Error::NotFound { entity: "Paper Team file" })?;
+        let workspace_id: Uuid = file.try_get("workspace_id").map_err(V2Error::Database)?;
+        let path: String = file.try_get("path").map_err(V2Error::Database)?;
+        let current_policy: String = file.try_get("policy").map_err(V2Error::Database)?;
+        if path.starts_with(".latex-core/frontmatter/")
+            && (current_policy != "HIDDEN_SYSTEM" || policy != V2FilePolicy::HiddenSystem)
+        {
+            return Err(V2Error::Conflict {
+                entity: "managed Front Matter file policy",
+            });
+        }
         sqlx::query(
             "INSERT INTO latex_core.paper_file_policies (file_id,workspace_id,policy,updated_by_admin_user_id) \
              VALUES ($1,$2,$3,$4) ON CONFLICT (file_id) DO UPDATE SET policy=EXCLUDED.policy,\
@@ -1077,6 +1090,16 @@ async fn apply_restore(
         .bind(number).bind(actor.as_uuid()).bind(actual).bind(safety.snapshot_id.to_hex()).bind(&safety.manifest).bind(&safety.state_hash)
         .execute(&mut **tx).await.map_err(V2Error::Database)?;
 
+    if matches!(kind, RestoreKind::Team) {
+        restore_front_matter_version_state(
+            tx,
+            actor,
+            paper_id,
+            target_manifest.get("front_matter"),
+        )
+        .await?;
+    }
+
     let rows = sqlx::query(
         "SELECT file_id,path,tombstoned FROM latex_core.paper_files WHERE workspace_id=$1 FOR UPDATE",
     ).bind(workspace_id.as_uuid()).fetch_all(&mut **tx).await.map_err(V2Error::Database)?;
@@ -1193,6 +1216,114 @@ async fn apply_restore(
             message: "negative restored workspace version".to_owned(),
         })?,
     })
+}
+
+async fn restore_front_matter_version_state(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: UserId,
+    paper_id: Uuid,
+    state: Option<&Value>,
+) -> Result<(), V2Error> {
+    sqlx::query("DELETE FROM latex_core.paper_front_matter_sections WHERE paper_team_id=$1")
+        .bind(paper_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(V2Error::Database)?;
+    sqlx::query("DELETE FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1")
+        .bind(paper_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(V2Error::Database)?;
+    sqlx::query("DELETE FROM latex_core.paper_front_matter_pins WHERE paper_team_id=$1")
+        .bind(paper_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(V2Error::Database)?;
+    let Some(state) = state.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if state.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err(V2Error::Integrity {
+            message: "invalid Front Matter version state".into(),
+        });
+    }
+    let pin = state.get("pin").ok_or_else(|| V2Error::Integrity {
+        message: "Front Matter version state has no pin".into(),
+    })?;
+    let pack_id = json_uuid(pin, "front_matter_pack_id")?;
+    let dominant = pin.get("dominant_programme_code").and_then(Value::as_str);
+    let method = pin
+        .get("resolution_method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| V2Error::Integrity {
+            message: "Front Matter version state has no resolution method".into(),
+        })?;
+    let status = pin.get("status").and_then(Value::as_str).unwrap_or("READY");
+    let missing = pin
+        .get("missing_required_fields")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let last_error = pin.get("last_error").and_then(Value::as_str);
+    sqlx::query("INSERT INTO latex_core.paper_front_matter_pins (paper_team_id,front_matter_pack_id,dominant_programme_code,resolution_method,assigned_by_user_id,status,missing_required_fields,last_error) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+        .bind(paper_id).bind(pack_id).bind(dominant).bind(method).bind(actor.as_uuid()).bind(status).bind(missing).bind(last_error)
+        .execute(&mut **tx).await.map_err(V2Error::Database)?;
+    for value in state
+        .get("values")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = value
+            .get("field_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| V2Error::Integrity {
+                message: "Front Matter version value has no key".into(),
+            })?;
+        let content = value
+            .get("value_json")
+            .cloned()
+            .ok_or_else(|| V2Error::Integrity {
+                message: "Front Matter version value has no value".into(),
+            })?;
+        let source = value
+            .get("value_source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| V2Error::Integrity {
+                message: "Front Matter version value has no source".into(),
+            })?;
+        sqlx::query("INSERT INTO latex_core.paper_front_matter_values(paper_team_id,field_key,value_json,value_source,updated_by_user_id) VALUES($1,$2,$3,$4,$5)").bind(paper_id).bind(key).bind(content).bind(source).bind(actor.as_uuid()).execute(&mut **tx).await.map_err(V2Error::Database)?;
+    }
+    for section in state
+        .get("sections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = section
+            .get("section_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| V2Error::Integrity {
+                message: "Front Matter version section has no key".into(),
+            })?;
+        let enabled = section
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| V2Error::Integrity {
+                message: "Front Matter version section has no enabled state".into(),
+            })?;
+        sqlx::query("INSERT INTO latex_core.paper_front_matter_sections(paper_team_id,section_key,enabled,updated_by_user_id) VALUES($1,$2,$3,$4)").bind(paper_id).bind(key).bind(enabled).bind(actor.as_uuid()).execute(&mut **tx).await.map_err(V2Error::Database)?;
+    }
+    Ok(())
+}
+
+fn json_uuid(value: &Value, key: &str) -> Result<Uuid, V2Error> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| V2Error::Integrity {
+            message: format!("Front Matter version state has invalid {key}"),
+        })
 }
 
 async fn ensure_target_version(

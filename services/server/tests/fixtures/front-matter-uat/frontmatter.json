@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "entry_file": "frontmatter.tex",
+  "sections": [
+    { "key": "cover", "label": "Cover", "file": "cover.tex", "required": true, "default_enabled": true },
+    { "key": "certificate", "label": "Certificate", "file": "certificate.tex", "required": true, "default_enabled": true },
+    { "key": "declaration", "label": "Declaration", "file": "declaration.tex", "required": true, "default_enabled": true },
+    { "key": "acknowledgements", "label": "Acknowledgements", "file": "acknowledgements.tex", "required": false, "default_enabled": true },
+    { "key": "abstract", "label": "Abstract", "file": "abstract.tex", "required": false, "default_enabled": true },
+    { "key": "list_of_figures", "label": "List of Figures", "file": "list_of_figures.tex", "required": false, "default_enabled": true },
+    { "key": "list_of_tables", "label": "List of Tables", "file": "list_of_tables.tex", "required": false, "default_enabled": true }
+  ],
+  "fields": [
+    { "key": "paper_title", "label": "Paper title", "type": "TEXT", "required": true, "source": "team.name", "default": null, "allow_team_override": true },
+    { "key": "author_names", "label": "Authors", "type": "MULTILINE", "required": true, "source": "writers.names_and_registration_numbers", "default": null, "allow_team_override": false },
+    { "key": "programme_code", "label": "Programme", "type": "TEXT", "required": false, "source": "team.dominant_programme_code", "default": null, "allow_team_override": false },
+    { "key": "mentor_name", "label": "Mentor", "type": "TEXT", "required": false, "source": "mentor.name", "default": null, "allow_team_override": false },
+    { "key": "academic_year", "label": "Academic year", "type": "TEXT", "required": false, "source": "team.academic_year", "default": null, "allow_team_override": false },
+    { "key": "institution_name", "label": "Institution", "type": "TEXT", "required": true, "source": null, "default": "VIT UAT", "allow_team_override": false },
+    { "key": "acknowledgement", "label": "Acknowledgements", "type": "MULTILINE", "required": false, "source": null, "default": "", "allow_team_override": true },
+    { "key": "abstract", "label": "Abstract", "type": "MULTILINE", "required": false, "source": null, "default": "", "allow_team_override": true },
+    { "key": "submission_date", "label": "Submission date", "type": "DATE", "required": false, "source": null, "default": "2026-09-03", "allow_team_override": true }
+  ]
+}
