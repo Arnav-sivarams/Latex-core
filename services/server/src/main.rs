@@ -11098,6 +11098,9 @@ mod database_tests {
             "current and historical review comments remain visible to Admin"
         );
         assert_eq!(admin_reviews[0]["paper_name"], "S5 Review Team");
+        assert_eq!(admin_reviews[0]["round_status"], "OPEN_FOR_REVIEW");
+        assert_eq!(admin_reviews[0]["review_open"], true);
+        assert_eq!(admin_reviews[0]["current_review_round_id"], round_id);
         assert_eq!(admin_reviews[0]["thread_type"], "COMMENT");
         assert_eq!(admin_reviews[0]["severity"], "NOTE");
         assert_eq!(admin_reviews[0]["category"], "WRITING");

@@ -197,21 +197,28 @@ impl V2Repository {
     pub async fn admin_reviews(&self, admin: UserId) -> Result<Vec<Value>, V2Error> {
         require_role_pool(self.database.pool(), admin, GlobalRole::Admin).await?;
         let rows = sqlx::query(
-            "SELECT rt.id,rr.paper_id,t.name AS paper_name,rt.thread_type,rt.severity,rt.category,rt.state,\
+            "SELECT rt.id,rr.id AS review_round_id,rr.paper_id,t.name AS paper_name,rt.thread_type,rt.severity,rt.category,rt.state,\
+                    current_round.id AS current_review_round_id,current_round.status AS round_status,\
+                    current_round.status='OPEN_FOR_REVIEW' AS review_open,\
                     mentor.email AS mentor,assigned.email AS assigned_writer,\
                     rt.created_at::text AS created_at,rt.updated_at::text AS updated_at \
              FROM latex_core.review_threads rt \
              JOIN latex_core.review_rounds rr ON rr.id=rt.review_round_id \
              JOIN latex_core.paper_teams t ON t.id=rr.paper_id \
+             JOIN LATERAL (SELECT current_rr.id,current_rr.status FROM latex_core.review_rounds current_rr \
+                           WHERE current_rr.paper_id=rr.paper_id ORDER BY current_rr.round_number DESC LIMIT 1) current_round ON true \
              JOIN latex_core.user_credentials mentor ON mentor.user_id=rt.created_by_mentor_user_id \
              LEFT JOIN latex_core.user_credentials assigned ON assigned.user_id=rt.assigned_writer_user_id \
              ORDER BY rt.updated_at DESC LIMIT 200",
         ).fetch_all(self.database.pool()).await.map_err(V2Error::Database)?;
         rows.into_iter().map(|row| Ok(json!({
-            "id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"paper_id":row.try_get::<Uuid,_>("paper_id").map_err(V2Error::Database)?,
+            "id":row.try_get::<Uuid,_>("id").map_err(V2Error::Database)?,"review_round_id":row.try_get::<Uuid,_>("review_round_id").map_err(V2Error::Database)?,
+            "paper_id":row.try_get::<Uuid,_>("paper_id").map_err(V2Error::Database)?,"current_review_round_id":row.try_get::<Uuid,_>("current_review_round_id").map_err(V2Error::Database)?,
             "paper_name":row.try_get::<String,_>("paper_name").map_err(V2Error::Database)?,"thread_type":row.try_get::<String,_>("thread_type").map_err(V2Error::Database)?,
             "severity":row.try_get::<String,_>("severity").map_err(V2Error::Database)?,"category":row.try_get::<String,_>("category").map_err(V2Error::Database)?,
-            "state":row.try_get::<String,_>("state").map_err(V2Error::Database)?,"mentor":row.try_get::<String,_>("mentor").map_err(V2Error::Database)?,
+            "state":row.try_get::<String,_>("state").map_err(V2Error::Database)?,"round_status":row.try_get::<String,_>("round_status").map_err(V2Error::Database)?,
+            "review_open":row.try_get::<bool,_>("review_open").map_err(V2Error::Database)?,
+            "mentor":row.try_get::<String,_>("mentor").map_err(V2Error::Database)?,
             "assigned_writer":row.try_get::<Option<String>,_>("assigned_writer").map_err(V2Error::Database)?,
             "created_at":row.try_get::<String,_>("created_at").map_err(V2Error::Database)?,"updated_at":row.try_get::<String,_>("updated_at").map_err(V2Error::Database)?
         }))).collect()

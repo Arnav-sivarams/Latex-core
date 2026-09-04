@@ -1,10 +1,27 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import vm from 'node:vm';
 
 const html = readFileSync(new URL('../src/admin.html', import.meta.url), 'utf8');
 const js = readFileSync(new URL('../static/admin.js', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../static/shells.css', import.meta.url), 'utf8');
+
+function loadAdminReviewRoundLabel() {
+  const source = js.match(/function adminReviewRoundLabel\([^}]+\}/)?.[0];
+  assert.ok(source, 'Admin review-round label helper must remain directly testable');
+  return vm.runInNewContext(`(${source})`);
+}
+
+test('Admin Reviews keeps comment resolution separate from review-round state', () => {
+  const label = loadAdminReviewRoundLabel();
+  assert.equal(label(true, 'OPEN_FOR_REVIEW', 1), 'In review');
+  assert.equal(label(true, 'OPEN_FOR_REVIEW', 0), 'In review');
+  assert.equal(label(false, 'CLOSED', 0), 'Review closed');
+  assert.notEqual(label(true, 'OPEN_FOR_REVIEW', 1), 'Resolved');
+  assert.match(js, /adminReviewRoundLabel\(review\.review_open, review\.round_status\)/);
+  assert.doesNotMatch(js, /element\('td', '', humanLabel\(review\.state\)\)/);
+});
 
 test('Admin navigation exposes one grouped destination per product concept', () => {
   for (const section of ['Institution Data', 'Imports', 'Paper Teams', 'Templates']) {

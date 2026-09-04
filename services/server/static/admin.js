@@ -53,6 +53,10 @@ function humanLabel(value) {
   return String(value ?? '').replaceAll('_', ' ').toLowerCase().replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
 }
 
+function adminReviewRoundLabel(reviewOpen, roundStatus) {
+  return reviewOpen || roundStatus === 'OPEN_FOR_REVIEW' ? 'In review' : 'Review closed';
+}
+
 function statusChip(label, tone = '') {
   return element('span', `status-chip ${tone}`.trim(), label);
 }
@@ -180,8 +184,9 @@ function renderAdminReviews(reviews) {
   const grouped = new Map();
   reviews.forEach((review) => {
     const item = grouped.get(review.paper_id) || { ...review, open: 0, blocking: 0, last_activity: review.updated_at || review.created_at };
-    if (review.state !== 'RESOLVED') item.open += 1;
-    if (review.severity === 'BLOCKING' && review.state !== 'RESOLVED') item.blocking += 1;
+    const belongsToCurrentRound = review.review_round_id === review.current_review_round_id;
+    if (belongsToCurrentRound && review.state !== 'RESOLVED') item.open += 1;
+    if (belongsToCurrentRound && review.severity === 'BLOCKING' && review.state !== 'RESOLVED') item.blocking += 1;
     if (new Date(review.updated_at || review.created_at) > new Date(item.last_activity)) item.last_activity = review.updated_at || review.created_at;
     grouped.set(review.paper_id, item);
   });
@@ -191,7 +196,7 @@ function renderAdminReviews(reviews) {
   grouped.forEach((review) => {
     const row = document.createElement('tr');
     row.append(
-      element('td', '', review.paper_name), element('td', '', humanLabel(review.state)),
+      element('td', '', review.paper_name), element('td', '', adminReviewRoundLabel(review.review_open, review.round_status)),
       element('td', '', review.mentor), element('td', '', String(review.open)), element('td', '', String(review.blocking)),
       element('td', '', new Date(review.created_at).toLocaleString()), element('td', '', new Date(review.last_activity).toLocaleString()),
     );

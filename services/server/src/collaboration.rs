@@ -354,9 +354,26 @@ async fn room_actor(
                         let _ = reply.send(RoomJoin { initial_state, durable_sequence });
                     }
                     RoomCommand::Apply { source, actor, client_sequence, bytes, acknowledgements } => {
-                        if let Err(error) = apply_update(&doc, &bytes) {
-                            let _ = acknowledgements.send(error_json("malformed_update", &error)).await;
-                            continue;
+                        match apply_update_if_changed(&doc, &bytes) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let _ = acknowledgements
+                                    .send(
+                                        serde_json::json!({
+                                            "type":"DURABLE_ACK",
+                                            "client_seq":client_sequence,
+                                            "durable_seq":durable_sequence
+                                        })
+                                        .to_string(),
+                                    )
+                                    .await;
+                                tracing::debug!(workspace_id=%key.workspace_id, file_id=%key.file_id, document_epoch, client_sequence, durable_sequence, "duplicate collaboration update acknowledged without persistence");
+                                continue;
+                            }
+                            Err(error) => {
+                                let _ = acknowledgements.send(error_json("malformed_update", &error)).await;
+                                continue;
+                            }
                         }
                         pending_bytes += bytes.len();
                         pending.push(PendingUpdate { actor, client_sequence, bytes: bytes.clone(), acknowledgements });
@@ -514,6 +531,25 @@ fn apply_update(doc: &Doc, bytes: &[u8]) -> Result<(), String> {
     doc.transact_mut()
         .apply_update(update)
         .map_err(|error| error.to_string())
+}
+
+fn apply_update_if_changed(doc: &Doc, bytes: &[u8]) -> Result<bool, String> {
+    let update = Update::decode_v1(bytes).map_err(|error| error.to_string())?;
+    let transaction = doc.transact();
+    let extends_state = update.extends(&transaction.state_vector());
+    let state_before =
+        (!extends_state).then(|| transaction.encode_state_as_update_v1(&StateVector::default()));
+    drop(transaction);
+    doc.transact_mut()
+        .apply_update(update)
+        .map_err(|error| error.to_string())?;
+    Ok(extends_state
+        || state_before.is_some_and(|state| {
+            state
+                != doc
+                    .transact()
+                    .encode_state_as_update_v1(&StateVector::default())
+        }))
 }
 
 fn validate_update(bytes: &[u8]) -> Result<(), String> {
@@ -720,4 +756,42 @@ pub fn websocket_principal_is_supported(principal: &crate::AuthenticatedPrincipa
         principal.kind,
         PrincipalKind::V2(persistence::GlobalRole::Writer | persistence::GlobalRole::Mentor)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_state_update_does_not_change_the_room_document() {
+        let source = Doc::new();
+        let source_text = source.get_or_insert_text("source");
+        source_text.insert(&mut source.transact_mut(), 0, "durable source");
+        let state = source
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+
+        let room = Doc::new();
+        let room_text = room.get_or_insert_text("source");
+        assert!(
+            apply_update_if_changed(&room, &state).expect("initial state must be a valid update")
+        );
+        assert!(
+            !apply_update_if_changed(&room, &state)
+                .expect("duplicate state must remain a valid update")
+        );
+        assert_eq!(room_text.get_string(&room.transact()), "durable source");
+
+        let before_delete = source.transact().state_vector();
+        source_text.remove_range(&mut source.transact_mut(), 0, 1);
+        let deletion = source.transact().encode_diff_v1(&before_delete);
+        assert!(
+            apply_update_if_changed(&room, &deletion).expect("deletion must be a valid update")
+        );
+        assert!(
+            !apply_update_if_changed(&room, &deletion)
+                .expect("duplicate deletion must remain a valid update")
+        );
+        assert_eq!(room_text.get_string(&room.transact()), "urable source");
+    }
 }
