@@ -617,6 +617,46 @@ mod tests {
     }
 
     #[test]
+    fn professor_demo_assets_match_the_release_contract() {
+        let pack = validate_archive(fixture(
+            include_str!("../../../examples/professor-demo/front-matter/frontmatter.json"),
+            &[
+                (
+                    "frontmatter.tex",
+                    include_str!("../../../examples/professor-demo/front-matter/frontmatter.tex"),
+                ),
+                (
+                    "cover.tex",
+                    include_str!("../../../examples/professor-demo/front-matter/cover.tex"),
+                ),
+                (
+                    "certificate.tex",
+                    include_str!("../../../examples/professor-demo/front-matter/certificate.tex"),
+                ),
+                (
+                    "declaration.tex",
+                    include_str!("../../../examples/professor-demo/front-matter/declaration.tex"),
+                ),
+                (
+                    "acknowledgements.tex",
+                    include_str!(
+                        "../../../examples/professor-demo/front-matter/acknowledgements.tex"
+                    ),
+                ),
+                (
+                    "abstract.tex",
+                    include_str!("../../../examples/professor-demo/front-matter/abstract.tex"),
+                ),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(pack.manifest.sections.len(), 5);
+        assert!(main_template_compatible(include_bytes!(
+            "../../../examples/professor-demo/main-template/main.tex"
+        )));
+    }
+
+    #[test]
     fn values_are_latex_text_and_never_control_sequences() {
         let value = manifest("team.name");
         let pack = validate_archive(fixture(

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
-compose=(docker compose -f "$root/deploy/compose/docker-compose.yml")
+project="${COMPOSE_PROJECT_NAME:-}"
+if [[ -z "$project" && -f "$root/.env" ]]; then
+  project="$(awk -F= '$1=="COMPOSE_PROJECT_NAME"{print substr($0,index($0,"=")+1)}' "$root/.env" | tail -n1)"
+fi
+project="${project:-latex-core}"
+compose=(docker compose --project-name "$project" --env-file "$root/.env" -f "$root/deploy/compose/docker-compose.yml")
 usage(){ cat <<'EOF'
 LaTeX Core server administration
 Usage: latex-core {start|stop|restart|status|doctor|url|logs|backup|user|template|config|version}

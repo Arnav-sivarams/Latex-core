@@ -8,10 +8,11 @@ mod auth;
 
 use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
 use persistence::{
-    AppError, AppRepository, AppTemplateFileRecord, Database, DatabaseConfig, V2Repository,
+    AppError, AppRepository, AppTemplateFileRecord, Database, DatabaseConfig, GlobalRole,
+    V2Repository,
 };
-use std::env;
 use std::sync::Arc;
+use std::{env, io};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,6 +33,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if command == "list" {
         for user in v2.list_v2_users().await? {
             println!("{}", user_list_line(&user));
+        }
+        return Ok(());
+    }
+    if command == "bootstrap-admin" {
+        let email_flag = args.next().ok_or("missing --email")?;
+        if email_flag != "--email" {
+            return Err("bootstrap-admin requires --email EMAIL --password-stdin".into());
+        }
+        let email = auth::normalized_email(&args.next().ok_or("missing email")?)
+            .map_err(|()| "invalid email")?;
+        if args.next().as_deref() != Some("--password-stdin") || args.next().is_some() {
+            return Err("bootstrap-admin requires --email EMAIL --password-stdin".into());
+        }
+        let password = read_password_stdin()?;
+        let hash =
+            auth::hash_password(&password).map_err(|()| "password must be 12-256 characters")?;
+        match repo
+            .create_v2_account(&email, &hash, GlobalRole::Admin, false)
+            .await
+        {
+            Ok(_) => println!("Admin created\nEmail: {email}"),
+            Err(AppError::Conflict) => return Err("account already exists".into()),
+            Err(error) => return Err(error.into()),
         }
         return Ok(());
     }
@@ -223,6 +247,14 @@ fn option(
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
 }
+fn read_password_stdin() -> Result<String, Box<dyn std::error::Error>> {
+    let mut password = String::new();
+    io::stdin().read_line(&mut password)?;
+    while password.ends_with(['\n', '\r']) {
+        password.pop();
+    }
+    Ok(password)
+}
 fn user_list_line(user: &persistence::V2User) -> String {
     format!(
         "{}\t{}\tv2={}\tlegacy={}",
@@ -233,7 +265,7 @@ fn user_list_line(user: &persistence::V2User) -> String {
     )
 }
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
-    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password|set-type> EMAIL [--password PASSWORD] | template <add|list|remove|set-audience|grant-user>".into())
+    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password|set-type> EMAIL [--password PASSWORD] | user bootstrap-admin --email EMAIL --password-stdin | template <add|list|remove|set-audience|grant-user>".into())
 }
 
 #[cfg(test)]
@@ -247,7 +279,7 @@ mod tests {
             email: "writer@example.test".into(),
             enabled: true,
             legacy_account_type: "student".into(),
-            v2_role: Some(persistence::GlobalRole::Writer),
+            v2_role: Some(GlobalRole::Writer),
             migration_state: "ASSIGNED".into(),
             created_at: "now".into(),
             must_change_password: false,

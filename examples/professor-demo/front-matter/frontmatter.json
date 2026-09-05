@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "entry_file": "frontmatter.tex",
+  "sections": [
+    { "key": "cover", "label": "Cover", "file": "cover.tex", "required": true, "default_enabled": true },
+    { "key": "certificate", "label": "Certificate", "file": "certificate.tex", "required": true, "default_enabled": true },
+    { "key": "declaration", "label": "Declaration", "file": "declaration.tex", "required": true, "default_enabled": true },
+    { "key": "acknowledgements", "label": "Acknowledgements", "file": "acknowledgements.tex", "required": false, "default_enabled": true },
+    { "key": "abstract", "label": "Abstract", "file": "abstract.tex", "required": false, "default_enabled": true }
+  ],
+  "fields": [
+    { "key": "paper_title", "label": "Paper title", "type": "TEXT", "required": true, "source": "team.name", "default": null, "allow_team_override": false },
+    { "key": "writers", "label": "Writers", "type": "MULTILINE", "required": true, "source": "writers.names_and_registration_numbers", "default": null, "allow_team_override": false },
+    { "key": "mentor", "label": "Mentor", "type": "TEXT", "required": true, "source": "mentor.name", "default": null, "allow_team_override": false },
+    { "key": "programme", "label": "Programme", "type": "TEXT", "required": true, "source": "team.dominant_programme_code", "default": null, "allow_team_override": false },
+    { "key": "institution", "label": "Institution", "type": "TEXT", "required": true, "source": null, "default": "Example Institute of Technology", "allow_team_override": false },
+    { "key": "acknowledgement", "label": "Acknowledgement", "type": "MULTILINE", "required": false, "source": null, "default": "We thank our mentor and institution for their guidance.", "allow_team_override": true },
+    { "key": "abstract_text", "label": "Abstract", "type": "MULTILINE", "required": false, "source": null, "default": "This paper demonstrates the LaTeX Core review workflow.", "allow_team_override": true },
+    { "key": "submission_date", "label": "Submission date", "type": "DATE", "required": false, "source": null, "default": "2026-09-04", "allow_team_override": true }
+  ]
+}

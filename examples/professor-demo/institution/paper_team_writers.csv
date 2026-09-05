@@ -1,0 +1,3 @@
+external_team_key,student_reg_no,writer_order,is_leader
+TEAM-DEMO-001,STUDENT-DEMO-001,1,true
+TEAM-DEMO-001,STUDENT-DEMO-002,2,false
