@@ -20,7 +20,10 @@ The fixed Admin shell groups navigation into **People & data**, **Papers**, and 
 - **Templates** — Main templates, Front Matter, and Automatic defaults in one page.
 - **File Policies** — inspect ordinary Team files and set server-enforced policies.
 - **Versions** — inspect immutable Team Paper history; revert authority remains with the Writer Leader.
-- **Reviews**, **Build Queue**, **Audit**, and **System** — read-only operational inspection using existing bounded APIs.
+- **Reviews**, **Build Queue**, and **Audit** — read-only operational inspection using existing bounded APIs.
+- **System** — read-only health plus application branding. An Admin can upload, preview, replace, or reset the shared header logo.
+
+Branding accepts at most 512 KiB and decodes only PNG, JPEG, or WebP images with dimensions from 1×1 through 2048×2048. Filename extensions and submitted MIME types are not trusted. The approved blob is served from a fixed same-origin route; clients cannot provide filesystem paths or remote URLs. Branding affects application/login headers only and never changes Front Matter or existing PDFs.
 
 ## Templates and policies
 

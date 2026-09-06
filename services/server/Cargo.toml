@@ -31,6 +31,7 @@ compiler.workspace = true
 core-types.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+image.workspace = true
 latex-parser.workspace = true
 lettre.workspace = true
 persistence.workspace = true

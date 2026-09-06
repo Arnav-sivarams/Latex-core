@@ -209,6 +209,7 @@ impl V2Repository {
                            WHERE current_rr.paper_id=rr.paper_id ORDER BY current_rr.round_number DESC LIMIT 1) current_round ON true \
              JOIN latex_core.user_credentials mentor ON mentor.user_id=rt.created_by_mentor_user_id \
              LEFT JOIN latex_core.user_credentials assigned ON assigned.user_id=rt.assigned_writer_user_id \
+             WHERE rt.publication_status='PUBLISHED' \
              ORDER BY rt.updated_at DESC LIMIT 200",
         ).fetch_all(self.database.pool()).await.map_err(V2Error::Database)?;
         rows.into_iter().map(|row| Ok(json!({

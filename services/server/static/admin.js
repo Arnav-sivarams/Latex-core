@@ -248,7 +248,7 @@ function renderAudit(events) {
   table.append(body); wrap.append(table); content.append(wrap);
 }
 
-function renderSystem(data, overview) {
+function renderSystem(data, overview, branding) {
   content.append(element('p', 'muted-note', 'Read-only operational summary. Administrative actions remain in the operator service.'));
   const systems = [
     ['API', 'Healthy', data.version],
@@ -259,6 +259,16 @@ function renderSystem(data, overview) {
     ['Mail delivery', overview.mail_delivery_enabled ? 'Healthy' : 'Disabled', overview.mail_delivery_enabled ? 'Credential delivery enabled' : 'Disabled in this environment'],
   ];
   const grid = element('div', 'system-grid'); systems.forEach(([name, state, detail]) => { const card = element('article', 'system-card'); card.append(element('strong', '', name), statusChip(state, state === 'Healthy' ? 'good' : state === 'Disabled' ? '' : 'warning'), element('span', '', detail)); grid.append(card); }); content.append(grid);
+  const section = element('section', 'admin-section branding-settings');
+  section.append(element('h2', '', 'Branding'), element('p', 'muted-note', 'Application header only. PNG, JPEG, or WebP; maximum 512 KiB and 2048 × 2048 px. PDF and Front Matter logos are unchanged.'));
+  const preview = element('div', 'branding-preview');
+  if (branding.logo_url) { const image = document.createElement('img'); image.src = `${branding.logo_url}?v=${Date.now()}`; image.alt = 'Current institution logo'; preview.append(image, element('span', '', `${branding.width} × ${branding.height} · ${branding.media_type}`)); }
+  else preview.append(element('strong', '', 'LaTeX Core'), element('span', '', 'Default wordmark'));
+  const form = element('form', 'branding-form'); const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'; input.required = true; input.setAttribute('aria-label', 'Upload institution logo');
+  const upload = buttonAction(branding.logo_url ? 'Replace logo' : 'Upload logo', () => {}, 'primary'); upload.type = 'submit';
+  const remove = buttonAction('Remove / reset to default', async () => { if (!confirm('Remove the application logo and restore the LaTeX Core wordmark?')) return; await api('/api/admin/v2/branding', { method: 'DELETE' }); announce('Application logo reset to default.'); await showSection('System'); }); remove.disabled = !branding.logo_url;
+  form.append(input, upload, remove); form.addEventListener('submit', async (event) => { event.preventDefault(); try { const file = input.files[0]; if (!file) return; if (file.size > 512 * 1024) throw new Error('Logo exceeds the 512 KiB limit.'); await api('/api/admin/v2/branding', { method: 'POST', headers: { 'Content-Type': file.type || 'application/octet-stream' }, body: file }); announce('Application logo saved.'); await showSection('System'); } catch (error) { showError(error); } });
+  section.append(preview, form); content.append(section);
 }
 
 async function renderTemplates(templates, frontMatterPacks) {
@@ -949,8 +959,8 @@ async function showSection(section, options = {}) {
       return;
     }
     if (section === 'System') {
-      const [data, overview] = await Promise.all([api(endpoints.System), api(endpoints.Overview)]);
-      content.replaceChildren(element('h1', '', 'System')); renderSystem(data, overview); return;
+      const [data, overview, branding] = await Promise.all([api(endpoints.System), api(endpoints.Overview), api('/api/admin/v2/branding')]);
+      content.replaceChildren(element('h1', '', 'System')); renderSystem(data, overview, branding); return;
     }
     const data = await api(endpoints[section]);
     content.replaceChildren(element('h1', '', section));
@@ -971,4 +981,16 @@ nav.addEventListener('click', (event) => {
   if (button) showSection(button.dataset.section);
 });
 
+async function loadAdminIdentity() {
+  let identity;
+  try { identity = await api('/api/v2/me'); }
+  catch { identity = await api('/api/auth/me'); }
+  document.querySelector('#adminAccountName').textContent = identity.display_name || identity.email;
+  const branding = await api('/api/branding');
+  if (branding.logo_url) {
+    const brand = document.querySelector('.branded-wordmark'); const image = brand.querySelector('.header-logo'); const fallback = brand.querySelector('span');
+    image.src = branding.logo_url; image.hidden = false; fallback.hidden = true; image.onerror = () => { image.hidden = true; fallback.hidden = false; };
+  }
+}
+loadAdminIdentity().catch(() => { document.querySelector('#adminAccountName').textContent = 'Admin'; });
 showSection('Overview');

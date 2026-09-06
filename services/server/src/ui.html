@@ -8,7 +8,7 @@
   <!-- login-view:start -->
   <section id="loginView" class="login-view">
     <form id="loginForm" class="login-card" method="post" action="/login">
-      <div class="wordmark">LaTeX Core</div><h1>Welcome back</h1><p>Sign in to your document workspace.</p>
+      <div class="wordmark login-brand"><img src="/branding/logo" alt="Institution logo" style="width:auto;max-width:220px;height:auto;max-height:52px;object-fit:contain" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span hidden>LaTeX Core</span></div><h1>Welcome back</h1><p>Sign in to your document workspace.</p>
       <label>Email<input id="email" name="email" type="email" autocomplete="username" required></label>
       <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
       <p id="loginError" class="inline-error" role="alert">{{LOGIN_ERROR}}</p><button type="submit" class="primary wide">Sign in</button>

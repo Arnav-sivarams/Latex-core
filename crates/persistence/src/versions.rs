@@ -403,6 +403,34 @@ impl V2Repository {
         .ok_or(V2Error::NotFound { entity: "artifact" })?;
         decode_artifact(row)
     }
+
+    pub async fn v2_artifact_for_build(
+        &self,
+        actor: UserId,
+        paper_id: Uuid,
+        build_id: Uuid,
+        kind: &str,
+    ) -> Result<V2ArtifactRecord, V2Error> {
+        if !matches!(kind, "pdf" | "log" | "synctex") {
+            return Err(V2Error::NotFound { entity: "artifact" });
+        }
+        let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
+        let row = sqlx::query(
+            "SELECT a.artifact_id,a.job_id,a.logical_name,a.blob_hash,a.size_bytes,a.content_type \
+             FROM latex_core.v2_paper_builds b \
+             JOIN latex_core.compilation_artifacts a ON a.job_id=b.compile_job_id \
+             WHERE b.workspace_id=$1 AND b.id=$2 AND b.status='SUCCEEDED' AND a.kind=$3 \
+             ORDER BY a.logical_name LIMIT 1",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(build_id)
+        .bind(kind)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?
+        .ok_or(V2Error::NotFound { entity: "artifact" })?;
+        decode_artifact(row)
+    }
 }
 
 async fn participant_workspace(

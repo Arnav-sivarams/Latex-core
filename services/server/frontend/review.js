@@ -1,5 +1,5 @@
 import { basicSetup } from 'codemirror';
-import { EditorState } from '@codemirror/state';
+import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { StreamLanguage } from '@codemirror/language';
 import { stex } from '@codemirror/legacy-modes/mode/stex';
@@ -26,6 +26,9 @@ class ReviewApi {
   }
   json(path, method, body = {}) { return this.request(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
   papers() { return this.request('/api/v2/mentor/papers'); }
+  me() { return this.request('/api/v2/me'); }
+  preferences() { return this.request('/api/v2/preferences/editor'); }
+  savePreferences(body) { return this.json('/api/v2/preferences/editor', 'PUT', body); }
   paper(id) { return this.request(`/api/v2/reviews/papers/${id}`); }
   files(id) { return this.request(`/api/v2/reviews/papers/${id}/files`); }
   file(id, fileId) { return this.request(`/api/v2/reviews/papers/${id}/files/${fileId}`); }
@@ -33,6 +36,9 @@ class ReviewApi {
   rounds(id) { return this.request(`/api/v2/reviews/papers/${id}/rounds`); }
   threads(id) { return this.request(`/api/v2/reviews/papers/${id}/threads`); }
   createThread(id, body) { return this.json(`/api/v2/reviews/papers/${id}/threads`, 'POST', body); }
+  updateDraft(id, threadId, body) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}`, 'PATCH', body); }
+  deleteDraft(id, threadId, expectedRevision) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}`, 'DELETE', { expected_revision: expectedRevision }); }
+  publish(id, roundId, body) { return this.json(`/api/v2/reviews/papers/${id}/rounds/${roundId}/submit`, 'POST', body); }
   message(id, threadId, body) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}/messages`, 'POST', { body }); }
   transition(id, threadId, state) { return this.json(`/api/v2/reviews/papers/${id}/threads/${threadId}/state`, 'POST', { state }); }
   map(id, body) { return this.json(`/api/v2/reviews/papers/${id}/synctex`, 'POST', body); }
@@ -49,7 +55,8 @@ const ui = Object.fromEntries([
   'reviewPopover', 'anchorSummary', 'threadType', 'threadMessage', 'cancelAnnotation',
   'createAnnotation', 'createComment', 'createSuggestion', 'threadFilters', 'threadList',
   'roundList', 'reviewNotice', 'reviewGateBadge', 'mentorCommentsToggle', 'mentorReviewDrawer',
-  'mentorDrawerClose',
+  'mentorDrawerClose', 'pushReview', 'draftStatus', 'accountName', 'editorSettings',
+  'editorFontSize', 'editorTheme', 'resetEditorSettings',
 ].map((id) => [id, document.getElementById(id)]));
 
 const model = {
@@ -58,11 +65,49 @@ const model = {
   filter: 'active', collaboration: null, view: null, pendingAnchor: null, pendingAnchorSummary: null,
   pdf: null, pdfBuildId: null, page: 1, scale: 1, viewport: null, renderTask: null, dragStart: null,
   suppressSelection: false,
+  identity: null, preferences: { font_size_px: 14, theme: 'LIGHT' },
+  editorAppearance: new Compartment(), pendingDraftSave: null, draftSaveFailed: null,
+  failedDraftEdit: null, failedDraftDeleteId: null,
+  pendingSubmissionId: null,
 };
 
 function notice(message, failed = false) { ui.reviewNotice.textContent = message; ui.reviewNotice.classList.toggle('danger', failed); }
 function button(label, handler, active = false) { const node = document.createElement('button'); node.type = 'button'; node.textContent = label; if (active) node.setAttribute('aria-current', 'page'); node.addEventListener('click', handler); return node; }
 function clearNode(node, message) { node.replaceChildren(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: message })); }
+function editorAppearance(preference) {
+  const dark = preference.theme === 'DARK';
+  return EditorView.theme({
+    '&': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#1f2329' : '#ffffff', color: dark ? '#e6edf3' : '#20242a' },
+    '.cm-gutters': { backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
+    '.cm-content': { caretColor: dark ? '#f0f6fc' : '#111827' },
+    '.cm-activeLine,.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
+    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#bfdcff' },
+  }, { dark });
+}
+
+function applyIdentity(identity) {
+  model.identity = identity;
+  ui.accountName.textContent = identity.display_name || identity.email;
+  document.querySelectorAll('.branded-wordmark').forEach((brand) => {
+    const image = brand.querySelector('.header-logo');
+    const fallback = brand.querySelector('span');
+    if (identity.branding_logo_url) {
+      image.src = identity.branding_logo_url; image.hidden = false; fallback.hidden = true;
+      image.onerror = () => { image.hidden = true; fallback.hidden = false; };
+    }
+  });
+}
+
+async function loadPreferences() {
+  model.preferences = await api.preferences();
+  ui.editorFontSize.value = model.preferences.font_size_px;
+  ui.editorTheme.value = model.preferences.theme;
+}
+
+async function persistPreferences(preferences) {
+  model.preferences = await api.savePreferences(preferences);
+  if (model.view) model.view.dispatch({ effects: model.editorAppearance.reconfigure(editorAppearance(model.preferences)) });
+}
 
 class ReadOnlySession {
   constructor(paper, file) {
@@ -83,6 +128,7 @@ class ReadOnlySession {
       const value = JSON.parse(event.data);
       if (value.type === 'JOIN_ACCEPTED') { this.metadata = value; this.initialize(); }
       else if (value.type === 'REMOTE_DURABLE') { ui.liveStatus.textContent = 'Live · read only'; refreshPaperDetail(); }
+      else if (value.type === 'REVIEW_PUBLISHED') { refreshThreads(); refreshRounds(); }
       else if (value.type === 'RELOAD_REQUIRED') notice('The selected file was removed.', true);
       else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('The Team Leader changed the paper version; reloading.', true); openPaper(model.paper); }
       else if (value.type === 'POLICY_CHANGED') { notice(value.message || 'File policy changed; reload.', true); openPaper(model.paper); }
@@ -108,6 +154,7 @@ function mountReadOnlyEditor(session) {
   const extensions = [basicSetup, EditorState.readOnly.of(true), EditorView.editable.of(false), yCollab(session.text),
     EditorView.updateListener.of((update) => { if (update.selectionSet && !model.suppressSelection) sourceSelected(update.state); }),
     EditorView.theme({ '&': { height: '100%' }, '.cm-scroller': { overflow: 'auto' }, '.cm-content': { caretColor: 'transparent' } }),
+    model.editorAppearance.of(editorAppearance(model.preferences)),
   ];
   if (session.file.path.endsWith('.tex')) extensions.push(StreamLanguage.define(stex));
   model.view = new EditorView({ state: EditorState.create({ doc: session.text.toString(), extensions }), parent: ui.reviewEditor });
@@ -116,14 +163,14 @@ function mountReadOnlyEditor(session) {
 async function sourceSelected(state) {
   const range = state.selection.main;
   if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text, then right-click to review'; ui.reviewSelection.disabled = true; return; }
-  if (!reviewOpen()) { ui.sourceSelection.textContent = 'Waiting for Team Review'; ui.reviewSelection.disabled = true; return; }
+  if (!canDraft()) { ui.sourceSelection.textContent = 'Waiting for your active review assignment'; ui.reviewSelection.disabled = true; return; }
   const quoted = state.sliceDoc(range.from, range.to);
   const relativeStart = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.from));
   const relativeEnd = Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, range.to));
   const context = state.sliceDoc(Math.max(0, range.from - 80), Math.min(state.doc.length, range.to + 80));
   const sourceAnchor = {
     file_id: model.file.file_id, encoded_relative_start: [...relativeStart], encoded_relative_end: [...relativeEnd],
-    quoted_text: quoted, context_hash: await sha256(context), source_sequence: model.detail.version,
+    quoted_text: quoted, context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq,
     source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch,
   };
   const pending = { source_anchor: sourceAnchor, pdf_anchor: null };
@@ -140,7 +187,7 @@ async function sourceSelected(state) {
 }
 
 ui.reviewEditor.addEventListener('contextmenu', (event) => {
-  if (!reviewOpen() || !model.pendingAnchor?.source_anchor || !model.view) return;
+  if (!canDraft() || !model.pendingAnchor?.source_anchor || !model.view) return;
   const selection = model.view.state.selection.main;
   const position = model.view.posAtCoords({ x: event.clientX, y: event.clientY });
   if (selection.empty || position == null || position < selection.from || position > selection.to) return;
@@ -152,7 +199,7 @@ async function sha256(value) { const bytes = await crypto.subtle.digest('SHA-256
 
 async function refreshPapers() {
   const payload = await api.papers(); model.papers = payload.papers; if (model.paper) model.paper = model.papers.find((paper) => paper.id === model.paper.id) || model.paper; ui.assignedPapers.replaceChildren();
-  if (!model.papers.length) return clearNode(ui.assignedPapers, 'No assigned Team Papers.');
+  if (!model.papers.length) return clearNode(ui.assignedPapers, 'No assigned Team reports.');
   const list = document.createElement('div'); list.className = 'paper-list';
   model.papers.forEach((paper) => { const item = button(paper.name, () => openPaper(paper), model.paper?.id === paper.id); const count = document.createElement('small'); count.textContent = `${paper.open_review_count} open`; item.append(count); list.append(item); });
   ui.assignedPapers.append(list);
@@ -221,7 +268,7 @@ async function pdfAnchorFromMapping(mapping) {
 ui.pdfOverlay.addEventListener('pointerdown', (event) => { if (!model.viewport || event.target !== ui.pdfOverlay) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); model.dragStart = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; ui.pdfOverlay.setPointerCapture(event.pointerId); });
 ui.pdfOverlay.addEventListener('pointerup', async (event) => {
   if (!model.dragStart || !model.viewport) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); const end = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; const rectangle = normalizeRectangle({ x1: model.dragStart.x, y1: model.dragStart.y, x2: end.x, y2: end.y }, model.viewport.width, model.viewport.height); model.dragStart = null; if (rectangle.width < 0.005 || rectangle.height < 0.005) return;
-  if (!reviewOpen()) return;
+  if (!canDraft()) return;
   const point = { x: (rectangle.x + rectangle.width / 2) * model.viewport.width / model.scale, y: (rectangle.y + rectangle.height / 2) * model.viewport.height / model.scale };
   let mapping = { mapping_status: 'PDF_ONLY' }; try { mapping = await api.map(model.paper.id, { direction: 'INVERSE', page: model.page, ...point }); } catch { /* PDF-only is truthful. */ }
   let sourceAnchor = null; if (mapping.mapped_file_id) sourceAnchor = await anchorMappedLine(mapping);
@@ -231,7 +278,7 @@ ui.pdfOverlay.addEventListener('pointerup', async (event) => {
 });
 
 ui.pdfOverlay.addEventListener('contextmenu', (event) => {
-  if (!event.target.closest?.('.pdf-highlight.pending') || !reviewOpen()) return;
+  if (!event.target.closest?.('.pdf-highlight.pending') || !canDraft()) return;
   event.preventDefault();
   showReviewPopover(event.clientX, event.clientY, model.pendingAnchorSummary || `PDF page ${model.page}`);
 });
@@ -240,12 +287,13 @@ async function anchorMappedLine(mapping) {
   const target = model.files.find((file) => file.file_id === mapping.mapped_file_id); if (!target) return null; if (model.file?.file_id !== target.file_id) await openFile(target);
   const lineNumber = Math.min(Math.max(mapping.mapped_line, 1), model.view.state.doc.lines); const line = model.view.state.doc.line(lineNumber); const from = Math.min(line.to, line.from + (mapping.mapped_column || 0)); const to = line.to;
   const context = model.view.state.sliceDoc(Math.max(0, from - 80), Math.min(model.view.state.doc.length, to + 80));
-  return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.detail.version, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch };
+  return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch };
 }
 
 function reviewOpen() { return model.reviewOpen; }
+function canDraft() { return reviewOpen() && model.currentReviewRound?.mentor_participation?.status === 'PENDING'; }
 function showReviewPopover(x, y, summary) {
-  if (!reviewOpen() || !model.pendingAnchor) return;
+  if (!canDraft() || !model.pendingAnchor) return;
   ui.anchorSummary.textContent = summary;
   ui.createSuggestion.hidden = !model.pendingAnchor.source_anchor;
   ui.reviewPopover.hidden = false;
@@ -263,19 +311,77 @@ function hideComposer({ clearAnchor = true } = {}) {
 }
 
 async function createAnnotation(type = 'COMMENT') {
-  if (!reviewOpen()) throw new Error('This paper has not been sent for review.');
+  if (!canDraft()) throw new Error('You do not have an active review assignment for this report.');
+  if (model.failedDraftEdit || model.failedDraftDeleteId) throw new Error('Retry the failed draft edit or deletion before saving another draft.');
   const message = ui.threadMessage.value.trim();
   if (!message) throw new Error(type === 'SUGGESTION' ? 'Suggestion text is required.' : 'Comment text is required.');
   if (type === 'SUGGESTION' && !model.pendingAnchor?.source_anchor) throw new Error('Suggestions require a source selection.');
   const request = { thread_type: type, message, severity: 'NOTE', category: 'WRITING', assigned_writer_user_id: null, due_at: null, source_anchor: model.pendingAnchor?.source_anchor || null, pdf_anchor: model.pendingAnchor?.pdf_anchor || null, suggested_replacement: type === 'SUGGESTION' ? message : null, section_label: null };
-  await api.createThread(model.paper.id, request); hideComposer(); ui.threadMessage.value = ''; await Promise.all([refreshThreads(), refreshRounds()]); notice('Review annotation created.');
+  ui.draftStatus.textContent = 'Saving draft…';
+  ui.createAnnotation.disabled = true; ui.createComment.disabled = true; ui.createSuggestion.disabled = true; ui.pushReview.disabled = true;
+  model.draftSaveFailed = null;
+  model.pendingDraftSave = api.createThread(model.paper.id, request);
+  try {
+    await model.pendingDraftSave;
+    hideComposer(); ui.threadMessage.value = '';
+    await Promise.all([refreshThreads(), refreshRounds()]);
+    ui.draftStatus.textContent = 'Draft saved — not yet visible to writers';
+    notice('Draft feedback saved.');
+  } catch (failure) {
+    model.draftSaveFailed = failure;
+    ui.draftStatus.textContent = 'Draft save failed — retry before submitting';
+    throw failure;
+  } finally {
+    model.pendingDraftSave = null;
+    ui.createAnnotation.disabled = !canDraft(); ui.createComment.disabled = !canDraft(); ui.createSuggestion.disabled = !canDraft(); ui.pushReview.disabled = !canDraft();
+  }
 }
 
 async function refreshThreads() { const payload = await api.threads(model.paper.id); model.threads = payload.threads; renderThreads(); renderOverlays(); }
 function renderThreads() {
   ui.threadList.replaceChildren(); const selected = model.threads.filter((thread) => model.filter === 'all' || (model.filter === 'active' && ['OPEN', 'REOPENED', 'ADDRESSED'].includes(thread.state)) || thread.state === model.filter);
   if (!selected.length) return clearNode(ui.threadList, 'No matching comments.');
-  selected.forEach((thread) => { const card = document.createElement('article'); card.className = 'thread-card'; const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'thread-title'; heading.textContent = `${thread.thread_type.replaceAll('_', ' ')} · ${thread.state}`; heading.addEventListener('click', () => focusThread(thread)); const meta = document.createElement('p'); meta.textContent = mappingStatus(thread); const discussion = document.createElement('div'); discussion.className = 'discussion'; thread.messages.forEach((message) => { const row = document.createElement('p'); const author = document.createElement('strong'); author.textContent = `${message.author_email}: `; row.append(author, document.createTextNode(message.body)); discussion.append(row); }); const actions = document.createElement('div'); actions.className = 'thread-actions'; if (reviewOpen()) actions.append(button('Reply', () => reply(thread))); if (thread.state === 'ADDRESSED') actions.append(button('Done', () => transition(thread, 'RESOLVED')), button('Reopen', () => transition(thread, 'REOPENED'))); else if (thread.state === 'RESOLVED' && reviewOpen()) actions.append(button('Reopen', () => transition(thread, 'REOPENED'))); card.append(heading, meta, discussion, actions); ui.threadList.append(card); });
+  selected.forEach((thread) => {
+    const draft = thread.publication_status === 'DRAFT';
+    const card = document.createElement('article'); card.className = `thread-card${draft ? ' draft-thread' : ''}`;
+    const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'thread-title'; heading.textContent = `${thread.thread_type.replaceAll('_', ' ')} · ${draft ? 'DRAFT' : thread.state}`; heading.addEventListener('click', () => focusThread(thread));
+    const meta = document.createElement('p'); meta.textContent = `${thread.source_anchor?.path || 'PDF'} · ${mappingStatus(thread)}`;
+    const discussion = document.createElement('div'); discussion.className = 'discussion';
+    thread.messages.forEach((message) => { const row = document.createElement('p'); const author = document.createElement('strong'); author.textContent = `${message.author_email}: `; row.append(author, document.createTextNode(message.body)); discussion.append(row); });
+    const actions = document.createElement('div'); actions.className = 'thread-actions';
+    if (draft && canDraft()) actions.append(button('Edit draft', () => editDraft(thread)), button('Delete draft', () => deleteDraft(thread)));
+    else if (!draft && reviewOpen()) actions.append(button('Reply', () => reply(thread)));
+    if (!draft && thread.state === 'ADDRESSED') actions.append(button('Done', () => transition(thread, 'RESOLVED')), button('Reopen', () => transition(thread, 'REOPENED')));
+    else if (!draft && thread.state === 'RESOLVED' && reviewOpen()) actions.append(button('Reopen', () => transition(thread, 'REOPENED')));
+    card.append(heading, meta, discussion, actions); ui.threadList.append(card);
+  });
+}
+
+async function editDraft(thread) {
+  if (model.failedDraftDeleteId || (model.draftSaveFailed && model.failedDraftEdit?.threadId !== thread.id)) return notice('Retry the earlier failed draft write first.', true);
+  const current = model.failedDraftEdit?.threadId === thread.id ? model.failedDraftEdit.message : (thread.messages?.[0]?.body || '');
+  const message = window.prompt('Edit draft feedback', current);
+  if (!message || message === current) return;
+  ui.draftStatus.textContent = 'Saving draft…';
+  model.draftSaveFailed = null;
+  model.pendingDraftSave = api.updateDraft(model.paper.id, thread.id, { expected_revision: thread.draft_revision, message, suggested_replacement: thread.thread_type === 'SUGGESTION' ? message : null });
+  try {
+    await model.pendingDraftSave; model.failedDraftEdit = null; model.draftSaveFailed = null;
+    await Promise.all([refreshThreads(), refreshRounds()]);
+    ui.draftStatus.textContent = 'Draft saved — not yet visible to writers';
+  } catch (failure) { model.draftSaveFailed = failure; model.failedDraftEdit = { threadId: thread.id, message }; ui.draftStatus.textContent = 'Draft save failed — choose Edit draft to retry'; notice(`${failure.message} Your edit and the saved server draft were retained.`, true); }
+  finally { model.pendingDraftSave = null; }
+}
+
+async function deleteDraft(thread) {
+  if (model.failedDraftEdit || (model.draftSaveFailed && model.failedDraftDeleteId !== thread.id)) return notice('Retry the earlier failed draft write first.', true);
+  if (!window.confirm('Delete this unpublished draft comment?')) return;
+  ui.draftStatus.textContent = 'Saving draft…';
+  model.draftSaveFailed = null;
+  model.pendingDraftSave = api.deleteDraft(model.paper.id, thread.id, thread.draft_revision);
+  try { await model.pendingDraftSave; model.failedDraftDeleteId = null; model.draftSaveFailed = null; await Promise.all([refreshThreads(), refreshRounds()]); ui.draftStatus.textContent = 'Draft saved — not yet visible to writers'; }
+  catch (failure) { model.draftSaveFailed = failure; model.failedDraftDeleteId = thread.id; ui.draftStatus.textContent = 'Draft delete failed — choose Delete draft to retry'; notice(`${failure.message} The saved server draft was retained.`, true); }
+  finally { model.pendingDraftSave = null; }
 }
 function mappingStatus(thread) {
   if (thread.thread_type === 'PAPER_APPROVAL') return thread.approved_workspace_version === model.detail?.version ? 'EXACT · current version' : 'SOURCE_CHANGED · historical approval';
@@ -295,8 +401,13 @@ async function focusThread(thread) {
   const anchor = thread.source_anchor; if (!anchor || anchor.file_deleted) return;
   const file = model.files.find((candidate) => candidate.file_id === anchor.file_id); if (!file) return; if (model.file?.file_id !== file.file_id) await openFile(file);
   const range = resolveSuggestionRange(model.collaboration.doc, model.collaboration.text, base64(anchor.encoded_relative_start), base64(anchor.encoded_relative_end));
-  if (!range) return notice('Source anchor no longer resolves.', true); model.suppressSelection = true; model.view.dispatch({ selection: { anchor: range.from, head: range.to }, scrollIntoView: true }); model.suppressSelection = false;
-  const current = model.view.state.sliceDoc(range.from, range.to); if (current !== anchor.quoted_text) notice('Source changed materially; historical context is retained.', true);
+  if (!range) return notice(`Source changed. Original reviewed excerpt: “${anchor.quoted_text}”`, true);
+  const current = model.view.state.sliceDoc(range.from, range.to);
+  if (current !== anchor.quoted_text) {
+    if (thread.pdf_anchor?.page) { model.page = thread.pdf_anchor.page; await renderPage(); }
+    return notice(`Source changed. Original reviewed excerpt: “${anchor.quoted_text}”${thread.pdf_anchor?.page ? ` · showing reviewed PDF page ${thread.pdf_anchor.page}` : ''}`, true);
+  }
+  model.suppressSelection = true; model.view.dispatch({ selection: { anchor: range.from, head: range.to }, scrollIntoView: true }); model.suppressSelection = false;
   const line = model.view.state.doc.lineAt(range.from); try { const mapping = await api.map(model.paper.id, { direction: 'FORWARD', file_id: file.file_id, line: line.number, column: range.from - line.from }); const projection = await pdfAnchorFromMapping(mapping); if (projection) { model.pendingAnchor = { pdf_anchor: projection }; renderOverlays(); } } catch { /* Historical anchor remains useful. */ }
 }
 function base64(value) { if (!value) return null; const binary = atob(value.replaceAll('\n', '')); return Uint8Array.from(binary, (character) => character.charCodeAt(0)); }
@@ -311,10 +422,42 @@ async function refreshRounds() {
 function renderRounds() {
   ui.roundList.replaceChildren();
   const open = reviewOpen();
-  ui.reviewGateBadge.textContent = open ? 'Review open' : 'Waiting for Team Review';
+  const participation = model.currentReviewRound?.mentor_participation;
+  ui.reviewGateBadge.textContent = open ? (participation?.status === 'SUBMITTED' ? 'Your review submitted' : 'Review open') : 'Waiting for Team Review';
+  ui.pushReview.disabled = !open || participation?.status !== 'PENDING';
+  if (participation?.status === 'PENDING') ui.draftStatus.textContent = participation.draft_count ? 'Draft saved — not yet visible to writers' : 'No draft feedback yet';
+  else if (participation?.status === 'SUBMITTED') ui.draftStatus.textContent = 'Review submitted';
+  else ui.draftStatus.textContent = 'No active review';
   if (!model.rounds.length) clearNode(ui.roundList, 'This paper has not been sent for review.');
   else model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status.replaceAll('_', ' ')}`; row.append(text); ui.roundList.append(row); });
   if (!open) hideComposer();
+}
+
+async function pushReview() {
+  if (model.pendingDraftSave) {
+    ui.draftStatus.textContent = 'Saving draft…';
+    try { await model.pendingDraftSave; } catch { /* handled below */ }
+  }
+  if (model.draftSaveFailed || model.failedDraftEdit || model.failedDraftDeleteId) return notice(`A draft write failed and was retained. Retry the draft save before Push review: ${model.draftSaveFailed?.message || 'pending retry'}`, true);
+  await refreshRounds();
+  const participation = model.currentReviewRound?.mentor_participation;
+  if (!participation || participation.status !== 'PENDING') return notice('Your active review assignment is no longer available. Reload its status.', true);
+  const count = Number(participation.draft_count || 0);
+  const question = count === 0 ? 'Submit review with no new comments?' : `Push review with ${count} draft comment${count === 1 ? '' : 's'}/suggestion${count === 1 ? '' : 's'}?`;
+  if (!window.confirm(question)) return;
+  const submissionId = model.pendingSubmissionId || crypto.randomUUID();
+  model.pendingSubmissionId = submissionId;
+  ui.pushReview.disabled = true; ui.draftStatus.textContent = 'Submitting review…';
+  try {
+    const result = await api.publish(model.paper.id, model.currentReviewRound.id, { expected_revision: participation.draft_revision, submission_id: submissionId });
+    model.pendingSubmissionId = null; model.draftSaveFailed = null;
+    await Promise.all([refreshThreads(), refreshRounds(), refreshPapers()]);
+    ui.draftStatus.textContent = 'Review submitted';
+    notice(result.remaining_mentors ? 'Review submitted. Writers can now see your feedback. Your review submitted — another Mentor is still reviewing.' : 'Review submitted. Writers can now see your feedback.');
+  } catch (failure) {
+    ui.pushReview.disabled = false; ui.draftStatus.textContent = 'Submission failed — retry Push review';
+    notice(`${failure.message} Your saved drafts were retained; retry Push review.`, true);
+  }
 }
 
 ui.reviewSelection.addEventListener('click', () => {
@@ -328,6 +471,10 @@ ui.createSuggestion.addEventListener('click', () => createAnnotation('SUGGESTION
 ui.createAnnotation.addEventListener('click', () => createAnnotation(ui.threadType.value).catch((failure) => notice(failure.message, true)));
 ui.mentorCommentsToggle.addEventListener('click', () => { ui.mentorReviewDrawer.hidden = false; });
 ui.mentorDrawerClose.addEventListener('click', () => { ui.mentorReviewDrawer.hidden = true; });
+ui.pushReview.addEventListener('click', pushReview);
+ui.editorFontSize.addEventListener('change', () => persistPreferences({ font_size_px: Number(ui.editorFontSize.value), theme: ui.editorTheme.value }).catch((failure) => notice(failure.message, true)));
+ui.editorTheme.addEventListener('change', () => persistPreferences({ font_size_px: Number(ui.editorFontSize.value), theme: ui.editorTheme.value }).catch((failure) => notice(failure.message, true)));
+ui.resetEditorSettings.addEventListener('click', () => { ui.editorFontSize.value = 14; ui.editorTheme.value = 'LIGHT'; persistPreferences({ font_size_px: 14, theme: 'LIGHT' }).catch((failure) => notice(failure.message, true)); });
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   hideComposer({ clearAnchor: false });
@@ -340,4 +487,4 @@ ui.compileReview.addEventListener('click', async () => { try { ui.buildStatus.te
 ui.previousPage.addEventListener('click', async () => { if (model.page > 1) { model.page -= 1; await renderPage(); } }); ui.nextPage.addEventListener('click', async () => { if (model.page < model.pdf.numPages) { model.page += 1; await renderPage(); } }); ui.zoomOut.addEventListener('click', async () => { model.scale = Math.max(0.5, model.scale - 0.25); await renderPage(); }); ui.zoomIn.addEventListener('click', async () => { model.scale = Math.min(3, model.scale + 0.25); await renderPage(); });
 ui.threadFilters.addEventListener('click', (event) => { const filter = event.target.dataset.filter; if (!filter) return; model.filter = filter; [...ui.threadFilters.children].forEach((node) => node.toggleAttribute('aria-current', node === event.target)); renderThreads(); });
 window.setInterval(() => { if (model.paper) { refreshBuild().catch(() => {}); refreshPapers().catch(() => {}); } }, 2000);
-refreshPapers().catch((failure) => notice(failure.message, true));
+Promise.all([api.me(), loadPreferences()]).then(([identity]) => { applyIdentity(identity); return refreshPapers(); }).catch((failure) => notice(failure.message, true));

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import * as Y from 'yjs';
+import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
 import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange, showsReplacementInput } from './review-helpers.mjs';
 
 function sync(from, to) {
@@ -59,6 +60,22 @@ test('suggestion helper refuses an anchor unresolved in the current document', (
   assert.equal(resolveSuggestionRange(current, currentText, start, end), null);
 });
 
+test('CodeMirror appearance reconfiguration preserves review state and the Yjs document', () => {
+  const appearance = new Compartment();
+  const setReviewIds = StateEffect.define();
+  const reviewIds = StateField.define({
+    create: () => [],
+    update: (value, transaction) => transaction.effects.reduce((current, effect) => effect.is(setReviewIds) ? effect.value : current, value),
+  });
+  const ydoc = new Y.Doc();
+  ydoc.getText('source').insert(0, 'reviewed source');
+  let state = EditorState.create({ doc: ydoc.getText('source').toString(), extensions: [reviewIds, appearance.of(EditorState.tabSize.of(4))] });
+  state = state.update({ effects: setReviewIds.of(['thread-1', 'thread-2']) }).state;
+  state = state.update({ effects: appearance.reconfigure(EditorState.tabSize.of(8)) }).state;
+  assert.deepEqual(state.field(reviewIds), ['thread-1', 'thread-2']);
+  assert.equal(ydoc.getText('source').toString(), 'reviewed source');
+});
+
 test('Mentor bundle is read-only and PDF.js assets are same-origin', () => {
   const review = readFileSync(new URL('./review.js', import.meta.url), 'utf8');
   const html = readFileSync(new URL('../src/review.html', import.meta.url), 'utf8');
@@ -67,7 +84,7 @@ test('Mentor bundle is read-only and PDF.js assets are same-origin', () => {
   assert.doesNotMatch(review, /sendUpdate|0x01|contenteditable\s*=\s*["']?true/i);
   assert.match(review, /\/static\/pdf\.min\.mjs/);
   assert.match(review, /\/static\/pdf\.worker\.min\.mjs/);
-  assert.doesNotMatch(html, /iframe|cdn|Set Main|New File|Publish/i);
+  assert.doesNotMatch(html, /iframe|cdn|Set Main|New File/i);
   assert.equal(packageJson.dependencies['pdfjs-dist'], '6.3.289');
 });
 
@@ -94,7 +111,7 @@ test('Writer surface uses Save semantics and inline historical review highlights
   assert.match(writer, /review-source-highlight/);
   assert.match(writer, /button\('Done'/);
   assert.match(writer, /button\('Apply'/);
-  assert.match(html, /id="sendReview"[^>]*hidden[^>]*aria-label="Send for Review"/);
+  assert.match(html, /id="sendReview"[^>]*hidden[^>]*aria-label="Send for review"/);
   assert.match(writer, /ui\.sendReview\.hidden = !teamLeader/);
   assert.match(writer, /model\.reviewOpen = payload\.review_open/);
   assert.match(writer, /model\.currentReviewRound = payload\.current_review_round/);

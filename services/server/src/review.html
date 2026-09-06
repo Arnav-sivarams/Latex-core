@@ -8,9 +8,10 @@
 </head>
 <body class="workspace-shell mentor-shell">
   <header class="shell-topbar">
-    <a class="shell-brand" href="/review" aria-current="page">LaTeX Core</a>
-    <span id="reviewContext" class="current-context">No paper selected</span>
-    <span class="role-badge">Mentor</span>
+    <a class="shell-brand branded-wordmark" href="/review" aria-current="page"><img class="header-logo" alt="Institution logo" hidden><span>LaTeX Core</span></a>
+    <span class="header-divider" aria-hidden="true">|</span><span id="accountName" class="header-identity">Loading…</span>
+    <span class="header-divider" aria-hidden="true">|</span><span class="role-badge">Mentor</span>
+    <span class="header-divider" aria-hidden="true">|</span><span id="reviewContext" class="current-context">No report selected</span>
     <span class="shell-spacer"></span>
     <span id="liveStatus" class="save-status" data-state="synced">Read only</span>
     <form method="post" action="/logout"><button class="quiet-button" type="submit" title="Log out">Log out</button></form>
@@ -18,7 +19,7 @@
 
   <nav class="action-toolbar" aria-label="Mentor review actions">
     <div class="toolbar-group">
-      <button id="compileReview" class="icon-button" type="button" disabled aria-label="Compile" title="Compile latest paper"><span aria-hidden="true">▶</span></button>
+      <button id="compileReview" class="workflow-button" type="button" disabled aria-label="Compile" title="Compile latest report"><span aria-hidden="true">▶</span><span>Compile</span></button>
       <span id="buildStatus" class="toolbar-status">No PDF yet</span>
     </div>
     <div class="toolbar-group">
@@ -27,15 +28,18 @@
       <button id="mentorCommentsToggle" class="icon-button" type="button" aria-label="Comments and review history" title="Comments and review history"><span aria-hidden="true">☰</span></button>
       <a id="csvExport" class="icon-link" href="#" aria-disabled="true" aria-label="Export comments as CSV" title="Export comments as CSV">⇩</a>
       <a id="printExport" class="icon-link" href="#" aria-disabled="true" target="_blank" aria-label="Print review report" title="Print review report">▤</a>
+      <button id="pushReview" class="workflow-button primary" type="button" disabled aria-label="Push review" title="Publish saved feedback to Writers"><span aria-hidden="true">➤</span><span>Push review</span></button>
+      <span id="draftStatus" class="toolbar-status">No active review</span>
+      <details id="editorSettings" class="toolbar-menu"><summary>Editor settings</summary><div class="compact-settings"><label>Font size <input id="editorFontSize" type="number" min="12" max="26" step="1"></label><label>Theme <select id="editorTheme"><option value="LIGHT">Light</option><option value="DARK">Dark</option></select></label><button id="resetEditorSettings" type="button">Reset to default</button></div></details>
     </div>
     <span id="sourceSelection" class="toolbar-status">Select text, then right-click to review</span>
   </nav>
 
   <div class="review-workspace three-pane-workspace">
     <nav class="review-nav workspace-pane files-pane" aria-label="Mentor papers and files">
-      <section aria-labelledby="assigned-heading"><h2 id="assigned-heading">ASSIGNED PAPERS</h2><div id="assignedPapers"><p class="empty-copy">Loading…</p></div></section>
+      <section aria-labelledby="assigned-heading"><h2 id="assigned-heading">TEAM REPORTS</h2><div id="assignedPapers"><p class="empty-copy">Loading…</p></div></section>
       <section aria-labelledby="review-files-heading"><h2 id="review-files-heading">FILES</h2><div id="reviewFiles"><p class="empty-copy">Choose a paper.</p></div></section>
-      <div class="paper-summary"><strong id="reviewTitle">No assigned paper</strong><small id="reviewSummary">Select an assigned Team Paper.</small></div>
+      <div class="paper-summary"><strong id="reviewTitle">No assigned report</strong><small id="reviewSummary">Select an assigned Team report.</small></div>
     </nav>
 
     <main class="review-source workspace-pane source-pane" aria-labelledby="source-heading">

@@ -160,6 +160,25 @@ impl CollaborationHub {
         }
     }
 
+    /// Announces an already-committed review publication to every loaded file
+    /// room. Clients always refetch the authoritative published thread list.
+    pub async fn review_published(
+        &self,
+        workspace_id: WorkspaceId,
+        submission_id: Uuid,
+        published_count: u64,
+    ) {
+        let rooms = self.rooms.lock().await;
+        for (key, room) in rooms.iter() {
+            if key.workspace_id == workspace_id {
+                let _ = room.events.send(RoomEvent::ReviewPublished {
+                    submission_id,
+                    published_count,
+                });
+            }
+        }
+    }
+
     /// Waits until every currently loaded room in a workspace has persisted and
     /// canonically materialized all updates observed before its flush command.
     /// Unloaded files are already represented by the canonical workspace state.
@@ -182,11 +201,22 @@ impl CollaborationHub {
 
 #[derive(Clone, Debug)]
 enum RoomEvent {
-    Update { source: Uuid, bytes: Vec<u8> },
-    Durable { sequence: u64 },
+    Update {
+        source: Uuid,
+        bytes: Vec<u8>,
+    },
+    Durable {
+        sequence: u64,
+    },
     ReloadRequired,
     PolicyChanged,
-    EpochChanged { document_epoch: u64 },
+    EpochChanged {
+        document_epoch: u64,
+    },
+    ReviewPublished {
+        submission_id: Uuid,
+        published_count: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -732,6 +762,10 @@ pub async fn serve_socket(
                     }
                     Ok(RoomEvent::Durable { sequence }) => {
                         let value = serde_json::json!({"type":"REMOTE_DURABLE","durable_seq":sequence});
+                        if sender.send(Message::Text(value.to_string().into())).await.is_err() { break; }
+                    }
+                    Ok(RoomEvent::ReviewPublished { submission_id, published_count }) => {
+                        let value = serde_json::json!({"type":"REVIEW_PUBLISHED","submission_id":submission_id,"published_count":published_count});
                         if sender.send(Message::Text(value.to_string().into())).await.is_err() { break; }
                     }
                     Ok(RoomEvent::Update { .. }) => {}

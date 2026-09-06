@@ -32,6 +32,7 @@ use core_types::{
     LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
     WorkspaceManifestV1, WorkspaceVersion,
 };
+use image::{GenericImageView, ImageFormat, ImageReader, Limits};
 use latex_parser::{DiagnosticSeverity, ProjectAnalyzer, ProjectSource, SectionLevel};
 use persistence::{
     AccountType, AppError, AppRepository, AppSessionRecord, AppTemplateFileRecord,
@@ -439,6 +440,14 @@ struct V2IdentityWire {
     user_id: String,
     email: String,
     role: String,
+    display_name: String,
+    branding_logo_url: Option<&'static str>,
+}
+
+#[derive(Deserialize)]
+struct EditorPreferencesInput {
+    font_size_px: i16,
+    theme: String,
 }
 #[derive(Serialize)]
 struct IdentityCapabilitiesWire {
@@ -680,6 +689,18 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/me", get(me))
         .route("/api/v2/me", get(v2_me))
+        .route(
+            "/api/v2/preferences/editor",
+            get(v2_editor_preferences).put(v2_set_editor_preferences),
+        )
+        .route("/api/branding", get(public_branding))
+        .route("/branding/logo", get(branding_logo))
+        .route(
+            "/api/admin/v2/branding",
+            get(admin_branding)
+                .post(admin_set_branding)
+                .delete(admin_clear_branding),
+        )
         .route(
             "/api/admin/v2/users",
             get(admin_v2_users).post(admin_v2_create_user),
@@ -1317,12 +1338,240 @@ async fn v2_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let PrincipalKind::V2(role) = principal.kind else {
         return error(StatusCode::FORBIDDEN, "V2 principal required");
     };
+    let display_name = match state.v2.display_name(principal.user_id()).await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    let branding_logo_url = match state.v2.branding().await {
+        Ok(branding) if branding.logo_blob_hash.is_some() => Some("/branding/logo"),
+        Ok(_) => None,
+        Err(value) => return v2_error(value),
+    };
     Json(V2IdentityWire {
         user_id: principal.user_id().to_string(),
         email: principal.email().to_owned(),
         role: role.as_str().to_owned(),
+        display_name,
+        branding_logo_url,
     })
     .into_response()
+}
+
+async fn v2_editor_preferences(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(
+        principal.kind,
+        PrincipalKind::V2(GlobalRole::Writer | GlobalRole::Mentor)
+    ) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Writer or Mentor preference access required",
+        );
+    }
+    match state.v2.editor_preferences(principal.user_id()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn v2_set_editor_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<EditorPreferencesInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match principal_auth(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(
+        principal.kind,
+        PrincipalKind::V2(GlobalRole::Writer | GlobalRole::Mentor)
+    ) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Writer or Mentor preference access required",
+        );
+    }
+    match state
+        .v2
+        .set_editor_preferences(principal.user_id(), input.font_size_px, &input.theme)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(V2Error::Integrity { .. }) => error(
+            StatusCode::BAD_REQUEST,
+            "Font size must be 12–26 px and theme must be LIGHT or DARK.",
+        ),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn public_branding(State(state): State<AppState>) -> Response {
+    match state.v2.branding().await {
+        Ok(value) => Json(serde_json::json!({
+            "schema_version": 1,
+            "logo_url": value.logo_blob_hash.map(|_| "/branding/logo"),
+            "width": value.logo_width,
+            "height": value.logo_height,
+        }))
+        .into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_branding(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    match state.v2.branding().await {
+        Ok(value) => Json(serde_json::json!({
+            "schema_version": value.schema_version,
+            "logo_url": value.logo_blob_hash.map(|_| "/branding/logo"),
+            "media_type": value.logo_media_type,
+            "width": value.logo_width,
+            "height": value.logo_height,
+        }))
+        .into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+const MAX_BRANDING_LOGO_BYTES: usize = 512 * 1024;
+const MAX_BRANDING_LOGO_DIMENSION: u32 = 2048;
+
+async fn admin_set_branding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if bytes.is_empty() || bytes.len() > MAX_BRANDING_LOGO_BYTES {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Logo must be a PNG, JPEG, or WebP image no larger than 512 KiB.",
+        );
+    }
+    let format = match image::guess_format(&bytes) {
+        Ok(format @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)) => format,
+        _ => {
+            return error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Logo content must decode as PNG, JPEG, or WebP.",
+            );
+        }
+    };
+    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes.as_ref()), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_BRANDING_LOGO_DIMENSION);
+    limits.max_image_height = Some(MAX_BRANDING_LOGO_DIMENSION);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = match reader.decode() {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Logo image data is corrupt or unsupported.",
+            );
+        }
+    };
+    let (width, height) = decoded.dimensions();
+    if width == 0
+        || height == 0
+        || width > MAX_BRANDING_LOGO_DIMENSION
+        || height > MAX_BRANDING_LOGO_DIMENSION
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Logo dimensions must be between 1 and 2048 pixels.",
+        );
+    }
+    let media_type = match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::WebP => "image/webp",
+        _ => unreachable!("format was restricted above"),
+    };
+    let stored = match state.blobs.put(bytes).await {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Logo storage failed."),
+    };
+    match state.v2.set_branding(
+        principal.user_id(),
+        &stored.hash().to_hex(),
+        media_type,
+        i32::try_from(width).unwrap_or(i32::MAX),
+        i32::try_from(height).unwrap_or(i32::MAX),
+    ).await {
+        Ok(value) => Json(serde_json::json!({"schema_version":1,"logo_url":"/branding/logo","media_type":value.logo_media_type,"width":value.logo_width,"height":value.logo_height})).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_clear_branding(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.clear_branding(principal.user_id()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn branding_logo(State(state): State<AppState>) -> Response {
+    let branding = match state.v2.branding().await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    let (Some(hash), Some(media_type)) = (branding.logo_blob_hash, branding.logo_media_type) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let hash = match hash.parse() {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid branding asset metadata.",
+            );
+        }
+    };
+    let bytes = match state.blobs.get(hash).await {
+        Ok(value) => value,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut response = bytes.into_response();
+    let content_type = match HeaderValue::from_str(&media_type) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid branding media type.",
+            );
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 const INITIAL_TEX: &str =
@@ -5594,16 +5843,27 @@ async fn v2_current_artifact(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((paper_id, kind)): Path<(uuid::Uuid, String)>,
+    Query(query): Query<ArtifactQuery>,
 ) -> Response {
     let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match state
-        .v2
-        .current_v2_artifact(principal.user_id(), paper_id, &kind)
-        .await
-    {
+    let artifact = match query.build {
+        Some(build_id) => {
+            state
+                .v2
+                .v2_artifact_for_build(principal.user_id(), paper_id, build_id, &kind)
+                .await
+        }
+        None => {
+            state
+                .v2
+                .current_v2_artifact(principal.user_id(), paper_id, &kind)
+                .await
+        }
+    };
+    match artifact {
         Ok(artifact) => match state.blobs.get(artifact.blob_hash).await {
             Ok(bytes) => (
                 [
@@ -5635,6 +5895,11 @@ async fn v2_current_artifact(
         },
         Err(error_value) => v2_error(error_value),
     }
+}
+
+#[derive(Deserialize)]
+struct ArtifactQuery {
+    build: Option<uuid::Uuid>,
 }
 
 fn default_manual_trigger() -> String {
@@ -9495,13 +9760,13 @@ mod tests {
         let writer = writer_html();
         for required in [
             "PAPERS",
-            "TEAM PAPERS",
+            "TEAM REPORTS",
             "FILES",
             "SOURCE",
             "PDF",
             "workspaceDrawer",
             "Math palette",
-            "Send for Review",
+            "Send for review",
         ] {
             assert!(
                 writer.contains(required),
@@ -9516,6 +9781,9 @@ mod tests {
             "Project Manager",
             "Publish Changes",
             "Add Member",
+            "Outline",
+            "Show source in PDF",
+            "Show in PDF",
         ] {
             assert!(
                 !writer.contains(forbidden),
@@ -9525,11 +9793,13 @@ mod tests {
 
         let mentor = mentor_html();
         for required in [
-            "ASSIGNED PAPERS",
+            "TEAM REPORTS",
             "READ-ONLY SOURCE",
             "Waiting for Team Review",
             "reviewPopover",
             "Suggest replacement",
+            "Push review",
+            "Editor settings",
         ] {
             assert!(
                 mentor.contains(required),
@@ -9548,12 +9818,13 @@ mod tests {
             "Rename",
             "Move",
             "Delete",
-            "Publish",
             "ACTIVITY",
             "CHANGES SINCE",
             "RESTORATION REQUESTS",
             "APPROVALS",
             "NEW ANNOTATION",
+            "Show source in PDF",
+            "Show in PDF",
         ] {
             assert!(
                 !mentor.contains(forbidden),
@@ -10776,6 +11047,17 @@ mod database_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn test_text(response: Response) -> String {
+        String::from_utf8(test_bytes(response).await).unwrap()
+    }
+
+    async fn test_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
     async fn test_user_id(pool: &PgPool, email: &str) -> UserId {
         UserId::from_uuid(
             sqlx::query_scalar("SELECT user_id FROM latex_core.user_credentials WHERE email=$1")
@@ -10797,36 +11079,198 @@ mod database_tests {
         let other_writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let other_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let outsider_mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;
         let other_writer_id = test_user_id(&pool, &other_writer.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
-        let empty_admin_reviews = get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await;
-        assert_eq!(empty_admin_reviews.status(), StatusCode::OK);
-        assert!(
-            test_json(empty_admin_reviews)
-                .await
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-
-        let created = test_json(
+        let other_mentor_id = test_user_id(&pool, &other_mentor.email).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+        let template_id = uuid::Uuid::new_v4();
+        let main_template = state
+            .blobs
+            .put(Bytes::from_static(
+                b"\\documentclass{article}\n\\begin{document}Review\\end{document}\n",
+            ))
+            .await
+            .unwrap();
+        state
+            .repo
+            .create_template(
+                template_id,
+                &format!("Review fixture {template_id}"),
+                None,
+                Some("main.tex"),
+                &[AppTemplateFileRecord {
+                    path: "main.tex".into(),
+                    blob_hash: main_template.hash(),
+                    size_bytes: main_template.size_bytes(),
+                }],
+            )
+            .await
+            .unwrap();
+        state
+            .institution
+            .set_global_fallback(admin_id, template_id)
+            .await
+            .unwrap();
+        let registration = format!("R{}", uuid::Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO vcap.students (reg_no,name,email) VALUES ($1,'Ananya Rao',$2)")
+            .bind(&registration)
+            .bind(&writer.email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vcap.student_user_links (reg_no,user_id,match_method,status,linked_at) VALUES ($1,$2,'TEST','LINKED',now())")
+            .bind(&registration)
+            .bind(writer_id.as_uuid())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let identity = test_json(get(&app, "/api/v2/me", Some(&writer.cookie)).await).await;
+        assert_eq!(identity["display_name"], "Ananya Rao");
+        assert_eq!(identity["role"], "writer");
+        let defaults =
+            test_json(get(&app, "/api/v2/preferences/editor", Some(&writer.cookie)).await).await;
+        assert_eq!(defaults["font_size_px"], 14);
+        assert_eq!(defaults["theme"], "LIGHT");
+        let updated_preferences = test_json(
             request(
                 &app,
-                Method::POST,
-                "/api/admin/v2/paper-teams",
-                Some(&admin.cookie),
-                &serde_json::json!({"name":"S5 Review Team","writer_ids":[writer_id,other_writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id]}).to_string(),
+                Method::PUT,
+                "/api/v2/preferences/editor",
+                Some(&writer.cookie),
+                r#"{"font_size_px":20,"theme":"DARK"}"#,
                 Some("application/json"),
             )
             .await,
         )
         .await;
+        assert_eq!(updated_preferences["font_size_px"], 20);
+        assert_eq!(updated_preferences["theme"], "DARK");
+        let mentor_preferences =
+            test_json(get(&app, "/api/v2/preferences/editor", Some(&mentor.cookie)).await).await;
+        assert_eq!(mentor_preferences["font_size_px"], 14);
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                "/api/v2/preferences/editor",
+                Some(&writer.cookie),
+                r#"{"font_size_px":27,"theme":"DARK"}"#,
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/branding",
+                Some(&admin.cookie),
+                b"<svg onload=alert(1)>".to_vec(),
+                Some("image/svg+xml"),
+            )
+            .await
+            .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 1)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/branding",
+                Some(&writer.cookie),
+                png.clone(),
+                Some("image/png"),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let branding = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/branding",
+                Some(&admin.cookie),
+                png.clone(),
+                Some("application/octet-stream"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(branding["media_type"], "image/png");
+        assert_eq!(branding["width"], 2);
+        assert_eq!(branding["height"], 1);
+        assert_eq!(
+            test_bytes(get(&app, "/branding/logo", None).await).await,
+            png
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::DELETE,
+                "/api/admin/v2/branding",
+                Some(&admin.cookie),
+                "",
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            get(&app, "/branding/logo", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let team_name = format!("S5 Review Team {}", uuid::Uuid::new_v4().simple());
+        let created = request(
+            &app,
+            Method::POST,
+            "/api/admin/v2/paper-teams",
+            Some(&admin.cookie),
+            &serde_json::json!({"name":team_name,"writer_ids":[writer_id,other_writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id,other_mentor_id]}).to_string(),
+            Some("application/json"),
+        )
+        .await;
+        let created_status = created.status();
+        let created = test_json(created).await;
+        assert_eq!(created_status, StatusCode::CREATED, "{created}");
         let paper_id = created["team"]["id"].as_str().unwrap();
         let workspace_id =
             uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap();
-        let file_id =
-            uuid::Uuid::parse_str(created["main_file"]["file_id"].as_str().unwrap()).unwrap();
+        let file_id = uuid::Uuid::parse_str(
+            created["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["path"] == "main.tex")
+                .unwrap()["file_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let second_file = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+                &serde_json::json!({"path":"sections/results.tex","content":"Results need context.","version":1}).to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let second_file_id =
+            uuid::Uuid::parse_str(second_file["file"]["file_id"].as_str().unwrap()).unwrap();
         let review_root = format!("/api/v2/reviews/papers/{paper_id}");
         let source_anchor = serde_json::json!({
             "file_id":file_id,"encoded_relative_start":[1],"encoded_relative_end":[2],
@@ -10837,6 +11281,14 @@ mod database_tests {
             "thread_type":"COMMENT","message":"Clarify this paragraph",
             "source_anchor":source_anchor,"pdf_anchor":null
         });
+        let second_comment = serde_json::json!({
+            "thread_type":"COMMENT","message":"Explain these results",
+            "source_anchor":{
+                "file_id":second_file_id,"encoded_relative_start":[1],"encoded_relative_end":[2],
+                "quoted_text":"Results","context_hash":"1".repeat(64),"source_sequence":1,
+                "source_version_id":null,"document_epoch":1
+            },"pdf_anchor":null
+        });
 
         let listed =
             test_json(get(&app, "/api/v2/mentor/papers", Some(&mentor.cookie)).await).await;
@@ -10846,7 +11298,18 @@ mod database_tests {
                 .as_bool()
                 .is_some_and(|value| !value)
         );
-        assert!(test_json(get(&app, "/api/v2/mentor/papers", Some(&other_mentor.cookie)).await).await["papers"].as_array().unwrap().is_empty());
+        assert_eq!(
+            test_json(get(&app, "/api/v2/mentor/papers", Some(&other_mentor.cookie)).await).await["papers"]
+                [0]["id"],
+            paper_id
+        );
+        assert!(
+            test_json(get(&app, "/api/v2/mentor/papers", Some(&outsider_mentor.cookie)).await)
+                .await["papers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             get(&app, "/api/v2/mentor/papers", Some(&admin.cookie))
                 .await
@@ -11068,7 +11531,7 @@ mod database_tests {
                 &app,
                 Method::POST,
                 &format!("{review_root}/threads"),
-                Some(&other_mentor.cookie),
+                Some(&outsider_mentor.cookie),
                 &comment.to_string(),
                 Some("application/json")
             )
@@ -11086,26 +11549,111 @@ mod database_tests {
         )
         .await;
         assert_eq!(created_thread.status(), StatusCode::CREATED);
-        let thread_id = test_json(created_thread).await["thread_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let created_thread = test_json(created_thread).await;
+        let thread_id = created_thread["thread_id"].as_str().unwrap().to_owned();
+        assert_eq!(created_thread["draft_revision"], 1);
+        let second_created = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &second_comment.to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second_created["draft_revision"], 2);
+
+        let mentor_drafts = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(mentor_drafts["threads"].as_array().unwrap().len(), 3);
+        assert_eq!(mentor_drafts["threads"][0]["publication_status"], "DRAFT");
+        let other_mentor_before_publish = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&other_mentor.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            other_mentor_before_publish["threads"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !other_mentor_before_publish
+                .to_string()
+                .contains("Clarify this paragraph")
+        );
+        let writer_before_publish = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            writer_before_publish["threads"].as_array().unwrap().len(),
+            1
+        );
+        assert!(
+            writer_before_publish
+                .to_string()
+                .contains("Historical review comment")
+        );
+        assert!(
+            !writer_before_publish
+                .to_string()
+                .contains("Clarify this paragraph")
+        );
+        let writer_activity = test_text(
+            get(
+                &app,
+                &format!("{review_root}/activity"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert!(!writer_activity.contains("Clarify this paragraph"));
+        let writer_export = test_text(
+            get(
+                &app,
+                &format!("{review_root}/report.csv"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert!(!writer_export.contains("Clarify this paragraph"));
         let admin_reviews =
             test_json(get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await).await;
+        let current_admin_reviews = admin_reviews
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|review| review["paper_name"] == team_name)
+            .collect::<Vec<_>>();
         assert_eq!(
-            admin_reviews.as_array().unwrap().len(),
-            2,
-            "current and historical review comments remain visible to Admin"
+            current_admin_reviews.len(),
+            1,
+            "unpublished Mentor drafts are excluded from Admin responses"
         );
-        assert_eq!(admin_reviews[0]["paper_name"], "S5 Review Team");
-        assert_eq!(admin_reviews[0]["round_status"], "OPEN_FOR_REVIEW");
-        assert_eq!(admin_reviews[0]["review_open"], true);
-        assert_eq!(admin_reviews[0]["current_review_round_id"], round_id);
-        assert_eq!(admin_reviews[0]["thread_type"], "COMMENT");
-        assert_eq!(admin_reviews[0]["severity"], "NOTE");
-        assert_eq!(admin_reviews[0]["category"], "WRITING");
-        assert_eq!(admin_reviews[0]["mentor"], mentor.email);
-        assert!(admin_reviews[0]["assigned_writer"].is_null());
         assert_eq!(
             get(&app, &format!("{review_root}/threads"), Some(&admin.cookie),)
                 .await
@@ -11125,7 +11673,8 @@ mod database_tests {
             )
             .await
             .status(),
-            StatusCode::CREATED
+            StatusCode::NOT_FOUND,
+            "Writer cannot reply to an unpublished draft"
         );
         assert_eq!(
             request(
@@ -11138,7 +11687,8 @@ mod database_tests {
             )
             .await
             .status(),
-            StatusCode::NO_CONTENT
+            StatusCode::NOT_FOUND,
+            "Writer cannot resolve an unpublished draft"
         );
 
         let before_source = test_json(
@@ -11167,6 +11717,20 @@ mod database_tests {
         )
         .await;
         let suggestion_id = suggested["thread_id"].as_str().unwrap();
+        assert_eq!(suggested["draft_revision"], 3);
+        let rejected = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &suggestion.to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(rejected["draft_revision"], 4);
         let after_mentor = test_json(
             get(
                 &app,
@@ -11182,6 +11746,164 @@ mod database_tests {
         assert_eq!(
             before_source, after_mentor,
             "Mentor suggestion must not mutate source"
+        );
+
+        let stale_submit = request(
+            &app,
+            Method::POST,
+            &format!("{review_root}/rounds/{round_id}/submit"),
+            Some(&mentor.cookie),
+            &serde_json::json!({"expected_revision":3,"submission_id":uuid::Uuid::new_v4()})
+                .to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(stale_submit.status(), StatusCode::CONFLICT);
+        let still_private = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(still_private["threads"].as_array().unwrap().len(), 1);
+
+        let submission_id = uuid::Uuid::new_v4();
+        let submitted = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds/{round_id}/submit"),
+                Some(&mentor.cookie),
+                &serde_json::json!({"expected_revision":4,"submission_id":submission_id})
+                    .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(submitted["published_count"], 4);
+        assert_eq!(submitted["remaining_mentors"], 1);
+        assert_eq!(submitted["round_completed"], false);
+        assert_eq!(submitted["already_submitted"], false);
+        let retried = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds/{round_id}/submit"),
+                Some(&mentor.cookie),
+                &serde_json::json!({"expected_revision":4,"submission_id":submission_id})
+                    .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(retried["already_submitted"], true);
+        let publication_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.audit_events WHERE id=$1 AND event_type='review.feedback.published'",
+        ).bind(submission_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            publication_events, 1,
+            "submission retry must not duplicate its durable event"
+        );
+        let writer_after_publish = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(writer_after_publish["threads"].as_array().unwrap().len(), 5);
+        assert!(
+            writer_after_publish
+                .to_string()
+                .contains("Clarify this paragraph")
+        );
+
+        let mentor_state_after_submit =
+            test_json(get(&app, &format!("{review_root}/rounds"), Some(&mentor.cookie)).await)
+                .await;
+        assert_eq!(
+            mentor_state_after_submit["current_review_round"]["mentor_participation"]["status"],
+            "SUBMITTED"
+        );
+        let other_state = test_json(
+            get(
+                &app,
+                &format!("{review_root}/rounds"),
+                Some(&other_mentor.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            other_state["current_review_round"]["mentor_participation"]["status"],
+            "PENDING"
+        );
+        let other_submission_id = uuid::Uuid::new_v4();
+        let other_submitted = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds/{round_id}/submit"),
+                Some(&other_mentor.cookie),
+                &serde_json::json!({"expected_revision":0,"submission_id":other_submission_id})
+                    .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(other_submitted["published_count"], 0);
+        assert_eq!(other_submitted["round_completed"], true);
+
+        let admin_reviews =
+            test_json(get(&app, "/api/admin/v2/reviews", Some(&admin.cookie)).await).await;
+        let current_admin_reviews = admin_reviews
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|review| review["paper_name"] == team_name)
+            .collect::<Vec<_>>();
+        assert_eq!(current_admin_reviews.len(), 5);
+        assert!(
+            current_admin_reviews
+                .iter()
+                .any(|review| review["paper_name"] == team_name
+                    && review["thread_type"] == "COMMENT"
+                    && review["mentor"] == mentor.email)
+        );
+
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/messages"),
+                Some(&writer.cookie),
+                r#"{"body":"Writer reply"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&writer.cookie),
+                r#"{"state":"RESOLVED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
         );
         let durable_sequence: i64 = sqlx::query_scalar(
             "INSERT INTO latex_core.collaboration_updates (workspace_id,file_id,document_epoch,actor_user_id,update_bytes) VALUES ($1,$2,1,$3,$4) RETURNING id",
@@ -11203,18 +11925,6 @@ mod database_tests {
         assert_eq!(accepted.0, "ACCEPTED");
         assert_eq!(accepted.1, *writer_id.as_uuid());
 
-        let rejected = test_json(
-            request(
-                &app,
-                Method::POST,
-                &format!("{review_root}/threads"),
-                Some(&mentor.cookie),
-                &suggestion.to_string(),
-                Some("application/json"),
-            )
-            .await,
-        )
-        .await;
         assert_eq!(
             request(
                 &app,
@@ -11245,22 +11955,24 @@ mod database_tests {
             .status(),
             StatusCode::GONE
         );
-        let closed = request(
-            &app,
-            Method::POST,
-            &format!("{review_root}/rounds/{round_id}/close"),
-            Some(&writer.cookie),
-            "{}",
-            Some("application/json"),
-        )
-        .await;
-        assert_eq!(closed.status(), StatusCode::OK);
-        assert_eq!(test_json(closed).await["status"], "CLOSED");
         let closed_state =
             test_json(get(&app, &format!("{review_root}/rounds"), Some(&mentor.cookie)).await)
                 .await;
         assert_eq!(closed_state["review_open"], false);
         assert!(closed_state["current_review_round"].is_null());
+        let published_after_close = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            published_after_close["threads"].as_array().unwrap().len(),
+            5
+        );
         let after_close = request(
             &app,
             Method::POST,
@@ -11364,6 +12076,109 @@ mod database_tests {
             reopened_state["current_review_round"]["id"],
             second_round["id"]
         );
+        let mut cancelled_draft = second_comment.clone();
+        cancelled_draft["message"] =
+            serde_json::Value::String("Canceled draft stays private".into());
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads"),
+                Some(&mentor.cookie),
+                &cancelled_draft.to_string(),
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let second_round_id = second_round["id"].as_str().unwrap();
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/rounds/{second_round_id}/close"),
+                Some(&writer.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let after_withdrawal = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(after_withdrawal["threads"].as_array().unwrap().len(), 5);
+        assert!(
+            !after_withdrawal
+                .to_string()
+                .contains("Canceled draft stays private")
+        );
+        let retained_cancelled_drafts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.review_threads WHERE review_round_id=$1 AND publication_status='DRAFT'",
+        )
+        .bind(uuid::Uuid::parse_str(second_round_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_cancelled_drafts, 1);
+
+        let paper_after_review = test_json(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        let renamed_second_file = test_json(
+            request(
+                &app,
+                Method::PATCH,
+                &format!("/api/v2/papers/{paper_id}/files/{second_file_id}/path"),
+                Some(&writer.cookie),
+                &serde_json::json!({
+                    "path":"sections/findings.tex",
+                    "version":paper_after_review["version"]
+                })
+                .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            renamed_second_file["file"]["file_id"],
+            second_file_id.to_string()
+        );
+        assert_eq!(renamed_second_file["file"]["path"], "sections/findings.tex");
+        let after_rename = test_json(
+            get(
+                &app,
+                &format!("{review_root}/threads"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            after_rename["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| {
+                    thread["source_anchor"]["file_id"] == second_file_id.to_string()
+                        && thread["source_anchor"]["path"] == "sections/findings.tex"
+                })
+        );
 
         assert_eq!(
             get(
@@ -11379,7 +12194,7 @@ mod database_tests {
             get(
                 &app,
                 &format!("{review_root}/threads"),
-                Some(&other_mentor.cookie)
+                Some(&outsider_mentor.cookie)
             )
             .await
             .status(),

@@ -48,6 +48,7 @@ mod permissions;
     reason = "S5 review transactions keep authorization and state transitions adjacent"
 )]
 mod reviews;
+mod settings;
 #[allow(
     clippy::missing_errors_doc,
     clippy::needless_pass_by_value,
@@ -104,8 +105,10 @@ pub use mail_outbox::{
 };
 pub use permissions::{GroupRoles, OverrideEffect, Permission, PermissionResolver, ProjectRoles};
 pub use reviews::{
-    ReviewPaperSummary, ReviewPdfAnchorInput, ReviewSourceAnchorInput, ReviewThreadInput,
+    ReviewDraftSave, ReviewPaperSummary, ReviewPdfAnchorInput, ReviewPublication,
+    ReviewSourceAnchorInput, ReviewThreadInput,
 };
+pub use settings::{BrandingSettings, EditorPreferences};
 pub use v2::{
     CollaborationAccess, CollaborationAccessMode, CollaborationRecovery, CollaborationUpdateInput,
     GlobalRole, GlobalRoleAssignment, PaperFile, PaperKind, PaperStatus, PaperTeam,

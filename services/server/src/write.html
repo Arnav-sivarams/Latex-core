@@ -8,9 +8,10 @@
 </head>
 <body class="workspace-shell writer-shell">
   <header class="shell-topbar">
-    <a class="shell-brand" href="/write" aria-current="page">LaTeX Core</a>
-    <span id="currentPaper" class="current-context">No paper selected</span>
-    <span class="role-badge">Writer</span>
+    <a class="shell-brand branded-wordmark" href="/write" aria-current="page"><img class="header-logo" alt="Institution logo" hidden><span>LaTeX Core</span></a>
+    <span class="header-divider" aria-hidden="true">|</span><span id="accountName" class="header-identity">Loading…</span>
+    <span class="header-divider" aria-hidden="true">|</span><span id="roleIdentity" class="role-badge">Writer</span>
+    <span class="header-divider" aria-hidden="true">|</span><span id="currentPaper" class="current-context">No report selected</span>
     <span id="reviewStateBadge" class="subtle-badge">Draft</span>
     <span class="shell-spacer"></span>
     <span id="saveStatus" class="save-status" data-state="local">Saved</span>
@@ -19,19 +20,19 @@
 
   <nav class="action-toolbar" aria-label="Paper actions">
     <div class="toolbar-group" aria-label="File and edit">
-      <button id="saveFile" class="icon-button primary" type="button" disabled aria-label="Save" title="Save (Ctrl/Cmd+S)"><span aria-hidden="true">▣</span></button>
+      <button id="saveFile" class="workflow-button primary" type="button" disabled aria-label="Save" title="Save (Ctrl/Cmd+S)"><span aria-hidden="true">▣</span><span>Save</span></button>
       <button id="undoText" class="icon-button" type="button" disabled aria-label="Undo edit" title="Undo edit"><span aria-hidden="true">↶</span></button>
       <button id="redoText" class="icon-button" type="button" disabled aria-label="Redo edit" title="Redo edit"><span aria-hidden="true">↷</span></button>
       <button id="quickOpen" class="icon-button" type="button" aria-label="Quick Open" title="Quick Open (Ctrl/Cmd+P)"><span aria-hidden="true">⌕</span></button>
       <button id="commandPalette" class="icon-button" type="button" aria-label="Command palette" title="Command palette (Ctrl/Cmd+K)"><span aria-hidden="true">⌘</span></button>
     </div>
     <div class="toolbar-group" aria-label="Build and review">
-      <button id="compilePaper" class="icon-button" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span></button>
+      <button id="compilePaper" class="workflow-button" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span><span>Compile</span></button>
       <span id="buildStatus" class="toolbar-status">No PDF yet</span>
-      <button id="sendReview" class="icon-button" type="button" disabled hidden aria-label="Send for Review" title="Send for Review (Ctrl/Cmd+Shift+R)"><span aria-hidden="true">⚑</span></button>
-      <button id="endReview" class="icon-button" type="button" disabled hidden aria-label="End Review" title="End Review"><span aria-hidden="true">■</span></button>
+      <button id="sendReview" class="workflow-button" type="button" disabled hidden aria-label="Send for review" title="Send for review (Ctrl/Cmd+Shift+R)"><span aria-hidden="true">⚑</span><span>Send for review</span></button>
+      <button id="endReview" class="icon-button" type="button" disabled hidden aria-label="Withdraw review" title="Withdraw review"><span aria-hidden="true">■</span></button>
     </div>
-    <div class="toolbar-group" aria-label="Insert">
+    <div class="toolbar-group toolbar-secondary" aria-label="Insert">
       <button id="insertMenu" class="icon-button menu-button" type="button" disabled aria-label="Insert" title="Insert"><span aria-hidden="true">＋</span><small>Insert</small></button>
       <button id="mathPalette" class="icon-button menu-button" type="button" disabled aria-label="Math palette" title="Math palette"><span aria-hidden="true">∑</span><small>Math</small></button>
       <button id="tableBuilder" class="icon-button" type="button" disabled aria-label="Insert table" title="Table builder"><span aria-hidden="true">▦</span></button>
@@ -41,9 +42,9 @@
     <div class="toolbar-group toolbar-view" aria-label="View">
       <button id="problemsToggle" class="icon-button badge-button" type="button" aria-label="Problems" title="Problems"><span aria-hidden="true">△</span><small id="problemsCount">0</small></button>
       <button id="historyToggle" class="icon-button" type="button" aria-label="History" title="Version history"><span aria-hidden="true">◷</span></button>
-      <button id="commentsToggle" class="icon-button" type="button" aria-label="Comments and review" title="Comments and review"><span aria-hidden="true">◰</span></button>
+      <button id="commentsToggle" class="workflow-button" type="button" aria-label="Reviews" title="Reviews"><span aria-hidden="true">◰</span><span>Reviews</span><small id="toolbarReviewCount">0</small></button>
       <button id="documentDetails" class="icon-button" type="button" disabled aria-label="Document details" title="Document details"><span aria-hidden="true">▤</span></button>
-      <button id="showInPdf" class="icon-button" type="button" disabled aria-label="Show source in PDF" title="Show source in PDF"><span aria-hidden="true">⇥</span></button>
+      <details id="editorSettings" class="toolbar-menu"><summary>Editor settings</summary><div class="compact-settings"><label>Font size <input id="editorFontSize" type="number" min="12" max="26" step="1"></label><label>Theme <select id="editorTheme"><option value="LIGHT">Light</option><option value="DARK">Dark</option></select></label><button id="resetEditorSettings" type="button">Reset to default</button></div></details>
       <button id="moreActions" class="icon-button" type="button" aria-label="More actions" title="More actions"><span aria-hidden="true">⋯</span></button>
     </div>
   </nav>
@@ -55,25 +56,24 @@
         <div id="myPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="team-papers-heading">
-        <h2 id="team-papers-heading">TEAM PAPERS</h2>
+        <h2 id="team-papers-heading">TEAM REPORTS</h2>
         <div id="teamPapers"><p class="empty-copy">Loading…</p></div>
       </section>
       <section aria-labelledby="files-heading">
         <div class="section-heading"><h2 id="files-heading">FILES</h2><div class="mini-actions">
           <button id="newFile" class="mini-icon" type="button" disabled aria-label="New file" title="New file">＋</button>
-          <button id="uploadImage" class="mini-icon" type="button" disabled aria-label="Upload asset" title="Upload asset">⇧</button>
+          <button id="uploadImage" class="mini-icon" type="button" disabled aria-label="Upload asset" title="Upload to Assets">⇧</button>
           <button id="fileActionsToggle" class="mini-icon" type="button" disabled aria-label="File actions" title="File actions">⋯</button>
         </div></div>
         <input id="assetInput" type="file" accept="image/png,image/jpeg,application/pdf,text/csv,.csv" hidden>
         <div id="fileTree"><p class="empty-copy">Choose a paper to view its files.</p></div>
       </section>
-      <details><summary>Outline</summary><button id="refreshIntelligence" class="quiet-button" type="button" disabled>Refresh outline</button><div id="outlineTree"><p class="empty-copy">Choose a paper to view its outline.</p></div></details>
       <details><summary>Search paper</summary><div class="project-search"><input id="projectSearch" type="search" placeholder="Search paper" disabled><label><input id="caseSensitive" type="checkbox"> Aa</label></div><div id="searchResults"></div></details>
     </nav>
 
     <main class="editor-foundation workspace-pane source-pane" aria-labelledby="editor-heading">
       <div class="panel-heading editor-heading"><div><h1 id="editor-heading">SOURCE</h1><span id="currentFile">No file selected</span><span id="mainBadge" class="main-badge" hidden>Main</span></div></div>
-      <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No paper selected</strong><p>Create a personal paper or open an assigned team paper.</p></div></div>
+      <div id="editorMount" class="editor-mount"><div class="foundation-empty"><strong>No report selected</strong><p>Create a personal paper or open an assigned Team report.</p></div></div>
     </main>
 
     <section class="pdf-foundation workspace-pane pdf-pane" aria-labelledby="pdf-heading">
@@ -93,7 +93,7 @@
     <section id="problems" class="drawer-panel" hidden aria-labelledby="problems-heading"><h3 id="problems-heading">Problems</h3><div id="problemsList"><p class="empty-copy">Choose a paper to analyze it.</p></div></section>
     <section id="reviews" class="drawer-panel" hidden aria-labelledby="writer-reviews-heading"><div class="drawer-section-heading"><h3 id="writer-reviews-heading">Comments</h3><span id="reviewCounts"></span></div><div id="writerReviewFilters" class="thread-filters"><button type="button" data-filter="active" aria-current="page">Active</button><button type="button" data-filter="RESOLVED">Resolved</button><button type="button" data-filter="all">All</button></div><div id="writerReviewList"><p class="empty-copy">No review comments.</p></div></section>
     <section id="history" class="drawer-panel" hidden aria-labelledby="history-heading"><div class="drawer-section-heading"><h3 id="history-heading">History</h3><button id="createCheckpoint" type="button" disabled>Create checkpoint</button></div><div id="versionHistory" class="version-history"><p class="empty-copy">Choose a paper to view history.</p></div><pre id="versionDiff" class="version-diff">Select two versions to compare.</pre></section>
-    <section id="documentDetailsPanel" class="drawer-panel" hidden aria-labelledby="document-details-heading"><h3 id="document-details-heading">Document details</h3><div id="documentDetailsBody"><p class="empty-copy">Choose a Team paper to view its Front Matter.</p></div></section>
+    <section id="documentDetailsPanel" class="drawer-panel" hidden aria-labelledby="document-details-heading"><h3 id="document-details-heading">Document details</h3><div id="documentDetailsBody"><p class="empty-copy">Choose a Team report to view its Front Matter.</p></div></section>
   </aside>
 
   <dialog id="productivityDialog" class="productivity-dialog"><form method="dialog" class="dialog-shell"><div class="dialog-heading"><h2 id="dialogTitle">Writer tool</h2><button value="cancel" aria-label="Close" title="Close">Close</button></div><input id="dialogSearch" type="search" placeholder="Type to filter" hidden><div id="dialogBody"></div><pre id="dialogPreview" hidden></pre><div id="dialogActions" class="dialog-actions"></div></form></dialog>

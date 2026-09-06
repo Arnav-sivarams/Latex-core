@@ -71,6 +71,24 @@ struct SuggestionRejectInput {
 }
 
 #[derive(Deserialize)]
+struct DraftUpdateInput {
+    expected_revision: u64,
+    message: String,
+    suggested_replacement: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DraftDeleteInput {
+    expected_revision: u64,
+}
+
+#[derive(Deserialize)]
+struct PublishReviewInput {
+    expected_revision: u64,
+    submission_id: Uuid,
+}
+
+#[derive(Deserialize)]
 struct SynctexInput {
     direction: String,
     file_id: Option<Uuid>,
@@ -110,12 +128,20 @@ pub fn router() -> Router<AppState> {
             post(close_round),
         )
         .route(
+            "/api/v2/reviews/papers/{paper_id}/rounds/{round_id}/submit",
+            post(publish_review),
+        )
+        .route(
             "/api/v2/reviews/papers/{paper_id}/threads",
             get(review_threads).post(create_thread),
         )
         .route(
             "/api/v2/reviews/papers/{paper_id}/threads/{thread_id}/messages",
             post(add_message),
+        )
+        .route(
+            "/api/v2/reviews/papers/{paper_id}/threads/{thread_id}",
+            patch(update_draft).delete(delete_draft),
         )
         .route(
             "/api/v2/reviews/papers/{paper_id}/threads/{thread_id}/state",
@@ -381,6 +407,12 @@ async fn open_round(
             StatusCode::CONFLICT,
             "Only an active Paper Team can be sent for review.",
         ),
+        Err(V2Error::Conflict {
+            entity: "assigned Mentor participation",
+        }) => error(
+            StatusCode::CONFLICT,
+            "Assign at least one Mentor before sending this report for review.",
+        ),
         Err(value) => v2_error(value),
     }
 }
@@ -413,7 +445,7 @@ async fn deprecated_approve_round(headers: HeaderMap) -> Response {
     }
     error(
         StatusCode::GONE,
-        "Mentor review approval is deprecated; the Team Leader ends review.",
+        "Mentor review approval is deprecated; use Push review to publish saved feedback.",
     )
 }
 
@@ -453,9 +485,9 @@ async fn create_thread(
         .create_review_thread(mentor, paper_id, &input)
         .await
     {
-        Ok(id) => (
+        Ok(saved) => (
             StatusCode::CREATED,
-            Json(json!({"schema_version":1,"thread_id":id})),
+            Json(json!({"schema_version":1,"thread_id":saved.thread_id,"draft_revision":saved.draft_revision})),
         )
             .into_response(),
         Err(V2Error::Conflict {
@@ -463,6 +495,134 @@ async fn create_thread(
         }) => error(
             StatusCode::CONFLICT,
             "This paper has not been sent for review.",
+        ),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn update_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, thread_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<DraftUpdateInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if input.message.trim().is_empty() || input.message.chars().count() > 20_000 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "draft message must contain between 1 and 20000 characters",
+        );
+    }
+    match state
+        .v2
+        .update_review_draft(
+            mentor,
+            paper_id,
+            thread_id,
+            input.expected_revision,
+            &input.message,
+            input.suggested_replacement.as_deref(),
+        )
+        .await
+    {
+        Ok(saved) => Json(saved).into_response(),
+        Err(V2Error::Conflict {
+            entity: "review draft revision",
+        }) => error(
+            StatusCode::CONFLICT,
+            "Draft changed in another tab. Reload the saved draft before retrying.",
+        ),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn delete_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, thread_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<DraftDeleteInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .delete_review_draft(mentor, paper_id, thread_id, input.expected_revision)
+        .await
+    {
+        Ok(revision) => Json(json!({"schema_version":1,"draft_revision":revision})).into_response(),
+        Err(V2Error::Conflict {
+            entity: "review draft revision",
+        }) => error(
+            StatusCode::CONFLICT,
+            "Draft changed in another tab. Reload before deleting it.",
+        ),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn publish_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, round_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<PublishReviewInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (paper, _) = match state.v2.review_paper(mentor, paper_id).await {
+        Ok(value) => value,
+        Err(value) => return v2_error(value),
+    };
+    match state
+        .v2
+        .publish_review_drafts(
+            mentor,
+            paper_id,
+            round_id,
+            input.expected_revision,
+            input.submission_id,
+        )
+        .await
+    {
+        Ok(publication) => {
+            if !publication.already_submitted {
+                state
+                    .collaboration
+                    .review_published(
+                        paper.workspace_id,
+                        publication.submission_id,
+                        publication.published_count,
+                    )
+                    .await;
+            }
+            Json(publication).into_response()
+        }
+        Err(V2Error::Conflict {
+            entity: "review draft revision",
+        }) => error(
+            StatusCode::CONFLICT,
+            "Drafts changed while submitting. Reload the saved draft set and Push review again.",
+        ),
+        Err(V2Error::Conflict {
+            entity: "completed review submission",
+        }) => error(
+            StatusCode::CONFLICT,
+            "This review was already submitted with a different request. Reload its status.",
         ),
         Err(value) => v2_error(value),
     }
@@ -787,10 +947,11 @@ async fn report_csv(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let threads = match state.v2.review_threads(actor, paper_id).await {
+    let mut threads = match state.v2.review_threads(actor, paper_id).await {
         Ok(value) => value,
         Err(value) => return v2_error(value),
     };
+    threads.retain(|thread| thread["publication_status"] == "PUBLISHED");
     let mut csv = String::from(
         "round,thread_type,status,severity,category,assigned_writer,due_date,source_file,source_context,pdf_page,initial_message,created_at,resolved_at\n",
     );
@@ -851,10 +1012,11 @@ async fn report_html(
         Ok(value) => value,
         Err(value) => return v2_error(value),
     };
-    let threads = match state.v2.review_threads(actor, paper_id).await {
+    let mut threads = match state.v2.review_threads(actor, paper_id).await {
         Ok(value) => value,
         Err(value) => return v2_error(value),
     };
+    threads.retain(|thread| thread["publication_status"] == "PUBLISHED");
     let mut rows = String::new();
     for thread in threads {
         let message = thread["messages"]
@@ -910,10 +1072,8 @@ fn validate_thread(input: &ReviewThreadInput) -> Result<(), &'static str> {
     if input.message.trim().is_empty() || input.message.chars().count() > 20_000 {
         return Err("message must contain between 1 and 20000 characters");
     }
-    if input.thread_type == "SUGGESTION"
-        && (input.source_anchor.is_none() || input.pdf_anchor.is_some())
-    {
-        return Err("suggestion requires one source anchor");
+    if input.thread_type == "SUGGESTION" && input.source_anchor.is_none() {
+        return Err("suggestion requires a source anchor");
     }
     if input.thread_type == "SUGGESTION"
         && input
@@ -929,8 +1089,8 @@ fn validate_thread(input: &ReviewThreadInput) -> Result<(), &'static str> {
     if input.assigned_writer_user_id.is_some() || input.due_at.is_some() {
         return Err("new comments and suggestions do not accept assignment or due dates");
     }
-    if input.source_anchor.is_none() == input.pdf_anchor.is_none() {
-        return Err("review thread requires exactly one source or PDF anchor");
+    if input.source_anchor.is_none() && input.pdf_anchor.is_none() {
+        return Err("review thread requires a source or PDF anchor");
     }
     if let Some(anchor) = &input.source_anchor {
         if !valid_hash(&anchor.context_hash)
