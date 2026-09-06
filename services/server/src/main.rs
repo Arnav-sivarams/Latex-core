@@ -69,6 +69,7 @@ const COOKIE: &str = "latex_core_session_v2";
 const LEGACY_COOKIE: &str = "latex_core_session";
 const LEGACY_COOKIE_PATHS: [&str; 2] = ["/api", "/api/auth"];
 const MAX_FILE_BYTES: usize = 1024 * 1024;
+const MAX_REPORT_IMAGE_DIMENSION: u32 = 8192;
 
 #[derive(Clone)]
 struct AppState {
@@ -312,6 +313,8 @@ struct V2SearchQuery {
 struct V2AssetQuery {
     path: String,
     version: u64,
+    replace_file_id: Option<uuid::Uuid>,
+    file_revision: Option<u64>,
 }
 #[derive(Deserialize)]
 struct V2CheckpointInput {
@@ -5066,41 +5069,152 @@ async fn v2_upload_asset(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let extension = path.extension().unwrap_or("").to_ascii_lowercase();
-    let valid = matches!(
+    let declared_type_matches = matches!(
         (extension.as_str(), content_type),
         ("png", "image/png")
             | ("jpg" | "jpeg", "image/jpeg")
             | ("pdf", "application/pdf")
             | ("csv", "text/csv" | "application/csv")
     );
-    if !valid || body.is_empty() {
+    if !declared_type_matches || body.is_empty() {
         return error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "asset must be a non-empty PNG, JPEG, PDF, or CSV matching its content type",
         );
     }
+    if body.len() > MAX_FILE_BYTES {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "assets are limited to 1 MiB");
+    }
+    if matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        let expected = if extension == "png" {
+            ImageFormat::Png
+        } else {
+            ImageFormat::Jpeg
+        };
+        if image::guess_format(&body).ok() != Some(expected) {
+            return error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "image bytes must match the PNG or JPEG file extension",
+            );
+        }
+        let mut reader = ImageReader::with_format(std::io::Cursor::new(body.as_ref()), expected);
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_REPORT_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_REPORT_IMAGE_DIMENSION);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        reader.limits(limits);
+        let decoded = match reader.decode() {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "image data is corrupt, unsupported, or exceeds 8192 by 8192 pixels",
+                );
+            }
+        };
+        let (width, height) = decoded.dimensions();
+        if width == 0
+            || height == 0
+            || width > MAX_REPORT_IMAGE_DIMENSION
+            || height > MAX_REPORT_IMAGE_DIMENSION
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "image dimensions must be between 1 and 8192 pixels",
+            );
+        }
+    } else if extension == "pdf" && !body.starts_with(b"%PDF-") {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "PDF asset data is invalid",
+        );
+    } else if extension == "csv" && (std::str::from_utf8(&body).is_err() || body.contains(&0)) {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "CSV asset must be UTF-8 text",
+        );
+    }
+    let replacement = match (query.replace_file_id, query.file_revision) {
+        (None, None) => None,
+        (Some(file_id), Some(expected_revision)) => {
+            let (_, file) =
+                match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+                    Ok(value) => value,
+                    Err(response) => return response,
+                };
+            if file.path != path {
+                return error(
+                    StatusCode::CONFLICT,
+                    "replacement file path does not match the current report asset",
+                );
+            }
+            if file.revision != expected_revision {
+                return error(
+                    StatusCode::CONFLICT,
+                    "asset changed before replacement; reload and choose Replace again",
+                );
+            }
+            Some(file)
+        }
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "asset replacement requires both file identity and revision",
+            );
+        }
+    };
     let stored = match state.blobs.put(body).await {
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
     };
-    match state
-        .v2
-        .create_file_with_event(
-            paper.workspace_id,
-            principal.user_id(),
-            query.version,
-            path,
-            stored.hash(),
-            stored.size_bytes(),
-        )
-        .await
-    {
-        Ok((file, version)) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({"file":file,"version":version})),
-        )
-            .into_response(),
-        Err(error_value) => v2_error(error_value),
+    if let Some(file) = replacement {
+        match state
+            .v2
+            .save_file_with_event(
+                file.file_id,
+                principal.user_id(),
+                query.version,
+                stored.hash(),
+                stored.size_bytes(),
+            )
+            .await
+        {
+            Ok((file, version)) => {
+                state
+                    .collaboration
+                    .files_changed(file.workspace_id, file.file_id, file.revision)
+                    .await;
+                Json(serde_json::json!({"file":file,"version":version,"replaced":true}))
+                    .into_response()
+            }
+            Err(error_value) => v2_error(error_value),
+        }
+    } else {
+        match state
+            .v2
+            .create_file_with_event(
+                paper.workspace_id,
+                principal.user_id(),
+                query.version,
+                path,
+                stored.hash(),
+                stored.size_bytes(),
+            )
+            .await
+        {
+            Ok((file, version)) => {
+                state
+                    .collaboration
+                    .files_changed(file.workspace_id, file.file_id, file.revision)
+                    .await;
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({"file":file,"version":version,"replaced":false})),
+                )
+                    .into_response()
+            }
+            Err(error_value) => v2_error(error_value),
+        }
     }
 }
 
@@ -5109,18 +5223,17 @@ async fn v2_raw_file(
     headers: HeaderMap,
     Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let (paper, file) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await
-    {
+    let file = match authorized_reader_file(&state, principal.user_id(), paper_id, file_id).await {
         Ok(value) => value,
         Err(response) => return response,
     };
     let bytes = match state
         .workspaces
-        .read_file(paper.workspace_id, &file.path)
+        .read_file(file.workspace_id, &file.path)
         .await
     {
         Ok(value) => value,
@@ -5930,6 +6043,20 @@ async fn authorized_file(
         return Err(error(StatusCode::NOT_FOUND, "file not found"));
     }
     Ok((paper, file))
+}
+
+async fn authorized_reader_file(
+    state: &AppState,
+    user_id: UserId,
+    paper_id: uuid::Uuid,
+    file_id: uuid::Uuid,
+) -> Result<persistence::PaperFile, Response> {
+    state
+        .v2
+        .collaboration_access(user_id, paper_id, file_id)
+        .await
+        .map_err(v2_error)?;
+    state.v2.paper_file(file_id).await.map_err(v2_error)
 }
 
 fn parse_user_id(value: &str) -> Result<UserId, Response> {
@@ -6979,7 +7106,27 @@ async fn admin_system(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if let Err(response) = admin_session(&state, &headers).await {
         return response;
     }
-    Json(serde_json::json!({"version":"latex-core 0.1.0","database":"application database configured","queue":"durable PostgreSQL queue","compiler":"M7 verified by operator doctor","host_operations":"Operator service required"})).into_response()
+    let recovery = match state.v2.recovery_status().await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    Json(serde_json::json!({
+        "version":"latex-core 0.1.0",
+        "database":"application database configured",
+        "queue":"durable PostgreSQL queue",
+        "compiler":"M7 verified by operator doctor",
+        "host_operations":"Operator service required",
+        "backup":{
+            "schema_version":1,
+            "last_successful_backup_at":recovery.last_successful_backup_at,
+            "last_failure_at":recovery.last_backup_failure_at,
+            "last_failure_phase":recovery.last_backup_failure_phase,
+            "schedule_configured":bool_env("LATEX_CORE_BACKUP_SCHEDULE_CONFIGURED", false),
+            "off_host_copy_configured":bool_env("LATEX_CORE_BACKUP_OFFHOST_CONFIGURED", false),
+            "last_successful_restore_drill_at":recovery.last_successful_restore_drill_at
+        }
+    }))
+    .into_response()
 }
 async fn projects(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let s = match auth(&state, &headers).await {
@@ -10419,8 +10566,8 @@ mod database_tests {
         assert!(stored.0.starts_with("$argon2"));
         assert!(!stored.0.contains(temporary));
         assert!(stored.1);
-        let delivery: (String, bool, bool) = sqlx::query_as(
-            "SELECT status,secret_ciphertext IS NOT NULL,encode(secret_ciphertext,'escape') LIKE '%' || $2 || '%' \
+        let delivery: (uuid::Uuid, String, bool, bool) = sqlx::query_as(
+            "SELECT id,status,secret_ciphertext IS NOT NULL,encode(secret_ciphertext,'escape') LIKE '%' || $2 || '%' \
              FROM latex_core.email_outbox WHERE account_user_id=$1 ORDER BY created_at DESC LIMIT 1",
         )
         .bind(writer_id.as_uuid())
@@ -10428,9 +10575,31 @@ mod database_tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(delivery.0, "PENDING");
-        assert!(delivery.1);
-        assert!(!delivery.2);
+        assert_eq!(delivery.1, "PENDING");
+        assert!(delivery.2);
+        assert!(!delivery.3);
+        let replacement = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/users/{writer_id}/temporary-password"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let replacement_temporary = replacement["temporary_password"].as_str().unwrap();
+        let superseded: (String, bool) = sqlx::query_as(
+            "SELECT status,secret_ciphertext IS NULL FROM latex_core.email_outbox WHERE id=$1",
+        )
+        .bind(delivery.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(superseded.0, "EXPIRED");
+        assert!(superseded.1);
         let audit: (String, String) = sqlx::query_as(
             "SELECT event_type,metadata::text FROM latex_core.audit_events \
              WHERE resource_id=$1 ORDER BY created_at DESC LIMIT 1",
@@ -10441,7 +10610,11 @@ mod database_tests {
         .unwrap();
         assert_eq!(audit.0, "account.temporary_password.generated");
         assert!(!audit.1.contains(temporary));
-        let login = login_request(&app, &writer.email, temporary).await;
+        assert_eq!(
+            login_request(&app, &writer.email, temporary).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let login = login_request(&app, &writer.email, replacement_temporary).await;
         assert_eq!(login.headers()[header::LOCATION], "/change-password");
 
         pool.close().await;
@@ -11084,6 +11257,19 @@ mod database_tests {
         let other_writer_id = test_user_id(&pool, &other_writer.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
         let other_mentor_id = test_user_id(&pool, &other_mentor.email).await;
+
+        assert_eq!(
+            get(&app, "/api/admin/system", Some(&writer.cookie))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let system = test_json(get(&app, "/api/admin/system", Some(&admin.cookie)).await).await;
+        assert_eq!(system["backup"]["schema_version"], 1);
+        assert_eq!(system["backup"]["schedule_configured"], false);
+        assert_eq!(system["backup"]["off_host_copy_configured"], false);
+        assert!(system["backup"]["last_successful_backup_at"].is_null());
+        assert!(system["backup"]["last_successful_restore_drill_at"].is_null());
         let admin_id = test_user_id(&pool, &admin.email).await;
         let template_id = uuid::Uuid::new_v4();
         let main_template = state
@@ -12518,6 +12704,264 @@ mod database_tests {
     }
 
     #[tokio::test]
+    async fn report_assets_are_validated_replaced_and_isolated_by_report() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+
+        let paper_a_body = serde_json::json!({"name":"Asset isolation A"}).to_string();
+        let paper_a = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                &paper_a_body,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_b_body = serde_json::json!({"name":"Asset isolation B"}).to_string();
+        let paper_b = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                &paper_b_body,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_a = paper_a["paper"]["id"].as_str().unwrap();
+        let paper_b = paper_b["paper"]["id"].as_str().unwrap();
+
+        let png = |red: u8, green: u8, blue: u8| {
+            let mut output = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                3,
+                2,
+                image::Rgb([red, green, blue]),
+            ))
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+            output.into_inner()
+        };
+        let original_a = png(220, 20, 20);
+        let original_b = png(20, 20, 220);
+        let replacement_a = png(20, 180, 20);
+        let upload_path = |paper_id: &str, version: u64| {
+            format!("/api/v2/papers/{paper_id}/assets?path=assets%2Fdiagram.png&version={version}")
+        };
+        let uploaded_a = request_bytes(
+            &app,
+            Method::POST,
+            &upload_path(paper_a, 1),
+            Some(&writer.cookie),
+            original_a.clone(),
+            Some("image/png"),
+        )
+        .await;
+        assert_eq!(uploaded_a.status(), StatusCode::CREATED);
+        let uploaded_a = test_json(uploaded_a).await;
+        let file_a = uploaded_a["file"]["file_id"].as_str().unwrap();
+        let revision_a = uploaded_a["file"]["revision"].as_u64().unwrap();
+        let uploaded_b = request_bytes(
+            &app,
+            Method::POST,
+            &upload_path(paper_b, 1),
+            Some(&writer.cookie),
+            original_b.clone(),
+            Some("image/png"),
+        )
+        .await;
+        assert_eq!(uploaded_b.status(), StatusCode::CREATED);
+        let uploaded_b = test_json(uploaded_b).await;
+        let file_b = uploaded_b["file"]["file_id"].as_str().unwrap();
+
+        let raw_a = format!("/api/v2/papers/{paper_a}/files/{file_a}/raw");
+        let raw_b = format!("/api/v2/papers/{paper_b}/files/{file_b}/raw");
+        assert_eq!(
+            test_bytes(get(&app, &raw_a, Some(&writer.cookie)).await).await,
+            original_a
+        );
+        assert_eq!(
+            test_bytes(get(&app, &raw_b, Some(&writer.cookie)).await).await,
+            original_b
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_a}/files/{file_b}/raw"),
+                Some(&writer.cookie),
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            get(&app, &raw_a, Some(&outsider.cookie))
+                .await
+                .status()
+                .is_client_error()
+        );
+
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                &upload_path(paper_a, 2),
+                Some(&writer.cookie),
+                original_a.clone(),
+                Some("image/png"),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                &upload_path(paper_a, 2),
+                Some(&writer.cookie),
+                b"not a png".to_vec(),
+                Some("image/png"),
+            )
+            .await
+            .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                &upload_path(paper_a, 2),
+                Some(&writer.cookie),
+                vec![0; MAX_FILE_BYTES + 1],
+                Some("image/png"),
+            )
+            .await
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let replace_path = format!(
+            "{}&replace_file_id={file_a}&file_revision={revision_a}",
+            upload_path(paper_a, 2)
+        );
+        let replaced = request_bytes(
+            &app,
+            Method::POST,
+            &replace_path,
+            Some(&writer.cookie),
+            replacement_a.clone(),
+            Some("image/png"),
+        )
+        .await;
+        assert_eq!(replaced.status(), StatusCode::OK);
+        let replaced = test_json(replaced).await;
+        assert_eq!(replaced["file"]["file_id"], file_a);
+        assert_eq!(replaced["file"]["revision"], revision_a + 1);
+        assert_eq!(
+            test_bytes(get(&app, &raw_a, Some(&writer.cookie)).await).await,
+            replacement_a
+        );
+        assert_eq!(
+            test_bytes(get(&app, &raw_b, Some(&writer.cookie)).await).await,
+            original_b
+        );
+
+        let cross_replace = format!(
+            "{}&replace_file_id={file_b}&file_revision=1",
+            upload_path(paper_a, 3)
+        );
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                &cross_replace,
+                Some(&writer.cookie),
+                png(80, 80, 80),
+                Some("image/png"),
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            test_bytes(get(&app, &raw_b, Some(&writer.cookie)).await).await,
+            original_b
+        );
+
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let team_body = serde_json::json!({
+            "name":"Assigned image preview",
+            "writer_ids":[writer_id],
+            "leader_writer_id":writer_id,
+            "mentor_ids":[mentor_id]
+        })
+        .to_string();
+        let team = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &team_body,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let team_id = team["team"]["id"].as_str().unwrap();
+        let team_image = png(180, 120, 20);
+        let team_upload = request_bytes(
+            &app,
+            Method::POST,
+            &upload_path(team_id, 1),
+            Some(&writer.cookie),
+            team_image.clone(),
+            Some("image/png"),
+        )
+        .await;
+        assert_eq!(team_upload.status(), StatusCode::CREATED);
+        let team_upload = test_json(team_upload).await;
+        let team_file_id = team_upload["file"]["file_id"].as_str().unwrap();
+        let team_raw = format!("/api/v2/papers/{team_id}/files/{team_file_id}/raw");
+        assert_eq!(
+            test_bytes(get(&app, &team_raw, Some(&mentor.cookie)).await).await,
+            team_image
+        );
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                &upload_path(team_id, 2),
+                Some(&mentor.cookie),
+                png(30, 30, 30),
+                Some("image/png"),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&app, &team_raw, Some(&admin.cookie)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
     async fn s4_versions_coalesce_deduplicate_and_suppress_stale_promotion() {
         use core_types::WorkerId;
 
@@ -12671,6 +13115,14 @@ mod database_tests {
         let current = test_json(get(&app, &build_path, Some(&writer.cookie)).await).await;
         assert_eq!(current["build"]["current_build_id"], h4_id);
         assert_eq!(current["build"]["current_source_sequence"], version);
+        let exact_pdf = get(
+            &app,
+            &format!("/api/v2/papers/{paper_id}/artifacts/pdf?build={h4_id}"),
+            Some(&writer.cookie),
+        )
+        .await;
+        assert_eq!(exact_pdf.status(), StatusCode::OK);
+        assert_eq!(test_bytes(exact_pdf).await, b"pdf-h4");
 
         let reused = test_json(
             request(

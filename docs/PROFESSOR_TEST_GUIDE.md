@@ -19,13 +19,16 @@ This walkthrough assumes `./install.sh` completed and printed a healthy URL.
 10. Sign in as a Writer using the temporary password. Complete **Set your password** with a permanent 12–256 character password.
 11. Open Writer sessions for both Students in separate browsers or incognito profiles. Edit the Team paper and verify collaboration converges.
 12. Request a manual PDF compile and open the produced PDF.
+    Also exercise **Insert → Algorithm Builder**, **Insert → Algorithmic Builder**, and **Insert → Long Table Builder** in a synthetic single-column report. Add the packages the UI names to the preamble and confirm the generated algorithm, multipage table with repeated heading, and final row appear. In a two-column fixture, confirm the Long Table builder explains the incompatibility instead of silently switching layout.
 13. As the Team Leader, open **Document details**. Edit the acknowledgement, abstract, and submission date.
 14. Compile again and verify Cover, Certificate, Declaration, Acknowledgements, and Abstract pages appear before the main paper.
 15. Select **Send for Review**.
-16. Sign in as the Mentor. Open the submitted Team paper, add a comment, and add a suggestion.
-17. Return as a Writer. Confirm the review highlight, respond as needed, and mark the thread **Done**.
-18. As Team Leader, exercise **End Review**, then reopen/send another round and verify previous review history remains visible.
-19. Create checkpoints, make a later change, and exercise the governed revert/restoration workflow.
-20. As Admin, inspect **Build Queue**, **Audit**, and **System** for the actions performed and healthy service state.
+16. Sign in as the Mentor. Open the submitted Team report, add feedback in two different `.tex` files, reload, and confirm the toolbar says **Draft saved — not yet visible to writers**.
+17. In the Writer context, confirm the drafts are absent. Return to the Mentor and select **Push review**. Confirm the count and submit; wait for **Review submitted. Writers can now see your feedback.**
+18. Return as a Writer without refreshing. Open **Reviews**, choose the second item, and confirm the correct file and range open in the editor pane. Select **Done** and confirm the active highlight disappears while Resolved history remains.
+19. As Team Leader, send a new review round and verify prior published feedback remains visible. With multiple Mentors, verify one submission does not publish the other's drafts.
+20. Create checkpoints, make a later change, and exercise the governed revert/restoration workflow.
+21. As Admin, inspect **Build Queue**, **Audit**, and **System**, including backup and restore-drill status.
+22. Create two isolated reports and use each report's file-sidebar **Upload image** (`+`) action to upload visibly different PNG files both named `diagram.png`. Confirm each appears at `assets/diagram.png`, each PDF uses its own image, replacing/deleting one does not change the other, and an `images/` legacy fixture still compiles. Repeat while switching reports during a delayed upload and confirm no file or insertion appears in the wrong report.
 
 The demo data is synthetic. Do not import real institutional records into a disposable evaluation system.

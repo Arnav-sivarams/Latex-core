@@ -1,0 +1,6 @@
+# Store a real copy outside Git with mode 0600.
+# Frequency belongs in the host cron/systemd timer invoking scheduled-backup.sh.
+LATEX_CORE_BACKUP_DESTINATION=/mnt/off-host/latex-core-backups
+LATEX_CORE_BACKUP_RETENTION_COUNT=14
+# Optional rclone remote; omit to disable off-host copy.
+# LATEX_CORE_BACKUP_RCLONE_DESTINATION=campus-backup:latex-core

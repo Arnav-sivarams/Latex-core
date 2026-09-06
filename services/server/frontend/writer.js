@@ -13,7 +13,7 @@ import { pdfPreviewState } from './writer-pdf.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
-  buildPlot, buildTable, buildTheorem, commonSnippets,
+  buildLongTable, buildPlot, buildTable, buildTheorem, commonSnippets,
   fuzzyRankFiles, packageRequirement, symbols,
 } from './writer-productivity.mjs';
 
@@ -61,7 +61,14 @@ class PaperApi {
   structuralRedo(paperId) { return this.json(`/api/v2/papers/${paperId}/structural-redo`, 'POST', {}); }
   intelligence(paperId) { return this.request(`/api/v2/papers/${paperId}/intelligence`); }
   search(paperId, query, caseSensitive) { return this.request(`/api/v2/papers/${paperId}/search?q=${encodeURIComponent(query)}&case_sensitive=${caseSensitive}`); }
-  uploadAsset(paperId, path, version, file) { return this.request(`/api/v2/papers/${paperId}/assets?path=${encodeURIComponent(path)}&version=${version}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file }); }
+  uploadAsset(paperId, path, version, file, replacement = null) {
+    const query = new URLSearchParams({ path, version: String(version) });
+    if (replacement) {
+      query.set('replace_file_id', replacement.file_id);
+      query.set('file_revision', String(replacement.revision));
+    }
+    return this.request(`/api/v2/papers/${paperId}/assets?${query}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
+  }
   map(paperId, body) { return this.json(`/api/v2/reviews/papers/${paperId}/synctex`, 'POST', body); }
   versions(paperId) { return this.request(`/api/v2/papers/${paperId}/versions`); }
   checkpoint(paperId, name) { return this.json(`/api/v2/papers/${paperId}/versions`, 'POST', { name }); }
@@ -141,6 +148,7 @@ const model = {
   undoManager: null,
   preferences: { font_size_px: 14, theme: 'LIGHT' },
   editorAppearance: new Compartment(),
+  assetUploadTarget: null,
 };
 
 const autoBuild = createIdleBuildScheduler({
@@ -157,9 +165,9 @@ function notice(message, failed = false) {
 function editorAppearance(preference) {
   const dark = preference.theme === 'DARK';
   return EditorView.theme({
-    '&': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#1f2329' : '#ffffff', color: dark ? '#e6edf3' : '#20242a' },
-    '.cm-gutters': { backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
-    '.cm-content': { caretColor: dark ? '#f0f6fc' : '#111827' },
+    '&': { backgroundColor: dark ? '#1f2329' : '#ffffff', color: dark ? '#e6edf3' : '#20242a' },
+    '.cm-gutters': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
+    '.cm-content': { fontSize: `${preference.font_size_px}px`, caretColor: dark ? '#f0f6fc' : '#111827' },
     '.cm-activeLine,.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
     '.cm-selectionBackground,&.cm-focused .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#bfdcff' },
     '.review-source-highlight': { color: dark ? '#fff2b2' : '#241a00' },
@@ -191,12 +199,13 @@ async function persistPreferences(preferences) {
 
 function saveState(state) {
   const labels = {
-    local: 'Saved',
+    local: 'Opening…',
     syncing: 'Saving…',
     synced: 'Saved',
     offline: 'Offline',
     reconnecting: 'Reconnecting…',
     conflict: 'Conflict/Error',
+    storage_error: 'Local recovery unavailable',
   };
   ui.saveStatus.textContent = labels[state];
   ui.saveStatus.dataset.state = state;
@@ -266,7 +275,8 @@ function renderTree(node) {
     const item = document.createElement('li');
     const label = document.createElement('span');
     label.className = 'directory';
-    label.textContent = name;
+    label.textContent = name === 'assets' ? 'Assets' : name === 'images' ? 'Images (legacy)' : name;
+    if (name === 'images') label.title = 'Legacy project-local asset path: images/';
     item.append(label, renderTree(child));
     list.append(item);
   });
@@ -353,6 +363,7 @@ class CollaborationSession {
     this.documentEpoch = null;
     this.initialState = null;
     this.initializing = false;
+    this.localPersistenceAvailable = true;
     this.bufferedRemote = [];
     this.ready = new Promise((resolve) => { this.resolveReady = resolve; });
   }
@@ -424,6 +435,8 @@ class CollaborationSession {
         refreshReviews();
         refreshReviewRounds();
         notice(`${control.published_count} new review item${control.published_count === 1 ? '' : 's'} published.`);
+      } else if (control.type === 'FILES_CHANGED') {
+        refreshReportFiles(control.file_id, control.revision);
       } else if (control.type === 'RELOAD_REQUIRED') {
         model.conflict = true;
         saveState('conflict');
@@ -465,23 +478,90 @@ class CollaborationSession {
     if (model.paper && Number.isInteger(newEpoch)) window.setTimeout(() => openPaper(model.paper), 0);
   }
 
+  recoveryScope() {
+    return `latex-core:${model.identity.user_id}:${this.paper.workspace_id}:${this.file.file_id}`;
+  }
+
+  async cachedText(key) {
+    const cached = new Y.Doc();
+    const persistence = new IndexeddbPersistence(key, cached);
+    try {
+      await Promise.race([
+        persistence.whenSynced,
+        new Promise((_, reject) => window.setTimeout(() => reject(new Error('browser recovery storage timed out')), 5000)),
+      ]);
+      return cached.getText('source').toString();
+    } finally {
+      persistence.destroy();
+      cached.destroy();
+    }
+  }
+
+  async recoverIncompatibleCache(currentEpoch) {
+    const registryKey = `${this.recoveryScope()}:latest-epoch`;
+    let priorEpoch;
+    try { priorEpoch = window.localStorage.getItem(registryKey); }
+    catch (_) { this.localPersistenceAvailable = false; return; }
+    if (priorEpoch && priorEpoch !== String(currentEpoch)) {
+      try {
+        const recovered = await this.cachedText(`${this.recoveryScope()}:${priorEpoch}`);
+        if (recovered) {
+          model.recoveryText = recovered;
+          ui.copyRecoveryText.hidden = false;
+          notice('Source restoration changed this file generation. Previous offline text is available for recovery and was not merged.', true);
+        }
+      } catch (_) {
+        this.localPersistenceAvailable = false;
+        notice('Previous offline work may exist, but browser recovery storage is unavailable. Do not clear site data.', true);
+      }
+      return;
+    }
+    try { window.localStorage.setItem(registryKey, String(currentEpoch)); }
+    catch (_) { this.localPersistenceAvailable = false; }
+  }
+
   async initializeOrMerge() {
     if (!this.metadata || !this.initialState || this.initializing) return;
     this.initializing = true;
     try {
       if (!this.doc) {
+        await this.recoverIncompatibleCache(this.metadata.document_epoch);
         this.doc = new Y.Doc();
         this.text = this.doc.getText('source');
         const key = `latex-core:${model.identity.user_id}:${this.paper.workspace_id}:${this.file.file_id}:${this.metadata.document_epoch}`;
-        this.persistence = new IndexeddbPersistence(key, this.doc);
-        await new Promise((resolve) => this.persistence.once('synced', resolve));
+        if (this.access === 'read_write') {
+          try {
+            this.persistence = new IndexeddbPersistence(key, this.doc);
+            await Promise.race([
+              this.persistence.whenSynced,
+              new Promise((_, reject) => window.setTimeout(() => reject(new Error('browser recovery storage timed out')), 5000)),
+            ]);
+          } catch (_) {
+            this.localPersistenceAvailable = false;
+            this.persistence?.destroy();
+            this.persistence = null;
+            notice('Browser recovery storage is unavailable. Connected edits can still save to the server, but offline work may not survive a reload.', true);
+          }
+        } else {
+          try {
+            const cached = await this.cachedText(key);
+            const serverDoc = new Y.Doc();
+            Y.applyUpdate(serverDoc, this.initialState, REMOTE_ORIGIN);
+            if (cached && cached !== serverDoc.getText('source').toString()) {
+              model.recoveryText = cached;
+              ui.copyRecoveryText.hidden = false;
+              notice('File access is now read-only. Offline text was preserved for recovery and was not submitted.', true);
+            }
+            serverDoc.destroy();
+          } catch (_) { this.localPersistenceAvailable = false; }
+        }
         Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
         this.bufferedRemote.forEach((update) => Y.applyUpdate(this.doc, update, REMOTE_ORIGIN));
         this.bufferedRemote = [];
         this.doc.on('update', (update, origin) => {
           if (origin === REMOTE_ORIGIN) return;
           if (this.connected && this.access === 'read_write') this.sendUpdate(update);
-          else saveState('offline');
+          else saveState(this.localPersistenceAvailable ? 'offline' : 'storage_error');
         });
         mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
         this.resolveReady();
@@ -546,6 +626,21 @@ class CollaborationSession {
     this.socket = null;
     this.doc = null;
   }
+}
+
+async function refreshReportFiles(changedFileId, revision) {
+  const paperId = model.paper?.id;
+  if (!paperId) return;
+  try {
+    const files = await api.files(paperId);
+    if (model.paper?.id !== paperId) return;
+    model.files = files;
+    renderFiles();
+    if (model.file?.file_id === changedFileId && !model.collaboration) {
+      const current = files.find((file) => file.file_id === changedFileId && file.revision === revision);
+      if (current) await openFile(current);
+    }
+  } catch (error) { notice(error.message, true); }
 }
 
 async function refreshPapers() {
@@ -619,7 +714,11 @@ async function openFile(file, force = false) {
       if (raster) {
         const image = document.createElement('img');
         image.alt = `Preview of ${file.path}`;
-        image.src = `/api/v2/papers/${model.paper.id}/files/${file.file_id}/raw`;
+        image.src = `/api/v2/papers/${model.paper.id}/files/${file.file_id}/raw?revision=${file.revision}`;
+        const copy = button('Copy LaTeX path', async () => {
+          try { await navigator.clipboard.writeText(file.path); notice(`Copied ${file.path}.`); }
+          catch (_) { window.prompt('Copy LaTeX path', file.path); }
+        });
         const insert = button('Insert Figure', async () => {
           const target = model.files.find((candidate) => candidate.path === model.paperDetail.main_file && candidate.file_id !== file.file_id)
             || model.files.find((candidate) => candidate.path.endsWith('.tex'));
@@ -627,7 +726,7 @@ async function openFile(file, force = false) {
           await openFile(target);
           openBuilder('figure', { asset: file.path });
         });
-        preview.append(image, insert);
+        preview.append(image, copy, insert);
       } else {
         const heading = document.createElement('strong');
         heading.textContent = 'Binary asset';
@@ -637,7 +736,11 @@ async function openFile(file, force = false) {
       }
       ui.editorMount.append(preview);
       model.file = file;
-      updateFileActions(false);
+      ui.currentFile.textContent = file.path;
+      ui.mainBadge.hidden = file.path !== model.paperDetail.main_file;
+      updateFileActions(Boolean(model.paperDetail?.editable) && file.policy === 'EDITABLE');
+      renderFiles();
+      return;
     }
     notice(error.message, true);
   }
@@ -740,7 +843,7 @@ async function syncCurrent(showNotice = true) {
 }
 
 async function requireDurableFlush() {
-  if (!await syncCurrent(false)) return false;
+  if (model.collaboration && !await syncCurrent(false)) return false;
   try {
     model.paperDetail = await api.paper(model.paper.id);
     model.version = model.paperDetail.version;
@@ -776,7 +879,7 @@ async function requestBuild(triggerType) {
 async function manualCompile() {
   if (!model.paper || !model.paperDetail?.editable) return;
   autoBuild.cancel();
-  if (!await syncCurrent(false)) return;
+  if (!await requireDurableFlush()) return;
   await requestBuild('manual');
 }
 
@@ -1226,10 +1329,11 @@ function insertLatex(source, origin = 'writer-builder') {
 
 const builderSchemas = {
   table: [['rows', 'Rows', 'number', 3], ['columns', 'Columns', 'number', 3], ['header', 'Header row', 'checkbox', true], ['alignments', 'Column alignments', 'text', 'left,center,left'], ['booktabs', 'Booktabs', 'checkbox', false], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'tab:'], ['placement', 'Placement', 'text', 'htbp']],
+  longtable: [['rows', 'Rows', 'number', 40], ['columns', 'Columns', 'number', 3], ['header', 'Repeat header on later pages', 'checkbox', true], ['alignments', 'Column alignments', 'text', 'left,center,left'], ['caption', 'Caption', 'text', 'Long table'], ['label', 'Label', 'text', 'tab:long']],
   figure: [['asset', 'Asset', 'asset', ''], ['width', 'Width', 'select', ['\\linewidth', '0.75\\linewidth', '0.5\\linewidth', 'custom']], ['customWidth', 'Custom width', 'text', ''], ['placement', 'Placement', 'text', 'htbp'], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:']],
   equation: [['type', 'Type', 'select', ['inline', 'display', 'aligned', 'matrix', 'cases']], ['body', 'Expression / body', 'textarea', 'x = y'], ['rows', 'Rows', 'number', 2], ['columns', 'Columns', 'number', 2], ['delimiter', 'Matrix delimiter', 'select', ['()', '[]', '||', 'none']], ['label', 'Label', 'text', 'eq:']],
   plot: [['asset', 'CSV asset', 'csv', ''], ['x', 'X column', 'text', 'x'], ['y', 'Y column', 'text', 'y'], ['type', 'Plot type', 'select', ['line', 'scatter', 'bar']], ['title', 'Title', 'text', ''], ['xLabel', 'X label', 'text', ''], ['yLabel', 'Y label', 'text', ''], ['legend', 'Legend', 'text', ''], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:plot'], ['width', 'Width', 'text', '\\linewidth']],
-  algorithm: [['caption', 'Caption', 'text', 'Algorithm'], ['label', 'Label', 'text', 'alg:'], ['body', 'Algorithm lines', 'textarea', '\\State Describe the method']],
+  algorithm: [['family', 'Commands', 'select', ['algpseudocode', 'algorithmic']], ['caption', 'Caption', 'text', 'Algorithm'], ['label', 'Label', 'text', 'alg:'], ['body', 'Algorithm lines (\\State for algpseudocode; \\STATE for algorithmic)', 'textarea', '\\State Describe the method']],
   code: [['language', 'Language', 'text', ''], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'lst:'], ['file', 'File reference (optional)', 'text', ''], ['code', 'Inline code', 'textarea', '']],
   bibliography: [['target', 'Target .bib file', 'bib', ''], ['type', 'Entry type', 'select', ['article', 'book', 'inproceedings', 'misc']], ['key', 'Citation key', 'text', 'key2026'], ['title', 'Title', 'text', ''], ['author', 'Author', 'text', ''], ['year', 'Year', 'text', '2026'], ['journal', 'Journal', 'text', ''], ['booktitle', 'Book title', 'text', ''], ['doi', 'DOI', 'text', ''], ['url', 'URL', 'text', '']],
   theorem: [['environment', 'Environment', 'select', ['theorem', 'lemma', 'proposition', 'corollary', 'definition', 'remark', 'proof']], ['title', 'Optional title', 'text', ''], ['label', 'Label', 'text', 'thm:'], ['body', 'Body', 'textarea', 'Statement.']],
@@ -1240,16 +1344,20 @@ function builderRequirement(kind, values) {
     return { available: false, message: `Environment not detected: ${values.environment}` };
   }
   const required = {
-    table: values.booktabs ? ['booktabs'] : [], figure: ['graphicx'], plot: ['pgfplots'],
-    algorithm: ['algorithm', 'algpseudocode'], code: ['listings'],
+    table: values.booktabs ? ['booktabs'] : [], longtable: ['longtable'], figure: ['graphicx'], plot: ['pgfplots'],
+    algorithm: ['algorithm', values.family === 'algorithmic' ? 'algorithmic' : 'algpseudocode'], code: ['listings'],
     equation: ['aligned', 'matrix', 'cases'].includes(values.type) ? ['amsmath'] : [],
   }[kind] || [];
+  if (kind === 'longtable' && /\\documentclass\s*\[[^\]]*\btwocolumn\b[^\]]*\]|\\twocolumn\b/.test(model.collaboration?.text?.toString() || '')) {
+    return { available: false, message: 'Long tables cannot break across pages in a two-column layout. Use a normal table or make an explicit one-column region.' };
+  }
   const missing = required.filter((name) => !packageRequirement(model.intelligence.packages || [], name).available);
   return missing.length ? { available: false, message: `Requires package${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}` } : { available: true, message: 'Available' };
 }
 
 function builderSource(kind, values) {
   if (kind === 'table') return buildTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()) });
+  if (kind === 'longtable') return buildLongTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()) });
   if (kind === 'figure') return buildFigure(values);
   if (kind === 'equation') return buildEquation(values);
   if (kind === 'plot') return buildPlot(values);
@@ -1324,7 +1432,8 @@ function openBuilder(kind, defaults = {}) {
 
 function openInsertMenu() {
   showPalette('Insert LaTeX', [
-    ...['table', 'figure', 'plot', 'algorithm', 'code', 'bibliography', 'theorem'].map((kind) => ({ label: `${kind[0].toUpperCase()}${kind.slice(1)} Builder`, run: () => openBuilder(kind) })),
+    ...['table', 'longtable', 'figure', 'plot', 'algorithm', 'code', 'bibliography', 'theorem'].map((kind) => ({ label: kind === 'longtable' ? 'Long Table Builder' : `${kind[0].toUpperCase()}${kind.slice(1)} Builder`, run: () => openBuilder(kind) })),
+    { label: 'Algorithmic Builder', detail: 'algorithm + algorithmic commands such as \\STATE', run: () => openBuilder('algorithm', { family: 'algorithmic', body: '\\STATE Describe the method' }) },
     { label: 'Insert Citation', run: openCitationPalette }, { label: 'Insert Reference', run: openReferencePalette },
     ...Object.entries(commonSnippets).map(([name, source]) => ({ label: `${name} snippet`, run: () => insertLatex(`${source}\n`, 'writer-snippet') })),
   ]);
@@ -1408,7 +1517,7 @@ function commandItems() {
   const items = [
     ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ['Set Main', () => ui.setMain.click()],
     ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
-    ['Open Table Builder', () => openBuilder('table')], ['Open Figure Builder', () => openBuilder('figure')], ['Open Math Palette', openMathPalette], ['Open Equation Builder', () => openBuilder('equation')], ['Open Plot Builder', () => openBuilder('plot')],
+    ['Open Table Builder', () => openBuilder('table')], ['Open Long Table Builder', () => openBuilder('longtable')], ['Open Algorithmic Builder', () => openBuilder('algorithm', { family: 'algorithmic', body: '\\STATE Describe the method' })], ['Open Figure Builder', () => openBuilder('figure')], ['Open Math Palette', openMathPalette], ['Open Equation Builder', () => openBuilder('equation')], ['Open Plot Builder', () => openBuilder('plot')],
     ['Open Problems', () => openDrawer('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
     ['Document details', openDocumentDetails],
     ['Insert Citation', openCitationPalette], ['Insert Reference', openReferencePalette],
@@ -1453,12 +1562,14 @@ ui.deleteFile.addEventListener('click', async () => {
   if (!window.confirm(`Delete ${model.file.path}?`) || !await requireDurableFlush()) return;
   try {
     const deletedId = model.file.file_id;
+    const deletedPath = model.file.path;
     const result = await api.deleteFile(model.paper.id, deletedId, { version: model.version });
     model.version = result.version;
     model.file = null;
     model.conflict = false;
     closeEditor();
     await openPaper(model.paper);
+    notice(`Deleted ${deletedPath}.`);
   } catch (error) { notice(error.message, true); }
 });
 
@@ -1474,7 +1585,7 @@ ui.setMain.addEventListener('click', async () => {
 ui.saveFile.addEventListener('click', syncCurrent);
 ui.compilePaper.addEventListener('click', manualCompile);
 ui.sendReview.addEventListener('click', async () => {
-  if (!model.paper?.is_team_leader || !await syncCurrent(false)) return;
+  if (!model.paper?.is_team_leader || !await requireDurableFlush()) return;
   try {
     await api.sendForReview(model.paper.id);
     await refreshReviewRounds();
@@ -1517,19 +1628,40 @@ ui.fileActionsToggle.addEventListener('click', (event) => {
 });
 ui.structuralUndo.addEventListener('click', () => runStructural(false));
 ui.structuralRedo.addEventListener('click', () => runStructural(true));
-ui.uploadImage.addEventListener('click', () => ui.assetInput.click());
+ui.uploadImage.addEventListener('click', async () => {
+  if (!model.paper) return;
+  if (model.collaboration && !await requireDurableFlush()) return;
+  model.assetUploadTarget = { paperId: model.paper.id, reportName: model.paper.name, version: model.version };
+  ui.assetInput.click();
+});
 ui.assetInput.addEventListener('change', async () => {
   const file = ui.assetInput.files[0];
   if (!file) return;
-  if (file.size > 1024 * 1024) return notice('Assets are limited to 1 MiB.', true);
-  const path = window.prompt('Asset path', `Assets/${file.name}`);
-  if (!path) return;
+  const target = model.assetUploadTarget;
+  model.assetUploadTarget = null;
+  if (!target || model.paper?.id !== target.paperId) {
+    ui.assetInput.value = '';
+    return notice('Image upload cancelled because the selected report changed.', true);
+  }
+  if (file.size > 1024 * 1024) { ui.assetInput.value = ''; return notice('Images are limited to 1 MiB.', true); }
+  let path = window.prompt('Image path in this report', `assets/${file.name}`);
+  if (!path) { ui.assetInput.value = ''; return; }
+  let replacement = model.files.find((candidate) => candidate.path === path) || null;
+  if (replacement) {
+    const choice = (window.prompt(`${path} already exists in ${target.reportName}. Type REPLACE, RENAME, or CANCEL.`, 'CANCEL') || 'CANCEL').trim().toUpperCase();
+    if (choice === 'RENAME') {
+      path = window.prompt('New image path in this report', `assets/new-${file.name}`);
+      if (!path || model.files.some((candidate) => candidate.path === path)) { ui.assetInput.value = ''; return notice('Choose an unused report-local path.', true); }
+      replacement = null;
+    } else if (choice !== 'REPLACE') { ui.assetInput.value = ''; return notice('Image upload cancelled.'); }
+  }
   try {
-    if (model.collaboration && !await requireDurableFlush()) return;
-    const result = await api.uploadAsset(model.paper.id, path, model.version, file);
-    model.version = result.version;
-    await reloadPaperAndFile(result.file.file_id);
-    notice(`Uploaded ${result.file.path}.`);
+    const result = await api.uploadAsset(target.paperId, path, target.version, file, replacement);
+    if (model.paper?.id === target.paperId) {
+      model.version = result.version;
+      await reloadPaperAndFile(result.file.file_id);
+      notice(`${replacement ? 'Replaced' : 'Uploaded'} ${result.file.path} in ${target.reportName}.`);
+    } else notice(`Uploaded ${result.file.path} to ${target.reportName}; the current report was not changed.`);
   } catch (error) { notice(error.message, true); }
   finally { ui.assetInput.value = ''; }
 });
@@ -1569,7 +1701,7 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('click', (event) => { if (!ui.fileActionsMenu.contains(event.target) && event.target !== ui.fileActionsToggle) closeTransientMenus(); });
 ui.createCheckpoint.addEventListener('click', async () => {
-  if (!model.paper || !await syncCurrent(false)) return;
+  if (!model.paper || !await requireDurableFlush()) return;
   const name = window.prompt('Checkpoint name');
   if (!name) return;
   try {

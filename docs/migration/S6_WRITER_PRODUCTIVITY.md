@@ -20,11 +20,11 @@ Problems combines analyzer diagnostics (including unresolved references/citation
 
 ## Assets and builders
 
-Writer asset upload accepts validated PNG, JPEG, PDF, and CSV files up to the server's 1 MiB file limit, stores bytes in BlobStore as a normal paper file, and previews raster assets. CSV assets feed the plot builder. SVG upload remains disabled because same-origin active SVG content is not yet covered by an asset sanitization policy.
+Writer asset upload accepts bounded PNG, JPEG, PDF, and CSV files up to the server's 1 MiB file limit and stores bytes in BlobStore as a normal report file. Raster bytes must actually decode and match their extension; decoded dimensions are limited to 8192×8192. The file-sidebar image action captures the report before its asynchronous picker, defaults to `assets/`, and uses report/file/revision preconditions for explicit replacement. CSV assets feed the plot builder. SVG upload remains disabled because same-origin active SVG content is not yet covered by an asset sanitization policy.
 
 Local builders generate ordinary editable LaTeX/BibTeX for tables, figures, equations/alignment/matrices/cases, pgfplots CSV plots, algorithmic algorithms, listings code, bibliography entries, and theorem-like environments. Builder preview and insertion are browser-only; no builder server endpoint writes source. Bibliography insertion opens the selected `.bib` Yjs room before appending. Generated snippets, autocomplete, citations, references, symbols, and builders all use explicit Writer-attributed `Y.Doc.transact` origins.
 
-Package awareness comes from analyzer-reported `\usepackage` requests. Builders show `Available` or `Requires package: ...` for booktabs, graphicx, pgfplots, algorithm, and listings. S6 never edits a preamble or template-managed file automatically. Optional package insertion and subfigure generation are deferred.
+Package awareness comes from analyzer-reported `\usepackage` requests. Builders show `Available` or `Requires package: ...` for booktabs, graphicx, pgfplots, longtable, algorithm plus the chosen algorithmic family, and listings. Long Table output is not placed in an unbreakable float and is refused with actionable guidance for detected two-column layouts. S6 never edits a preamble or template-managed file automatically. Optional package insertion and subfigure generation are deferred.
 
 ## Security and scope
 

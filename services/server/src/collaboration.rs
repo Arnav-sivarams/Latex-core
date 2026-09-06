@@ -179,6 +179,19 @@ impl CollaborationHub {
         }
     }
 
+    /// Announces an already-committed report-local file change. The event
+    /// carries identity only; each client refetches its authorized file list.
+    pub async fn files_changed(&self, workspace_id: WorkspaceId, file_id: Uuid, revision: u64) {
+        let rooms = self.rooms.lock().await;
+        for (key, room) in rooms.iter() {
+            if key.workspace_id == workspace_id {
+                let _ = room
+                    .events
+                    .send(RoomEvent::FilesChanged { file_id, revision });
+            }
+        }
+    }
+
     /// Waits until every currently loaded room in a workspace has persisted and
     /// canonically materialized all updates observed before its flush command.
     /// Unloaded files are already represented by the canonical workspace state.
@@ -216,6 +229,10 @@ enum RoomEvent {
     ReviewPublished {
         submission_id: Uuid,
         published_count: u64,
+    },
+    FilesChanged {
+        file_id: Uuid,
+        revision: u64,
     },
 }
 
@@ -766,6 +783,10 @@ pub async fn serve_socket(
                     }
                     Ok(RoomEvent::ReviewPublished { submission_id, published_count }) => {
                         let value = serde_json::json!({"type":"REVIEW_PUBLISHED","submission_id":submission_id,"published_count":published_count});
+                        if sender.send(Message::Text(value.to_string().into())).await.is_err() { break; }
+                    }
+                    Ok(RoomEvent::FilesChanged { file_id, revision }) => {
+                        let value = serde_json::json!({"type":"FILES_CHANGED","file_id":file_id,"revision":revision});
                         if sender.send(Message::Text(value.to_string().into())).await.is_err() { break; }
                     }
                     Ok(RoomEvent::Update { .. }) => {}

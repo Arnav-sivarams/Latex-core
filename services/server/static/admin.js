@@ -259,6 +259,22 @@ function renderSystem(data, overview, branding) {
     ['Mail delivery', overview.mail_delivery_enabled ? 'Healthy' : 'Disabled', overview.mail_delivery_enabled ? 'Credential delivery enabled' : 'Disabled in this environment'],
   ];
   const grid = element('div', 'system-grid'); systems.forEach(([name, state, detail]) => { const card = element('article', 'system-card'); card.append(element('strong', '', name), statusChip(state, state === 'Healthy' ? 'good' : state === 'Disabled' ? '' : 'warning'), element('span', '', detail)); grid.append(card); }); content.append(grid);
+  const backup = data.backup || {};
+  const recovery = element('section', 'admin-section');
+  const recoveryDetails = element('dl', 'detail-list');
+  recoveryDetails.append(
+    element('dt', '', 'Last successful backup'), element('dd', '', backup.last_successful_backup_at ? new Date(backup.last_successful_backup_at).toLocaleString() : 'No successful backup recorded'),
+    element('dt', '', 'Last backup failure'), element('dd', '', backup.last_failure_at ? `${new Date(backup.last_failure_at).toLocaleString()} · ${backup.last_failure_phase || 'unknown phase'}` : 'No failure recorded'),
+    element('dt', '', 'Schedule'), element('dd', '', backup.schedule_configured ? 'Configured' : 'Not configured'),
+    element('dt', '', 'Off-host copy'), element('dd', '', backup.off_host_copy_configured ? 'Configured' : 'Not configured'),
+    element('dt', '', 'Last successful restore drill'), element('dd', '', backup.last_successful_restore_drill_at ? new Date(backup.last_successful_restore_drill_at).toLocaleString() : 'No successful restore drill recorded'),
+  );
+  recovery.append(
+    element('h2', '', 'Backup and recovery'),
+    element('p', 'muted-note', 'Read-only operator status. Backup contents, keys, and restore actions are never exposed here.'),
+    recoveryDetails,
+  );
+  content.append(recovery);
   const section = element('section', 'admin-section branding-settings');
   section.append(element('h2', '', 'Branding'), element('p', 'muted-note', 'Application header only. PNG, JPEG, or WebP; maximum 512 KiB and 2048 × 2048 px. PDF and Front Matter logos are unchanged.'));
   const preview = element('div', 'branding-preview');

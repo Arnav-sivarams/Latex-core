@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "build": "esbuild services/server/frontend/writer.js --bundle --format=esm --minify --outfile=services/server/static/writer.js && esbuild services/server/frontend/review.js --bundle --format=esm --minify --external:/static/pdf.min.mjs --outfile=services/server/static/review.js && cp node_modules/pdfjs-dist/build/pdf.min.mjs services/server/static/pdf.min.mjs && cp node_modules/pdfjs-dist/build/pdf.worker.min.mjs services/server/static/pdf.worker.min.mjs",
-    "test": "node --test services/server/frontend/*.test.mjs"
+    "test": "node --test services/server/frontend/*.test.mjs",
+    "test:browser:run2": "node services/server/tests/run2-browser.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
@@ -18,6 +19,7 @@
     "yjs": "13.6.32"
   },
   "devDependencies": {
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "playwright": "1.62.1"
   }
 }

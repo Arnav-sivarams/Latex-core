@@ -419,7 +419,7 @@ impl V2Repository {
             "SELECT a.artifact_id,a.job_id,a.logical_name,a.blob_hash,a.size_bytes,a.content_type \
              FROM latex_core.v2_paper_builds b \
              JOIN latex_core.compilation_artifacts a ON a.job_id=b.compile_job_id \
-             WHERE b.workspace_id=$1 AND b.id=$2 AND b.status='SUCCEEDED' AND a.kind=$3 \
+             WHERE b.workspace_id=$1 AND b.id=$2 AND b.status='succeeded' AND a.kind=$3 \
              ORDER BY a.logical_name LIMIT 1",
         )
         .bind(workspace_id.as_uuid())

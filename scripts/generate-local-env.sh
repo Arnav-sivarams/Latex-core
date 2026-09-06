@@ -3,22 +3,25 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 force=false
+target=''
 usage() {
   cat <<'EOF'
-Usage: ./scripts/generate-local-env.sh [--force]
+Usage: ./scripts/generate-local-env.sh [--output ABSOLUTE_PATH] [--force]
 
 Create .env from .env.example with cryptographically random local secrets.
 Existing .env files are preserved unless --force is supplied.
 EOF
 }
-case "${1:-}" in
-  '') ;;
-  --force) force=true ;;
-  --help|-h) usage; exit 0 ;;
-  *) usage >&2; exit 2 ;;
-esac
-[[ $# -le 1 ]] || { usage >&2; exit 2; }
-target="$root/.env"
+while (($#)); do
+  case "$1" in
+    --force) force=true; shift ;;
+    --output) target="${2:-}"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+target="${target:-$root/.env}"
+[[ "$target" == /* ]] || { echo 'Output path must be absolute.' >&2; exit 2; }
 example="$root/.env.example"
 [[ -f "$example" ]] || { echo '.env.example is missing.' >&2; exit 1; }
 if [[ -e "$target" && "$force" != true ]]; then
@@ -37,7 +40,9 @@ random_base64_32() {
 }
 postgres_password="$(random_hex)"
 mail_key="$(random_base64_32)"
-temporary="$(mktemp "$root/.env.tmp.XXXXXX")"
+target_directory="$(dirname "$target")"
+[[ -d "$target_directory" ]] || { echo 'Output directory does not exist.' >&2; exit 1; }
+temporary="$(mktemp "$target_directory/.latex-core-env.tmp.XXXXXX")"
 trap 'rm -f "$temporary"' EXIT
 umask 077
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -57,4 +62,4 @@ chmod 600 "$temporary" 2>/dev/null || true
 mv -f "$temporary" "$target"
 trap - EXIT
 chmod 600 "$target" 2>/dev/null || true
-echo 'Created .env with generated local secrets (mode 600 where supported).'
+printf 'Created %s with generated local secrets (mode 600 where supported).\n' "$target"

@@ -5,7 +5,7 @@ services:
     image: postgres:18.4
     restart: unless-stopped
     env_file:
-      - ../../.env
+      - ${LATEX_CORE_ENV_FILE:-../../.env}
     ports:
       - "127.0.0.1:${LATEX_CORE_POSTGRES_PORT:-54329}:5432"
     volumes:
@@ -23,7 +23,7 @@ services:
     command: ["/usr/local/bin/latex-core-api"]
     restart: unless-stopped
     env_file:
-      - ../../.env
+      - ${LATEX_CORE_ENV_FILE:-../../.env}
     environment:
       BLOB_STORAGE_ROOT: /var/lib/latex-core/blobs
       BIND_ADDR: 0.0.0.0:8080
@@ -40,7 +40,7 @@ services:
     command: ["/usr/local/bin/latex-core-worker"]
     restart: unless-stopped
     env_file:
-      - ../../.env
+      - ${LATEX_CORE_ENV_FILE:-../../.env}
     environment:
       BLOB_STORAGE_ROOT: /var/lib/latex-core/blobs
       RUST_LOG: info

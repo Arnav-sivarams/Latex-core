@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "entry_file": "frontmatter.tex",
+  "sections": [
+    {
+      "key": "cover",
+      "label": "Cover",
+      "file": "cover.tex",
+      "required": true,
+      "default_enabled": true
+    }
+  ],
+  "fields": []
+}

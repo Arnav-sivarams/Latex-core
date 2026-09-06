@@ -21,7 +21,45 @@ pub struct BrandingSettings {
     pub logo_height: Option<i32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryStatus {
+    pub schema_version: u8,
+    pub last_successful_backup_at: Option<String>,
+    pub last_backup_failure_at: Option<String>,
+    pub last_backup_failure_phase: Option<String>,
+    pub last_successful_restore_drill_at: Option<String>,
+}
+
 impl V2Repository {
+    /// Returns secret-free operator backup and restore-drill timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistence fails.
+    pub async fn recovery_status(&self) -> Result<RecoveryStatus, V2Error> {
+        let row = sqlx::query(
+            "SELECT \
+             (SELECT occurred_at::text FROM latex_core.operator_recovery_events WHERE operation='BACKUP' AND status='SUCCESS' ORDER BY occurred_at DESC LIMIT 1) AS last_backup, \
+             (SELECT occurred_at::text FROM latex_core.operator_recovery_events WHERE operation='BACKUP' AND status='FAILED' ORDER BY occurred_at DESC LIMIT 1) AS last_failure, \
+             (SELECT phase FROM latex_core.operator_recovery_events WHERE operation='BACKUP' AND status='FAILED' ORDER BY occurred_at DESC LIMIT 1) AS last_failure_phase, \
+             (SELECT occurred_at::text FROM latex_core.operator_recovery_events WHERE operation='RESTORE_DRILL' AND status='SUCCESS' ORDER BY occurred_at DESC LIMIT 1) AS last_restore",
+        )
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        Ok(RecoveryStatus {
+            schema_version: 1,
+            last_successful_backup_at: row.try_get("last_backup").map_err(V2Error::Database)?,
+            last_backup_failure_at: row.try_get("last_failure").map_err(V2Error::Database)?,
+            last_backup_failure_phase: row
+                .try_get("last_failure_phase")
+                .map_err(V2Error::Database)?,
+            last_successful_restore_drill_at: row
+                .try_get("last_restore")
+                .map_err(V2Error::Database)?,
+        })
+    }
+
     /// Returns the linked institutional name, falling back to account email.
     ///
     /// # Errors

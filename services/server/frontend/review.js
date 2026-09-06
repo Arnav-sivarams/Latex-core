@@ -129,6 +129,7 @@ class ReadOnlySession {
       if (value.type === 'JOIN_ACCEPTED') { this.metadata = value; this.initialize(); }
       else if (value.type === 'REMOTE_DURABLE') { ui.liveStatus.textContent = 'Live · read only'; refreshPaperDetail(); }
       else if (value.type === 'REVIEW_PUBLISHED') { refreshThreads(); refreshRounds(); }
+      else if (value.type === 'FILES_CHANGED') { refreshReportFiles(value.file_id, value.revision); }
       else if (value.type === 'RELOAD_REQUIRED') notice('The selected file was removed.', true);
       else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('The Team Leader changed the paper version; reloading.', true); openPaper(model.paper); }
       else if (value.type === 'POLICY_CHANGED') { notice(value.message || 'File policy changed; reload.', true); openPaper(model.paper); }
@@ -147,6 +148,20 @@ class ReadOnlySession {
     mountReadOnlyEditor(this); ui.liveStatus.textContent = 'Live · read only'; ui.liveStatus.dataset.state = 'synced'; this.resolveReady();
   }
   destroy() { this.destroyed = true; if (this.socket) this.socket.close(); if (this.doc) this.doc.destroy(); this.socket = null; this.doc = null; }
+}
+
+async function refreshReportFiles(changedFileId, revision) {
+  const paperId = model.paper?.id;
+  if (!paperId) return;
+  try {
+    const payload = await api.files(paperId);
+    if (model.paper?.id !== paperId) return;
+    model.files = payload.files; renderFiles();
+    if (model.file?.file_id === changedFileId && !model.collaboration) {
+      const current = model.files.find((file) => file.file_id === changedFileId && file.revision === revision);
+      if (current) await openFile(current);
+    }
+  } catch (failure) { notice(failure.message, true); }
 }
 
 function mountReadOnlyEditor(session) {
@@ -221,9 +236,23 @@ function renderFiles() {
   const list = document.createElement('ul'); list.className = 'file-tree'; model.files.forEach((file) => { const item = document.createElement('li'); item.append(button(file.path, () => openFile(file), model.file?.file_id === file.file_id)); list.append(item); }); ui.reviewFiles.append(list);
 }
 async function openFile(file) {
-  disposeSource(); const payload = await api.file(model.paper.id, file.file_id); model.file = payload.file; renderFiles();
-  ui.reviewEditor.innerHTML = '<div class="foundation-empty"><strong>Opening live read-only source…</strong></div>';
-  model.collaboration = new ReadOnlySession(model.detail.paper, payload.file); model.collaboration.start(); await model.collaboration.ready;
+  disposeSource();
+  try {
+    const payload = await api.file(model.paper.id, file.file_id); model.file = payload.file; renderFiles();
+    ui.reviewEditor.innerHTML = '<div class="foundation-empty"><strong>Opening live read-only source…</strong></div>';
+    model.collaboration = new ReadOnlySession(model.detail.paper, payload.file); model.collaboration.start(); await model.collaboration.ready;
+  } catch (failure) {
+    if (failure.status !== 415) throw failure;
+    model.file = file; renderFiles(); ui.reviewEditor.replaceChildren();
+    if (/\.(png|jpe?g)$/i.test(file.path)) {
+      const preview = document.createElement('div'); preview.className = 'binary-preview';
+      const image = document.createElement('img'); image.alt = `Read-only preview of ${file.path}`;
+      image.src = `/api/v2/papers/${model.paper.id}/files/${file.file_id}/raw?revision=${file.revision}`;
+      preview.append(image); ui.reviewEditor.append(preview); ui.liveStatus.textContent = 'Stored image · read only'; ui.liveStatus.dataset.state = 'synced';
+    } else {
+      clearNode(ui.reviewEditor, 'Stored binary asset · read only'); ui.liveStatus.textContent = 'Binary asset · read only';
+    }
+  }
 }
 function disposeSource() { if (model.view) model.view.destroy(); if (model.collaboration) model.collaboration.destroy(); model.view = null; model.collaboration = null; }
 

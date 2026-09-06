@@ -23,8 +23,8 @@ for service in postgres api worker caddy; do
   [[ -n "$id" ]] && state="$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || true)"
   if [[ "$state" == running ]]; then pass "$service service is running"; else fail "$service service is not running"; fi
 done
-migrations="$("${compose[@]}" exec -T postgres psql -X -U "${POSTGRES_USER:-latex_core}" -d "${POSTGRES_DB:-latex_core}" -Atc "SELECT count(*) FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 24 AND success" 2>/dev/null || true)"
-if [[ "$migrations" == 24 ]]; then pass 'Migrations 1-24 are successful'; else fail 'Migrations 1-24 are not all successful'; fi
+migrations="$("${compose[@]}" exec -T postgres psql -X -U "${POSTGRES_USER:-latex_core}" -d "${POSTGRES_DB:-latex_core}" -Atc "SELECT count(*) FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 26 AND success" 2>/dev/null || true)"
+if [[ "$migrations" == 26 ]]; then pass 'Migrations 1-26 are successful'; else fail 'Migrations 1-26 are not all successful'; fi
 if ./latex-core doctor >/dev/null 2>&1; then pass './latex-core doctor is healthy'; else fail './latex-core doctor failed'; fi
 if ((failures)); then printf '%d install verification check(s) failed.\n' "$failures" >&2; exit 1; fi
 echo 'All install verification checks passed.'

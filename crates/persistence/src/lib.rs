@@ -108,7 +108,7 @@ pub use reviews::{
     ReviewDraftSave, ReviewPaperSummary, ReviewPdfAnchorInput, ReviewPublication,
     ReviewSourceAnchorInput, ReviewThreadInput,
 };
-pub use settings::{BrandingSettings, EditorPreferences};
+pub use settings::{BrandingSettings, EditorPreferences, RecoveryStatus};
 pub use v2::{
     CollaborationAccess, CollaborationAccessMode, CollaborationRecovery, CollaborationUpdateInput,
     GlobalRole, GlobalRoleAssignment, PaperFile, PaperKind, PaperStatus, PaperTeam,

@@ -369,6 +369,14 @@ impl AppRepository {
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound);
         }
+        sqlx::query(
+            "UPDATE latex_core.email_outbox SET status='EXPIRED',secret_ciphertext=NULL,secret_nonce=NULL,claimed_at=NULL,last_error='superseded by password reset' \
+             WHERE account_user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1) AND status IN ('PENDING','SENDING','FAILED')",
+        )
+        .bind(email)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
         sqlx::query("DELETE FROM latex_core.sessions WHERE user_id=(SELECT user_id FROM latex_core.user_credentials WHERE email=$1)").bind(email).execute(&mut *tx).await.map_err(AppError::Database)?;
         tx.commit().await.map_err(AppError::Database)
     }
@@ -475,6 +483,14 @@ impl AppRepository {
         .await
         .map_err(AppError::Database)?;
         let email = email.ok_or(AppError::Forbidden)?;
+        sqlx::query(
+            "UPDATE latex_core.email_outbox SET status='EXPIRED',secret_ciphertext=NULL,secret_nonce=NULL,claimed_at=NULL,last_error='superseded by password reset' \
+             WHERE account_user_id=$1 AND status IN ('PENDING','SENDING','FAILED')",
+        )
+        .bind(user.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
         sqlx::query("DELETE FROM latex_core.sessions WHERE user_id=$1")
             .bind(user.as_uuid())
             .execute(&mut *tx)

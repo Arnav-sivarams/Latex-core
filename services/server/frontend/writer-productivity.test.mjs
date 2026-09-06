@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildOutlineTree, buildPlot, buildTable, buildTheorem, fuzzyRankFiles, packageRequirement } from './writer-productivity.mjs';
+import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildTable, buildTheorem, fuzzyRankFiles, packageRequirement } from './writer-productivity.mjs';
 
 test('outline hierarchy follows section levels', () => {
   const tree = buildOutlineTree([{ level: 'section', title: 'A' }, { level: 'subsection', title: 'B' }, { level: 'section', title: 'C' }]);
@@ -30,6 +30,13 @@ test('plot, BibTeX, algorithm, listing, and theorem output stays editable', () =
   assert.match(buildPlot({ asset: 'data.csv', x: 'time', y: 'value', type: 'scatter' }), /only marks/);
   assert.match(buildBibtexEntry({ type: 'article', key: 'doe2026', title: 'Paper', author: 'Doe', year: '2026' }), /@article\{doe2026/);
   assert.match(buildAlgorithm({ caption: 'Method' }), /\\begin\{algorithmic\}/);
+  assert.match(buildAlgorithm({ family: 'algpseudocode' }), /\\State Describe/);
+  assert.match(buildAlgorithm({ family: 'algorithmic' }), /\\STATE Describe/);
+  const longtable = buildLongTable({ rows: 40, columns: 2, header: true, caption: 'Results' });
+  assert.match(longtable, /^\\begin\{longtable\}/);
+  assert.match(longtable, /\\endfirsthead/);
+  assert.match(longtable, /Cell 40\.2/);
+  assert.doesNotMatch(longtable, /\\begin\{table\}|\\begin\{minipage\}|\\resizebox/);
   assert.match(buildCodeListing({ language: 'Rust', code: 'fn main() {}' }), /lstlisting/);
   assert.match(buildTheorem({ environment: 'lemma', label: 'lem:x' }), /\\begin\{lemma\}/);
 });

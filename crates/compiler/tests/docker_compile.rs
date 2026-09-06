@@ -92,6 +92,159 @@ fn pdf(execution: &compiler::CompileExecution) {
     );
 }
 
+fn log_text(execution: &compiler::CompileExecution) -> String {
+    let artifact = execution
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::Log)
+        .expect("compile log artifact");
+    String::from_utf8_lossy(artifact.bytes()).into_owned()
+}
+
+#[tokio::test]
+async fn package_compat_algorithm_and_algorithmic_commands_compile_on_frozen_m7() {
+    let source = br"\documentclass{article}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\begin{document}
+\begin{algorithm}\caption{Classic commands}\begin{algorithmic}[1]
+\STATE Initialize the result
+\FOR{$i=1$ to $3$}\STATE Update the result\ENDFOR
+\end{algorithmic}\end{algorithm}
+\end{document}
+";
+    let (execution, _) = compile(
+        &[("main.tex", source)],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        execution.status(),
+        CompileStatus::Succeeded,
+        "{}",
+        log_text(&execution)
+    );
+    pdf(&execution);
+}
+
+#[tokio::test]
+async fn package_compat_algorithm_and_algpseudocode_commands_compile_on_frozen_m7() {
+    let source = br"\documentclass{article}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\begin{document}
+\begin{algorithm}\caption{Pseudocode commands}\begin{algorithmic}[1]
+\State Initialize the result
+\For{$i=1$ to $3$}\State Update the result\EndFor
+\end{algorithmic}\end{algorithm}
+\end{document}
+";
+    let (execution, _) = compile(
+        &[("main.tex", source)],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        execution.status(),
+        CompileStatus::Succeeded,
+        "{}",
+        log_text(&execution)
+    );
+    pdf(&execution);
+}
+
+#[tokio::test]
+async fn package_compat_longtable_spans_pages_with_repeated_heading_on_frozen_m7() {
+    let rows = (1..=120)
+        .map(|row| format!("Row {row} & Later-page value {row} \\\\\n"))
+        .collect::<String>();
+    let source = format!(
+        "\\documentclass{{article}}\n\\usepackage{{longtable}}\n\\begin{{document}}\n\\begin{{longtable}}{{ll}}\n\\caption{{Multipage proof}}\\\\\n\\hline Repeated heading & Value \\\\ \\hline\n\\endfirsthead\n\\hline Repeated heading & Value \\\\ \\hline\n\\endhead\n{rows}\\hline\nFinal row & Final value \\\\ \n\\end{{longtable}}\n\\end{{document}}\n"
+    );
+    let (execution, _) = compile(
+        &[("main.tex", source.as_bytes())],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    let log = log_text(&execution);
+    assert_eq!(execution.status(), CompileStatus::Succeeded, "{log}");
+    assert!(
+        log.lines()
+            .any(|line| line.contains("Output written on") && line.contains("pages,")),
+        "multipage output not reported: {log}"
+    );
+    assert!(
+        !log.contains("(1 page,"),
+        "longtable unexpectedly fit on one page: {log}"
+    );
+    pdf(&execution);
+}
+
+#[tokio::test]
+async fn package_compat_longtable_in_two_column_layout_fails_with_actionable_tex_error() {
+    let source = br"\documentclass[twocolumn]{article}
+\usepackage{longtable}
+\begin{document}
+\begin{longtable}{ll}A & B \\\end{longtable}
+\end{document}
+";
+    let (execution, _) = compile(
+        &[("main.tex", source)],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    let log = log_text(&execution);
+    assert_eq!(execution.status(), CompileStatus::Failed);
+    assert!(
+        log.contains("longtable not in 1-column mode"),
+        "unexpected first compatibility error: {log}"
+    );
+}
+
+#[tokio::test]
+async fn package_compat_combined_algorithm_longtable_and_project_image_compile_on_frozen_m7() {
+    let pixel: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let source = br"\documentclass{article}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{longtable}
+\usepackage{graphicx}
+\begin{document}
+\begin{algorithm}\caption{Combined}\begin{algorithmic}\State Compile\end{algorithmic}\end{algorithm}
+\begin{longtable}{ll}\hline Heading & Value \\\endhead Row & One \\\end{longtable}
+\includegraphics[width=1cm]{assets/diagram.png}
+\end{document}
+";
+    let (execution, _) = compile(
+        &[("main.tex", source), ("assets/diagram.png", pixel)],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        execution.status(),
+        CompileStatus::Succeeded,
+        "{}",
+        log_text(&execution)
+    );
+    pdf(&execution);
+}
+
 #[tokio::test]
 async fn s6_representative_builder_output_compiles_on_frozen_m7() {
     let pixel: &[u8] = &[

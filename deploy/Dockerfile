@@ -3,8 +3,8 @@ WORKDIR /src
 COPY . .
 # The repository's development toolchain tracks stable. Pin image builds to the
 # compiler already present in this tagged base so `docker compose up --build`
-# does not try to download a newer toolchain during a release deployment.
-RUN cargo +1.97.0 build --release -p server --bins
+# does not download a second patch-level toolchain during deployment.
+RUN cargo +1.97.1 build --release -p server --bins
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates docker.io && rm -rf /var/lib/apt/lists/*

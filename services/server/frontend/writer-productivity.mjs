@@ -68,6 +68,24 @@ export function buildTable(options = {}) {
   return lines.join('\n');
 }
 
+export function buildLongTable(options = {}) {
+  const rows = clamp(options.rows, 1, 120);
+  const columns = clamp(options.columns, 1, 12);
+  const alignments = Array.from({ length: columns }, (_, index) => ({ left: 'l', center: 'c', right: 'r' }[options.alignments?.[index]] || 'l')).join('');
+  const header = Array.from({ length: columns }, (_, column) => `Header ${column + 1}`).join(' & ');
+  const lines = [`\\begin{longtable}{${alignments}}`];
+  if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}${options.label ? `\\label{${safeLabel(options.label)}}` : ''} \\\\`);
+  else if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);
+  if (options.header) {
+    lines.push('\\hline', `${header} \\\\`, '\\hline', '\\endfirsthead', '\\hline', `${header} \\\\`, '\\hline', '\\endhead');
+  }
+  for (let row = 0; row < rows; row += 1) {
+    lines.push(Array.from({ length: columns }, (_, column) => `Cell ${row + 1}.${column + 1}`).join(' & ') + ' \\\\');
+  }
+  lines.push('\\hline', '\\end{longtable}');
+  return lines.join('\n');
+}
+
 export function buildFigure(options = {}) {
   const width = options.width === 'custom' ? (options.customWidth || '\\linewidth') : (options.width || '\\linewidth');
   const lines = [`\\begin{figure}[${options.placement || 'htbp'}]`, '\\centering', `\\includegraphics[width=${width}]{${safePath(options.asset || 'path/to/image')}}`];
@@ -113,7 +131,8 @@ export function buildBibtexEntry(options = {}) {
 }
 
 export function buildAlgorithm(options = {}) {
-  const body = (options.body || '\\State Describe the method').split('\n').join('\n');
+  const family = options.family === 'algorithmic' ? 'algorithmic' : 'algpseudocode';
+  const body = (options.body || (family === 'algorithmic' ? '\\STATE Describe the method' : '\\State Describe the method')).split('\n').join('\n');
   return `\\begin{algorithm}\n\\caption{${safeText(options.caption || 'Algorithm')}}${options.label ? `\n\\label{${safeLabel(options.label)}}` : ''}\n\\begin{algorithmic}[1]\n${body}\n\\end{algorithmic}\n\\end{algorithm}`;
 }
 
@@ -138,5 +157,6 @@ export const commonSnippets = {
   table: buildTable({ rows: 2, columns: 2, header: true }), equation: buildEquation({ type: 'display' }),
   align: buildEquation({ type: 'aligned' }), itemize: '\\begin{itemize}\n  \\item Item\n\\end{itemize}',
   enumerate: '\\begin{enumerate}\n  \\item Item\n\\end{enumerate}', theorem: buildTheorem(),
-  proof: '\\begin{proof}\nProof.\n\\end{proof}', algorithm: buildAlgorithm(), code: buildCodeListing(),
+  proof: '\\begin{proof}\nProof.\n\\end{proof}', algorithm: buildAlgorithm(),
+  longtable: buildLongTable({ rows: 6, columns: 2, header: true, caption: 'Long table', label: 'tab:long' }), code: buildCodeListing(),
 };

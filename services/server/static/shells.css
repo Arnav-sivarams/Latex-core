@@ -330,6 +330,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .policy-guide div { padding: 9px; border: 1px solid var(--border); border-radius: 6px; }
 .policy-guide small { display: block; color: var(--muted); }
 .system-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+.detail-list { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); gap: 6px 14px; margin: 10px 0 0; }
+.detail-list dt { color: var(--muted); font-weight: 650; }
+.detail-list dd { margin: 0; overflow-wrap: anywhere; }
 .system-card { min-width: 0; padding: 11px; border: 1px solid var(--border); border-radius: 7px; }
 .system-card strong, .system-card span { display: block; overflow-wrap: anywhere; }
 .system-card span { margin-top: 4px; color: var(--muted); }
