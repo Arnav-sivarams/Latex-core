@@ -1,4 +1,6 @@
 .git
+.agents
+.codex
 .env
 .env.*
 !.env.example
@@ -12,6 +14,8 @@ screenshots
 uat-results
 data
 runtime
+.runtime
+.install-diagnostics
 blobs
 backups
 backup

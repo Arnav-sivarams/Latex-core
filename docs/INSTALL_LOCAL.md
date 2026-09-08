@@ -11,7 +11,7 @@ git switch --track origin/professor-feedback-publication-workspace-ux
 ./install.sh
 ```
 
-The installer verifies Docker, anonymously obtains the frozen M7 compiler image when necessary, creates a private `.env`, starts PostgreSQL/API/worker/Caddy, applies migrations, runs the doctor and verifier, and prompts for the first Admin email and permanent password. SMTP is optional. Open the printed URL (normally `http://localhost:8080`).
+The installer verifies Docker, anonymously obtains the frozen M7 compiler image when necessary, creates a private `.env`, starts PostgreSQL/API/worker/Caddy, applies migrations, runs the doctor and verifier, and prompts for the first Admin email and permanent password. SMTP is optional. Open the printed URL (normally `http://localhost:9000`).
 
 Useful commands:
 

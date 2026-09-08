@@ -111,7 +111,7 @@ echo 'PHASE proxy readiness'
 "${LATEX_CORE_COMPOSE[@]}" up -d caddy
 wait_running_stable caddy 60
 http_port="$(latex_core_env_value HTTP_PORT "$LATEX_CORE_ENV_FILE")"
-curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:$http_port/" >/dev/null
+curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:${http_port:-9000}/" >/dev/null
 
 phase=complete
 trap - EXIT

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-for command in git docker awk sed grep mktemp chmod mv python3 curl ss df; do
+for command in git docker awk sed grep mktemp chmod mv python3 curl ss df sha384sum; do
   command -v "$command" >/dev/null 2>&1 || { echo "Unsupported host: required utility '$command' is missing." >&2; exit 1; }
 done
 [[ "$(uname -s)" == Linux ]] || { echo 'Unsupported host: this server release supports Linux only.' >&2; exit 1; }

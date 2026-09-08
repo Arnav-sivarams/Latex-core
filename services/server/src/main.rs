@@ -5045,6 +5045,121 @@ async fn v2_project_search(
     Json(serde_json::json!({"schema_version":1,"workspace_version":workspace.version().get(),"results":results,"truncated":results.len() == 200})).into_response()
 }
 
+fn validate_report_asset(
+    headers: &HeaderMap,
+    path: &LogicalPath,
+    body: &Bytes,
+) -> Result<(), Response> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let extension = path.extension().unwrap_or("").to_ascii_lowercase();
+    let declared_type_matches = matches!(
+        (extension.as_str(), content_type),
+        ("png", "image/png")
+            | ("jpg" | "jpeg", "image/jpeg")
+            | ("pdf", "application/pdf")
+            | ("csv", "text/csv" | "application/csv")
+    );
+    if !declared_type_matches || body.is_empty() {
+        return Err(error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "asset must be a non-empty PNG, JPEG, PDF, or CSV matching its content type",
+        ));
+    }
+    if body.len() > MAX_FILE_BYTES {
+        return Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "assets are limited to 1 MiB",
+        ));
+    }
+    if matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        let expected = if extension == "png" {
+            ImageFormat::Png
+        } else {
+            ImageFormat::Jpeg
+        };
+        if image::guess_format(body).ok() != Some(expected) {
+            return Err(error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "image bytes must match the PNG or JPEG file extension",
+            ));
+        }
+        let mut reader = ImageReader::with_format(std::io::Cursor::new(body.as_ref()), expected);
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_REPORT_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_REPORT_IMAGE_DIMENSION);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        reader.limits(limits);
+        let decoded = match reader.decode() {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "image data is corrupt, unsupported, or exceeds 8192 by 8192 pixels",
+                ));
+            }
+        };
+        let (width, height) = decoded.dimensions();
+        if width == 0
+            || height == 0
+            || width > MAX_REPORT_IMAGE_DIMENSION
+            || height > MAX_REPORT_IMAGE_DIMENSION
+        {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "image dimensions must be between 1 and 8192 pixels",
+            ));
+        }
+    } else if extension == "pdf" && !body.starts_with(b"%PDF-") {
+        return Err(error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "PDF asset data is invalid",
+        ));
+    } else if extension == "csv" && (std::str::from_utf8(body).is_err() || body.contains(&0)) {
+        return Err(error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "CSV asset must be UTF-8 text",
+        ));
+    }
+    Ok(())
+}
+
+async fn replacement_asset_file(
+    state: &AppState,
+    writer: UserId,
+    paper_id: uuid::Uuid,
+    path: &LogicalPath,
+    query: &V2AssetQuery,
+) -> Result<Option<persistence::PaperFile>, Response> {
+    let (Some(file_id), Some(expected_revision)) = (query.replace_file_id, query.file_revision)
+    else {
+        return if query.replace_file_id.is_none() && query.file_revision.is_none() {
+            Ok(None)
+        } else {
+            Err(error(
+                StatusCode::BAD_REQUEST,
+                "asset replacement requires both file identity and revision",
+            ))
+        };
+    };
+    let (_, file) = authorized_file(state, writer, paper_id, file_id).await?;
+    if file.path != *path {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "replacement file path does not match the current report asset",
+        ));
+    }
+    if file.revision != expected_revision {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "asset changed before replacement; reload and choose Replace again",
+        ));
+    }
+    Ok(Some(file))
+}
+
 async fn v2_upload_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5067,105 +5182,14 @@ async fn v2_upload_asset(
         Ok(value) => value,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid asset path"),
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    let extension = path.extension().unwrap_or("").to_ascii_lowercase();
-    let declared_type_matches = matches!(
-        (extension.as_str(), content_type),
-        ("png", "image/png")
-            | ("jpg" | "jpeg", "image/jpeg")
-            | ("pdf", "application/pdf")
-            | ("csv", "text/csv" | "application/csv")
-    );
-    if !declared_type_matches || body.is_empty() {
-        return error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "asset must be a non-empty PNG, JPEG, PDF, or CSV matching its content type",
-        );
+    if let Err(response) = validate_report_asset(&headers, &path, &body) {
+        return response;
     }
-    if body.len() > MAX_FILE_BYTES {
-        return error(StatusCode::PAYLOAD_TOO_LARGE, "assets are limited to 1 MiB");
-    }
-    if matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
-        let expected = if extension == "png" {
-            ImageFormat::Png
-        } else {
-            ImageFormat::Jpeg
-        };
-        if image::guess_format(&body).ok() != Some(expected) {
-            return error(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "image bytes must match the PNG or JPEG file extension",
-            );
-        }
-        let mut reader = ImageReader::with_format(std::io::Cursor::new(body.as_ref()), expected);
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(MAX_REPORT_IMAGE_DIMENSION);
-        limits.max_image_height = Some(MAX_REPORT_IMAGE_DIMENSION);
-        limits.max_alloc = Some(64 * 1024 * 1024);
-        reader.limits(limits);
-        let decoded = match reader.decode() {
+    let replacement =
+        match replacement_asset_file(&state, principal.user_id(), paper_id, &path, &query).await {
             Ok(value) => value,
-            Err(_) => {
-                return error(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "image data is corrupt, unsupported, or exceeds 8192 by 8192 pixels",
-                );
-            }
+            Err(response) => return response,
         };
-        let (width, height) = decoded.dimensions();
-        if width == 0
-            || height == 0
-            || width > MAX_REPORT_IMAGE_DIMENSION
-            || height > MAX_REPORT_IMAGE_DIMENSION
-        {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "image dimensions must be between 1 and 8192 pixels",
-            );
-        }
-    } else if extension == "pdf" && !body.starts_with(b"%PDF-") {
-        return error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "PDF asset data is invalid",
-        );
-    } else if extension == "csv" && (std::str::from_utf8(&body).is_err() || body.contains(&0)) {
-        return error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "CSV asset must be UTF-8 text",
-        );
-    }
-    let replacement = match (query.replace_file_id, query.file_revision) {
-        (None, None) => None,
-        (Some(file_id), Some(expected_revision)) => {
-            let (_, file) =
-                match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
-                    Ok(value) => value,
-                    Err(response) => return response,
-                };
-            if file.path != path {
-                return error(
-                    StatusCode::CONFLICT,
-                    "replacement file path does not match the current report asset",
-                );
-            }
-            if file.revision != expected_revision {
-                return error(
-                    StatusCode::CONFLICT,
-                    "asset changed before replacement; reload and choose Replace again",
-                );
-            }
-            Some(file)
-        }
-        _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "asset replacement requires both file identity and revision",
-            );
-        }
-    };
     let stored = match state.blobs.put(body).await {
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),

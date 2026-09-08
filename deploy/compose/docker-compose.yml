@@ -7,6 +7,8 @@ services:
     env_file:
       - ../../.env
     ports:
+      # Existing main installations did not define this variable and used
+      # 54329. Fresh candidate environments explicitly select 9001.
       - "127.0.0.1:${LATEX_CORE_POSTGRES_PORT:-54329}:5432"
     volumes:
       - latex_core_postgres_data:/var/lib/postgresql
@@ -72,7 +74,9 @@ services:
     image: caddy:2.10-alpine
     restart: unless-stopped
     ports:
-      - "${HTTP_BIND_ADDRESS}:${HTTP_PORT}:8080"
+      # Preserve the main-branch exposure contract when an older .env lacks
+      # HTTP_BIND_ADDRESS. Fresh environments explicitly select loopback:9000.
+      - "${HTTP_BIND_ADDRESS:-0.0.0.0}:${HTTP_PORT:-9000}:8080"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:

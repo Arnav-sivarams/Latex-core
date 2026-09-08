@@ -31,6 +31,7 @@ SMTP is optional during basic installation. To configure password-email delivery
 
 ## Guides
 
+- [Staging Compose handoff](docs/STAGING_COMPOSE_HANDOFF.md)
 - [Local installation](docs/INSTALL_LOCAL.md)
 - [Server installation](docs/INSTALL_SERVER.md)
 - [SMTP setup](docs/SMTP_SETUP.md)

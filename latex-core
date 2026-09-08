@@ -11,7 +11,7 @@ Usage: latex-core {start|stop|restart|status|doctor|diagnose|url|logs|backup|use
 EOF
 }
 require_env() { latex_core_init "$root"; }
-url() { local port; port="$(latex_core_env_value HTTP_PORT "$LATEX_CORE_ENV_FILE")"; printf 'http://localhost:%s\n' "${port:-8080}"; }
+url() { local port; port="$(latex_core_env_value HTTP_PORT "$LATEX_CORE_ENV_FILE")"; printf 'http://localhost:%s\n' "${port:-9000}"; }
 service_state() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf missing; }
 service_health() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || printf none; }
 case "${1:-}" in

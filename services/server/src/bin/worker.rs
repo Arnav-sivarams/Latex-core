@@ -137,9 +137,9 @@ mod tests {
 
     #[test]
     fn staging_probe_accepts_directory_and_rejects_regular_file() {
-        let directory = tempfile::tempdir().unwrap();
-        verify_staging(directory.path()).unwrap();
-        let file = tempfile::NamedTempFile::new().unwrap();
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        verify_staging(directory.path()).expect("temporary directory is writable");
+        let file = tempfile::NamedTempFile::new().expect("temporary file is created");
         assert!(verify_staging(file.path()).is_err());
     }
 }

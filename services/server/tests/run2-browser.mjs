@@ -323,6 +323,10 @@ async function afterRestart() {
   } else {
     assert.equal(beforePublication.payload.threads.length, 2, 'resume requires the already-published two-thread fixture');
   }
+  const publishedThreads = await json(writer.page, `/api/v2/reviews/papers/${state.paperId}/threads`);
+  const secondThread = publishedThreads.payload.threads.find((thread) => thread.messages
+    .some((message) => message.body === 'Second-file private draft'));
+  assert.ok(secondThread, 'published second-file thread missing');
   await assertEventuallyText(writer.page.locator('#toolbarReviewCount'), '2', 20_000);
   await writer.page.locator('#commentsToggle').click();
   const secondCard = writer.page.locator('#writerReviewList .thread-card', { hasText: 'Second-file private draft' });
@@ -349,7 +353,12 @@ async function afterRestart() {
   await writer.page.screenshot({ path: `${evidenceDirectory}/published-second-file-zoom.png`, fullPage: false });
   await cdp.send('Emulation.setPageScaleFactor', { pageScaleFactor: 1 });
 
+  const transitionPath = `/api/v2/reviews/papers/${state.paperId}/threads/${secondThread.id}/state`;
+  expectedDroppedRequests.add(transitionPath);
+  const resolvedResponse = writer.page.waitForResponse((response) => response.request().method() === 'POST'
+    && new URL(response.url()).pathname === transitionPath);
   await secondCard.getByRole('button', { name: 'Done', exact: true }).click();
+  assert.equal((await resolvedResponse).status(), 204, 'Writer Done transition did not complete');
   await assertEventuallyText(writer.page.locator('#toolbarReviewCount'), '1');
   assert.equal(await writer.page.locator('#editorMount .review-source-highlight').count(), 0);
   await writer.page.locator('#writerReviewFilters button[data-filter="RESOLVED"]').click();

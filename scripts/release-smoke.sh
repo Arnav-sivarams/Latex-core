@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-base_url="${LATEX_CORE_URL:-http://127.0.0.1:8080}"
+base_url="${LATEX_CORE_URL:-http://127.0.0.1:9000}"
 cookie_file="$(mktemp)"
 trap 'rm -f "${cookie_file}"' EXIT
 email="smoke-$(date +%s)-${RANDOM}@example.test"

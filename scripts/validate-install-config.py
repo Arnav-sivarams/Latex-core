@@ -64,15 +64,38 @@ def require(values: dict[str, str], name: str) -> str:
     return value
 
 
-def boolean(values: dict[str, str], name: str) -> bool:
-    value = require(values, name)
+def value_or_default(values: dict[str, str], name: str, default: str) -> str:
+    value = values.get(name, default)
+    if not value:
+        raise ConfigError(f"required variable {name} is missing or empty")
+    if PLACEHOLDER.search(value):
+        raise ConfigError(f"required variable {name} still contains a placeholder")
+    return value
+
+
+def boolean(values: dict[str, str], name: str, default: bool | None = None) -> bool:
+    value = (
+        require(values, name)
+        if default is None
+        else value_or_default(values, name, str(default).lower())
+    )
     if value not in {"true", "false"}:
         raise ConfigError(f"{name} must be true or false (the application parser is case-sensitive)")
     return value == "true"
 
 
-def integer(values: dict[str, str], name: str, low: int = 1, high: int | None = None) -> int:
-    value = require(values, name)
+def integer(
+    values: dict[str, str],
+    name: str,
+    low: int = 1,
+    high: int | None = None,
+    default: int | None = None,
+) -> int:
+    value = (
+        require(values, name)
+        if default is None
+        else value_or_default(values, name, str(default))
+    )
     if not value.isascii() or not value.isdecimal():
         raise ConfigError(f"{name} must be a base-10 integer")
     parsed = int(value)
@@ -106,7 +129,7 @@ def validate_database(values: dict[str, str]) -> None:
 
 
 def validate_mail(values: dict[str, str]) -> None:
-    enabled = boolean(values, "LATEX_CORE_MAIL_ENABLED")
+    enabled = boolean(values, "LATEX_CORE_MAIL_ENABLED", False)
     if not enabled:
         return
     host = require(values, "LATEX_CORE_SMTP_HOST")
@@ -146,16 +169,18 @@ def validate(path: Path) -> None:
     conflicts = sorted(key for key in managed if key in os.environ and os.environ[key] != values[key])
     if conflicts:
         raise ConfigError("exported configuration conflicts with .env: " + ", ".join(conflicts) + "; unset those variables and rerun")
-    if not PROJECT.fullmatch(require(values, "COMPOSE_PROJECT_NAME")):
+    if not PROJECT.fullmatch(value_or_default(values, "COMPOSE_PROJECT_NAME", "latex-core")):
         raise ConfigError("COMPOSE_PROJECT_NAME must use 2-63 lowercase letters, numbers, dashes, or underscores")
     integer(values, "HTTP_PORT", 1, 65535)
-    integer(values, "LATEX_CORE_POSTGRES_PORT", 1, 65535)
-    bind = require(values, "HTTP_BIND_ADDRESS")
+    # These defaults exactly preserve the main-branch Compose behavior for an
+    # existing .env. Fresh candidate environments write 9001 and loopback.
+    integer(values, "LATEX_CORE_POSTGRES_PORT", 1, 65535, 54329)
+    bind = value_or_default(values, "HTTP_BIND_ADDRESS", "0.0.0.0")
     if bind not in {"127.0.0.1", "0.0.0.0"}:
         raise ConfigError("HTTP_BIND_ADDRESS must be 127.0.0.1 or 0.0.0.0 for this release")
     validate_database(values)
     boolean(values, "SESSION_COOKIE_SECURE")
-    integer(values, "SESSION_TTL_SECONDS")
+    integer(values, "SESSION_TTL_SECONDS", default=604800)
     boolean(values, "ALLOW_REGISTRATION")
     if require(values, "COMPILER_IMAGE") != EXPECTED_IMAGE:
         raise ConfigError("COMPILER_IMAGE must retain the frozen M7 sha256 identity")
@@ -166,18 +191,32 @@ def validate(path: Path) -> None:
         raise ConfigError("WORKER_STAGING_HOST_ROOT must be a dedicated absolute path without '..' or commas")
     if "latex-core" not in str(staging):
         raise ConfigError("WORKER_STAGING_HOST_ROOT must identify a dedicated latex-core path")
-    for name in ("WORKER_CONCURRENCY", "QUEUE_GLOBAL_RUNNING", "QUEUE_PER_USER_RUNNING", "QUEUE_PER_USER_OUTSTANDING", "QUEUE_LEASE_SECONDS", "QUEUE_MAX_ATTEMPTS"):
-        integer(values, name)
-    public_url = urlsplit(require(values, "LATEX_CORE_PUBLIC_BASE_URL"))
-    if public_url.scheme not in {"http", "https"} or not public_url.hostname or public_url.username or public_url.password:
-        raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL must be an http(s) origin without credentials")
-    secure = values["SESSION_COOKIE_SECURE"] == "true"
-    if (public_url.scheme == "https") != secure:
-        raise ConfigError("SESSION_COOKIE_SECURE must be true for https and false for http access")
-    if public_url.hostname in {"localhost", "127.0.0.1"} and public_url.scheme == "http":
-        public_port = public_url.port or 80
-        if public_port != int(values["HTTP_PORT"]):
-            raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL port must match HTTP_PORT for local access")
+    defaults = {
+        "WORKER_CONCURRENCY": 1,
+        "QUEUE_GLOBAL_RUNNING": 2,
+        "QUEUE_PER_USER_RUNNING": 1,
+        "QUEUE_PER_USER_OUTSTANDING": 8,
+        "QUEUE_LEASE_SECONDS": 120,
+        "QUEUE_MAX_ATTEMPTS": 3,
+    }
+    for name, default in defaults.items():
+        integer(values, name, default=default)
+    public_url_value = values.get("LATEX_CORE_PUBLIC_BASE_URL", "")
+    if public_url_value:
+        public_url = urlsplit(public_url_value)
+        if public_url.scheme not in {"http", "https"} or not public_url.hostname or public_url.username or public_url.password:
+            raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL must be an http(s) origin without credentials")
+        secure = values["SESSION_COOKIE_SECURE"] == "true"
+        if (public_url.scheme == "https") != secure:
+            raise ConfigError("SESSION_COOKIE_SECURE must be true for https and false for http access")
+        if public_url.hostname in {"localhost", "127.0.0.1"} and public_url.scheme == "http":
+            public_port = public_url.port or 80
+            if public_port != int(values["HTTP_PORT"]):
+                raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL port must match HTTP_PORT for local access")
+    if "LATEX_CORE_BACKUP_SCHEDULE_CONFIGURED" in values:
+        boolean(values, "LATEX_CORE_BACKUP_SCHEDULE_CONFIGURED")
+    if "LATEX_CORE_BACKUP_OFFHOST_CONFIGURED" in values:
+        boolean(values, "LATEX_CORE_BACKUP_OFFHOST_CONFIGURED")
     validate_mail(values)
 
 

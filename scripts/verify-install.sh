@@ -37,7 +37,7 @@ failed_migrations="$("${LATEX_CORE_COMPOSE[@]}" exec -T postgres sh -ceu 'PGPASS
 if [[ "$actual_versions" == "$expected_versions" && "$failed_migrations" == 0 ]]; then pass 'database migration version set matches this checkout'; else fail 'database migration version set does not match this checkout'; fi
 if "$root/latex-core" doctor >/dev/null; then pass 'Worker database/storage/staging/Docker/compiler readiness'; else fail 'Worker readiness failed'; fi
 http_port="$(latex_core_env_value HTTP_PORT "$root/.env")"
-if curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:$http_port/" >/dev/null; then pass 'proxy serves the application'; else fail 'proxy readiness failed'; fi
+if curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:${http_port:-9000}/" >/dev/null; then pass 'proxy serves the application'; else fail 'proxy readiness failed'; fi
 
 if ((failures)); then printf '%d install verification check(s) failed. Run ./scripts/diagnose-install.sh.\n' "$failures" >&2; exit 1; fi
 echo 'All install verification checks passed.'

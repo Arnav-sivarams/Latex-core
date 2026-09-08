@@ -19,10 +19,10 @@ git switch --track origin/professor-feedback-publication-workspace-ux
 ./install.sh
 ```
 
-The default binds Caddy to `127.0.0.1:8080`, disables registration and SMTP, and is suitable for local access or an SSH tunnel:
+The default binds Caddy to `127.0.0.1:9000`, disables registration and SMTP, and is suitable for local access or an SSH tunnel:
 
 ```sh
-ssh -L 8080:127.0.0.1:8080 operator@server
+ssh -L 9000:127.0.0.1:9000 operator@server
 ```
 
 The installer generates `.env` once with mode 600, a random PostgreSQL password, a matching URL-encoded-safe database URL, and a standard-base64 32-byte mail encryption key. Mail-disabled startup does not require SMTP host, username, or password. The mail key is generated separately so later mail enablement does not require replacing other secrets; disabling mail never deletes queued credentials or rewrites that key.

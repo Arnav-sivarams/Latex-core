@@ -52,11 +52,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     POSTGRES_PASSWORD=*) printf 'POSTGRES_PASSWORD=%s\n' "$postgres_password" ;;
     DATABASE_URL=*) printf 'DATABASE_URL=postgresql://latex_core:%s@postgres:5432/latex_core\n' "$postgres_password" ;;
     COMPOSE_PROJECT_NAME=*) printf 'COMPOSE_PROJECT_NAME=%s\n' "$project_name" ;;
-    HTTP_PORT=*) printf 'HTTP_PORT=%s\n' "${HTTP_PORT:-8080}" ;;
+    HTTP_PORT=*) printf 'HTTP_PORT=%s\n' "${HTTP_PORT:-9000}" ;;
     HTTP_BIND_ADDRESS=*) printf 'HTTP_BIND_ADDRESS=%s\n' "${HTTP_BIND_ADDRESS:-127.0.0.1}" ;;
-    LATEX_CORE_POSTGRES_PORT=*) printf 'LATEX_CORE_POSTGRES_PORT=%s\n' "${LATEX_CORE_POSTGRES_PORT:-54329}" ;;
+    LATEX_CORE_POSTGRES_PORT=*) printf 'LATEX_CORE_POSTGRES_PORT=%s\n' "${LATEX_CORE_POSTGRES_PORT:-9001}" ;;
     WORKER_STAGING_HOST_ROOT=*) printf 'WORKER_STAGING_HOST_ROOT=%s\n' "${WORKER_STAGING_HOST_ROOT:-$staging_default}" ;;
-    LATEX_CORE_PUBLIC_BASE_URL=*) printf 'LATEX_CORE_PUBLIC_BASE_URL=%s\n' "${LATEX_CORE_PUBLIC_BASE_URL:-http://localhost:${HTTP_PORT:-8080}}" ;;
+    LATEX_CORE_PUBLIC_BASE_URL=*) printf 'LATEX_CORE_PUBLIC_BASE_URL=%s\n' "${LATEX_CORE_PUBLIC_BASE_URL:-http://localhost:${HTTP_PORT:-9000}}" ;;
     LATEX_CORE_MAIL_SECRET_KEY=*) printf 'LATEX_CORE_MAIL_SECRET_KEY=%s\n' "$mail_key" ;;
     *) printf '%s\n' "$line" ;;
   esac
