@@ -73,6 +73,7 @@ const MAX_REPORT_IMAGE_DIMENSION: u32 = 8192;
 
 #[derive(Clone)]
 struct AppState {
+    database: Database,
     repo: AppRepository,
     v2: V2Repository,
     institution: InstitutionRepository,
@@ -623,6 +624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collaboration =
         collaboration::CollaborationHub::new(v2.clone(), workspaces.clone(), blobs.clone());
     let state = AppState {
+        database: database.clone(),
         repo: mail_config.clone().map_or_else(
             || AppRepository::new(database.clone()),
             |config| AppRepository::new(database.clone()).with_mail(config),
@@ -667,6 +669,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 )]
 fn router(state: AppState) -> Router {
     Router::new()
+        .route("/api/readiness", get(readiness))
         .route("/", get(ui))
         .route("/login", post(browser_login))
         .route("/logout", post(browser_logout))
@@ -9531,6 +9534,15 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     )
         .into_response()
 }
+async fn readiness(State(state): State<AppState>) -> StatusCode {
+    match state.database.health_check().await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(error) => {
+            tracing::warn!(%error, "readiness database check failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
 }
@@ -15219,6 +15231,7 @@ mod database_tests {
         )
         .unwrap();
         let state = AppState {
+            database: database.clone(),
             repo: AppRepository::new(database.clone()).with_mail(mail_config.clone()),
             v2,
             institution: InstitutionRepository::new(database.clone())

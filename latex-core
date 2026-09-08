@@ -1,32 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 root="$(cd "$(dirname "$0")" && pwd)"
-project="${COMPOSE_PROJECT_NAME:-}"
-if [[ -z "$project" && -f "$root/.env" ]]; then
-  project="$(awk -F= '$1=="COMPOSE_PROJECT_NAME"{print substr($0,index($0,"=")+1)}' "$root/.env" | tail -n1)"
-fi
-project="${project:-latex-core}"
-compose=(docker compose --project-name "$project" --env-file "$root/.env" -f "$root/deploy/compose/docker-compose.yml")
-usage(){ cat <<'EOF'
+# shellcheck source=scripts/install-common.sh
+source "$root/scripts/install-common.sh"
+usage() {
+  cat <<'EOF'
 LaTeX Core server administration
-Usage: latex-core {start|stop|restart|status|doctor|url|logs|backup|user|template|config|version}
+Usage: latex-core {start|stop|restart|status|doctor|diagnose|url|logs|backup|user|template|config|version}
 EOF
 }
-require_env(){ [[ -f "$root/.env" ]] || { echo 'LaTeX Core is not installed. Run ./install.sh first.' >&2; return 1; }; }
-url(){ local port; port="$(awk -F= '$1=="HTTP_PORT"{print $2}' "$root/.env" | tail -n1)"; printf 'http://localhost:%s\n' "${port:-8080}"; }
-service_state(){ local service="$1" id; id="$("${compose[@]}" ps -q "$service")"; [[ -n "$id" ]] && docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf 'missing'; }
+require_env() { latex_core_init "$root"; }
+url() { local port; port="$(latex_core_env_value HTTP_PORT "$LATEX_CORE_ENV_FILE")"; printf 'http://localhost:%s\n' "${port:-8080}"; }
+service_state() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf missing; }
+service_health() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || printf none; }
 case "${1:-}" in
-  start) require_env; "${compose[@]}" up -d --build >/dev/null 2>&1; echo 'LaTeX Core is running.'; printf 'URL          '; url ;;
-  stop) require_env; "${compose[@]}" down >/dev/null 2>&1; echo 'LaTeX Core stopped.' ;;
-  restart) require_env; "${compose[@]}" down >/dev/null 2>&1; "${compose[@]}" up -d --build >/dev/null 2>&1; echo 'LaTeX Core restarted.'; printf 'URL          '; url ;;
-  status) require_env; printf 'LaTeX Core\n────────────────────────────────\n'; api="$(service_state api)"; db="$(service_state postgres)"; worker="$(service_state worker)"; caddy="$(service_state caddy)"; [[ "$api" == running && "$db" == running && "$worker" == running && "$caddy" == running ]] && overall=Running || overall=Degraded; printf 'Status       %s\nURL          ' "$overall"; url; printf 'Database     %s\nQueue        %s\nCompiler     %s\nWorkers      %s\n' "$db" "$worker" "$worker" "$([[ "$worker" == running ]] && echo 1 || echo 0)" ;;
-  doctor) require_env; "${compose[@]}" exec -T worker /usr/local/bin/latex-core-doctor ;;
+  start|restart)
+    require_env; "$root/scripts/start-install-services.sh"
+    echo 'LaTeX Core is running.'; printf 'URL          '; url ;;
+  stop)
+    require_env; "${LATEX_CORE_COMPOSE[@]}" down
+    echo 'LaTeX Core stopped. Persistent volumes were retained.' ;;
+  status)
+    require_env; printf 'LaTeX Core\n────────────────────────────────\n'
+    api="$(service_state api)"; api_health="$(service_health api)"
+    db="$(service_state postgres)"; db_health="$(service_health postgres)"
+    worker="$(service_state worker)"; caddy="$(service_state caddy)"
+    if [[ "$api" == running && "$api_health" == healthy && "$db" == running && "$db_health" == healthy && "$worker" == running && "$caddy" == running ]]; then overall=Running; else overall=Degraded; fi
+    printf 'Status       %s\nURL          ' "$overall"; url
+    printf 'Database     %s (%s)\nAPI          %s (%s)\nWorker       %s\nProxy        %s\n' "$db" "$db_health" "$api" "$api_health" "$worker" "$caddy" ;;
+  doctor) require_env; "${LATEX_CORE_COMPOSE[@]}" exec -T worker /usr/local/bin/latex-core-doctor ;;
+  diagnose) exec "$root/scripts/diagnose-install.sh" ;;
   url) require_env; url ;;
-  logs) require_env; service="${2:-}"; case "$service" in '' ) "${compose[@]}" logs --tail="${LOG_TAIL:-200}";; api|worker) "${compose[@]}" logs --tail="${LOG_TAIL:-200}" "$service";; database) "${compose[@]}" logs --tail="${LOG_TAIL:-200}" postgres;; *) echo 'usage: latex-core logs [api|worker|database]' >&2; exit 2;; esac ;;
+  logs)
+    require_env; service="${2:-}"
+    case "$service" in
+      '') "${LATEX_CORE_COMPOSE[@]}" logs --tail="${LOG_TAIL:-200}" ;;
+      api|worker|caddy) "${LATEX_CORE_COMPOSE[@]}" logs --tail="${LOG_TAIL:-200}" "$service" ;;
+      database|postgres) "${LATEX_CORE_COMPOSE[@]}" logs --tail="${LOG_TAIL:-200}" postgres ;;
+      *) echo 'usage: latex-core logs [api|worker|database|caddy]' >&2; exit 2 ;;
+    esac ;;
   backup) require_env; "$root/scripts/backup-release.sh" "${2:?usage: latex-core backup DIRECTORY}" ;;
-  user) require_env; shift; "${compose[@]}" exec -T api /usr/local/bin/latex-core-admin user "$@" ;;
-  template) require_env; shift; if [[ "${1:-}" == add ]]; then zip="${2:?usage: latex-core template add ZIP --name NAME [--main PATH]}"; [[ -f "$zip" ]] || { echo 'Template ZIP not found.' >&2; exit 2; }; api_id="$("${compose[@]}" ps -q api)"; [[ -n "$api_id" ]] || { echo 'LaTeX Core API is not running.' >&2; exit 1; }; remote="/tmp/latex-core-template-$$.zip"; docker cp "$zip" "$api_id:$remote"; "${compose[@]}" exec -T api /usr/local/bin/latex-core-admin template add "$remote" "${@:3}"; docker exec "$api_id" rm -f "$remote" >/dev/null; else "${compose[@]}" exec -T api /usr/local/bin/latex-core-admin template "$@"; fi ;;
-  config) require_env; printf 'LaTeX Core configuration\n────────────────────────────────\n'; awk -F= '$1 ~ /^(HTTP_PORT|WORKER_CONCURRENCY|QUEUE_GLOBAL_RUNNING|QUEUE_PER_USER_RUNNING|QUEUE_PER_USER_OUTSTANDING|ALLOW_REGISTRATION|COMPILER_IMAGE|TEX_ENVIRONMENT_ID|WORKER_STAGING_HOST_ROOT)$/ {print $1 "=" $2}' "$root/.env" | sed -e 's/^HTTP_PORT=/Port          /' -e 's/^WORKER_CONCURRENCY=/Workers       /' -e 's/^ALLOW_REGISTRATION=/Registration  /' ;;
+  user) require_env; shift; "${LATEX_CORE_COMPOSE[@]}" exec -T api /usr/local/bin/latex-core-admin user "$@" ;;
+  template)
+    require_env; shift
+    if [[ "${1:-}" == add ]]; then
+      zip="${2:?usage: latex-core template add ZIP --name NAME [--main PATH]}"
+      [[ -f "$zip" ]] || { echo 'Template ZIP not found.' >&2; exit 2; }
+      api_id="$(latex_core_container_id api)"; [[ -n "$api_id" ]] || { echo 'LaTeX Core API is not running.' >&2; exit 1; }
+      remote="/tmp/latex-core-template-$$.zip"; docker cp "$zip" "$api_id:$remote"
+      "${LATEX_CORE_COMPOSE[@]}" exec -T api /usr/local/bin/latex-core-admin template add "$remote" "${@:3}"
+      docker exec "$api_id" rm -f "$remote" >/dev/null
+    else
+      "${LATEX_CORE_COMPOSE[@]}" exec -T api /usr/local/bin/latex-core-admin template "$@"
+    fi ;;
+  config)
+    require_env; printf 'LaTeX Core configuration\n────────────────────────────────\n'
+    for key in HTTP_BIND_ADDRESS HTTP_PORT COMPOSE_PROJECT_NAME WORKER_CONCURRENCY QUEUE_GLOBAL_RUNNING QUEUE_PER_USER_RUNNING QUEUE_PER_USER_OUTSTANDING ALLOW_REGISTRATION COMPILER_IMAGE TEX_ENVIRONMENT_ID WORKER_STAGING_HOST_ROOT; do
+      printf '%s=%s\n' "$key" "$(latex_core_env_value "$key" "$LATEX_CORE_ENV_FILE")"
+    done ;;
   version|--version) echo 'latex-core 0.1.0' ;;
   --help|-h|help) usage ;;
   *) usage >&2; exit 2 ;;

@@ -40,6 +40,8 @@ random_base64_32() {
 }
 postgres_password="$(random_hex)"
 mail_key="$(random_base64_32)"
+project_name="${COMPOSE_PROJECT_NAME:-latex-core}"
+staging_default="$root/.runtime/${project_name}-worker-staging"
 target_directory="$(dirname "$target")"
 [[ -d "$target_directory" ]] || { echo 'Output directory does not exist.' >&2; exit 1; }
 temporary="$(mktemp "$target_directory/.latex-core-env.tmp.XXXXXX")"
@@ -49,10 +51,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   case "$line" in
     POSTGRES_PASSWORD=*) printf 'POSTGRES_PASSWORD=%s\n' "$postgres_password" ;;
     DATABASE_URL=*) printf 'DATABASE_URL=postgresql://latex_core:%s@postgres:5432/latex_core\n' "$postgres_password" ;;
-    COMPOSE_PROJECT_NAME=*) printf 'COMPOSE_PROJECT_NAME=%s\n' "${COMPOSE_PROJECT_NAME:-latex-core}" ;;
+    COMPOSE_PROJECT_NAME=*) printf 'COMPOSE_PROJECT_NAME=%s\n' "$project_name" ;;
     HTTP_PORT=*) printf 'HTTP_PORT=%s\n' "${HTTP_PORT:-8080}" ;;
+    HTTP_BIND_ADDRESS=*) printf 'HTTP_BIND_ADDRESS=%s\n' "${HTTP_BIND_ADDRESS:-127.0.0.1}" ;;
     LATEX_CORE_POSTGRES_PORT=*) printf 'LATEX_CORE_POSTGRES_PORT=%s\n' "${LATEX_CORE_POSTGRES_PORT:-54329}" ;;
-    WORKER_STAGING_HOST_ROOT=*) printf 'WORKER_STAGING_HOST_ROOT=%s\n' "${WORKER_STAGING_HOST_ROOT:-/tmp/latex-core-worker-staging}" ;;
+    WORKER_STAGING_HOST_ROOT=*) printf 'WORKER_STAGING_HOST_ROOT=%s\n' "${WORKER_STAGING_HOST_ROOT:-$staging_default}" ;;
     LATEX_CORE_PUBLIC_BASE_URL=*) printf 'LATEX_CORE_PUBLIC_BASE_URL=%s\n' "${LATEX_CORE_PUBLIC_BASE_URL:-http://localhost:${HTTP_PORT:-8080}}" ;;
     LATEX_CORE_MAIL_SECRET_KEY=*) printf 'LATEX_CORE_MAIL_SECRET_KEY=%s\n' "$mail_key" ;;
     *) printf '%s\n' "$line" ;;

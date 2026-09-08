@@ -12,12 +12,12 @@ This is the Professor V2 release candidate. The retired V1 workspace and Researc
 
 ## Quick Start
 
-Requirements: Git, Docker, and Docker Compose v2. On Windows, use WSL2 Ubuntu with Docker Desktop WSL integration.
+The current installation-hardening candidate is published on the named candidate branch; no release tag points at it yet. Do not use `v2.3.0-rc2` when qualifying this candidate.
 
 ```sh
 git clone https://github.com/Arnav-sivarams/latex-core.git
 cd latex-core
-git checkout v2.3.0-rc2
+git switch --track origin/professor-feedback-publication-workspace-ux
 ./install.sh
 ```
 

@@ -19,6 +19,8 @@ latex-core-generated-credentials-*.csv
 credentials-*.csv
 data/
 runtime/
+.runtime/
+.install-diagnostics/
 blobs/
 backups/
 backup/

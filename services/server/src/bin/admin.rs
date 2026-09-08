@@ -22,6 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database =
         Database::connect(DatabaseConfig::development(required("DATABASE_URL")?)?).await?;
     database.migrate().await?;
+    if group == "database" && command == "migrate" && args.next().is_none() {
+        println!("Embedded SQLx migrations applied and verified.");
+        return Ok(());
+    }
     let v2 = V2Repository::new(database.clone());
     let repo = AppRepository::new(database);
     if group == "template" {
@@ -265,7 +269,7 @@ fn user_list_line(user: &persistence::V2User) -> String {
     )
 }
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
-    Err("usage: latex-core-admin user <create|list|disable|enable|reset-password|set-type> EMAIL [--password PASSWORD] | user bootstrap-admin --email EMAIL --password-stdin | template <add|list|remove|set-audience|grant-user>".into())
+    Err("usage: latex-core-admin database migrate | user <create|list|disable|enable|reset-password|set-type> EMAIL [--password PASSWORD] | user bootstrap-admin --email EMAIL --password-stdin | template <add|list|remove|set-audience|grant-user>".into())
 }
 
 #[cfg(test)]

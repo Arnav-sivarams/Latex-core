@@ -2,12 +2,12 @@
 
 ## One-command installation
 
-Install Git, Docker, and Docker Compose v2 first. Docker must be running and usable by your account. Linux and macOS are supported. On Windows, install WSL2 with Ubuntu, enable Docker Desktop's WSL integration, and run every command inside Ubuntu.
+The qualified server contract is in [Server installation](INSTALL_SERVER.md). Local development is accepted on Ubuntu 24.04 x86_64, including WSL2 Ubuntu when Docker Desktop exposes the local `/var/run/docker.sock` endpoint. Native macOS and non-amd64 images are not supported by this installer candidate.
 
 ```sh
 git clone https://github.com/Arnav-sivarams/latex-core.git
 cd latex-core
-git checkout v2.3.0-rc2
+git switch --track origin/professor-feedback-publication-workspace-ux
 ./install.sh
 ```
 
@@ -21,6 +21,7 @@ Useful commands:
 ./latex-core logs
 ./latex-core logs api
 ./latex-core logs worker
+./latex-core diagnose
 ./latex-core restart
 ./latex-core stop
 ./install.sh --verify-only

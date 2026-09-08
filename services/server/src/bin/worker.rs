@@ -13,7 +13,7 @@ use compiler::{CompileLimits, CompilerConfig, CompilerService, DockerCliRuntime}
 use core_types::TexEnvironmentId;
 use persistence::{Database, DatabaseConfig, PostgresCompileQueue, QueueLimits};
 use queue::{CompilationWorker, WorkerConfig, WorkerShutdown};
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reaped = runtime.reap_orphans()?;
     tracing::info!(reaped, "reaped stale labelled compiler containers");
     let staging = PathBuf::from(required("WORKER_STAGING_ROOT")?);
+    verify_staging(&staging)?;
     let compiler = CompilerService::new(
         blobs.clone(),
         runtime,
@@ -91,6 +92,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     compile_result?;
     Ok(())
 }
+fn verify_staging(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(path)?;
+    let probe = path.join(format!(
+        ".latex-core-worker-write-check-{}",
+        std::process::id()
+    ));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    fs::remove_file(probe)?;
+    Ok(())
+}
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is missing").into())
 }
@@ -115,4 +129,17 @@ fn queue_limits() -> Result<QueueLimits, Box<dyn std::error::Error>> {
         u32::try_from(int_env("QUEUE_MAX_ATTEMPTS", 3)?)?,
     )
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_probe_accepts_directory_and_rejects_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        verify_staging(directory.path()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(verify_staging(file.path()).is_err());
+    }
 }

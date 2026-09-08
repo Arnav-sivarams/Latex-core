@@ -12,6 +12,7 @@ case "$enable" in
 esac
 declare -A updates
 updates[LATEX_CORE_MAIL_ENABLED]="$enabled"
+declare -A quote_value
 if [[ "$enabled" == true ]]; then
   read -r -p 'SMTP host: ' smtp_host
   read -r -p 'SMTP port: ' smtp_port
@@ -43,6 +44,9 @@ if [[ "$enabled" == true ]]; then
   updates[LATEX_CORE_SMTP_FROM_EMAIL]="$from_email"
   updates[LATEX_CORE_SMTP_FROM_NAME]="$from_name"
   updates[LATEX_CORE_PUBLIC_BASE_URL]="$public_base_url"
+  for key in LATEX_CORE_SMTP_HOST LATEX_CORE_SMTP_USERNAME LATEX_CORE_SMTP_PASSWORD LATEX_CORE_SMTP_FROM_EMAIL LATEX_CORE_SMTP_FROM_NAME LATEX_CORE_PUBLIC_BASE_URL; do
+    quote_value[$key]=1
+  done
 fi
 temporary="$(mktemp "$root/.env.smtp.tmp.XXXXXX")"
 trap 'rm -f "$temporary"' EXIT
@@ -51,14 +55,28 @@ declare -A seen
 while IFS= read -r line || [[ -n "$line" ]]; do
   key="${line%%=*}"
   if [[ -v "updates[$key]" ]]; then
-    printf '%s=%s\n' "$key" "${updates[$key]}"
+    value="${updates[$key]}"
+    if [[ -v "quote_value[$key]" ]]; then
+      value="${value//\'/\\\'}"
+      printf "%s='%s'\n" "$key" "$value"
+    else
+      printf '%s=%s\n' "$key" "$value"
+    fi
     seen[$key]=1
   else
     printf '%s\n' "$line"
   fi
 done <"$env_file" >"$temporary"
 for key in "${!updates[@]}"; do
-  [[ -v "seen[$key]" ]] || printf '%s=%s\n' "$key" "${updates[$key]}" >>"$temporary"
+  if [[ ! -v "seen[$key]" ]]; then
+    value="${updates[$key]}"
+    if [[ -v "quote_value[$key]" ]]; then
+      value="${value//\'/\\\'}"
+      printf "%s='%s'\n" "$key" "$value" >>"$temporary"
+    else
+      printf '%s=%s\n' "$key" "$value" >>"$temporary"
+    fi
+  fi
 done
 chmod 600 "$temporary" 2>/dev/null || true
 mv -f "$temporary" "$env_file"

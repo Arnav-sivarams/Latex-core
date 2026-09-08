@@ -7,7 +7,7 @@ COPY . .
 RUN cargo +1.97.1 build --release -p server --bins
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates docker.io && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl docker.io && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/latex-core-api /usr/local/bin/latex-core-api
 COPY --from=build /src/target/release/latex-core-worker /usr/local/bin/latex-core-worker
 COPY --from=build /src/target/release/latex-core-doctor /usr/local/bin/latex-core-doctor
