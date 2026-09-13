@@ -654,7 +654,8 @@ async fn assert_membership_has_only_team_leader_capability(pool: &PgPool) {
             "user_id",
             "assigned_by_user_id",
             "created_at",
-            "is_leader"
+            "is_leader",
+            "writer_order"
         ]
     );
 }

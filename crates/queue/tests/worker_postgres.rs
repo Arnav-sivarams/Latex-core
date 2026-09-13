@@ -69,9 +69,21 @@ async fn fixture(limits: QueueLimits) -> Fixture {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO latex_core.user_credentials (user_id,email,password_hash) VALUES ($1,$2,'test-hash')")
+        .bind(user.as_uuid())
+        .bind(format!("worker-{user}@example.test"))
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO latex_core.workspaces (id,tenant_id,owner_user_id) VALUES ($1,$2,$3)")
         .bind(workspace.as_uuid())
         .bind(tenant.as_uuid())
+        .bind(user.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.projects (workspace_id,owner_user_id,name) VALUES ($1,$2,'Worker fixture')")
+        .bind(workspace.as_uuid())
         .bind(user.as_uuid())
         .execute(&pool)
         .await

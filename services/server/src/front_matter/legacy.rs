@@ -408,7 +408,35 @@ pub fn details(
     )
 }
 
+/// A previously chosen identity may cease to apply after institutional changes.
+/// Keep that historical choice in history, but require a current applicable choice.
+pub fn applicable_overrides(
+    automatic: &BTreeMap<String, Value>,
+    overrides: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    let mut result = overrides.clone();
+    for identity in ["guide", "dean"] {
+        let key = format!("{identity}_identity");
+        let options = automatic
+            .get(&format!("{identity}.options"))
+            .and_then(Value::as_array);
+        if result.get(&key).is_some_and(|chosen| {
+            !options.is_some_and(|items| items.iter().any(|item| item["value"] == *chosen))
+        }) {
+            result.remove(&key);
+        }
+        if identity == "dean" && options.is_some_and(|items| items.len() > 1) {
+            result.remove("dean_name");
+        }
+    }
+    result
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit test fixtures contain fixed valid paths and values"
+)]
 mod tests {
     use super::*;
     use crate::{archive::ImportedArchive, front_matter::validate_archive};
@@ -583,28 +611,4 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.resolved["hod_name"].source, "AUTO");
     }
-}
-
-/// A previously chosen identity may cease to apply after institutional changes.
-/// Keep that historical choice in history, but require a current applicable choice.
-pub fn applicable_overrides(
-    automatic: &BTreeMap<String, Value>,
-    overrides: &BTreeMap<String, Value>,
-) -> BTreeMap<String, Value> {
-    let mut result = overrides.clone();
-    for identity in ["guide", "dean"] {
-        let key = format!("{identity}_identity");
-        let options = automatic
-            .get(&format!("{identity}.options"))
-            .and_then(Value::as_array);
-        if result.get(&key).is_some_and(|chosen| {
-            !options.is_some_and(|items| items.iter().any(|item| item["value"] == *chosen))
-        }) {
-            result.remove(&key);
-        }
-        if identity == "dean" && options.is_some_and(|items| items.len() > 1) {
-            result.remove("dean_name");
-        }
-    }
-    result
 }
