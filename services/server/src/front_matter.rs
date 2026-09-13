@@ -9,6 +9,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+pub mod legacy;
+
 pub const MANIFEST_PATH: &str = "frontmatter.json";
 pub const MANAGED_ROOT: &str = ".latex-core/frontmatter";
 pub const INTEGRATION_MARKER: &str =
@@ -137,7 +139,21 @@ pub enum FrontMatterError {
     InvalidValue(String),
 }
 
-pub fn validate_archive(archive: ImportedArchive) -> Result<ValidatedPack, FrontMatterError> {
+pub fn validate_archive(mut archive: ImportedArchive) -> Result<ValidatedPack, FrontMatterError> {
+    if !archive
+        .files
+        .iter()
+        .any(|file| file.path.as_str() == MANIFEST_PATH)
+    {
+        let manifest = legacy::normalize(&archive.files)?;
+        archive.files.push(ImportedFile {
+            path: LogicalPath::parse(MANIFEST_PATH)
+                .map_err(|_| FrontMatterError::InvalidManifest)?,
+            bytes: Bytes::from(
+                serde_json::to_vec(&manifest).map_err(|_| FrontMatterError::InvalidManifest)?,
+            ),
+        });
+    }
     let manifest_file = archive
         .files
         .iter()
@@ -174,13 +190,22 @@ pub fn validate_manifest(
     manifest: &FrontMatterManifest,
     files: &[ImportedFile],
 ) -> Result<(), FrontMatterError> {
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         return Err(FrontMatterError::SchemaVersion);
     }
     let paths = files
         .iter()
         .map(|file| file.path.as_str())
         .collect::<BTreeSet<_>>();
+    if manifest.schema_version == 2 {
+        let normalized = legacy::normalize(files)?;
+        if serde_json::to_value(&normalized).map_err(|_| FrontMatterError::InvalidManifest)?
+            != serde_json::to_value(manifest).map_err(|_| FrontMatterError::InvalidManifest)?
+        {
+            return Err(FrontMatterError::InvalidManifest);
+        }
+        return Ok(());
+    }
     validate_referenced_tex(&manifest.entry_file, &paths)?;
     let mut section_keys = BTreeSet::new();
     for section in &manifest.sections {
@@ -249,7 +274,7 @@ pub fn resolve_and_render(
             .iter()
             .find(|field| &field.key == key)
             .ok_or_else(|| FrontMatterError::InvalidValue(key.clone()))?;
-        if !field.allow_team_override {
+        if !field.allow_team_override || !value_matches(field.field_type, &overrides[key]) {
             return Err(FrontMatterError::InvalidValue(key.clone()));
         }
     }
@@ -263,23 +288,31 @@ pub fn resolve_and_render(
             return Err(FrontMatterError::InvalidValue(key.clone()));
         }
     }
+    let applicable;
+    let overrides = if pack.manifest.schema_version == 2 {
+        applicable = legacy::applicable_overrides(automatic, overrides);
+        &applicable
+    } else {
+        overrides
+    };
     let mut resolved = BTreeMap::new();
     let mut missing = Vec::new();
     for field in &pack.manifest.fields {
-        let selected = if field.allow_team_override {
-            overrides
-                .get(&field.key)
-                .map(|value| (value, "TEAM_OVERRIDE"))
+        let auto = field
+            .source
+            .as_ref()
+            .and_then(|source| automatic.get(source))
+            .map(|value| (value, "AUTO"));
+        let team = field
+            .allow_team_override
+            .then(|| overrides.get(&field.key))
+            .flatten()
+            .map(|value| (value, "TEAM_OVERRIDE"));
+        let selected = if pack.manifest.schema_version == 2 {
+            auto.or(team)
         } else {
-            None
+            team.or(auto)
         }
-        .or_else(|| {
-            field
-                .source
-                .as_ref()
-                .and_then(|source| automatic.get(source))
-                .map(|value| (value, "AUTO"))
-        })
         .or_else(|| field.default.as_ref().map(|value| (value, "PACK_DEFAULT")));
         if let Some((value, source)) = selected {
             if !value_matches(field.field_type, value) {
@@ -315,6 +348,13 @@ pub fn resolve_and_render(
             (section.key.clone(), enabled)
         })
         .collect::<BTreeMap<_, _>>();
+    if pack.manifest.schema_version == 2 {
+        return Ok(RenderedPack {
+            files: legacy::render(pack, &resolved, &enabled_sections)?,
+            resolved,
+            enabled_sections,
+        });
+    }
     let disabled_files = pack
         .manifest
         .sections

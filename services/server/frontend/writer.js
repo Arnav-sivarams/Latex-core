@@ -1,3 +1,4 @@
+import { frontMatterStatus, editableDetail, needsFirstUseDetails } from './document-details.mjs';
 import { basicSetup } from 'codemirror';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
 import { Decoration, EditorView, keymap } from '@codemirror/view';
@@ -648,6 +649,8 @@ async function refreshPapers() {
   renderPapers();
 }
 
+const promptedDocumentDetails = new Set();
+
 async function openPaper(paper) {
   autoBuild.cancel();
   closeEditor();
@@ -683,6 +686,17 @@ async function openPaper(paper) {
   const initial = model.files.find((file) => file.path === model.paperDetail.main_file) || model.files[0];
   if (initial) await openFile(initial, true);
   await Promise.all([refreshBuildStatus(), refreshHistory(), refreshReviews(), refreshReviewRounds(), refreshIntelligence()]);
+  if (paper.kind === 'team') {
+    const detail = await api.documentDetails(paper.id);
+    if (model.paper.id !== paper.id) return;
+    ui.documentDetails.title = detail.pack_id ? frontMatterStatus(detail) : 'Document details';
+    const key = `${paper.id}:${detail.pack_id}`;
+    if (needsFirstUseDetails(detail) && !promptedDocumentDetails.has(key)) {
+      promptedDocumentDetails.add(key);
+      await openDocumentDetails(detail);
+      ui.drawerTitle.textContent = 'Complete document details';
+    }
+  }
 }
 
 async function openFile(file, force = false) {
@@ -1474,25 +1488,42 @@ function openDrawer(kind) {
   ui.workspaceDrawer.hidden = false;
 }
 
-async function openDocumentDetails() {
+async function openDocumentDetails(prefetched = null) {
   if (!model.paper || model.paper.kind !== 'team') return;
   try {
-    const detail = await api.documentDetails(model.paper.id);
+    const detail = prefetched?.pack_id ? prefetched : await api.documentDetails(model.paper.id);
     ui.documentDetailsBody.replaceChildren();
     ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: `Front Matter Pack: ${detail.pack_name || 'None'}` }));
     if (!detail.pack_id) {
       ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter is assigned to this Team.' }));
       openDrawer('documentDetails'); return;
     }
-    const status = Object.assign(document.createElement('p'), { textContent: `Status: ${detail.status === 'READY' ? 'Ready' : detail.status.replaceAll('_', ' ')}` }); ui.documentDetailsBody.append(status);
-    if ((detail.missing_required_fields || []).length) ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'danger', textContent: `Needs information: ${detail.missing_required_fields.join(', ')}` }));
+    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: frontMatterStatus(detail) }));
+    for (const warning of detail.warnings || []) ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: warning }));
     const currentValues = Object.fromEntries((detail.values || []).map((item) => [item.field_key, item.value]));
     const currentSections = Object.fromEntries((detail.sections || []).map((item) => [item.section_key, item.enabled]));
     const form = document.createElement('form'); form.className = 'document-details-form';
     const sectionsHeading = document.createElement('h4'); sectionsHeading.textContent = 'Sections'; form.append(sectionsHeading);
     (detail.manifest.sections || []).forEach((section) => { const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.name = `section:${section.key}`; checkbox.checked = section.required || (currentSections[section.key] ?? section.default_enabled); checkbox.disabled = section.required || !detail.can_edit; label.append(checkbox, document.createTextNode(` ${section.label}${section.required ? ' · Required' : ' · Optional'}`)); form.append(label); });
     const fieldsHeading = document.createElement('h4'); fieldsHeading.textContent = 'Metadata'; form.append(fieldsHeading);
-    (detail.manifest.fields || []).forEach((field) => { const label = document.createElement('label'); label.textContent = field.label; const multiline = field.type === 'MULTILINE' || Array.isArray(currentValues[field.key]); const input = document.createElement(multiline ? 'textarea' : 'input'); input.name = `field:${field.key}`; if (field.type === 'DATE') input.type = 'date'; if (field.type === 'BOOLEAN') input.type = 'checkbox'; const value = currentValues[field.key]; if (field.type === 'BOOLEAN') input.checked = Boolean(value); else input.value = Array.isArray(value) ? value.join('\n') : value ?? ''; const editable = detail.can_edit && (!field.source || field.allow_team_override); input.disabled = !editable; if (field.required) input.required = true; label.append(input); if (field.source) label.append(Object.assign(document.createElement('small'), { textContent: ` Automatic: ${field.source}${field.allow_team_override ? ' · override permitted' : ''}` })); form.append(label); });
+    (detail.manifest.fields || []).forEach((field) => {
+      const value = currentValues[field.key];
+      const editable = editableDetail(detail, field);
+      if (!editable) {
+        if (value !== undefined && !field.key.endsWith('_identity')) form.append(Object.assign(document.createElement('p'), { textContent: `${field.label}: ${Array.isArray(value) ? value.join(', ') : value}` }));
+        return;
+      }
+      const label = document.createElement('label'); label.textContent = field.label;
+      const multiline = field.type === 'MULTILINE' || Array.isArray(value);
+      const input = document.createElement(field.options ? 'select' : multiline ? 'textarea' : 'input');
+      input.name = `field:${field.key}`;
+      if (field.options) { input.append(new Option('Choose an assigned Mentor', '')); field.options.forEach((option) => input.append(new Option(option.label, option.value))); }
+      if (field.type === 'DATE') input.type = 'date';
+      if (field.type === 'BOOLEAN') { input.type = 'checkbox'; input.checked = Boolean(value); }
+      else input.value = Array.isArray(value) ? value.join('\n') : value ?? '';
+      input.required = field.required;
+      label.append(input); form.append(label);
+    });
     if (detail.can_edit) { const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save document details'; form.append(save); }
     form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); if (result.auto_build_required) await requestBuild('auto'); notice('Document details saved. Front Matter was rebuilt.'); } catch (error) { notice(error.message, true); } });
     ui.documentDetailsBody.append(form); openDrawer('documentDetails');

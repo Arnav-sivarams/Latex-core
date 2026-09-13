@@ -85,6 +85,7 @@ pub struct ApplyFrontMatterRequest {
     pub values: Vec<FrontMatterValueRecord>,
     pub sections: BTreeMap<String, bool>,
     pub safety: Option<ExactStateRecord>,
+    pub missing_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -399,6 +400,14 @@ impl FrontMatterRepository {
         let mut writer_names = Vec::new();
         let mut registration_numbers = Vec::new();
         let mut pairs = Vec::new();
+        let mentor_count = people
+            .iter()
+            .map(|row| row.try_get::<String, _>("role"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(FrontMatterRepositoryError::Database)?
+            .iter()
+            .filter(|role| role.as_str() == "mentor")
+            .count();
         let mut mentor_done = false;
         for row in people {
             let role: String = row
@@ -431,7 +440,7 @@ impl FrontMatterRepository {
                         output.insert("leader.registration_number".into(), Value::String(reg));
                     }
                 }
-            } else if role == "mentor" && !mentor_done {
+            } else if role == "mentor" && mentor_count == 1 && !mentor_done {
                 optional_string(&row, "faculty_name", "mentor.name", &mut output)?;
                 optional_string(&row, "honorific", "mentor.honorific", &mut output)?;
                 optional_string(&row, "designation", "mentor.designation", &mut output)?;
@@ -458,6 +467,74 @@ impl FrontMatterRepository {
             "writers.names_and_registration_numbers".into(),
             Value::Array(pairs),
         );
+        Ok(output)
+    }
+
+    /// Canonical legacy metadata; ambiguous identities are never selected by ordering.
+    pub async fn legacy_automatic_values(
+        &self,
+        paper_id: Uuid,
+        guide: Option<&str>,
+        dean: Option<&str>,
+    ) -> Result<BTreeMap<String, Value>, FrontMatterRepositoryError> {
+        let mut output = self.automatic_values(paper_id).await?;
+        let writers = sqlx::query("SELECT s.name,s.reg_no FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='writer' LEFT JOIN vcap.student_user_links l ON l.user_id=m.user_id AND l.status='LINKED' LEFT JOIN vcap.students s ON s.reg_no=l.reg_no WHERE m.paper_team_id=$1 ORDER BY m.writer_order NULLS LAST,m.created_at,m.user_id")
+            .bind(paper_id).fetch_all(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?;
+        output.insert("team.size".into(), Value::String(writers.len().to_string()));
+        for (slot, row) in ["a", "b", "c", "d"].iter().zip(&writers) {
+            optional_string(row, "name", &format!("student.{slot}.name"), &mut output)?;
+            optional_string(
+                row,
+                "reg_no",
+                &format!("student.{slot}.reg_no"),
+                &mut output,
+            )?;
+        }
+        let mentors = sqlx::query("SELECT m.user_id,f.name,f.honorific,f.designation FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='mentor' LEFT JOIN vcap.faculty_user_links l ON l.user_id=m.user_id AND l.status='LINKED' LEFT JOIN vcap.faculty f ON f.faculty_id=l.faculty_id WHERE m.paper_team_id=$1 ORDER BY m.user_id")
+            .bind(paper_id).fetch_all(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?;
+        let mut options = Vec::new();
+        for row in &mentors {
+            let id: Uuid = row
+                .try_get("user_id")
+                .map_err(FrontMatterRepositoryError::Database)?;
+            let name = faculty_display(row)?;
+            options.push(json!({"value":id.to_string(),"label":name.clone().unwrap_or_else(|| "Assigned Mentor (institutional name unavailable)".into())}));
+            if mentors.len() == 1 || guide == Some(id.to_string().as_str()) {
+                if let Some(name) = name {
+                    output.insert("guide.name".into(), Value::String(name));
+                }
+                optional_string(row, "designation", "guide.designation", &mut output)?;
+            }
+        }
+        output.insert("guide.options".into(), Value::Array(options));
+        if let Some(programme) = output
+            .get("team.dominant_programme_code")
+            .and_then(Value::as_str)
+        {
+            let hod = sqlx::query("SELECT f.name,f.honorific FROM vcap.programmes p JOIN vcap.faculty f ON f.faculty_id=p.hod_id WHERE p.programme_code=$1")
+                .bind(programme).fetch_optional(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?;
+            let deans = sqlx::query("SELECT DISTINCT f.faculty_id,f.name,f.honorific FROM vcap.faculty_roles r JOIN vcap.faculty f ON f.faculty_id=r.faculty_id WHERE (r.programme_code=$1 OR r.school_id IN (SELECT DISTINCT scope.school_id FROM vcap.faculty_roles scope WHERE (scope.programme_code=$1 OR scope.faculty_id=(SELECT hod_id FROM vcap.programmes WHERE programme_code=$1)) AND lower(scope.status)='active' AND scope.school_id IS NOT NULL)) AND lower(r.role_type)='dean' AND lower(r.status)='active' ORDER BY f.faculty_id")
+                .bind(programme).fetch_all(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?;
+            if let Some(row) = hod {
+                if let Some(name) = faculty_display(&row)? {
+                    output.insert("hod.name".into(), Value::String(name));
+                }
+            }
+            let mut choices = Vec::new();
+            for row in &deans {
+                let id: String = row
+                    .try_get("faculty_id")
+                    .map_err(FrontMatterRepositoryError::Database)?;
+                let name = faculty_display(row)?;
+                choices.push(json!({"value":id,"label":name.clone().unwrap_or_else(|| format!("Dean {id} (institutional name unavailable)"))}));
+                if deans.len() == 1 || dean == Some(id.as_str()) {
+                    if let Some(name) = name {
+                        output.insert("dean.name".into(), Value::String(name));
+                    }
+                }
+            }
+            output.insert("dean.options".into(), Value::Array(choices));
+        }
         Ok(output)
     }
 
@@ -586,8 +663,8 @@ impl FrontMatterRepository {
         sqlx::query("INSERT INTO latex_core.workspace_events (workspace_id,sequence,event_id,base_version,event_type,event_schema_version,payload,created_by_user_id) VALUES ($1,$2,$3,$4,'workspace.mutation',1,$5,$6)")
             .bind(workspace).bind(next).bind(Uuid::new_v4()).bind(head).bind(json!({"schema_version":1,"operations":operations})).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
         sqlx::query("UPDATE latex_core.workspace_heads SET durable_version=$2,updated_at=statement_timestamp() WHERE workspace_id=$1").bind(workspace).bind(next).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
-        sqlx::query("INSERT INTO latex_core.paper_front_matter_pins (paper_team_id,front_matter_pack_id,dominant_programme_code,resolution_method,assigned_by_user_id,status,missing_required_fields,last_error) VALUES ($1,$2,$3,$4,$5,'READY','[]',NULL) ON CONFLICT(paper_team_id) DO UPDATE SET front_matter_pack_id=EXCLUDED.front_matter_pack_id,dominant_programme_code=EXCLUDED.dominant_programme_code,resolution_method=EXCLUDED.resolution_method,assigned_by_user_id=EXCLUDED.assigned_by_user_id,status='READY',missing_required_fields='[]',last_error=NULL,pinned_at=statement_timestamp()")
-            .bind(request.paper_team_id).bind(request.pack_id).bind(&request.dominant_programme_code).bind(&request.resolution_method).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
+        sqlx::query("INSERT INTO latex_core.paper_front_matter_pins (paper_team_id,front_matter_pack_id,dominant_programme_code,resolution_method,assigned_by_user_id,status,missing_required_fields,last_error) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL) ON CONFLICT(paper_team_id) DO UPDATE SET front_matter_pack_id=EXCLUDED.front_matter_pack_id,dominant_programme_code=EXCLUDED.dominant_programme_code,resolution_method=EXCLUDED.resolution_method,assigned_by_user_id=EXCLUDED.assigned_by_user_id,status=EXCLUDED.status,missing_required_fields=EXCLUDED.missing_required_fields,last_error=NULL,pinned_at=statement_timestamp()")
+            .bind(request.paper_team_id).bind(request.pack_id).bind(&request.dominant_programme_code).bind(&request.resolution_method).bind(actor.as_uuid()).bind(if request.missing_fields.is_empty() { "READY" } else { "NEEDS_INFORMATION" }).bind(json!(request.missing_fields)).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
         sqlx::query("DELETE FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1")
             .bind(request.paper_team_id)
             .execute(&mut *tx)
@@ -625,6 +702,7 @@ impl FrontMatterRepository {
         safety: Option<ExactStateRecord>,
     ) -> Result<u64, FrontMatterRepositoryError> {
         let request = ApplyFrontMatterRequest {
+            missing_fields: Vec::new(),
             paper_team_id: paper_id,
             workspace_id,
             expected_workspace_version: expected,
@@ -950,4 +1028,23 @@ fn optional_string(
         output.insert(key.into(), Value::String(value));
     }
     Ok(())
+}
+
+fn faculty_display(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<String>, FrontMatterRepositoryError> {
+    let name: Option<String> = row
+        .try_get("name")
+        .map_err(FrontMatterRepositoryError::Database)?;
+    let honorific: Option<String> = row
+        .try_get("honorific")
+        .map_err(FrontMatterRepositoryError::Database)?;
+    Ok(name.filter(|name| !name.trim().is_empty()).map(|name| {
+        let prefix = honorific.unwrap_or_default();
+        if prefix.trim().is_empty() || name.starts_with(prefix.trim()) {
+            name
+        } else {
+            format!("{} {name}", prefix.trim())
+        }
+    }))
 }

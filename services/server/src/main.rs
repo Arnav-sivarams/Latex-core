@@ -3382,16 +3382,177 @@ async fn v2_document_details(
         .team_detail(principal.user_id(), paper_id)
         .await
     {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            if value["manifest"]["schema_version"] == 2 {
+                match resolve_legacy_details(&state, paper_id, &value).await {
+                    Ok(details) => {
+                        value["manifest"]["fields"] = details["fields"].clone();
+                        value["values"] = details["values"].clone();
+                        value["missing_required_fields"] = details["missing"].clone();
+                        value["warnings"] = details["warnings"].clone();
+                        if matches!(
+                            value["status"].as_str(),
+                            Some("READY" | "NEEDS_INFORMATION")
+                        ) {
+                            value["status"] = serde_json::json!(if details["missing"]
+                                .as_array()
+                                .is_some_and(Vec::is_empty)
+                            {
+                                "READY"
+                            } else {
+                                "NEEDS_INFORMATION"
+                            });
+                        }
+                    }
+                    Err(response) => return response,
+                }
+            }
+            Json(value).into_response()
+        }
         Err(error_value) => front_matter_repository_error(error_value),
     }
+}
+
+fn detail_choices(
+    detail: &serde_json::Value,
+) -> (BTreeMap<String, serde_json::Value>, BTreeMap<String, bool>) {
+    let values = detail["values"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["value_source"] == "TEAM_OVERRIDE")
+        .filter_map(|item| {
+            Some((
+                item["field_key"].as_str()?.to_owned(),
+                item["value"].clone(),
+            ))
+        })
+        .collect();
+    let sections = detail["sections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some((
+                item["section_key"].as_str()?.to_owned(),
+                item["enabled"].as_bool()?,
+            ))
+        })
+        .collect();
+    (values, sections)
+}
+
+async fn resolve_legacy_details(
+    state: &AppState,
+    paper_id: uuid::Uuid,
+    detail: &serde_json::Value,
+) -> Result<serde_json::Value, Response> {
+    let pack_id = detail["pack_id"]
+        .as_str()
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| error(StatusCode::CONFLICT, "Front Matter pin is unavailable"))?;
+    let pack = load_front_matter_pack(state, pack_id).await?;
+    let (overrides, sections) = detail_choices(detail);
+    let automatic = state
+        .front_matter
+        .legacy_automatic_values(
+            paper_id,
+            overrides
+                .get("guide_identity")
+                .and_then(serde_json::Value::as_str),
+            overrides
+                .get("dean_identity")
+                .and_then(serde_json::Value::as_str),
+        )
+        .await
+        .map_err(front_matter_repository_error)?;
+    front_matter::legacy::details(&pack, &automatic, &overrides, &sections)
+        .map_err(|value| error(StatusCode::BAD_REQUEST, value.to_string()))
+}
+
+async fn validate_legacy_input(
+    state: &AppState,
+    paper_id: uuid::Uuid,
+    detail: &serde_json::Value,
+    input: &mut FrontMatterDetailsInput,
+) -> Result<(), Response> {
+    if detail["manifest"]["schema_version"] != 2 {
+        return Ok(());
+    }
+    input
+        .values
+        .retain(|_, value| !value.as_str().is_some_and(|text| text.trim().is_empty()));
+    let automatic = state
+        .front_matter
+        .legacy_automatic_values(
+            paper_id,
+            input
+                .values
+                .get("guide_identity")
+                .and_then(serde_json::Value::as_str),
+            input
+                .values
+                .get("dean_identity")
+                .and_then(serde_json::Value::as_str),
+        )
+        .await
+        .map_err(front_matter_repository_error)?;
+    for identity in ["guide", "dean"] {
+        if let Some(choice) = input
+            .values
+            .get(&format!("{identity}_identity"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if !automatic
+                .get(&format!("{identity}.options"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["value"].as_str() == Some(choice))
+                })
+            {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Choose an applicable {identity} from the listed options"),
+                ));
+            }
+        }
+    }
+    for key in input.values.keys() {
+        if detail["manifest"]["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|field| field["key"].as_str() == Some(key))
+            .and_then(|field| field["source"].as_str())
+            .is_some_and(|source| automatic.contains_key(source))
+        {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "Automatically resolved details cannot be overridden",
+            ));
+        }
+        if key == "dean_name"
+            && automatic
+                .get("dean.options")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| items.len() > 1)
+        {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "Choose an applicable Dean from the listed options",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn v2_save_document_details(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(paper_id): Path<uuid::Uuid>,
-    Json(input): Json<FrontMatterDetailsInput>,
+    Json(mut input): Json<FrontMatterDetailsInput>,
 ) -> Response {
     if let Err(response) = csrf(&headers) {
         return response;
@@ -3423,6 +3584,9 @@ async fn v2_save_document_details(
     else {
         return error(StatusCode::CONFLICT, "This paper has no Front Matter Pack.");
     };
+    if let Err(response) = validate_legacy_input(&state, paper_id, &detail, &mut input).await {
+        return response;
+    }
     match render_team_front_matter(
         &state,
         principal.user_id(),
@@ -3563,7 +3727,11 @@ async fn admin_remove_front_matter(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "exact-state capture, blob preparation, and atomic render commit share one error boundary"
+)]
 async fn render_team_front_matter(
     state: &AppState,
     actor: UserId,
@@ -3574,12 +3742,48 @@ async fn render_team_front_matter(
     resolution_method: &str,
     dominant_programme_code: Option<String>,
 ) -> Result<u64, Response> {
+    let team = state.v2.paper_team(paper_id).await.map_err(v2_error)?;
+    let paper = persistence::WriterPaper {
+        id: team.id,
+        workspace_id: team.workspace_id,
+        name: team.name,
+        kind: persistence::PaperKind::Team,
+        status: team.status,
+        is_team_leader: false,
+        updated_at: team.updated_at,
+    };
+    let exact = capture_exact_v2_state(state, &paper).await?;
     let pack = load_front_matter_pack(state, pack_id).await?;
-    let automatic = state
-        .front_matter
-        .automatic_values(paper_id)
-        .await
-        .map_err(front_matter_repository_error)?;
+    let automatic = if pack.manifest.schema_version == 2 {
+        state
+            .front_matter
+            .legacy_automatic_values(
+                paper_id,
+                overrides
+                    .get("guide_identity")
+                    .and_then(serde_json::Value::as_str),
+                overrides
+                    .get("dean_identity")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .await
+    } else {
+        state.front_matter.automatic_values(paper_id).await
+    }
+    .map_err(front_matter_repository_error)?;
+    let missing_fields = if pack.manifest.schema_version == 2 {
+        let detail = front_matter::legacy::details(&pack, &automatic, &overrides, &sections)
+            .map_err(|value| error(StatusCode::BAD_REQUEST, value.to_string()))?;
+        detail["missing"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let rendered = front_matter::resolve_and_render(&pack, &automatic, &overrides, &sections)
         .map_err(|error_value| match error_value {
             front_matter::FrontMatterError::MissingRequired(labels) => error(
@@ -3602,20 +3806,10 @@ async fn render_team_front_matter(
             size_bytes: stored.size_bytes(),
         });
     }
-    let team = state.v2.paper_team(paper_id).await.map_err(v2_error)?;
-    let paper = persistence::WriterPaper {
-        id: team.id,
-        workspace_id: team.workspace_id,
-        name: team.name,
-        kind: persistence::PaperKind::Team,
-        status: team.status,
-        is_team_leader: false,
-        updated_at: team.updated_at,
-    };
-    let exact = capture_exact_v2_state(state, &paper).await?;
     let values = rendered
         .resolved
         .into_iter()
+        .filter(|(_, value)| pack.manifest.schema_version == 1 || value.source == "TEAM_OVERRIDE")
         .map(|(field_key, value)| FrontMatterValueRecord {
             field_key,
             value_json: value.value,
@@ -3627,6 +3821,7 @@ async fn render_team_front_matter(
         .apply_render(
             actor,
             &ApplyFrontMatterRequest {
+                missing_fields,
                 paper_team_id: paper_id,
                 workspace_id: paper.workspace_id,
                 expected_workspace_version: exact.source_sequence,
@@ -7108,6 +7303,7 @@ async fn admin_v2_front_matter_remove(
 fn front_matter_preview_json(pack: &front_matter::ValidatedPack) -> serde_json::Value {
     serde_json::json!({
         "schema_version":pack.manifest.schema_version,
+        "warnings":if pack.manifest.schema_version == 2 { front_matter::legacy::warnings(pack).unwrap_or_else(|error| vec![error.to_string()]) } else { Vec::new() },
         "entry_file":pack.manifest.entry_file,
         "sections":pack.manifest.sections,
         "fields":pack.manifest.fields,
@@ -10063,6 +10259,7 @@ mod tests {
     reason = "disposable PostgreSQL authorization fixtures"
 )]
 mod database_tests {
+    include!("front_matter_db_tests.rs");
     use super::*;
     use axum::{
         body::Body,
