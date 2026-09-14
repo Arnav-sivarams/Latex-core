@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { deflateSync } from 'node:zlib';
 import { chromium } from 'playwright';
 
 const config = JSON.parse(process.env.FRONTMATTER_TEST_CONFIG);
@@ -42,6 +43,71 @@ async function pdfText(page) {
     await loading.destroy();
     return text.replace(/\s+/g, ' ');
   }, config.paper_id);
+}
+async function pdfHasImage(page) {
+  return page.evaluate(async (paper) => {
+    const pdfjs = await import('/static/pdf.min.mjs');
+    pdfjs.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
+    const response = await fetch(`/api/v2/papers/${paper}/artifacts/pdf`);
+    const loading = pdfjs.getDocument({ data: new Uint8Array(await response.arrayBuffer()) });
+    const pdf = await loading.promise;
+    let found = false;
+    for (let index = 1; index <= pdf.numPages && !found; index++) {
+      const operators = await (await pdf.getPage(index)).getOperatorList();
+      found = operators.fnArray.some((operation) => [pdfjs.OPS.paintImageXObject, pdfjs.OPS.paintInlineImageXObject, pdfjs.OPS.paintImageMaskXObject].includes(operation));
+    }
+    await loading.destroy();
+    return found;
+  }, config.paper_id);
+}
+async function editorText(page) {
+  return page.locator('.cm-content').innerText();
+}
+async function editorLines(page) {
+  return page.locator('.cm-line').allTextContents();
+}
+async function selectLineRange(page, lineText, start, length) {
+  const line = page.locator('.cm-line').filter({ hasText: lineText }).first();
+  await line.click();
+  await page.keyboard.press('Home');
+  for (let index = 0; index < start; index++) await page.keyboard.press('ArrowRight');
+  for (let index = 0; index < length; index++) await page.keyboard.press('Shift+ArrowRight');
+}
+async function waitEditorContains(page, expected) {
+  await page.waitForFunction((text) => document.querySelector('.cm-content')?.innerText.includes(text), expected);
+}
+async function insertAction(page, label) {
+  await page.locator('#insertMenu').click();
+  await page.getByRole('button', { name: label, exact: true }).click();
+}
+async function fillBuilder(page, label, value) {
+  const control = page.locator('#dialogBody label').filter({ hasText: label }).locator('input,textarea,select').first();
+  if (await control.getAttribute('type') === 'checkbox') {
+    if (value) await control.check(); else await control.uncheck();
+  } else await control.fill(String(value));
+}
+function pngChunk(type, data) {
+  const name = Buffer.from(type);
+  const body = Buffer.concat([name, data]);
+  let crc = 0xffffffff;
+  for (const byte of body) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+  const checksum = Buffer.alloc(4); checksum.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+  return Buffer.concat([length, body, checksum]);
+}
+function testPng() {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0); header.writeUInt32BE(1, 4);
+  header.set([8, 6, 0, 0, 0], 8);
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', deflateSync(Buffer.from([0, 40, 120, 220, 255]))),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
 }
 async function waitCompile(page) {
   const until = Date.now() + 120_000;
@@ -94,6 +160,125 @@ try {
   assert.equal(await writer.getByRole('button', { name: 'Save document details' }).count(), 0);
   assert.equal(await writer.locator('[name^="field:"]').count(), 0);
   assert.ok((await pdfText(writer)).includes('Alice Alpha'));
+  // Real CodeMirror/Yjs selection, replacement and undo across two already-open Writers.
+  await selectLineRange(leader, 'Main content target phrase.', 5, 7);
+  await leader.keyboard.type('section');
+  await waitEditorContains(writer, 'Main section target phrase.');
+  await leader.locator('#undoText').click();
+  await waitEditorContains(leader, 'Main content target phrase.');
+  await waitEditorContains(writer, 'Main content target phrase.');
+
+  // Dialog insertion preserves a Yjs-relative range while another Writer inserts before it.
+  await selectLineRange(leader, 'CodeSlot', 0, 'CodeSlot'.length);
+  await insertAction(leader, 'Code block');
+  await fillBuilder(leader, 'Inline code', 'fn demo() {\n    println!("# % & _");\n}');
+  await writer.locator('.cm-content').click();
+  await writer.keyboard.press('Control+Home');
+  await writer.keyboard.type('% second Writer shift\n');
+  await waitEditorContains(leader, '% second Writer shift');
+  await leader.locator('#dialogActions').getByRole('button', { name: 'Insert', exact: true }).click();
+  await waitEditorContains(writer, 'fn demo()');
+  assert.ok((await editorText(leader)).includes('Main content target phrase.'), 'remote shift must not replace unrelated text');
+
+  await selectLineRange(leader, 'InlineSlot', 0, 'InlineSlot'.length);
+  await insertAction(leader, 'Inline math');
+  await waitEditorContains(writer, '\\(InlineSlot\\)');
+  await selectLineRange(leader, 'SymbolSlot', 0, 'SymbolSlot'.length);
+  await insertAction(leader, 'Symbols');
+  const symbol = leader.locator('.symbol-grid button').first();
+  const symbolCommand = (await symbol.getAttribute('title')).split('—').at(-1).trim();
+  await symbol.click();
+  await waitEditorContains(writer, symbolCommand);
+  assert.ok(!(await editorText(leader)).includes('SymbolSlot'));
+
+  // Create and edit the chapter at the destination offered by the real wrapped template.
+  let fileDialogIndex = 0;
+  let offeredChapterPath = null;
+  const fileDialog = async (dialog) => {
+    fileDialogIndex += 1;
+    if (dialog.type() === 'prompt') {
+      offeredChapterPath = dialog.defaultValue();
+      await dialog.accept(offeredChapterPath);
+    } else await dialog.accept();
+  };
+  leader.on('dialog', fileDialog);
+  await leader.locator('#newFile').click();
+  await leader.waitForTimeout(1000);
+  assert.ok((await leader.locator('#currentFile').textContent()).includes('chapter9.tex'), JSON.stringify({ dialogs: fileDialogIndex, offeredChapterPath, notice: await leader.locator('#writerNotice').textContent(), current: await leader.locator('#currentFile').textContent() }));
+  leader.off('dialog', fileDialog);
+  assert.equal(fileDialogIndex, 2);
+  assert.equal(offeredChapterPath, 'Thesis_content_v1.0/chapters/chapter9.tex');
+  await leader.locator('.cm-content').click();
+  await leader.keyboard.type('First line\n\nThird line');
+  await leader.keyboard.press('Control+a');
+  await insertAction(leader, 'Comment selected lines');
+  await waitEditorContains(leader, '% First line');
+  assert.deepEqual(await editorLines(leader), ['% First line', '% ', '% Third line']);
+  await leader.keyboard.press('Control+a');
+  await insertAction(leader, 'Uncomment selected lines');
+  assert.deepEqual(await editorLines(leader), ['First line', '', 'Third line']);
+  await leader.locator('#undoText').click();
+  await waitEditorContains(leader, '% Third line');
+  await leader.locator('#redoText').click();
+  assert.deepEqual(await editorLines(leader), ['First line', '', 'Third line']);
+  await leader.locator('#fileTree button').filter({ hasText: 'main.tex' }).click();
+  await waitEditorContains(leader, 'TableSlot');
+
+  await selectLineRange(leader, 'TableSlot', 0, 'TableSlot'.length);
+  await insertAction(leader, 'Table');
+  await fillBuilder(leader, 'Rows', 2);
+  await fillBuilder(leader, 'Columns', 2);
+  await fillBuilder(leader, 'Column alignments', 'left,left');
+  await fillBuilder(leader, 'Column widths', '3cm,6cm');
+  await fillBuilder(leader, 'Minimum height', '8mm');
+  await fillBuilder(leader, 'Caption', 'Browser sized table');
+  await leader.locator('#dialogActions').getByRole('button', { name: 'Insert', exact: true }).click();
+  assert.ok((await editorText(leader)).indexOf('\\caption{Browser sized table}') < (await editorText(leader)).indexOf('\\begin{tabular}{p{3cm}p{6cm}}'));
+
+  await selectLineRange(leader, 'FigureSlot', 0, 'FigureSlot'.length);
+  const png = testPng();
+  let offeredImagePath = null;
+  const uploadDialogs = async (dialog) => {
+    if (dialog.type() === 'prompt') {
+      offeredImagePath = dialog.defaultValue();
+      await dialog.accept(offeredImagePath);
+    } else await dialog.accept();
+  };
+  leader.on('dialog', uploadDialogs);
+  const chooser = leader.waitForEvent('filechooser');
+  await leader.locator('#uploadImage').click();
+  await (await chooser).setFiles({ name: 'browser.png', mimeType: 'image/png', buffer: png });
+  try {
+    await leader.waitForFunction(() => document.querySelector('#productivityDialog')?.open && document.querySelector('#dialogTitle')?.textContent === 'Figure Builder', null, { timeout: 10000 });
+  } catch (error) {
+    throw new Error(JSON.stringify({ offeredImagePath, notice: await leader.locator('#writerNotice').textContent(), inputFiles: await leader.locator('#assetInput').evaluate((input) => input.files?.length), dialogOpen: await leader.locator('#productivityDialog').evaluate((dialog) => dialog.open) }), { cause: error });
+  }
+  leader.off('dialog', uploadDialogs);
+  assert.equal(offeredImagePath, 'Thesis_content_v1.0/images/browser.png');
+  await fillBuilder(leader, 'Caption', 'Browser uploaded image');
+  await leader.locator('#dialogActions').getByRole('button', { name: 'Insert', exact: true }).click();
+  const figureSource = await editorText(leader);
+  assert.ok(figureSource.includes('\\includegraphics[width=\\linewidth]{images/browser.png}'));
+  assert.ok(figureSource.indexOf('\\includegraphics') < figureSource.indexOf('\\caption{Browser uploaded image}'));
+
+  await selectLineRange(leader, 'PublicationSlot', '\\bibitem{placeholder} '.length, 'PublicationSlot'.length);
+  await insertAction(leader, 'Publications');
+  await leader.getByRole('button', { name: 'Insert categorized bibitems', exact: true }).click();
+  await leader.locator('#drawerClose').click();
+  for (const key of ['solar-communicated', 'solar-accepted', 'solar-published']) await waitEditorContains(leader, `\\bibitem{${key}}`);
+  await selectLineRange(leader, '\\bibitem{solar-communicated}', 0, 0);
+  await insertAction(leader, 'Publications');
+  await leader.getByRole('button', { name: 'Insert categorized bibitems', exact: true }).click();
+  await leader.getByText(/must be present and unique across this report/).waitFor();
+  await leader.locator('#drawerClose').click();
+
+  const jobsBeforeInsertionCompile = await api(leader, `/api/v2/papers/${config.paper_id}/builds`);
+  assert.equal(jobsBeforeInsertionCompile.build.active_build_id, null, 'editor and insertion actions must not compile');
+  await leader.getByRole('button', { name: 'Compile', exact: true }).click();
+  await waitCompile(leader);
+  const insertionPdf = await pdfText(leader);
+  for (const expected of ['Browser sized table', 'Browser uploaded image', 'Communicated', 'Accepted', 'Published', 'Draft Solar Work', 'demo']) assert.ok(insertionPdf.includes(expected), `insertion PDF missing ${expected}`);
+  assert.equal(await pdfHasImage(leader), true, 'uploaded PNG must be painted in the compiled PDF');
   const mentor = await login(config.mentor, 'review');
   assert.equal(await mentor.getByRole('button', { name: 'Document details' }).count(), 0);
   // Mentor PDF is loaded by the existing read-only review viewer.
@@ -117,7 +302,7 @@ try {
   await leader.locator('#drawerClose').click();
   await leader.locator('#insertMenu').click();
   const insertEntries = await leader.locator('#dialogBody button').allTextContents();
-  for (const entry of ['Table', 'Figure', 'Code block', 'Inline math', 'Display math', 'Symbols', 'Publications / bibliography']) assert.equal(insertEntries.filter((value) => value === entry).length, 1, `${entry} must appear once in Insert`);
+  for (const entry of ['Table', 'Figure', 'Code block', 'Inline math', 'Display math', 'Symbols', 'Publications', 'BibTeX entry']) assert.equal(insertEntries.filter((value) => value === entry).length, 1, `${entry} must appear once in Insert`);
   await leader.getByRole('button', { name: 'Symbols', exact: true }).click();
   assert.ok(await leader.locator('.symbol-grid button').count() > 10, 'symbol catalogue must render as a grid');
   const firstSymbol = leader.locator('.symbol-grid button').first();
@@ -152,7 +337,7 @@ try {
   await reviewingMentor.context().close();
   await secondMentor.context().close();
   assert.deepEqual(failures, []);
-  console.log(JSON.stringify({ leader: 'passed', writer: 'passed', mentor: 'passed', review_turn_taking: 'passed', m7: config.environment, populated_pdf_assertions: 27, optional_blank_compile: 'passed', browser_errors: failures.length }));
+  console.log(JSON.stringify({ leader: 'passed', writer: 'passed', editor_insertions: 'passed', wrapped_paths: 'passed', uploaded_pdf_image: 'passed', publications: 'passed', mentor: 'passed', review_turn_taking: 'passed', m7: config.environment, populated_pdf_assertions: 27, optional_blank_compile: 'passed', browser_errors: failures.length }));
 } finally {
   await browser.close();
 }

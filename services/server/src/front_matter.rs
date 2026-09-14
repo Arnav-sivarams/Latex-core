@@ -261,8 +261,43 @@ pub fn validate_manifest(
 }
 
 pub fn main_template_compatible(main: &[u8]) -> bool {
-    std::str::from_utf8(main)
-        .is_ok_and(|value| value.lines().any(|line| line.trim() == INTEGRATION_MARKER))
+    std::str::from_utf8(main).is_ok_and(|value| {
+        value.lines().any(|line| {
+            let line = line.trim();
+            if line == INTEGRATION_MARKER {
+                return true;
+            }
+            let Some(path) = line
+                .strip_prefix("\\input{")
+                .and_then(|line| line.strip_suffix("} % LATEX_CORE_FRONT_MATTER"))
+            else {
+                return false;
+            };
+            let depth = path.matches("../").count();
+            depth > 0
+                && depth <= 8
+                && path.trim_start_matches("../") == ".latex-core/frontmatter/frontmatter.tex"
+        })
+    })
+}
+
+pub fn rebase_generated_wrapper(files: &mut [RenderedFile], main_path: &LogicalPath) {
+    let depth = main_path.as_str().matches('/').count();
+    if depth == 0 {
+        return;
+    }
+    let prefix = "../".repeat(depth);
+    for file in files
+        .iter_mut()
+        .filter(|file| file.path.as_str() == format!("{MANAGED_ROOT}/frontmatter.tex"))
+    {
+        if let Ok(source) = std::str::from_utf8(&file.bytes) {
+            file.bytes = Bytes::from(source.replace(
+                "\\input{.latex-core/frontmatter/",
+                &format!("\\input{{{prefix}.latex-core/frontmatter/"),
+            ));
+        }
+    }
 }
 
 #[allow(

@@ -15,7 +15,7 @@ import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
   buildLongTable, buildPlot, buildTable, buildTheorem, commentLatexLines,
   buildPublicationBibitems,
-  fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
+  compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
   packageRequirement, suggestedInsertionPath,
 } from './writer-productivity.mjs';
 
@@ -1313,9 +1313,23 @@ function closeDialog() {
 }
 
 function captureInsertionSelection() {
-  if (!model.view || !model.file) return;
+  if (!model.view || !model.file || !model.collaboration) return;
   const selection = model.view.state.selection.main;
-  model.insertionSelection = { fileId: model.file.file_id, from: selection.from, to: selection.to };
+  model.insertionSelection = {
+    fileId: model.file.file_id,
+    from: Y.createRelativePositionFromTypeIndex(model.collaboration.text, selection.from, -1),
+    to: Y.createRelativePositionFromTypeIndex(model.collaboration.text, selection.to, 1),
+  };
+}
+
+function resolveInsertionSelection() {
+  const captured = model.insertionSelection;
+  if (!captured) return model.view?.state.selection.main || null;
+  if (captured.fileId !== model.file?.file_id || !model.collaboration) return null;
+  const from = Y.createAbsolutePositionFromRelativePosition(captured.from, model.collaboration.doc);
+  const to = Y.createAbsolutePositionFromRelativePosition(captured.to, model.collaboration.doc);
+  if (!from || !to || from.type !== model.collaboration.text || to.type !== model.collaboration.text) return null;
+  return { from: Math.min(from.index, to.index), to: Math.max(from.index, to.index) };
 }
 
 function showPalette(title, items, options = {}) {
@@ -1370,14 +1384,19 @@ function insertLatex(source, origin = 'writer-builder', cursorOffset = null) {
     notice('Open an editable text file before inserting LaTeX.', true);
     return false;
   }
-  const captured = model.insertionSelection;
-  const selection = captured?.fileId === model.file.file_id && captured.from <= model.view.state.doc.length && captured.to <= model.view.state.doc.length
-    ? captured : model.view.state.selection.main;
+  const selection = resolveInsertionSelection();
   model.insertionSelection = null;
+  if (!selection) {
+    notice('The source or selected range changed while this dialog was open. Reopen the insertion action.', true);
+    return false;
+  }
+  model.undoManager?.stopCapturing();
+  if (origin) model.undoManager?.trackedOrigins.add(origin);
   model.collaboration.doc.transact(() => {
     if (selection.to > selection.from) model.collaboration.text.delete(selection.from, selection.to - selection.from);
     model.collaboration.text.insert(selection.from, source);
   }, origin);
+  model.undoManager?.stopCapturing();
   model.view.focus();
   model.view.dispatch({ selection: { anchor: selection.from + (cursorOffset ?? source.length) }, scrollIntoView: true });
   scheduleIntelligence();
@@ -1391,7 +1410,10 @@ function toggleSourceComment(uncomment) {
   const endPosition = selection.to > selection.from && selection.to === model.view.state.doc.lineAt(selection.to).from ? selection.to - 1 : selection.to;
   const end = model.view.state.doc.lineAt(Math.max(start, endPosition)).to;
   const replacement = commentLatexLines(model.view.state.doc.sliceString(start, end), uncomment);
-  model.insertionSelection = { fileId: model.file.file_id, from: start, to: end };
+  const current = model.view.state.selection.main;
+  model.view.dispatch({ selection: { anchor: start, head: end } });
+  captureInsertionSelection();
+  model.view.dispatch({ selection: current });
   if (insertLatex(replacement, uncomment ? 'writer-uncomment-lines' : 'writer-comment-lines')) {
     model.view.dispatch({ selection: { anchor: start, head: start + replacement.length } });
   }
@@ -1399,7 +1421,11 @@ function toggleSourceComment(uncomment) {
 
 function insertInlineMath() {
   if (!model.view) return notice('Open an editable text file first.', true);
-  const selection = model.insertionSelection?.fileId === model.file?.file_id ? model.insertionSelection : model.view.state.selection.main;
+  const selection = resolveInsertionSelection();
+  if (!selection) {
+    model.insertionSelection = null;
+    return notice('The selected range is no longer available. Reopen Inline math.', true);
+  }
   if (isInsideInlineMath(model.view.state.doc.toString(), selection.from)) {
     model.insertionSelection = null;
     model.view.focus();
@@ -1440,7 +1466,7 @@ function builderRequirement(kind, values) {
 function builderSource(kind, values) {
   if (kind === 'table') return buildTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()), columnWidths: values.columnWidths.split(',').map((value) => value.trim()) });
   if (kind === 'longtable') return buildLongTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()) });
-  if (kind === 'figure') return buildFigure(values);
+  if (kind === 'figure') return buildFigure({ ...values, asset: compilationRelativePath(values.asset, model.paperDetail?.main_file) });
   if (kind === 'equation') return buildEquation(values);
   if (kind === 'plot') return buildPlot(values);
   if (kind === 'algorithm') return buildAlgorithm(values);
@@ -1536,7 +1562,8 @@ function openInsertMenu() {
     { label: 'Symbols', detail: 'Searchable accessible grid', run: openSymbols },
     { label: 'Plot', run: () => openBuilder('plot') },
     { label: 'Algorithm', run: () => openBuilder('algorithm') },
-    { label: 'Publications / bibliography', run: () => openBuilder('bibliography') },
+    { label: 'Publications', detail: 'Categorized communicated, accepted and published bibitems', run: openPublications },
+    { label: 'BibTeX entry', detail: 'Insert an entry into an existing .bib file', run: () => openBuilder('bibliography') },
     { label: 'Theorem', run: () => openBuilder('theorem') },
     { label: 'Citation', run: openCitationPalette }, { label: 'Reference', run: openReferencePalette },
     { label: 'Comment selected lines', detail: 'Prefix selected source lines with TeX comments', run: () => toggleSourceComment(false) },
@@ -1544,6 +1571,15 @@ function openInsertMenu() {
     { label: 'Itemized list', run: () => insertLatex('\\begin{itemize}\n  \\item Item\n\\end{itemize}\n', 'writer-list') },
     { label: 'Numbered list', run: () => insertLatex('\\begin{enumerate}\n  \\item Item\n\\end{enumerate}\n', 'writer-list') },
   ]);
+}
+
+async function openPublications() {
+  captureInsertionSelection();
+  await openDocumentDetails();
+  const publications = [...ui.documentDetailsBody.querySelectorAll('legend')]
+    .find((legend) => legend.textContent === 'Publications')?.closest('fieldset');
+  publications?.scrollIntoView({ block: 'center' });
+  publications?.querySelector('input')?.focus();
 }
 
 function openMathPalette() {
@@ -1570,7 +1606,13 @@ function openSymbols() {
     search: `${entry.category} ${entry.description} ${entry.keywords}`,
     ariaLabel: `${entry.description}, ${entry.latex}`,
     tooltip: `${entry.description} — ${entry.latex}`,
-    run: () => insertLatex(entry.latex, 'writer-symbol'),
+    run: () => {
+      const selection = resolveInsertionSelection();
+      if (!selection || !model.view) return insertLatex(entry.latex, 'writer-symbol');
+      const source = isInsideInlineMath(model.view.state.doc.toString(), selection.from)
+        ? entry.latex : `\\(${entry.latex}\\)`;
+      return insertLatex(source, 'writer-symbol');
+    },
   }));
   showPalette('Symbols', items, { grid: true });
 }
@@ -1637,7 +1679,11 @@ function projectMetadataEditor(detail) {
       const text = model.view?.state.doc.toString() || '';
       const cursor = model.view?.state.selection.main.from || 0;
       if (text.lastIndexOf('\\begin{thebibliography}', cursor) <= text.lastIndexOf('\\end{thebibliography}', cursor) || text.indexOf('\\end{thebibliography}', cursor) < 0) return notice('Place the cursor inside the existing thebibliography environment before inserting publications.', true);
-      try { captureInsertionSelection(); insertLatex(`${buildPublicationBibitems(readPublications())}\n`, 'writer-publications'); } catch (error) { notice(error.message, true); }
+      const existing = new Set([
+        ...(model.intelligence.bibliography || []).map((entry) => entry.key),
+        ...[...text.matchAll(/\\bibitem(?:\[[^\]]*\])?\{([^}]+)\}/g)].map((match) => match[1]),
+      ]);
+      try { insertLatex(`${buildPublicationBibitems(readPublications(), existing)}\n`, 'writer-publications'); } catch (error) { notice(error.message, true); }
     });
     insertPublications.type = 'button'; form.append(insertPublications);
     const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save project metadata'; form.append(save);
@@ -1738,6 +1784,7 @@ ui.newPaper.addEventListener('click', async () => {
 });
 
 ui.newFile.addEventListener('click', async () => {
+  if (model.collaboration && !await requireDurableFlush()) return;
   const suggestion = suggestedInsertionPath(model.files, model.paperDetail?.main_file, 'chapter', 'chapter9.tex');
   const choices = suggestion.candidates.length ? ` Existing chapter folders: ${suggestion.candidates.join(', ')}.` : '';
   const path = window.prompt(`New file path. The complete report-local destination is shown below.${choices}`, suggestion.path);
@@ -1877,11 +1924,11 @@ ui.assetInput.addEventListener('change', async () => {
   }
   try {
     if (model.paper?.id !== target.paperId || ui.uploadImage.disabled) throw new Error('Image upload is no longer permitted for this report. Reopen the report and try again.');
-    const sourceFileId = /\.tex$/i.test(model.file?.path || '') ? model.file.file_id : null;
     const result = await api.uploadAsset(target.paperId, path, target.version, file, replacement);
     if (model.paper?.id === target.paperId) {
       model.version = result.version;
-      await reloadPaperAndFile(sourceFileId || model.files.find((candidate) => candidate.path === model.paperDetail?.main_file)?.file_id || result.file.file_id);
+      model.files = await api.files(target.paperId);
+      renderFiles();
       notice(`${replacement ? 'Replaced' : 'Uploaded'} ${result.file.path} in ${target.reportName}.`);
       if (/\.(png|jpe?g)$/i.test(result.file.path) && window.confirm(`Insert a figure reference to ${result.file.path} at the current cursor?`)) {
         openBuilder('figure', { asset: result.file.path });

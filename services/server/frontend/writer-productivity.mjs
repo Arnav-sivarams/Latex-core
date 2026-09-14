@@ -135,6 +135,14 @@ export function suggestedInsertionPath(files, mainPath, kind, filename) {
   return { path: `${directory}/${filename}`, candidates };
 }
 
+export function compilationRelativePath(path, mainPath) {
+  const target = String(path || '').split('/').filter(Boolean);
+  const base = directoryOf(mainPath || '').split('/').filter(Boolean);
+  let common = 0;
+  while (common < target.length && common < base.length && target[common] === base[common]) common += 1;
+  return [...Array(base.length - common).fill('..'), ...target.slice(common)].join('/');
+}
+
 export function buildLongTable(options = {}) {
   const rows = clamp(options.rows, 1, 120);
   const columns = clamp(options.columns, 1, 12);
@@ -197,12 +205,12 @@ export function buildBibtexEntry(options = {}) {
   return `@${type}{${safeLabel(options.key || 'key')},\n${fields.map(([name, value]) => `  ${name} = {${safeText(String(value))}}`).join(',\n')}\n}`;
 }
 
-export function buildPublicationBibitems(entries = []) {
-  const seen = new Set();
+export function buildPublicationBibitems(entries = [], existingKeys = []) {
+  const seen = new Set(existingKeys);
   const groups = new Map([['communicated', []], ['accepted', []], ['published', []]]);
   for (const entry of entries) {
     const key = safeLabel(entry.citation_key || '');
-    if (!key || seen.has(key)) throw new Error('Publication citation keys must be present and unique.');
+    if (!key || seen.has(key)) throw new Error(`Publication citation key ${key || '(blank)'} must be present and unique across this report.`);
     seen.add(key);
     if (!groups.has(entry.status)) throw new Error('Publication status must be communicated, accepted, or published.');
     const details = `${safeText(entry.authors)}. ${safeText(entry.title)}. ${safeText(entry.venue)}, ${safeText(String(entry.year))}.`;

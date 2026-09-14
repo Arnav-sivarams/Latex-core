@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, commentLatexLines, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
+import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, commentLatexLines, compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
 
 test('outline hierarchy follows section levels', () => {
   const tree = buildOutlineTree([{ level: 'section', title: 'A' }, { level: 'subsection', title: 'B' }, { level: 'section', title: 'C' }]);
@@ -39,6 +39,8 @@ test('source line comments, inline math, and template-aware destinations are det
   assert.deepEqual(insertionDirectories(files, 'Thesis/main.tex', 'chapter'), ['Thesis/chapters']);
   assert.equal(suggestedInsertionPath(files, 'Thesis/main.tex', 'chapter', 'chapter9.tex').path, 'Thesis/chapters/chapter9.tex');
   assert.equal(suggestedInsertionPath(files, 'Thesis/main.tex', 'asset', 'plot.png').path, 'Thesis/images/plot.png');
+  assert.equal(compilationRelativePath('Thesis/images/plot.png', 'Thesis/main.tex'), 'images/plot.png');
+  assert.equal(compilationRelativePath('assets/plot.png', 'Thesis/main.tex'), '../assets/plot.png');
 });
 
 test('equation builder covers matrix and cases', () => {
@@ -71,6 +73,9 @@ test('categorized publication bibitems preserve all three statuses', () => {
   assert.match(source, /\\textbf\{Accepted\}[\s\S]*\\bibitem\{b\}/);
   assert.match(source, /\\textbf\{Published\}[\s\S]*\\bibitem\{c\}/);
   assert.throws(() => buildPublicationBibitems([{ citation_key: 'a', status: 'published' }, { citation_key: 'a', status: 'accepted' }]), /unique/);
+  assert.throws(() => buildPublicationBibitems([
+    { citation_key: 'existing', authors: 'A', title: 'T', venue: 'V', year: 2026, status: 'published' },
+  ], new Set(['existing'])), /unique across this report/);
 });
 
 test('package awareness is explicit', () => {

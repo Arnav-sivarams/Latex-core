@@ -64,20 +64,34 @@ async fn legacy_front_matter_institutional_api_contract() {
         mentor_ids.push(id);
     }
     let template_id = uuid::Uuid::new_v4();
-    let template = state.blobs.put(Bytes::from_static(b"\\documentclass{article}\n\\newcommand{\\studentAname}{Student A name}\n\\newcommand{\\projguidename}{Dr. Project guide name}\n\\newcommand{\\hoddept}{departmentname}\n\\begin{document}\n\\input{.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER\nMain content\n\\end{document}\n")).await.unwrap();
+    let template = state.blobs.put(Bytes::from_static(b"\\documentclass{article}\n\\usepackage{graphicx}\n\\usepackage{listings}\n\\newcommand{\\studentAname}{Student A name}\n\\newcommand{\\projguidename}{Dr. Project guide name}\n\\newcommand{\\hoddept}{departmentname}\n\\begin{document}\n\\input{../.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER\nMain content target phrase.\nInlineSlot\\par\nSymbolSlot\\par\nCodeSlot\nTableSlot\nFigureSlot\n\\input{chapters/chapter1.tex}\n\\begin{thebibliography}{9}\n\\bibitem{placeholder} PublicationSlot\n\\end{thebibliography}\n\\end{document}\n")).await.unwrap();
+    let chapter = state.blobs.put(Bytes::from_static(b"Existing chapter.\n")).await.unwrap();
+    let image_directory = state.blobs.put(Bytes::from_static(b"Project image directory.\n")).await.unwrap();
     state
         .repo
         .create_template_with_compatibility(
             template_id,
             &format!("Legacy test {suffix}"),
             None,
-            Some("main.tex"),
+            Some("Thesis_content_v1.0/main.tex"),
             true,
-            &[AppTemplateFileRecord {
-                path: "main.tex".into(),
-                blob_hash: template.hash(),
-                size_bytes: template.size_bytes(),
-            }],
+            &[
+                AppTemplateFileRecord {
+                    path: "Thesis_content_v1.0/main.tex".into(),
+                    blob_hash: template.hash(),
+                    size_bytes: template.size_bytes(),
+                },
+                AppTemplateFileRecord {
+                    path: "Thesis_content_v1.0/chapters/chapter1.tex".into(),
+                    blob_hash: chapter.hash(),
+                    size_bytes: chapter.size_bytes(),
+                },
+                AppTemplateFileRecord {
+                    path: "Thesis_content_v1.0/images/README.txt".into(),
+                    blob_hash: image_directory.hash(),
+                    size_bytes: image_directory.size_bytes(),
+                },
+            ],
         )
         .await
         .unwrap();

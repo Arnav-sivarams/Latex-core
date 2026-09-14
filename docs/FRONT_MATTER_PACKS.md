@@ -79,6 +79,8 @@ A compatible immutable Main Content Template contains this exact line at its int
 
 Template import and listing report either “Front Matter compatible” or “Front Matter not enabled.” Assignment is blocked with “This template is not configured for Front Matter.” when the marker is absent. LaTeX Core never searches for or rewrites a guessed insertion point.
 
+For a main file inside a bounded wrapper directory, the same exact managed suffix may have the required relative prefix, for example `\input{../.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER`. The renderer rebases only the generated managed wrapper to match that verified main-file depth. It does not rewrite the immutable uploaded template or guess other integration points. `SINGLE_SOURCE` templates without this explicit contract remain metadata-only and report a compatibility warning.
+
 ## Defaults, assignment, and document details
 
 The Templates page manages Main Content Templates, Front Matter Packs, and one Automatic Defaults table. Each programme independently chooses a Main Content Template and a Front Matter Pack. The global Front Matter fallback is nullable; `None` is valid. Changes affect future Teams only and never mutate existing pins.

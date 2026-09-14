@@ -4108,14 +4108,24 @@ async fn render_team_front_matter(
     } else {
         Vec::new()
     };
-    let rendered = front_matter::resolve_and_render(&pack, &automatic, &overrides, &sections)
+    let mut rendered = front_matter::resolve_and_render(&pack, &automatic, &overrides, &sections)
         .map_err(|error_value| match error_value {
-            front_matter::FrontMatterError::MissingRequired(labels) => error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("Needs information: {}", labels.join(", ")),
-            ),
-            other => error(StatusCode::BAD_REQUEST, other.to_string()),
+        front_matter::FrontMatterError::MissingRequired(labels) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Needs information: {}", labels.join(", ")),
+        ),
+        other => error(StatusCode::BAD_REQUEST, other.to_string()),
+    })?;
+    let main_path = exact.manifest["workspace"]["main_file"]
+        .as_str()
+        .and_then(|value| LogicalPath::parse(value).ok())
+        .ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exact workspace manifest has no valid main file",
+            )
         })?;
+    front_matter::rebase_generated_wrapper(&mut rendered.files, &main_path);
     let project = state
         .front_matter
         .project_metadata(paper_id)
@@ -4846,9 +4856,15 @@ async fn v2_paper(
     };
     let editable = paper.status == persistence::PaperStatus::Active && review_round_id.is_none();
     match state.workspaces.restore(paper.workspace_id).await {
-        Ok(workspace) => Json(serde_json::json!({
+        Ok(workspace) => {
+            let durable_version = match state.v2.durable_workspace_version(paper.workspace_id).await
+            {
+                Ok(value) => value,
+                Err(error_value) => return v2_error(error_value),
+            };
+            Json(serde_json::json!({
             "paper":paper,
-            "version":workspace.version().get(),
+            "version":durable_version,
             "main_file":workspace.main_file().map(LogicalPath::as_str),
             "editable":editable,
             "review_open":review_round_id.is_some(),
@@ -4860,8 +4876,9 @@ async fn v2_paper(
                 "send_for_review":editable && paper.kind == persistence::PaperKind::Team && paper.is_team_leader,
                 "end_review":review_round_id.is_some() && paper.is_team_leader
             }
-        }))
-        .into_response(),
+            }))
+            .into_response()
+        }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
     }
 }

@@ -82,6 +82,25 @@ pub struct V2ArtifactRecord {
 }
 
 impl V2Repository {
+    pub async fn durable_workspace_version(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<u64, V2Error> {
+        let value: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?
+        .ok_or(V2Error::NotFound {
+            entity: "workspace",
+        })?;
+        u64::try_from(value).map_err(|_| V2Error::Integrity {
+            message: "negative workspace version".to_owned(),
+        })
+    }
+
     pub async fn paper_document_epoch(&self, workspace_id: WorkspaceId) -> Result<u64, V2Error> {
         let value: i64 = sqlx::query_scalar(
             "INSERT INTO latex_core.paper_collaboration_state (workspace_id) VALUES ($1) \
