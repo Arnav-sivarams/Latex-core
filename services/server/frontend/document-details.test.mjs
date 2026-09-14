@@ -3,10 +3,11 @@ import test from 'node:test';
 import { frontMatterStatus, editableDetail, needsFirstUseDetails } from './document-details.mjs';
 
 test('first use only prompts a Leader with missing input', () => {
-  const detail = { pack_id: 'pack', can_edit: true, missing_required_fields: ['Course code'] };
+  const detail = { pack_id: 'pack', can_edit: true, missing_required_fields: ['Course code'], project_metadata: { setup_complete: true } };
   assert.equal(needsFirstUseDetails(detail), true);
   assert.equal(needsFirstUseDetails({ ...detail, can_edit: false }), false);
   assert.equal(needsFirstUseDetails({ ...detail, missing_required_fields: [] }), false);
+  assert.equal(needsFirstUseDetails({ ...detail, pack_id: null, project_metadata: { setup_complete: false } }), true);
   assert.equal(frontMatterStatus(detail), 'Front Matter needs 1 details');
 });
 

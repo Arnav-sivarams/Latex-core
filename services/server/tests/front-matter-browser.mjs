@@ -11,6 +11,8 @@ async function login(email, route) {
   page.on('console', (message) => { if (message.type() === 'error' && !message.text().includes('Failed to load resource:')) failures.push(message.text()); });
   page.on('response', (response) => { if (response.status() >= 500) failures.push(`${response.status()} ${response.url()}`); });
   await page.goto(config.base);
+  assert.equal(await page.locator('.login-brand').evaluate((node) => getComputedStyle(node).justifyContent), 'center');
+  assert.equal(await page.locator('.login-brand img').evaluate((node) => getComputedStyle(node).objectFit), 'contain');
   await page.locator('#email').fill(email);
   await page.locator('#password').fill(config.password);
   await Promise.all([page.waitForURL(`**/${route}`), page.getByRole('button', { name: 'Sign in', exact: true }).click()]);
@@ -53,18 +55,26 @@ async function waitCompile(page) {
 }
 try {
   const leader = await login(config.leader, 'write');
+  assert.equal(await leader.locator('header #projectSearch').count(), 1, 'Search paper belongs in the header');
+  assert.equal(await leader.locator('.files-pane #projectSearch').count(), 0, 'file explorer must not duplicate Search paper');
   await leader.getByText('Complete document details', { exact: true }).waitFor();
   const detailsPath = `/api/v2/papers/${config.paper_id}/document-details`;
   const detail = await api(leader, detailsPath);
   for (const key of ['team_name', 'team_size', 'student_a_name', 'student_a_reg_no', 'guide_name', 'guide_designation', 'team_semester', 'hod_name', 'dean_name']) {
     assert.equal(await leader.locator(`[name="field:${key}"]`).count(), 0, `${key} must not be requested`);
   }
+  await leader.locator('[name="project_type"]').selectOption('capstone');
+  await leader.locator('[name="executive_summary"]').fill('Browser-qualified executive summary.');
+  await leader.getByRole('button', { name: 'Save project metadata', exact: true }).click();
+  await leader.getByText('Project metadata saved. Compile to refresh the PDF.', { exact: true }).waitFor();
   for (const [key, value] of Object.entries(config.manual)) await leader.locator(`[name="field:${key}"]`).fill(value);
   const guide = leader.locator('[name="field:guide_identity"]');
   await guide.selectOption({ label: 'Dr. Grace Guide' });
   await leader.getByRole('button', { name: 'Save document details', exact: true }).click();
-  await leader.getByText('Document details saved. Front Matter was rebuilt.', { exact: true }).waitFor();
-  await waitCompile(leader);
+  await leader.getByText('Document details saved. Front Matter was rebuilt. Compile to refresh the PDF.', { exact: true }).waitFor();
+  const beforeManual = await api(leader, `/api/v2/papers/${config.paper_id}/builds`);
+  assert.equal(beforeManual.build.current_build_id, null, 'metadata and Front Matter saves must not compile');
+  assert.equal(beforeManual.build.active_build_id, null, 'metadata and Front Matter saves must not queue a build');
   await leader.getByRole('button', { name: 'Compile', exact: true }).click();
   await waitCompile(leader);
   const text = await pdfText(leader);
@@ -88,6 +98,8 @@ try {
   assert.equal(await mentor.getByRole('button', { name: 'Document details' }).count(), 0);
   // Mentor PDF is loaded by the existing read-only review viewer.
   await mentor.waitForFunction(() => document.querySelector('#pdfCanvas')?.width > 0 && document.querySelector('#pdfCanvas')?.height > 0);
+  const mentorColumns = await mentor.evaluate(() => ({ source: document.querySelector('.review-source').getBoundingClientRect().width, pdf: document.querySelector('.review-pdf').getBoundingClientRect().width }));
+  assert.ok(mentorColumns.pdf > mentorColumns.source, `Mentor PDF must be wider than source: ${JSON.stringify(mentorColumns)}`);
   assert.ok((await pdfText(mentor)).includes('Dr. Grace Guide'));
   await mentor.context().close();
   // One optional field is deliberately omitted, while all other choices persist.
@@ -95,14 +107,52 @@ try {
   const values = Object.fromEntries(saved.values.filter((value) => value.value_source === 'TEAM_OVERRIDE').map((value) => [value.field_key, value.value]));
   delete values.specialization;
   await api(leader, detailsPath, { values, sections: {} });
+  await leader.getByRole('button', { name: 'Compile', exact: true }).click();
   await waitCompile(leader);
   const optionalText = await pdfText(leader);
   assert.ok(!optionalText.includes('Intelligent Systems'));
   assert.ok(optionalText.includes('Synthetic Solar Project'));
   await leader.locator('#documentDetails').click();
   await leader.getByText('Specialization is not available from institution data or Document details.', { exact: true }).waitFor();
+  await leader.locator('#drawerClose').click();
+  await leader.locator('#insertMenu').click();
+  const insertEntries = await leader.locator('#dialogBody button').allTextContents();
+  for (const entry of ['Table', 'Figure', 'Code block', 'Inline math', 'Display math', 'Symbols', 'Publications / bibliography']) assert.equal(insertEntries.filter((value) => value === entry).length, 1, `${entry} must appear once in Insert`);
+  await leader.getByRole('button', { name: 'Symbols', exact: true }).click();
+  assert.ok(await leader.locator('.symbol-grid button').count() > 10, 'symbol catalogue must render as a grid');
+  const firstSymbol = leader.locator('.symbol-grid button').first();
+  assert.ok(await firstSymbol.getAttribute('aria-label'));
+  assert.ok(await firstSymbol.getAttribute('title'));
+  await leader.locator('#dialogSearch').press('ArrowDown');
+  await leader.locator('#dialogSearch').press('ArrowUp');
+  await leader.getByRole('button', { name: 'Close', exact: true }).click();
+  await leader.locator('#moreActions').click();
+  const moreEntries = await leader.locator('#dialogBody button').allTextContents();
+  assert.equal(moreEntries.filter((value) => ['Table', 'Figure', 'Code block', 'Inline math', 'Display math', 'Symbols'].includes(value)).length, 0, 'More actions must not duplicate Insert commands');
+  await leader.getByRole('button', { name: 'Close', exact: true }).click();
+  await leader.getByRole('button', { name: 'Send for review', exact: true }).click();
+  await leader.waitForFunction(() => document.querySelector('#compilePaper')?.disabled === true && document.querySelector('#endReview')?.disabled === false);
+  await writer.waitForFunction(() => document.querySelector('#compilePaper')?.disabled === true && document.querySelector('.cm-content')?.getAttribute('contenteditable') === 'false');
+  assert.equal(await writer.locator('#endReview').isVisible(), false, 'regular Writer must not receive End review');
+  const reviewingMentor = await login(config.mentor, 'review');
+  await reviewingMentor.waitForFunction(() => document.querySelector('#pushReview')?.disabled === false && document.querySelector('#createComment')?.disabled === false);
+  reviewingMentor.once('dialog', (dialog) => dialog.accept());
+  await reviewingMentor.getByRole('button', { name: 'Push review', exact: true }).click();
+  await reviewingMentor.waitForFunction(() => ['Review submitted', 'No active review'].includes(document.querySelector('#draftStatus')?.textContent));
+  await writer.bringToFront();
+  assert.equal(await writer.locator('#compilePaper').isDisabled(), true, 'one Mentor submission must not unlock a multi-Mentor round');
+  const secondMentor = await login(config.mentor_two, 'review');
+  await secondMentor.waitForFunction(() => document.querySelector('#pushReview')?.disabled === false);
+  secondMentor.once('dialog', (dialog) => dialog.accept());
+  await secondMentor.getByRole('button', { name: 'Push review', exact: true }).click();
+  await secondMentor.waitForFunction(() => ['Review submitted', 'No active review'].includes(document.querySelector('#draftStatus')?.textContent));
+  await writer.bringToFront();
+  await writer.waitForFunction(() => document.querySelector('#compilePaper')?.disabled === false);
+  assert.notEqual(await writer.locator('.cm-content').getAttribute('contenteditable'), 'false', 'Writer editor must leave read-only mode after the round');
+  await reviewingMentor.context().close();
+  await secondMentor.context().close();
   assert.deepEqual(failures, []);
-  console.log(JSON.stringify({ leader: 'passed', writer: 'passed', mentor: 'passed', m7: config.environment, populated_pdf_assertions: 27, optional_blank_compile: 'passed', browser_errors: failures.length }));
+  console.log(JSON.stringify({ leader: 'passed', writer: 'passed', mentor: 'passed', review_turn_taking: 'passed', m7: config.environment, populated_pdf_assertions: 27, optional_blank_compile: 'passed', browser_errors: failures.length }));
 } finally {
   await browser.close();
 }

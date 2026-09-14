@@ -248,11 +248,18 @@ async fn front_matter(
     if let Err(response) = report_principal(&state, &headers, "reports.read", report_id).await {
         return response;
     }
-    match state.front_matter.archive_metadata(report_id).await {
-        Ok(value) => {
-            Json(json!({"schema_version":1,"report_id":report_id,"current":value})).into_response()
-        }
-        Err(_) => api_error(
+    match (
+        state.front_matter.archive_metadata(report_id).await,
+        state.front_matter.project_metadata(report_id).await,
+    ) {
+        (Ok(value), Ok(project_metadata)) => Json(json!({
+            "schema_version":1,
+            "report_id":report_id,
+            "current":value,
+            "project_metadata":project_metadata
+        }))
+        .into_response(),
+        _ => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "persistence_error",
             "Front Matter metadata is unavailable",
@@ -617,7 +624,11 @@ fn permitted_files(version: &Value) -> Vec<Value> {
     identities.into_iter().filter_map(|identity| {
         let file_id = identity["file_id"].as_str()?;
         let path = identity["path"].as_str()?;
-        if policies.get(file_id).is_some_and(|policy| policy == "HIDDEN_SYSTEM") { return None; }
+        if policies.get(file_id).is_some_and(|policy| policy == "HIDDEN_SYSTEM")
+            && path != ".latex-core/frontmatter/Front-Matter.tex"
+        {
+            return None;
+        }
         let entry = version["files"].get(path)?;
         Some(json!({"file_id":file_id,"path":path,"sha256":entry["blob_hash"],"size_bytes":entry["size_bytes"],"content_url":format!("/api/integration/v1/reports/{}/versions/{}/files/{file_id}/content",version.get("report_id").and_then(Value::as_str).unwrap_or("REPORT_ID"),version["id"].as_str().unwrap_or("VERSION_ID"))}))
     }).collect()

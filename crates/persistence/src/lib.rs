@@ -91,7 +91,8 @@ pub use error::PersistenceError;
 pub use front_matter::{
     ApplyFrontMatterRequest, ExactStateRecord, FrontMatterPackFileRecord, FrontMatterPackRecord,
     FrontMatterRepository, FrontMatterRepositoryError, FrontMatterValueRecord,
-    ManagedFrontMatterFile,
+    ManagedFrontMatterFile, ProjectDataset, ProjectMetadataInput, ProjectPublication,
+    ProjectSourceSnippet,
 };
 pub use governance::{
     ExactRestoreState, RestorationApplied, RestorationRequest, TeamTemplateResolutionInput,

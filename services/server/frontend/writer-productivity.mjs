@@ -45,6 +45,17 @@ const safeLabel = (value = '') => value.replace(/[^A-Za-z0-9:_.-]/g, '-');
 const safeText = (value = '') => value.replace(/[\\{}%&#]/g, (character) => ({ '\\': '\\textbackslash{}', '{': '\\{', '}': '\\}', '%': '\\%', '&': '\\&', '#': '\\#' })[character]);
 const safePath = (value = '') => value.replace(/[{}\\\r\n%#]/g, '');
 
+const DIMENSION = /^(?:0?[.]\d+|[1-9]\d*(?:[.]\d+)?)\s*(?:pt|mm|cm|in|em|ex)$/;
+
+export function latexDimension(value, label = 'Dimension') {
+  const normalized = String(value || '').trim();
+  if (!normalized) return '';
+  if (!DIMENSION.test(normalized)) throw new Error(`${label} must be a positive number followed by pt, mm, cm, in, em, or ex.`);
+  const amount = Number.parseFloat(normalized);
+  if (!(amount > 0) || amount > 1000) throw new Error(`${label} must be greater than 0 and no more than 1000.`);
+  return normalized.replace(/\s+/g, '');
+}
+
 export function packageRequirement(packages, required) {
   return packages.includes(required) ? { available: true, message: 'Available' } : { available: false, message: `Requires package: ${required}` };
 }
@@ -52,20 +63,76 @@ export function packageRequirement(packages, required) {
 export function buildTable(options = {}) {
   const rows = clamp(options.rows, 1, 30);
   const columns = clamp(options.columns, 1, 12);
-  const alignments = Array.from({ length: columns }, (_, index) => ({ left: 'l', center: 'c', right: 'r' }[options.alignments?.[index]] || 'l')).join('');
+  const widths = Array.isArray(options.columnWidths) ? options.columnWidths : String(options.columnWidths || '').split(',');
+  const alignments = Array.from({ length: columns }, (_, index) => {
+    const width = latexDimension(widths[index], `Column ${index + 1} width`);
+    return width ? `p{${width}}` : ({ left: 'l', center: 'c', right: 'r' }[options.alignments?.[index]] || 'l');
+  }).join('');
+  const minimumRowHeight = latexDimension(options.minimumRowHeight, 'Minimum row height');
   const booktabs = Boolean(options.booktabs);
-  const lines = [`\\begin{table}[${options.placement || 'htbp'}]`, '\\centering', `\\begin{tabular}{${alignments}}`];
+  const lines = [`\\begin{table}[${options.placement || 'htbp'}]`, '\\centering'];
+  if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}`);
+  if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);
+  lines.push(`\\begin{tabular}{${alignments}}`);
   if (booktabs) lines.push('\\toprule');
   for (let row = 0; row < rows; row += 1) {
-    lines.push(Array.from({ length: columns }, (_, column) => options.header && row === 0 ? `Header ${column + 1}` : `Cell ${row + 1}.${column + 1}`).join(' & ') + ' \\\\');
+    const cells = Array.from({ length: columns }, (_, column) => options.header && row === 0 ? `Header ${column + 1}` : `Cell ${row + 1}.${column + 1}`);
+    if (minimumRowHeight) cells[0] = `\\rule{0pt}{${minimumRowHeight}}${cells[0]}`;
+    lines.push(cells.join(' & ') + ' \\\\');
     if (booktabs && options.header && row === 0) lines.push('\\midrule');
   }
   if (booktabs) lines.push('\\bottomrule');
   lines.push('\\end{tabular}');
-  if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}`);
-  if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);
   lines.push('\\end{table}');
   return lines.join('\n');
+}
+
+export function commentLatexLines(source, uncomment = false) {
+  return String(source).split('\n').map((line) => {
+    if (uncomment) return line.replace(/^(\s*)% ?/, '$1');
+    const indentation = line.match(/^\s*/)?.[0] || '';
+    return `${indentation}% ${line.slice(indentation.length)}`;
+  }).join('\n');
+}
+
+export function isInsideInlineMath(source, position) {
+  const before = String(source).slice(0, position);
+  const parenOpen = before.lastIndexOf('\\(');
+  const parenClose = before.lastIndexOf('\\)');
+  if (parenOpen > parenClose) return true;
+  const dollars = [...before].filter((character, index) => character === '$' && before[index - 1] !== '\\').length;
+  return dollars % 2 === 1;
+}
+
+export function inlineMathInsertion(selection = '') {
+  return { source: `\\(${selection}\\)`, cursorOffset: selection ? null : 2 };
+}
+
+function directoryOf(path) {
+  const separator = path.lastIndexOf('/');
+  return separator < 0 ? '' : path.slice(0, separator);
+}
+
+export function insertionDirectories(files, mainPath, kind) {
+  const preferredNames = kind === 'chapter' ? ['chapters', 'chapter'] : ['assets', 'images', 'image', 'figures'];
+  const mainRoot = directoryOf(mainPath || '');
+  const directories = [...new Set(files.flatMap((file) => {
+    const parts = file.path.split('/');
+    return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join('/'));
+  }))];
+  return directories.filter((directory) => preferredNames.includes(directory.split('/').at(-1).toLowerCase()))
+    .sort((left, right) => {
+      const leftInRoot = !mainRoot || left === mainRoot || left.startsWith(`${mainRoot}/`) ? 0 : 1;
+      const rightInRoot = !mainRoot || right === mainRoot || right.startsWith(`${mainRoot}/`) ? 0 : 1;
+      return leftInRoot - rightInRoot || preferredNames.indexOf(left.split('/').at(-1).toLowerCase()) - preferredNames.indexOf(right.split('/').at(-1).toLowerCase()) || left.localeCompare(right);
+    });
+}
+
+export function suggestedInsertionPath(files, mainPath, kind, filename) {
+  const candidates = insertionDirectories(files, mainPath, kind);
+  const root = directoryOf(mainPath || '');
+  const directory = candidates[0] || [root, kind === 'chapter' ? 'chapters' : 'assets'].filter(Boolean).join('/');
+  return { path: `${directory}/${filename}`, candidates };
 }
 
 export function buildLongTable(options = {}) {
@@ -128,6 +195,23 @@ export function buildBibtexEntry(options = {}) {
   const type = ['article', 'book', 'inproceedings', 'misc'].includes(options.type) ? options.type : 'article';
   const fields = [['title', options.title], ['author', options.author], ['year', options.year], ['journal', options.journal], ['booktitle', options.booktitle], ['doi', options.doi], ['url', options.url]].filter(([, value]) => value);
   return `@${type}{${safeLabel(options.key || 'key')},\n${fields.map(([name, value]) => `  ${name} = {${safeText(String(value))}}`).join(',\n')}\n}`;
+}
+
+export function buildPublicationBibitems(entries = []) {
+  const seen = new Set();
+  const groups = new Map([['communicated', []], ['accepted', []], ['published', []]]);
+  for (const entry of entries) {
+    const key = safeLabel(entry.citation_key || '');
+    if (!key || seen.has(key)) throw new Error('Publication citation keys must be present and unique.');
+    seen.add(key);
+    if (!groups.has(entry.status)) throw new Error('Publication status must be communicated, accepted, or published.');
+    const details = `${safeText(entry.authors)}. ${safeText(entry.title)}. ${safeText(entry.venue)}, ${safeText(String(entry.year))}.`;
+    const identifiers = [entry.doi ? ` DOI: ${safeText(entry.doi)}.` : '', entry.url ? ` URL: ${safeText(entry.url)}.` : ''].join('');
+    groups.get(entry.status).push(`\\bibitem{${key}} ${details}${identifiers}`);
+  }
+  return [...groups].filter(([, items]) => items.length).flatMap(([status, items]) => [
+    `\\item[]\\textbf{${status[0].toUpperCase()}${status.slice(1)}}`, ...items,
+  ]).join('\n');
 }
 
 export function buildAlgorithm(options = {}) {

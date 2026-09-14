@@ -13,8 +13,10 @@ import { pdfPreviewState } from './writer-pdf.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
-  buildLongTable, buildPlot, buildTable, buildTheorem, commonSnippets,
-  fuzzyRankFiles, packageRequirement, symbols,
+  buildLongTable, buildPlot, buildTable, buildTheorem, commentLatexLines,
+  buildPublicationBibitems,
+  fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
+  packageRequirement, suggestedInsertionPath,
 } from './writer-productivity.mjs';
 
 const SOURCE_UPDATE = 0x01;
@@ -90,6 +92,7 @@ class PaperApi {
   acceptSuggestion(paperId, threadId, durableSequence) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/accept`, 'POST', { durable_sequence: durableSequence }); }
   rejectSuggestion(paperId, threadId, rejectionReason) { return this.json(`/api/v2/reviews/papers/${paperId}/threads/${threadId}/suggestion/reject`, 'POST', { rejection_reason: rejectionReason || null }); }
   documentDetails(paperId) { return this.request(`/api/v2/papers/${paperId}/document-details`); }
+  saveProjectMetadata(paperId, body) { return this.json(`/api/v2/papers/${paperId}/project-metadata`, 'PUT', body); }
   saveDocumentDetails(paperId, body) { return this.json(`/api/v2/papers/${paperId}/document-details`, 'PUT', body); }
 
   json(path, method, body) {
@@ -107,6 +110,7 @@ const ui = Object.fromEntries([
   'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
   'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'pdfRelation', 'pdfEmpty',
   'pdfFrame', 'createCheckpoint', 'versionHistory', 'versionDiff',
+  'pdfPage', 'pdfZoom', 'locateInPdf',
   'reviewCounts', 'writerReviewFilters', 'writerReviewList',
     'quickOpen', 'commandPalette', 'uploadImage', 'assetInput',
   'projectSearch', 'caseSensitive', 'searchResults', 'insertMenu', 'symbolPalette',
@@ -149,7 +153,21 @@ const model = {
   preferences: { font_size_px: 14, theme: 'LIGHT' },
   editorAppearance: new Compartment(),
   assetUploadTarget: null,
+  insertionSelection: null,
+  pdfView: { page: 1, zoom: 100, x: 0, y: 0 },
+  pdfCurrent: false,
 };
+
+function pdfViewKey() { return model.paper ? `latex-core-pdf-view:${model.paper.id}` : null; }
+function loadPdfView() {
+  try { model.pdfView = { ...model.pdfView, ...JSON.parse(sessionStorage.getItem(pdfViewKey()) || '{}') }; } catch { model.pdfView = { page: 1, zoom: 100, x: 0, y: 0 }; }
+  model.pdfView.page = Math.max(1, Number(model.pdfView.page) || 1);
+  model.pdfView.zoom = [75, 100, 125, 150].includes(Number(model.pdfView.zoom)) ? Number(model.pdfView.zoom) : 100;
+  ui.pdfPage.value = model.pdfView.page; ui.pdfZoom.value = model.pdfView.zoom;
+}
+function savePdfView() { const key = pdfViewKey(); if (key) sessionStorage.setItem(key, JSON.stringify(model.pdfView)); }
+function currentPdfUrl(buildId) { return `/api/v2/papers/${model.paper.id}/artifacts/pdf?build=${buildId}#page=${model.pdfView.page}&zoom=${model.pdfView.zoom},${Math.max(0, model.pdfView.x || 0)},${Math.max(0, model.pdfView.y || 0)}`; }
+function applyPdfView() { if (model.currentBuildId) { savePdfView(); ui.pdfFrame.src = currentPdfUrl(model.currentBuildId); } }
 
 function notice(message, failed = false) {
   ui.writerNotice.textContent = message;
@@ -657,6 +675,7 @@ async function openPaper(paper) {
   ui.pdfFrame.hidden = true;
   ui.pdfEmpty.hidden = false;
   model.paper = paper;
+  loadPdfView();
   model.file = null;
   model.paperDetail = await api.paper(paper.id);
   model.version = model.paperDetail.version;
@@ -903,15 +922,17 @@ async function refreshBuildStatus() {
     const pdf = build.current_source_sequence;
     const preview = pdfPreviewState(build);
     const stale = source != null && pdf != null && source !== pdf;
+    model.pdfCurrent = Boolean(build.current_build_id && !stale);
     model.compileDiagnostic = build.latest_status === 'failed' && build.latest_error?.message
       ? { severity: 'error', code: 'compile', message: build.latest_error.message, path: null, file_id: null }
       : null;
     if (build.current_build_id && build.current_build_id !== model.currentBuildId) {
       model.currentBuildId = build.current_build_id;
-      ui.pdfFrame.src = `${payload.pdf_url}?build=${build.current_build_id}`;
+      ui.pdfFrame.src = currentPdfUrl(build.current_build_id);
     }
     ui.pdfFrame.hidden = !preview.viewer;
     ui.pdfEmpty.hidden = !preview.empty;
+    ui.locateInPdf.disabled = !model.pdfCurrent || !model.file || !/\.tex$/i.test(model.file.path);
     if (pdf == null) ui.pdfRelation.textContent = 'Compile to generate a PDF.';
     else if (stale) ui.pdfRelation.textContent = `PDF is out of date — Compile to refresh. Source version ${source} · PDF version ${pdf}`;
     else ui.pdfRelation.textContent = `PDF matches source version ${pdf}`;
@@ -1244,7 +1265,9 @@ async function focusWriterReview(thread) {
 function showReviewedPdf(thread) {
   if (!thread.pdf_anchor) return;
   const build = thread.pdf_anchor.build_id || model.currentBuildId;
-  ui.pdfFrame.src = `/api/v2/papers/${model.paper.id}/artifacts/pdf?build=${build}#page=${thread.pdf_anchor.page}`;
+  model.pdfView.page = thread.pdf_anchor.page; model.pdfView.x = thread.pdf_anchor.x || 0; model.pdfView.y = thread.pdf_anchor.y || 0;
+  ui.pdfPage.value = model.pdfView.page; savePdfView();
+  ui.pdfFrame.src = currentPdfUrl(build);
   ui.pdfFrame.hidden = false; ui.pdfEmpty.hidden = true;
 }
 
@@ -1289,7 +1312,14 @@ function closeDialog() {
   if (ui.productivityDialog.open) ui.productivityDialog.close();
 }
 
-function showPalette(title, items) {
+function captureInsertionSelection() {
+  if (!model.view || !model.file) return;
+  const selection = model.view.state.selection.main;
+  model.insertionSelection = { fileId: model.file.file_id, from: selection.from, to: selection.to };
+}
+
+function showPalette(title, items, options = {}) {
+  if (options.insertion !== false) captureInsertionSelection();
   ui.dialogTitle.textContent = title;
   ui.dialogBody.replaceChildren();
   ui.dialogActions.replaceChildren();
@@ -1302,10 +1332,11 @@ function showPalette(title, items) {
     const visible = items.filter((item) => `${item.label} ${item.detail || ''} ${item.search || ''}`.toLowerCase().includes(query));
     selected = Math.min(selected, Math.max(visible.length - 1, 0));
     const list = document.createElement('div');
-    list.className = 'palette-list';
+    list.className = options.grid ? 'palette-list symbol-grid' : 'palette-list';
     visible.forEach((item, index) => {
       const node = button(item.label, async () => { closeDialog(); await item.run(); }, index === selected);
-      if (item.detail) node.title = item.detail;
+      node.title = item.tooltip || item.detail || item.label;
+      if (item.ariaLabel) node.setAttribute('aria-label', item.ariaLabel);
       list.append(node);
     });
     ui.dialogBody.replaceChildren(list);
@@ -1324,7 +1355,7 @@ function showPalette(title, items) {
 }
 
 function quickOpen() {
-  showPalette('Quick Open', fuzzyRankFiles(model.files, '').map((file) => ({ label: file.path, run: () => openFile(file) })));
+  showPalette('Quick Open', fuzzyRankFiles(model.files, '').map((file) => ({ label: file.path, run: () => openFile(file) })), { insertion: false });
   ui.dialogSearch.oninput = () => {
     const ranked = fuzzyRankFiles(model.files, ui.dialogSearch.value);
     const list = document.createElement('div');
@@ -1334,23 +1365,52 @@ function quickOpen() {
   };
 }
 
-function insertLatex(source, origin = 'writer-builder') {
+function insertLatex(source, origin = 'writer-builder', cursorOffset = null) {
   if (!model.view || !model.collaboration || model.collaboration.access !== 'read_write') {
     notice('Open an editable text file before inserting LaTeX.', true);
     return false;
   }
-  const selection = model.view.state.selection.main;
+  const captured = model.insertionSelection;
+  const selection = captured?.fileId === model.file.file_id && captured.from <= model.view.state.doc.length && captured.to <= model.view.state.doc.length
+    ? captured : model.view.state.selection.main;
+  model.insertionSelection = null;
   model.collaboration.doc.transact(() => {
     if (selection.to > selection.from) model.collaboration.text.delete(selection.from, selection.to - selection.from);
     model.collaboration.text.insert(selection.from, source);
   }, origin);
   model.view.focus();
+  model.view.dispatch({ selection: { anchor: selection.from + (cursorOffset ?? source.length) }, scrollIntoView: true });
   scheduleIntelligence();
   return true;
 }
 
+function toggleSourceComment(uncomment) {
+  if (!model.view || !model.collaboration || model.collaboration.access !== 'read_write') return notice('Open an editable text file first.', true);
+  const selection = model.view.state.selection.main;
+  const start = model.view.state.doc.lineAt(selection.from).from;
+  const endPosition = selection.to > selection.from && selection.to === model.view.state.doc.lineAt(selection.to).from ? selection.to - 1 : selection.to;
+  const end = model.view.state.doc.lineAt(Math.max(start, endPosition)).to;
+  const replacement = commentLatexLines(model.view.state.doc.sliceString(start, end), uncomment);
+  model.insertionSelection = { fileId: model.file.file_id, from: start, to: end };
+  if (insertLatex(replacement, uncomment ? 'writer-uncomment-lines' : 'writer-comment-lines')) {
+    model.view.dispatch({ selection: { anchor: start, head: start + replacement.length } });
+  }
+}
+
+function insertInlineMath() {
+  if (!model.view) return notice('Open an editable text file first.', true);
+  const selection = model.insertionSelection?.fileId === model.file?.file_id ? model.insertionSelection : model.view.state.selection.main;
+  if (isInsideInlineMath(model.view.state.doc.toString(), selection.from)) {
+    model.insertionSelection = null;
+    model.view.focus();
+    return notice('The cursor is already inside inline math; no extra delimiters were added.');
+  }
+  const insertion = inlineMathInsertion(model.view.state.doc.sliceString(selection.from, selection.to));
+  insertLatex(insertion.source, 'writer-inline-math', insertion.cursorOffset);
+}
+
 const builderSchemas = {
-  table: [['rows', 'Rows', 'number', 3], ['columns', 'Columns', 'number', 3], ['header', 'Header row', 'checkbox', true], ['alignments', 'Column alignments', 'text', 'left,center,left'], ['booktabs', 'Booktabs', 'checkbox', false], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'tab:'], ['placement', 'Placement', 'text', 'htbp']],
+  table: [['rows', 'Rows', 'number', 3], ['columns', 'Columns', 'number', 3], ['header', 'Header row', 'checkbox', true], ['alignments', 'Column alignments (shared by each column)', 'text', 'left,center,left'], ['columnWidths', 'Column widths, comma-separated (for example 3cm,,5cm)', 'text', ''], ['minimumRowHeight', 'Minimum height shared by each row (for example 8mm)', 'text', ''], ['booktabs', 'Booktabs', 'checkbox', false], ['caption', 'Caption (placed above table)', 'text', ''], ['label', 'Label', 'text', 'tab:'], ['placement', 'Placement', 'text', 'htbp']],
   longtable: [['rows', 'Rows', 'number', 40], ['columns', 'Columns', 'number', 3], ['header', 'Repeat header on later pages', 'checkbox', true], ['alignments', 'Column alignments', 'text', 'left,center,left'], ['caption', 'Caption', 'text', 'Long table'], ['label', 'Label', 'text', 'tab:long']],
   figure: [['asset', 'Asset', 'asset', ''], ['width', 'Width', 'select', ['\\linewidth', '0.75\\linewidth', '0.5\\linewidth', 'custom']], ['customWidth', 'Custom width', 'text', ''], ['placement', 'Placement', 'text', 'htbp'], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:']],
   equation: [['type', 'Type', 'select', ['inline', 'display', 'aligned', 'matrix', 'cases']], ['body', 'Expression / body', 'textarea', 'x = y'], ['rows', 'Rows', 'number', 2], ['columns', 'Columns', 'number', 2], ['delimiter', 'Matrix delimiter', 'select', ['()', '[]', '||', 'none']], ['label', 'Label', 'text', 'eq:']],
@@ -1378,7 +1438,7 @@ function builderRequirement(kind, values) {
 }
 
 function builderSource(kind, values) {
-  if (kind === 'table') return buildTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()) });
+  if (kind === 'table') return buildTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()), columnWidths: values.columnWidths.split(',').map((value) => value.trim()) });
   if (kind === 'longtable') return buildLongTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()) });
   if (kind === 'figure') return buildFigure(values);
   if (kind === 'equation') return buildEquation(values);
@@ -1390,6 +1450,7 @@ function builderSource(kind, values) {
 }
 
 function openBuilder(kind, defaults = {}) {
+  captureInsertionSelection();
   const schema = builderSchemas[kind];
   ui.dialogTitle.textContent = `${kind[0].toUpperCase()}${kind.slice(1)} Builder`;
   ui.dialogSearch.hidden = true;
@@ -1427,13 +1488,25 @@ function openBuilder(kind, defaults = {}) {
     ui.dialogBody.append(helpers);
   }
   const note = document.createElement('div');
+  if (kind === 'table') ui.dialogBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: 'Widths apply to whole columns and minimum height applies to whole rows; LaTeX tables do not have independent per-cell grid geometry.' }));
   const values = () => Object.fromEntries(Object.entries(controls).map(([name, control]) => [name, control.type === 'checkbox' ? control.checked : control.value]));
+  let source = '';
   const refresh = () => {
-    const current = values();
-    const requirement = builderRequirement(kind, current);
-    note.className = requirement.available ? '' : 'package-note';
-    note.textContent = requirement.message;
-    ui.dialogPreview.textContent = builderSource(kind, current);
+    try {
+      const current = values();
+      const requirement = builderRequirement(kind, current);
+      note.className = requirement.available ? '' : 'package-note';
+      note.textContent = requirement.message;
+      source = builderSource(kind, current);
+      ui.dialogPreview.textContent = source;
+      insert.disabled = !requirement.available;
+    } catch (error) {
+      note.className = 'package-note';
+      note.textContent = error.message;
+      source = '';
+      ui.dialogPreview.textContent = '';
+      insert.disabled = true;
+    }
   };
   ui.dialogBody.append(note);
   Object.values(controls).forEach((control) => control.addEventListener('input', refresh));
@@ -1445,7 +1518,7 @@ function openBuilder(kind, defaults = {}) {
       await model.collaboration?.ready;
       if (model.view) model.view.dispatch({ selection: { anchor: model.view.state.doc.length } });
     }
-    if (insertLatex(`${builderSource(kind, current)}\n`, `writer-${kind}-builder`)) closeDialog();
+    if (source && insertLatex(`${source}\n`, `writer-${kind}-builder`)) closeDialog();
   });
   ui.dialogActions.append(insert);
   refresh();
@@ -1453,11 +1526,23 @@ function openBuilder(kind, defaults = {}) {
 }
 
 function openInsertMenu() {
-  showPalette('Insert LaTeX', [
-    ...['table', 'longtable', 'figure', 'plot', 'algorithm', 'code', 'bibliography', 'theorem'].map((kind) => ({ label: kind === 'longtable' ? 'Long Table Builder' : `${kind[0].toUpperCase()}${kind.slice(1)} Builder`, run: () => openBuilder(kind) })),
-    { label: 'Algorithmic Builder', detail: 'algorithm + algorithmic commands such as \\STATE', run: () => openBuilder('algorithm', { family: 'algorithmic', body: '\\STATE Describe the method' }) },
-    { label: 'Insert Citation', run: openCitationPalette }, { label: 'Insert Reference', run: openReferencePalette },
-    ...Object.entries(commonSnippets).map(([name, source]) => ({ label: `${name} snippet`, run: () => insertLatex(`${source}\n`, 'writer-snippet') })),
+  showPalette('Insert', [
+    { label: 'Table', detail: 'Caption above; column widths and row height', run: () => openBuilder('table') },
+    { label: 'Long table', detail: 'Multi-page table with caption above', run: () => openBuilder('longtable') },
+    { label: 'Figure', detail: 'Image with caption below', run: () => openBuilder('figure') },
+    { label: 'Code block', detail: 'listings; no shell escape', run: () => openBuilder('code') },
+    { label: 'Inline math', detail: 'Wrap the selection or insert an empty expression', run: insertInlineMath },
+    { label: 'Display math', run: () => openBuilder('equation', { type: 'display' }) },
+    { label: 'Symbols', detail: 'Searchable accessible grid', run: openSymbols },
+    { label: 'Plot', run: () => openBuilder('plot') },
+    { label: 'Algorithm', run: () => openBuilder('algorithm') },
+    { label: 'Publications / bibliography', run: () => openBuilder('bibliography') },
+    { label: 'Theorem', run: () => openBuilder('theorem') },
+    { label: 'Citation', run: openCitationPalette }, { label: 'Reference', run: openReferencePalette },
+    { label: 'Comment selected lines', detail: 'Prefix selected source lines with TeX comments', run: () => toggleSourceComment(false) },
+    { label: 'Uncomment selected lines', detail: 'Remove one TeX comment prefix from selected lines', run: () => toggleSourceComment(true) },
+    { label: 'Itemized list', run: () => insertLatex('\\begin{itemize}\n  \\item Item\n\\end{itemize}\n', 'writer-list') },
+    { label: 'Numbered list', run: () => insertLatex('\\begin{enumerate}\n  \\item Item\n\\end{enumerate}\n', 'writer-list') },
   ]);
 }
 
@@ -1479,8 +1564,15 @@ function openReferencePalette() {
 }
 
 function openSymbols() {
-  const items = Object.entries(symbols).flatMap(([category, values]) => values.map((value) => ({ label: `${category} · ${value}`, run: () => insertLatex(value, 'writer-symbol') })));
-  showPalette('Symbols', items);
+  const items = MATH_CATALOG.map((entry) => ({
+    label: entry.symbol,
+    detail: `${entry.category} · ${entry.description} · ${entry.latex}`,
+    search: `${entry.category} ${entry.description} ${entry.keywords}`,
+    ariaLabel: `${entry.description}, ${entry.latex}`,
+    tooltip: `${entry.description} — ${entry.latex}`,
+    run: () => insertLatex(entry.latex, 'writer-symbol'),
+  }));
+  showPalette('Symbols', items, { grid: true });
 }
 
 function closeDrawer() {
@@ -1496,16 +1588,86 @@ function openDrawer(kind) {
   ui.workspaceDrawer.hidden = false;
 }
 
+function projectMetadataEditor(detail) {
+  const project = detail.project_metadata || { values: {}, fields: [], setup_complete: false };
+  const values = project.values || {};
+  const section = document.createElement('section');
+  section.className = 'project-metadata-editor';
+  section.append(Object.assign(document.createElement('h4'), { textContent: 'Project metadata' }));
+  const canonical = document.createElement('details');
+  canonical.append(Object.assign(document.createElement('summary'), { textContent: 'Authoritative institutional values' }));
+  const canonicalList = document.createElement('dl');
+  (project.fields || []).filter((field) => field.origin === 'database').forEach((field) => {
+    canonicalList.append(Object.assign(document.createElement('dt'), { textContent: field.key.replaceAll('_', ' ') }));
+    canonicalList.append(Object.assign(document.createElement('dd'), { textContent: field.value == null ? 'Unavailable' : typeof field.value === 'string' ? field.value : JSON.stringify(field.value) }));
+  });
+  canonical.append(canonicalList); section.append(canonical);
+  const form = document.createElement('form'); form.className = 'document-details-form';
+  const typeLabel = document.createElement('label'); typeLabel.textContent = 'Project type';
+  const type = document.createElement('select'); type.name = 'project_type'; type.append(new Option('Choose project type', ''), new Option('Capstone', 'capstone'), new Option('Project 1', 'project-1')); type.value = values.project_type || ''; type.required = true; type.disabled = !detail.can_edit; typeLabel.append(type); form.append(typeLabel);
+  const summaryLabel = document.createElement('label'); summaryLabel.textContent = 'Executive summary';
+  const summary = document.createElement('textarea'); summary.name = 'executive_summary'; summary.maxLength = 20000; summary.value = values.executive_summary || ''; summary.disabled = !detail.can_edit; summaryLabel.append(summary); form.append(summaryLabel);
+  const collection = (heading, entries, fields) => {
+    const host = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = heading; host.append(legend);
+    const rows = document.createElement('div'); rows.className = 'metadata-collection'; host.append(rows);
+    const add = (entry = {}) => {
+      const row = document.createElement('div'); row.className = 'metadata-entry';
+      fields.forEach(([name, label, kind = 'input']) => {
+        const wrapper = document.createElement('label'); wrapper.textContent = label;
+        let control;
+        if (kind === 'textarea') control = document.createElement('textarea');
+        else if (Array.isArray(kind)) { control = document.createElement('select'); kind.forEach((choice) => control.append(new Option(choice[0], choice[1]))); }
+        else { control = document.createElement('input'); if (kind !== 'input') control.type = kind; }
+        control.dataset.field = name; control.value = entry[name] ?? ''; control.disabled = !detail.can_edit; wrapper.append(control); row.append(wrapper);
+      });
+      if (detail.can_edit) { const remove = button('Remove', () => row.remove()); remove.type = 'button'; row.append(remove); }
+      rows.append(row);
+    };
+    (entries || []).forEach(add);
+    if (detail.can_edit) { const addButton = button(`Add ${heading.replace(/s$/, '').toLowerCase()}`, () => add()); addButton.type = 'button'; host.append(addButton); }
+    form.append(host);
+    return () => [...rows.children].map((row) => Object.fromEntries([...row.querySelectorAll('[data-field]')].map((control) => [control.dataset.field, control.type === 'number' ? Number(control.value) : control.value || null])));
+  };
+  const readDatasets = collection('Datasets', values.datasets, [['name', 'Name'], ['url', 'URL (optional)', 'url'], ['description', 'Description (optional)', 'textarea']]);
+  const readSnippets = collection('Source code snippets', values.source_code_snippets, [['label', 'Label'], ['language', 'Language (optional)'], ['code', 'Code', 'textarea']]);
+  const readPublications = collection('Publications', values.publications, [['citation_key', 'Citation key'], ['authors', 'Authors'], ['title', 'Title'], ['venue', 'Venue'], ['year', 'Year', 'number'], ['doi', 'DOI (optional)'], ['url', 'URL (optional)', 'url'], ['status', 'Status', [['Communicated', 'communicated'], ['Accepted', 'accepted'], ['Published', 'published']]]]);
+  const payload = () => ({ executive_summary: summary.value || null, project_type: type.value || null, datasets: readDatasets(), source_code_snippets: readSnippets(), publications: readPublications(), setup_complete: true });
+  if (detail.can_edit) {
+    const insertPublications = button('Insert categorized bibitems', () => {
+      const text = model.view?.state.doc.toString() || '';
+      const cursor = model.view?.state.selection.main.from || 0;
+      if (text.lastIndexOf('\\begin{thebibliography}', cursor) <= text.lastIndexOf('\\end{thebibliography}', cursor) || text.indexOf('\\end{thebibliography}', cursor) < 0) return notice('Place the cursor inside the existing thebibliography environment before inserting publications.', true);
+      try { captureInsertionSelection(); insertLatex(`${buildPublicationBibitems(readPublications())}\n`, 'writer-publications'); } catch (error) { notice(error.message, true); }
+    });
+    insertPublications.type = 'button'; form.append(insertPublications);
+    const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save project metadata'; form.append(save);
+  }
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      if (model.collaboration && !await syncCurrent(false)) return;
+      const result = await api.saveProjectMetadata(model.paper.id, payload());
+      model.version = result.workspace_version;
+      await openPaper(model.paper);
+      notice(result.front_matter_warning || 'Project metadata saved. Compile to refresh the PDF.', Boolean(result.front_matter_warning));
+    } catch (error) { notice(error.message, true); }
+  });
+  section.append(form);
+  return section;
+}
+
 async function openDocumentDetails(prefetched = null) {
   if (!model.paper || model.paper.kind !== 'team') return;
   try {
     const detail = prefetched?.pack_id ? prefetched : await api.documentDetails(model.paper.id);
     ui.documentDetailsBody.replaceChildren();
     ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: `Front Matter Pack: ${detail.pack_name || 'None'}` }));
+    ui.documentDetailsBody.append(projectMetadataEditor(detail));
     if (!detail.pack_id) {
-      ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter is assigned to this Team.' }));
+      ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter pages are assigned. Project metadata remains available for institutional records.' }));
       openDrawer('documentDetails'); return;
     }
+    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: 'Managed definitions: .latex-core/frontmatter/Front-Matter.tex (generated; edit values here).' }));
     ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: frontMatterStatus(detail) }));
     for (const warning of detail.warnings || []) ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: warning }));
     const currentValues = Object.fromEntries((detail.values || []).map((item) => [item.field_key, item.value]));
@@ -1556,10 +1718,9 @@ function commandItems() {
   const items = [
     ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ['Set Main', () => ui.setMain.click()],
     ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
-    ['Open Table Builder', () => openBuilder('table')], ['Open Long Table Builder', () => openBuilder('longtable')], ['Open Algorithmic Builder', () => openBuilder('algorithm', { family: 'algorithmic', body: '\\STATE Describe the method' })], ['Open Figure Builder', () => openBuilder('figure')], ['Open Math Palette', openMathPalette], ['Open Equation Builder', () => openBuilder('equation')], ['Open Plot Builder', () => openBuilder('plot')],
+    ['Insert…', openInsertMenu],
     ['Open Problems', () => openDrawer('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
     ['Document details', openDocumentDetails],
-    ['Insert Citation', openCitationPalette], ['Insert Reference', openReferencePalette],
   ];
   if (model.paper?.kind !== 'team' || model.paper?.is_team_leader) items.push(['Create Checkpoint', () => ui.createCheckpoint.click()]);
   if (model.paper?.is_team_leader && !ui.sendReview.disabled) items.push(['Send for Review', () => ui.sendReview.click()]);
@@ -1577,8 +1738,11 @@ ui.newPaper.addEventListener('click', async () => {
 });
 
 ui.newFile.addEventListener('click', async () => {
-  const path = window.prompt('New file path (nested paths are supported)');
+  const suggestion = suggestedInsertionPath(model.files, model.paperDetail?.main_file, 'chapter', 'chapter9.tex');
+  const choices = suggestion.candidates.length ? ` Existing chapter folders: ${suggestion.candidates.join(', ')}.` : '';
+  const path = window.prompt(`New file path. The complete report-local destination is shown below.${choices}`, suggestion.path);
   if (!path) return;
+  if (!window.confirm(`Create ${path} in ${model.paper.name}?`)) return;
   try {
     const result = await api.createFile(model.paper.id, { path, content: '', version: model.version });
     model.version = result.version;
@@ -1623,6 +1787,20 @@ ui.setMain.addEventListener('click', async () => {
 
 ui.saveFile.addEventListener('click', syncCurrent);
 ui.compilePaper.addEventListener('click', manualCompile);
+ui.pdfPage.addEventListener('change', () => { model.pdfView.page = Math.max(1, Number(ui.pdfPage.value) || 1); model.pdfView.x = 0; model.pdfView.y = 0; applyPdfView(); });
+ui.pdfZoom.addEventListener('change', () => { model.pdfView.zoom = Number(ui.pdfZoom.value) || 100; applyPdfView(); });
+ui.locateInPdf.addEventListener('click', async () => {
+  if (!model.view || !model.file || !model.currentBuildId || !model.pdfCurrent) return notice('Compile the latest source before locating it in the PDF.', true);
+  const position = model.view.state.selection.main.from;
+  const line = model.view.state.doc.lineAt(position);
+  try {
+    const mapping = await api.map(model.paper.id, { direction: 'FORWARD', file_id: model.file.file_id, line: line.number, column: position - line.from });
+    if (!mapping.page || mapping.mapping_status === 'PDF_ONLY') return notice('No exact source/PDF location is available for this build.', true);
+    model.pdfView = { ...model.pdfView, page: mapping.page, x: mapping.x || 0, y: mapping.y || 0 };
+    ui.pdfPage.value = mapping.page; applyPdfView();
+    notice(`${mapping.mapping_status === 'EXACT' ? 'Located' : 'Approximately located'} ${model.file.path}:${line.number} on PDF page ${mapping.page}.`);
+  } catch (error) { notice(error.message || 'Source/PDF location is unavailable.', true); }
+});
 ui.sendReview.addEventListener('click', async () => {
   if (!model.paper?.is_team_leader || !await requireDurableFlush()) return;
   try {
@@ -1683,23 +1861,31 @@ ui.assetInput.addEventListener('change', async () => {
     return notice('Image upload cancelled because the selected report changed.', true);
   }
   if (file.size > 1024 * 1024) { ui.assetInput.value = ''; return notice('Images are limited to 1 MiB.', true); }
-  let path = window.prompt('Image path in this report', `assets/${file.name}`);
+  const destination = suggestedInsertionPath(model.files, model.paperDetail?.main_file, 'asset', file.name);
+  const choices = destination.candidates.length ? ` Existing image/asset folders: ${destination.candidates.join(', ')}.` : '';
+  let path = window.prompt(`Image path in this report.${choices} The complete destination is shown below.`, destination.path);
   if (!path) { ui.assetInput.value = ''; return; }
   let replacement = model.files.find((candidate) => candidate.path === path) || null;
   if (replacement) {
     const choice = (window.prompt(`${path} already exists in ${target.reportName}. Type REPLACE, RENAME, or CANCEL.`, 'CANCEL') || 'CANCEL').trim().toUpperCase();
     if (choice === 'RENAME') {
-      path = window.prompt('New image path in this report', `assets/new-${file.name}`);
+      const renamed = suggestedInsertionPath(model.files, model.paperDetail?.main_file, 'asset', `new-${file.name}`);
+      path = window.prompt('New image path in this report', renamed.path);
       if (!path || model.files.some((candidate) => candidate.path === path)) { ui.assetInput.value = ''; return notice('Choose an unused report-local path.', true); }
       replacement = null;
     } else if (choice !== 'REPLACE') { ui.assetInput.value = ''; return notice('Image upload cancelled.'); }
   }
   try {
+    if (model.paper?.id !== target.paperId || ui.uploadImage.disabled) throw new Error('Image upload is no longer permitted for this report. Reopen the report and try again.');
+    const sourceFileId = /\.tex$/i.test(model.file?.path || '') ? model.file.file_id : null;
     const result = await api.uploadAsset(target.paperId, path, target.version, file, replacement);
     if (model.paper?.id === target.paperId) {
       model.version = result.version;
-      await reloadPaperAndFile(result.file.file_id);
+      await reloadPaperAndFile(sourceFileId || model.files.find((candidate) => candidate.path === model.paperDetail?.main_file)?.file_id || result.file.file_id);
       notice(`${replacement ? 'Replaced' : 'Uploaded'} ${result.file.path} in ${target.reportName}.`);
+      if (/\.(png|jpe?g)$/i.test(result.file.path) && window.confirm(`Insert a figure reference to ${result.file.path} at the current cursor?`)) {
+        openBuilder('figure', { asset: result.file.path });
+      }
     } else notice(`Uploaded ${result.file.path} to ${target.reportName}; the current report was not changed.`);
   } catch (error) { notice(error.message, true); }
   finally { ui.assetInput.value = ''; }

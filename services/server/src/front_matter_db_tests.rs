@@ -164,6 +164,31 @@ async fn legacy_front_matter_institutional_api_contract() {
         }
     }
     let (paper_id, path, created) = representative.unwrap();
+    let project_path = format!("/api/v2/papers/{paper_id}/project-metadata");
+    let project_before = test_json(get(&app, &project_path, Some(&writers[0].cookie)).await).await;
+    assert_eq!(project_before["setup_complete"], false);
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1")
+        .bind(uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap()).fetch_one(&pool).await.unwrap();
+    let project_input = serde_json::json!({
+        "executive_summary":"A literal executive summary, distinct from an abstract.",
+        "project_type":"capstone",
+        "datasets":[{"name":"Synthetic Solar Set","url":"https://example.invalid/data","description":"Synthetic browser fixture"}],
+        "source_code_snippets":[{"label":"Literal Rust","language":"Rust","code":"fn main() {\n    println!(\"# % & _\");\n}"}],
+        "publications":[
+            {"citation_key":"solar-communicated","authors":"A. Alpha","title":"Draft Solar Work","venue":"Example Venue","year":2026,"doi":null,"url":null,"status":"communicated"},
+            {"citation_key":"solar-accepted","authors":"B. Beta","title":"Accepted Solar Work","venue":"Example Venue","year":2026,"doi":null,"url":null,"status":"accepted"},
+            {"citation_key":"solar-published","authors":"C. Gamma","title":"Published Solar Work","venue":"Example Venue","year":2026,"doi":"10.1/example","url":null,"status":"published"}
+        ],
+        "setup_complete":true
+    });
+    assert_eq!(request(&app, Method::PUT, &project_path, Some(&writers[0].cookie), &project_input.to_string(), Some("application/json")).await.status(), StatusCode::OK);
+    let project_after = test_json(get(&app, &project_path, Some(&writers[0].cookie)).await).await;
+    assert_eq!(project_after["values"]["project_type"], "capstone");
+    assert_eq!(project_after["values"]["source_code_snippets"][0]["code"], "fn main() {\n    println!(\"# % & _\");\n}");
+    assert_eq!(project_after["values"]["publications"].as_array().unwrap().len(), 3);
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1")
+        .bind(uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap()).fetch_one(&pool).await.unwrap();
+    assert_eq!(jobs_before, jobs_after, "project metadata saves must not compile");
     let before: i64 =
         sqlx::query_scalar("SELECT count(*) FROM latex_core.paper_versions WHERE paper_id=$1")
             .bind(paper_id)
@@ -244,7 +269,9 @@ async fn legacy_front_matter_institutional_api_contract() {
         Some("application/json"),
     )
     .await;
-    assert_eq!(save.status(), StatusCode::OK);
+    let save_status = save.status();
+    let save_body = test_text(save).await;
+    assert_eq!(save_status, StatusCode::OK, "{save_body}");
     let detail = test_json(get(&app, &path, Some(&writers[0].cookie)).await).await;
     assert_eq!(detail["missing_required_fields"], serde_json::json!([]));
     let versions: i64 =
@@ -263,6 +290,11 @@ async fn legacy_front_matter_institutional_api_contract() {
         .read_file(workspace, &metadata_path)
         .await
         .unwrap();
+    let semantic_path = LogicalPath::parse(".latex-core/frontmatter/Front-Matter.tex").unwrap();
+    let semantic = state.workspaces.read_file(workspace, &semantic_path).await.unwrap();
+    let semantic_text = String::from_utf8(semantic.to_vec()).unwrap();
+    assert!(semantic_text.contains("canonical: course_code"));
+    assert!(semantic_text.contains("LatexCoreCourseCode"));
     let hidden: uuid::Uuid = sqlx::query_scalar("SELECT f.file_id FROM latex_core.paper_files f JOIN latex_core.paper_file_policies p ON p.file_id=f.file_id WHERE f.workspace_id=$1 AND f.path='.latex-core/frontmatter/metadata.tex' AND p.policy='HIDDEN_SYSTEM' AND NOT f.tombstoned").bind(workspace.as_uuid()).fetch_one(&pool).await.unwrap();
     assert_eq!(
         get(
@@ -371,7 +403,7 @@ async fn legacy_front_matter_institutional_api_contract() {
     // Optional opt-in uses the real frozen compiler and one authenticated browser journey.
     if env::var_os("FRONTMATTER_BROWSER").is_some() {
         legacy_front_matter_browser(
-            &mut state, &mut app, &pool, &writers, &mentors, paper_id, &created, &manual,
+            &mut state, &mut app, &pool, &admin, &writers, &mentors, paper_id, &created, &manual,
         )
         .await;
     }
@@ -382,6 +414,7 @@ async fn legacy_front_matter_browser(
     state: &mut AppState,
     app: &mut Router,
     pool: &PgPool,
+    admin: &Fixture,
     writers: &[Fixture],
     mentors: &[Fixture],
     paper_id: uuid::Uuid,
@@ -423,7 +456,7 @@ async fn legacy_front_matter_browser(
     let worker_task = tokio::spawn(async move {
         worker.run_until_shutdown(worker_shutdown).await.unwrap();
     });
-    let config = serde_json::json!({"base":format!("http://{address}"),"paper_id":paper_id,"paper_name":created["team"]["name"],"leader":writers[0].email,"writer":writers[1].email,"mentor":mentors[0].email,"password":PASSWORD,"manual":manual,"environment":state.environment.to_string()});
+    let config = serde_json::json!({"base":format!("http://{address}"),"paper_id":paper_id,"paper_name":created["team"]["name"],"leader":writers[0].email,"writer":writers[1].email,"mentor":mentors[0].email,"mentor_two":mentors[1].email,"password":PASSWORD,"manual":manual,"environment":state.environment.to_string()});
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new("node")
             .arg("tests/front-matter-browser.mjs")
@@ -433,9 +466,6 @@ async fn legacy_front_matter_browser(
     })
     .await
     .unwrap();
-    shutdown.request();
-    worker_task.await.unwrap();
-    server.abort();
     assert!(
         output.status.success(),
         "browser stdout: {}\nstderr: {}",
@@ -443,4 +473,57 @@ async fn legacy_front_matter_browser(
         String::from_utf8_lossy(&output.stderr)
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
+
+    let integration = test_json(
+        request(
+            app,
+            Method::POST,
+            "/api/admin/integration/v1/clients",
+            Some(&admin.cookie),
+            &serde_json::json!({
+                "name":format!("browser archive {}",uuid::Uuid::new_v4()),
+                "scopes":["reports.read","reports.files.read","reports.pdf.read"],
+                "institution_wide":false,
+                "report_ids":[paper_id],
+                "expires_at":null
+            })
+            .to_string(),
+            Some("application/json"),
+        )
+        .await,
+    )
+    .await;
+    let secret = integration["secret"].as_str().unwrap().to_owned();
+    let archive = tempfile::tempdir().unwrap();
+    let archive_path = archive.path().to_owned();
+    let client_output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("python3")
+            .arg("../../examples/institutional-archive/archive.py")
+            .arg("--base-url")
+            .arg(format!("http://{address}"))
+            .arg("--output")
+            .arg(&archive_path)
+            .env("LATEX_CORE_INTEGRATION_TOKEN", secret)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        client_output.status.success(),
+        "archive client stderr: {}",
+        String::from_utf8_lossy(&client_output.stderr)
+    );
+    let report_root = archive.path().join("reports").join(paper_id.to_string());
+    assert!(report_root.join("front-matter.json").is_file());
+    assert!(
+        std::fs::read_dir(report_root.join("pdf"))
+            .unwrap()
+            .any(|entry| entry.unwrap().path().extension().is_some_and(|value| value == "pdf")),
+        "archive client did not download the existing PDF"
+    );
+    println!("archive client: passed (metadata, immutable files, existing PDF hash)");
+    shutdown.request();
+    worker_task.await.unwrap();
+    server.abort();
 }

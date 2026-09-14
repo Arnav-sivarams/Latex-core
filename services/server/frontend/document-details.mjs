@@ -11,5 +11,5 @@ export function editableDetail(detail, field) {
 }
 
 export function needsFirstUseDetails(detail) {
-  return Boolean(detail.pack_id && detail.can_edit && detail.missing_required_fields?.length);
+  return Boolean(detail.can_edit && (!detail.project_metadata?.setup_complete || (detail.pack_id && detail.missing_required_fields?.length)));
 }

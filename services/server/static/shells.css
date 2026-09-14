@@ -13,6 +13,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { min-height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--text); }
 button, input, select { font: inherit; color: inherit; }
@@ -132,6 +133,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 #dialogPreview { max-height: 220px; margin: 0; overflow: auto; border: 1px solid var(--border); border-radius: 6px; padding: 10px; background: var(--surface-subtle); white-space: pre-wrap; }
 .package-note { padding: 7px; border-radius: 5px; color: #805b09; background: #fff3cc; }
 .symbol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 5px; }
+.symbol-grid button { min-height: 52px; text-align: center !important; font: 20px/1.2 "STIX Two Math", "Cambria Math", serif; }
+.header-search { position: relative; flex: 0 0 auto; }
+.header-search > summary { cursor: pointer; list-style: none; white-space: nowrap; }
+.header-search > summary::-webkit-details-marker { display: none; }
+.header-search-popover { position: fixed; z-index: 90; top: 42px; right: 118px; width: min(430px, calc(100vw - 24px)); max-height: 60vh; overflow: auto; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: 0 12px 32px #2025202e; }
 .symbol-category { margin: 8px 0 2px; font-size: 12px; }
 .problem-row.error { border-left: 3px solid var(--danger); }
 .problem-row.warning { border-left: 3px solid #bd771f; }
@@ -435,6 +441,7 @@ html:has(body.workspace-shell), body.workspace-shell { overflow: hidden; }
   background: var(--border);
   gap: 1px;
 }
+.mentor-shell .three-pane-workspace { grid-template-columns: minmax(170px, 220px) minmax(300px, .78fr) minmax(380px, 1.22fr); }
 .workspace-pane { min-width: 0; min-height: 0; background: var(--surface); }
 .files-pane { height: 100%; padding: 14px 12px; overflow-x: hidden; overflow-y: auto; border-right: 0; }
 .files-pane section { margin-bottom: 20px; }
@@ -448,6 +455,9 @@ html:has(body.workspace-shell), body.workspace-shell { overflow: hidden; }
 .pdf-pane .pdf-frame { flex: 1 1 auto; width: 100%; height: auto; min-height: 0; overflow: auto; }
 .pdf-pane .foundation-empty { flex: 1 1 auto; min-height: 0; }
 .pdf-pane #pdfRelation { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.pdf-location-control { display: inline-flex; align-items: center; gap: 3px; margin: 0; color: var(--muted); font-size: 10px; }
+.pdf-location-control input { width: 48px; min-height: 26px; padding: 2px 4px; }
+.pdf-location-control select { width: 66px; min-height: 26px; padding: 2px 4px; }
 
 .compact-popover, .context-review-popover {
   position: fixed;

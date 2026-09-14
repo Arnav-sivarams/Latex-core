@@ -2,6 +2,17 @@
 
 `./install.sh` is for initial installation and repair of the same deployment. Ordinary code updates use the incremental Compose workflow and preserve the existing `.env`, Compose project, PostgreSQL container, PostgreSQL volume, and BlobStore volume.
 
+Fetch only the reviewed feature branch and switch without rewriting local history:
+
+```sh
+git fetch origin feature/manual-compile-review-lock-institutional-api
+git switch feature/manual-compile-review-lock-institutional-api
+git pull --ff-only origin feature/manual-compile-review-lock-institutional-api
+git rev-parse HEAD
+```
+
+Stop if the working tree is not clean or if the printed commit is not the approved delivery SHA.
+
 ## Matching schema
 
 After switching to an approved commit and confirming the working tree is clean, update both application services:
@@ -21,7 +32,7 @@ Use a narrower form when the release affects only one executable:
 
 ## Release with pending migrations
 
-This change adds migration `0027_institutional_read_api.sql`. It creates only integration-client verifier metadata and bounded access-audit rows; it does not rewrite reports, institutional records, build history, blobs, or review drafts. Apply it with the standard embedded migrator below. Keep the existing 9000/9001 host-port settings and Compose project/volumes unchanged.
+This branch contains additive migrations `0027_institutional_read_api.sql` and `0028_professor_project_metadata.sql`. Migration 0027 creates integration-client verifier metadata and bounded access-audit rows. Migration 0028 records each template's explicit Front Matter arrangement and adds typed project-specific metadata; it does not change the institutional VCAP schema or rewrite reports, institutional records, build history, blobs, or review drafts. Existing compatible templates are classified as separate-file arrangements. Apply both with the standard embedded migrator below. Keep the existing 9000/9001 host-port settings and Compose project/volumes unchanged.
 
 Schema changes require an explicit operator sequence:
 

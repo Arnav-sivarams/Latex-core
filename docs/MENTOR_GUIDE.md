@@ -12,7 +12,7 @@ Mentors use `/review`. Only Team reports explicitly assigned to the signed-in Me
 - A Mentor cannot mutate source through HTTP, WebSocket, or suggestion bypasses.
 - Project PNG/JPEG files can be opened as authenticated, read-only previews. Their stable file identity and bytes remain scoped to the assigned report; knowing another report's file ID or blob hash grants no access.
 
-The normal Mentor viewport contains only the compact toolbar and independently scrolling Papers/Files, read-only source, and PDF panes. Before review opens, the toolbar quietly says **Waiting for Team Review**; source and PDF remain readable and selection behaves normally.
+The normal Mentor viewport contains only the compact toolbar and independently scrolling Papers/Files, read-only source, and PDF panes. The Mentor grid deliberately gives the PDF more width than source while retaining a usable source minimum; Writer layout preferences are unchanged. Before review opens, the toolbar quietly says **Waiting for Team Review**; source and PDF remain readable and selection behaves normally.
 
 During an open review, select a non-empty source range or drag a PDF region, then right-click the selection to open the small review popover. It has one text input and Comment/Suggest actions—no severity, category, Writer assignment, or due-date form. Escape or clicking outside closes it without moving the page. The toolbar Comments action opens active/resolved history in a temporary drawer.
 

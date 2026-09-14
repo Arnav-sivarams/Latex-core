@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildTable, buildTheorem, fuzzyRankFiles, packageRequirement } from './writer-productivity.mjs';
+import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, commentLatexLines, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
 
 test('outline hierarchy follows section levels', () => {
   const tree = buildOutlineTree([{ level: 'section', title: 'A' }, { level: 'subsection', title: 'B' }, { level: 'section', title: 'C' }]);
@@ -15,10 +15,30 @@ test('quick open favors exact basename and supports subsequences', () => {
 });
 
 test('table and figure builders generate bounded ordinary LaTeX', () => {
-  const table = buildTable({ rows: 2, columns: 2, header: true, booktabs: true, caption: 'Results', label: 'tab:results' });
-  assert.match(table, /\\begin\{tabular\}\{ll\}/);
+  const table = buildTable({ rows: 2, columns: 2, header: true, booktabs: true, caption: 'Results', label: 'tab:results', columnWidths: ['3cm', ''], minimumRowHeight: '8mm' });
+  assert.match(table, /\\begin\{tabular\}\{p\{3cm\}l\}/);
   assert.match(table, /\\toprule/);
+  assert.ok(table.indexOf('\\caption{Results}') < table.indexOf('\\begin{tabular}'));
+  assert.match(table, /\\rule\{0pt\}\{8mm\}Header 1/);
   assert.match(buildFigure({ asset: 'images/result.png', width: '0.5\\linewidth', caption: 'Result' }), /\\includegraphics\[width=0.5\\linewidth\]\{images\/result.png\}/);
+});
+
+test('table dimensions are explicit and bounded', () => {
+  assert.equal(latexDimension('2.5 cm'), '2.5cm');
+  assert.throws(() => latexDimension('-1cm'), /positive number/);
+  assert.throws(() => buildTable({ columnWidths: ['2\\linewidth'] }), /positive number/);
+});
+
+test('source line comments, inline math, and template-aware destinations are deterministic', () => {
+  assert.equal(commentLatexLines('  alpha\n\nbeta'), '  % alpha\n% \n% beta');
+  assert.equal(commentLatexLines('  % alpha\n% \n% beta', true), '  alpha\n\nbeta');
+  assert.deepEqual(inlineMathInsertion('x+y'), { source: '\\(x+y\\)', cursorOffset: null });
+  assert.equal(isInsideInlineMath('before \\(x+y', 12), true);
+  assert.equal(isInsideInlineMath('before $x', 9), true);
+  const files = [{ path: 'Thesis/main.tex' }, { path: 'Thesis/chapters/chapter1.tex' }, { path: 'Thesis/images/logo.png' }];
+  assert.deepEqual(insertionDirectories(files, 'Thesis/main.tex', 'chapter'), ['Thesis/chapters']);
+  assert.equal(suggestedInsertionPath(files, 'Thesis/main.tex', 'chapter', 'chapter9.tex').path, 'Thesis/chapters/chapter9.tex');
+  assert.equal(suggestedInsertionPath(files, 'Thesis/main.tex', 'asset', 'plot.png').path, 'Thesis/images/plot.png');
 });
 
 test('equation builder covers matrix and cases', () => {
@@ -39,6 +59,18 @@ test('plot, BibTeX, algorithm, listing, and theorem output stays editable', () =
   assert.doesNotMatch(longtable, /\\begin\{table\}|\\begin\{minipage\}|\\resizebox/);
   assert.match(buildCodeListing({ language: 'Rust', code: 'fn main() {}' }), /lstlisting/);
   assert.match(buildTheorem({ environment: 'lemma', label: 'lem:x' }), /\\begin\{lemma\}/);
+});
+
+test('categorized publication bibitems preserve all three statuses', () => {
+  const source = buildPublicationBibitems([
+    { citation_key: 'a', authors: 'A', title: 'Draft', venue: 'V', year: 2026, status: 'communicated' },
+    { citation_key: 'b', authors: 'B', title: 'Accepted', venue: 'V', year: 2026, status: 'accepted' },
+    { citation_key: 'c', authors: 'C', title: 'Published', venue: 'V', year: 2026, status: 'published', doi: '10.1/x' },
+  ]);
+  assert.match(source, /\\item\[\]\\textbf\{Communicated\}[\s\S]*\\bibitem\{a\}/);
+  assert.match(source, /\\textbf\{Accepted\}[\s\S]*\\bibitem\{b\}/);
+  assert.match(source, /\\textbf\{Published\}[\s\S]*\\bibitem\{c\}/);
+  assert.throws(() => buildPublicationBibitems([{ citation_key: 'a', status: 'published' }, { citation_key: 'a', status: 'accepted' }]), /unique/);
 });
 
 test('package awareness is explicit', () => {

@@ -291,7 +291,7 @@ async function renderTemplates(templates, frontMatterPacks) {
   const heading = element('h2', 'admin-section-anchor', 'Main templates'); heading.id = 'main-templates'; content.append(heading);
   const intro = element('p', 'empty-copy', 'Import a bounded local ZIP, inspect its safe file tree, select Main when detection is ambiguous, then save an immutable template. Existing-Team changes use the separate conflict-safe preview workflow.');
   const form = element('form', 'admin-template-form');
-  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>+ Import Main Template</button>';
+  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Front Matter arrangement<select name="arrangement"><option value="REPORT_CONTENT_ONLY">Report content only</option><option value="SEPARATE_FILES">Report and Front Matter in separate files</option><option value="SINGLE_SOURCE">One source containing the entire report</option></select></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>+ Import Main Template</button>';
   const archiveInput = form.elements.archive;
   const mainSelect = form.elements.main;
   const validate = form.querySelector('[data-action="validate-template"]');
@@ -329,7 +329,7 @@ async function renderTemplates(templates, frontMatterPacks) {
       if (!mainSelect.value) throw new Error('Select the Main TeX file.');
       const body = new FormData();
       body.set('name', form.elements.name.value); body.set('description', form.elements.description.value);
-      body.set('main', mainSelect.value); body.set('archive', archiveInput.files[0]);
+      body.set('main', mainSelect.value); body.set('arrangement', form.elements.arrangement.value); body.set('archive', archiveInput.files[0]);
       const imported = await api('/api/admin/v2/templates/import', {
         method: 'POST', body,
       });
@@ -351,11 +351,12 @@ async function renderTemplates(templates, frontMatterPacks) {
     metadata.append(name, description);
     const mainCell = element('td'); const main = document.createElement('select'); main.setAttribute('aria-label', `Main file for ${template.name}`);
     template.tex_files.forEach((path) => main.append(new Option(path, path, false, path === template.main_file))); mainCell.append(main);
+    const arrangement = document.createElement('select'); arrangement.setAttribute('aria-label', `Front Matter arrangement for ${template.name}`); [['Report content only', 'REPORT_CONTENT_ONLY'], ['Separate files', 'SEPARATE_FILES'], ['One complete source', 'SINGLE_SOURCE']].forEach(([label, value]) => arrangement.append(new Option(label, value, false, value === template.front_matter_arrangement))); mainCell.append(arrangement);
     const usage = template.pinned ? `${template.usage_count} Paper Team pin${template.usage_count === 1 ? '' : 's'}` : 'Unused';
     const actions = element('td');
     actions.append(
       buttonAction('Edit', async () => {
-        await api(`/api/admin/v2/templates/${template.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.value, description: description.value || null, main_file: main.value }) });
+        await api(`/api/admin/v2/templates/${template.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.value, description: description.value || null, main_file: main.value, front_matter_arrangement: arrangement.value }) });
         announce(`Updated ${name.value}. Existing Paper Team sources were not changed.`); await showSection('Templates');
       }),
       buttonAction('Remove', async () => {
@@ -363,7 +364,7 @@ async function renderTemplates(templates, frontMatterPacks) {
         await api(`/api/admin/v2/templates/${template.id}`, { method: 'DELETE' }); announce(`Removed ${template.name}.`); await showSection('Templates');
       }, 'danger'),
     );
-    row.append(metadata, mainCell, element('td', '', template.front_matter_compatible ? 'Front Matter compatible' : 'Front Matter not enabled'), element('td', '', new Date(template.created_at).toLocaleString()), element('td', '', usage), actions);
+    row.append(metadata, mainCell, element('td', '', template.front_matter_arrangement === 'SEPARATE_FILES' ? 'Separate managed Front Matter' : template.front_matter_arrangement === 'SINGLE_SOURCE' ? 'Single source · verified bindings required' : 'Metadata only · no forced pages'), element('td', '', new Date(template.created_at).toLocaleString()), element('td', '', usage), actions);
     body.append(row);
   });
   table.append(body); wrap.append(table); content.append(wrap); await renderFrontMatterPacks(frontMatterPacks); await renderAutomaticDefaults(templates, frontMatterPacks);

@@ -67,7 +67,15 @@ paths:
           description: Current metadata, not historical metadata for an older PDF
           content:
             application/json:
-              schema: {type: object, additionalProperties: true}
+              schema:
+                type: object
+                additionalProperties: false
+                required: [schema_version, report_id, current, project_metadata]
+                properties:
+                  schema_version: {type: integer, enum: [1]}
+                  report_id: {type: string, format: uuid}
+                  current: {type: object, additionalProperties: true}
+                  project_metadata: {$ref: '#/components/schemas/ProjectMetadata'}
               example:
                 schema_version: 1
                 report_id: 11111111-1111-4111-8111-111111111111
@@ -80,6 +88,20 @@ paths:
                   selected_dean_identity: null
                   fields:
                     - {key: 'team.title', value: 'Compiler Design Report', origin: database, source_identity: 'team.name', status: resolved}
+                project_metadata:
+                  schema_version: 1
+                  paper_team_id: 11111111-1111-4111-8111-111111111111
+                  revision: 3
+                  setup_complete: true
+                  updated_at: '2026-09-14 12:00:00+00'
+                  values:
+                    executive_summary: A distinct executive summary.
+                    project_type: capstone
+                    datasets: [{name: Solar set, url: null, description: Synthetic records}]
+                    source_code_snippets: [{label: Parser, language: Rust, code: "fn main() {}"}]
+                    publications: [{citation_key: solar2026, authors: A. Student, title: Solar report, venue: Example venue, year: 2026, doi: null, url: null, status: published}]
+                  fields:
+                    - {key: project_title, value: Compiler Design Report, origin: database, source_identity: team.name}
         default: {$ref: '#/components/responses/Error'}
   /api/integration/v1/reports/{report_id}/versions:
     get:
@@ -262,6 +284,37 @@ components:
         institution_wide: {type: boolean, default: false}
         report_ids: {type: array, items: {type: string, format: uuid}}
         expires_at: {type: string, format: date-time, nullable: true}
+    ProjectMetadata:
+      type: object
+      additionalProperties: false
+      required: [schema_version, paper_team_id, revision, setup_complete, updated_at, values, fields]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        paper_team_id: {type: string, format: uuid}
+        revision: {type: integer, minimum: 0}
+        setup_complete: {type: boolean}
+        updated_at: {type: string, nullable: true}
+        values:
+          type: object
+          additionalProperties: false
+          required: [executive_summary, project_type, datasets, source_code_snippets, publications]
+          properties:
+            executive_summary: {type: string, nullable: true}
+            project_type: {type: string, enum: [capstone, project-1], nullable: true}
+            datasets: {type: array, items: {type: object, additionalProperties: false, required: [name, url, description], properties: {name: {type: string}, url: {type: string, nullable: true}, description: {type: string, nullable: true}}}}
+            source_code_snippets: {type: array, items: {type: object, additionalProperties: false, required: [label, language, code], properties: {label: {type: string}, language: {type: string, nullable: true}, code: {type: string}}}}
+            publications: {type: array, items: {type: object, additionalProperties: false, required: [citation_key, authors, title, venue, year, doi, url, status], properties: {citation_key: {type: string}, authors: {type: string}, title: {type: string}, venue: {type: string}, year: {type: integer}, doi: {type: string, nullable: true}, url: {type: string, nullable: true}, status: {type: string, enum: [communicated, accepted, published]}}}}
+        fields:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [key, value, origin, source_identity]
+            properties:
+              key: {type: string}
+              value: {nullable: true}
+              origin: {type: string, enum: [database, team_override, unresolved]}
+              source_identity: {type: string, nullable: true}
     Error:
       type: object
       required: [schema_version, code, error]
