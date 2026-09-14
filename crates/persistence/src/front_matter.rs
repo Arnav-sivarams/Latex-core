@@ -23,6 +23,8 @@ pub enum FrontMatterRepositoryError {
     IncompatibleTemplate,
     #[error("workspace changed during Front Matter rendering")]
     VersionConflict,
+    #[error("Paper is under review and its Front Matter is read-only")]
+    ReviewLocked,
     #[error("Front Matter persistence failed")]
     Database(#[source] sqlx::Error),
     #[error("persistent Front Matter data is invalid: {0}")]
@@ -277,6 +279,7 @@ impl FrontMatterRepository {
         paper_id: Uuid,
     ) -> Result<Value, FrontMatterRepositoryError> {
         let row = sqlx::query(r"SELECT t.id,t.workspace_id,t.name,t.status,member.is_leader,role.role,
+                    EXISTS(SELECT 1 FROM latex_core.review_rounds rr WHERE rr.paper_id=t.id AND rr.status='OPEN_FOR_REVIEW') AS review_open,
                     pin.front_matter_pack_id,p.name AS pack_name,p.manifest_json,pin.resolution_method,
                     pin.dominant_programme_code,pin.status AS front_matter_status,pin.missing_required_fields,pin.last_error,
                     warning.warning_code,warning.detail AS warning_detail
@@ -293,6 +296,9 @@ impl FrontMatterRepository {
             .map_err(FrontMatterRepositoryError::Database)?;
         let leader: Option<bool> = row
             .try_get("is_leader")
+            .map_err(FrontMatterRepositoryError::Database)?;
+        let review_open: bool = row
+            .try_get("review_open")
             .map_err(FrontMatterRepositoryError::Database)?;
         let values = sqlx::query("SELECT field_key,value_json,value_source FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1 ORDER BY field_key")
             .bind(paper_id).fetch_all(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?
@@ -330,7 +336,8 @@ impl FrontMatterRepository {
             "status":status,
             "missing_required_fields":row.try_get::<Option<Value>,_>("missing_required_fields").map_err(FrontMatterRepositoryError::Database)?.unwrap_or_else(|| json!([])),
             "last_error":pin_error.or(warning_detail),
-            "can_edit":role.as_deref()==Some("admin") || (role.as_deref()==Some("writer") && leader==Some(true)),
+            "review_open":review_open,
+            "can_edit":!review_open && (role.as_deref()==Some("admin") || (role.as_deref()==Some("writer") && leader==Some(true))),
             "values":values,"sections":sections
         }))
     }
@@ -355,6 +362,119 @@ impl FrontMatterRepository {
             "pin":{"front_matter_pack_id":pin.try_get::<Uuid,_>("front_matter_pack_id").map_err(FrontMatterRepositoryError::Database)?,"dominant_programme_code":pin.try_get::<Option<String>,_>("dominant_programme_code").map_err(FrontMatterRepositoryError::Database)?,"resolution_method":pin.try_get::<String,_>("resolution_method").map_err(FrontMatterRepositoryError::Database)?,"status":pin.try_get::<String,_>("status").map_err(FrontMatterRepositoryError::Database)?,"missing_required_fields":pin.try_get::<Value,_>("missing_required_fields").map_err(FrontMatterRepositoryError::Database)?,"last_error":pin.try_get::<Option<String>,_>("last_error").map_err(FrontMatterRepositoryError::Database)?,"pinned_at":pin.try_get::<String,_>("pinned_at").map_err(FrontMatterRepositoryError::Database)?},
             "values":values,"sections":sections
         })))
+    }
+
+    /// Resolves the current human-readable semantic metadata with the same
+    /// database/default/Team precedence used by Front Matter materialization.
+    pub async fn archive_metadata(
+        &self,
+        paper_id: Uuid,
+    ) -> Result<Value, FrontMatterRepositoryError> {
+        let pin = sqlx::query(
+            "SELECT pin.front_matter_pack_id,p.name AS pack_name,p.content_hash,p.manifest_json, \
+                    pin.status,pin.missing_required_fields,h.durable_version \
+             FROM latex_core.paper_front_matter_pins pin \
+             JOIN latex_core.front_matter_packs p ON p.id=pin.front_matter_pack_id \
+             JOIN latex_core.paper_teams t ON t.id=pin.paper_team_id \
+             JOIN latex_core.workspace_heads h ON h.workspace_id=t.workspace_id WHERE pin.paper_team_id=$1",
+        )
+        .bind(paper_id)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(FrontMatterRepositoryError::Database)?;
+        let Some(pin) = pin else {
+            return Ok(
+                json!({"schema_version":1,"status":"not_configured","fields":[],"missing_fields":[],"pack":null}),
+            );
+        };
+        let manifest: Value = pin
+            .try_get("manifest_json")
+            .map_err(FrontMatterRepositoryError::Database)?;
+        let stored = sqlx::query(
+            "SELECT field_key,value_json,value_source FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1 ORDER BY field_key",
+        )
+        .bind(paper_id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(FrontMatterRepositoryError::Database)?;
+        let stored = stored
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("field_key")
+                        .map_err(FrontMatterRepositoryError::Database)?,
+                    (
+                        row.try_get::<Value, _>("value_json")
+                            .map_err(FrontMatterRepositoryError::Database)?,
+                        row.try_get::<String, _>("value_source")
+                            .map_err(FrontMatterRepositoryError::Database)?,
+                    ),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, FrontMatterRepositoryError>>()?;
+        let schema_version = manifest
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let automatic = if schema_version == 2 {
+            self.legacy_automatic_values(
+                paper_id,
+                stored
+                    .get("guide_identity")
+                    .and_then(|(value, _)| value.as_str()),
+                stored
+                    .get("dean_identity")
+                    .and_then(|(value, _)| value.as_str()),
+            )
+            .await?
+        } else {
+            self.automatic_values(paper_id).await?
+        };
+        let missing = pin
+            .try_get::<Value, _>("missing_required_fields")
+            .map_err(FrontMatterRepositoryError::Database)?;
+        let fields = manifest
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|field| {
+                let key = field.get("key")?.as_str()?;
+                let source = field.get("source").and_then(Value::as_str);
+                let (value, origin) = if let Some((value, stored_origin)) = stored.get(key) {
+                    let origin = match stored_origin.as_str() {
+                        "TEAM_OVERRIDE" => "team_override",
+                        "AUTO" => "database",
+                        "PACK_DEFAULT" => "pack_default",
+                        _ => "unresolved",
+                    };
+                    (value.clone(), origin)
+                } else if let Some(value) = source.and_then(|source| automatic.get(source)) {
+                    (value.clone(), "database")
+                } else if let Some(value) = field.get("default") {
+                    (value.clone(), "pack_default")
+                } else {
+                    (Value::Null, "unresolved")
+                };
+                Some(json!({
+                    "key":key,
+                    "value":value,
+                    "origin":origin,
+                    "source_identity":source,
+                    "status":if origin=="unresolved" { "missing" } else { "resolved" }
+                }))
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "schema_version":1,
+            "status":pin.try_get::<String,_>("status").map_err(FrontMatterRepositoryError::Database)?,
+            "pack":{"id":pin.try_get::<Uuid,_>("front_matter_pack_id").map_err(FrontMatterRepositoryError::Database)?,"name":pin.try_get::<String,_>("pack_name").map_err(FrontMatterRepositoryError::Database)?,"content_hash":pin.try_get::<String,_>("content_hash").map_err(FrontMatterRepositoryError::Database)?,"manifest_schema_version":schema_version},
+            "report_revision":pin.try_get::<i64,_>("durable_version").map_err(FrontMatterRepositoryError::Database)?,
+            "missing_fields":missing,
+            "selected_guide_identity":stored.get("guide_identity").map(|(value,_)|value),
+            "selected_dean_identity":stored.get("dean_identity").map(|(value,_)|value),
+            "fields":fields
+        }))
     }
 
     pub async fn automatic_values(
@@ -583,6 +703,7 @@ impl FrontMatterRepository {
         let workspace: Uuid = row
             .try_get("workspace_id")
             .map_err(FrontMatterRepositoryError::Database)?;
+        reject_open_review(&mut tx, request.paper_team_id).await?;
         if workspace != *request.workspace_id.as_uuid() {
             return Err(FrontMatterRepositoryError::Integrity(
                 "paper workspace mismatch".into(),
@@ -744,6 +865,7 @@ impl FrontMatterRepository {
         .await
         .map_err(FrontMatterRepositoryError::Database)?
         .ok_or(FrontMatterRepositoryError::NotFound)?;
+        reject_open_review(&mut tx, request.paper_team_id).await?;
         if workspace != *request.workspace_id.as_uuid() {
             return Err(FrontMatterRepositoryError::Integrity(
                 "paper workspace mismatch".into(),
@@ -875,8 +997,11 @@ impl FrontMatterRepository {
     pub async fn claim_rerender(&self) -> Result<Option<Uuid>, FrontMatterRepositoryError> {
         sqlx::query_scalar(r"WITH selected AS (
                 SELECT paper_team_id FROM latex_core.front_matter_rerender_queue
-                WHERE (state='QUEUED' AND available_at<=statement_timestamp())
-                   OR (state='CLAIMED' AND claimed_at<statement_timestamp()-interval '10 minutes')
+                WHERE NOT EXISTS (SELECT 1 FROM latex_core.review_rounds rr
+                                  WHERE rr.paper_id=front_matter_rerender_queue.paper_team_id
+                                    AND rr.status='OPEN_FOR_REVIEW')
+                  AND ((state='QUEUED' AND available_at<=statement_timestamp())
+                    OR (state='CLAIMED' AND claimed_at<statement_timestamp()-interval '10 minutes'))
                 ORDER BY available_at,updated_at,paper_team_id FOR UPDATE SKIP LOCKED LIMIT 1
             ) UPDATE latex_core.front_matter_rerender_queue queue
               SET state='CLAIMED',attempts=attempts+1,claimed_at=statement_timestamp(),updated_at=statement_timestamp()
@@ -989,6 +1114,23 @@ async fn require_front_matter_editor(
         Ok(())
     } else {
         Err(FrontMatterRepositoryError::Forbidden)
+    }
+}
+async fn reject_open_review(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    paper_id: Uuid,
+) -> Result<(), FrontMatterRepositoryError> {
+    let open: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM latex_core.review_rounds WHERE paper_id=$1 AND status='OPEN_FOR_REVIEW')",
+    )
+    .bind(paper_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(FrontMatterRepositoryError::Database)?;
+    if open {
+        Err(FrontMatterRepositoryError::ReviewLocked)
+    } else {
+        Ok(())
     }
 }
 async fn audit(

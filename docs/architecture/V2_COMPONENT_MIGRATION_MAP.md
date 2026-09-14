@@ -9,7 +9,7 @@ This map describes intended future disposition. “Retire” and “replace” a
 | SHA-256 filesystem blob store abstraction | Immutable project content, snapshots, and artifacts | Keep abstraction and development backend | `BlobStore` with filesystem now and S3-compatible backend later | Storage checkpoint |
 | Workspace event and immutable snapshot model | Ordered file operations, canonical manifests, replay, and compile inputs | Migrate/evolve | Stable `file_id`, manifest revisions, paper versions, structural operation inverses | Collaboration/version checkpoints |
 | TeX compiler (`latexmk`/TeX Live) | Produce PDF/log in isolated worker path | Keep | Versioned exact-state compile behind `Sandbox` | Compile checkpoint |
-| Durable PostgreSQL compile queue | Bounded, leased, idempotent worker jobs | Keep and extend scheduling semantics | Coalesced auto-build plus manual jobs, exact manifests, stale classification | Compile checkpoint |
+| Durable PostgreSQL compile queue | Bounded, leased, idempotent worker jobs | Keep, with manual-only admission | Explicit manual jobs, exact manifests, duplicate protection, stale classification | Compile checkpoint |
 | Templates | Catalog and project instantiation | Migrate | Immutable `template_versions`, pinning, controlled update workflow | Template checkpoint |
 | File policies | Path-based editable/read-only/managed restrictions | Replace/evolve | Stable-file, versioned five-state V2 policy model with all-path enforcement | Policy checkpoint |
 | Team-project audit and general audit events | Record canonical changes and administrative actions | Keep and normalize | Append-only V2 `audit_events` linked to papers, versions, reviews, and restores | Audit checkpoint |

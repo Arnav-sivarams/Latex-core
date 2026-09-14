@@ -9,7 +9,6 @@ import * as Y from 'yjs';
 import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { resolveSuggestionRange } from './review-helpers.mjs';
-import { createIdleBuildScheduler } from './auto-build.mjs';
 import { pdfPreviewState } from './writer-pdf.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
 import {
@@ -151,12 +150,6 @@ const model = {
   editorAppearance: new Compartment(),
   assetUploadTarget: null,
 };
-
-const autoBuild = createIdleBuildScheduler({
-  requestBuild: (triggerType) => requestBuild(triggerType),
-  setTimer: window.setTimeout.bind(window),
-  clearTimer: window.clearTimeout.bind(window),
-});
 
 function notice(message, failed = false) {
   ui.writerNotice.textContent = message;
@@ -423,7 +416,6 @@ class CollaborationSession {
         if (this.pending.size === 0) {
           saveState('synced');
           scheduleIntelligence();
-          if (model.paperDetail?.editable) autoBuild.durableUpdate();
         }
       } else if (control.type === 'FLUSHED') {
         this.resolveFlushes(control.durable_seq);
@@ -431,7 +423,6 @@ class CollaborationSession {
       } else if (control.type === 'REMOTE_DURABLE') {
         if (this.pending.size === 0) saveState('synced');
         scheduleIntelligence();
-        if (model.paperDetail?.editable) autoBuild.durableUpdate();
       } else if (control.type === 'REVIEW_PUBLISHED') {
         refreshReviews();
         refreshReviewRounds();
@@ -450,6 +441,14 @@ class CollaborationSession {
         saveState('conflict');
         notice(control.message || 'File policy changed; reload the paper.', true);
         this.destroy();
+      } else if (control.type === 'CAPABILITIES_CHANGED') {
+        model.conflict = true;
+        saveState('conflict');
+        notice(control.review_open
+          ? (model.paper?.is_team_leader ? 'Under review — use End review to resume editing.' : 'Under review — your Team Leader can end the review.')
+          : 'Review ended — normal editing permissions are being restored.');
+        this.destroy();
+        if (model.paper) window.setTimeout(() => openPaper(model.paper), 0);
       } else if (control.type === 'ERROR') {
         model.conflict = true;
         saveState('conflict');
@@ -652,7 +651,6 @@ async function refreshPapers() {
 const promptedDocumentDetails = new Set();
 
 async function openPaper(paper) {
-  autoBuild.cancel();
   closeEditor();
   model.currentBuildId = null;
   ui.pdfFrame.removeAttribute('src');
@@ -663,7 +661,7 @@ async function openPaper(paper) {
   model.paperDetail = await api.paper(paper.id);
   model.version = model.paperDetail.version;
   model.files = await api.files(paper.id);
-  ui.currentPaper.textContent = `${paper.name}${paper.status === 'active' ? '' : ` — ${paper.status} (read-only)`}`;
+  ui.currentPaper.textContent = `${paper.name}${model.paperDetail.review_open ? ' — under review (read-only)' : paper.status === 'active' ? '' : ` — ${paper.status} (read-only)`}`;
   ui.roleIdentity.textContent = paper.is_team_leader ? 'Writer · Team leader' : 'Writer';
   ui.newFile.disabled = !model.paperDetail.editable;
   ui.uploadImage.disabled = !model.paperDetail.editable;
@@ -878,11 +876,11 @@ async function reloadPaperAndFile(fileId) {
   if (file) await openFile(file, true);
 }
 
-async function requestBuild(triggerType) {
+async function requestBuild() {
   if (!model.paper) return;
   try {
     ui.buildStatus.textContent = model.currentBuildId ? 'Rebuilding…' : 'Building…';
-    await api.build(model.paper.id, triggerType);
+    await api.build(model.paper.id, 'manual');
     await Promise.all([refreshBuildStatus(), refreshHistory()]);
   } catch (error) {
     ui.buildStatus.textContent = model.currentBuildId ? 'Build failed — showing last successful PDF' : 'Build failed';
@@ -892,9 +890,8 @@ async function requestBuild(triggerType) {
 
 async function manualCompile() {
   if (!model.paper || !model.paperDetail?.editable) return;
-  autoBuild.cancel();
   if (!await requireDurableFlush()) return;
-  await requestBuild('manual');
+  await requestBuild();
 }
 
 async function refreshBuildStatus() {
@@ -905,7 +902,7 @@ async function refreshBuildStatus() {
     const source = build.source_sequence;
     const pdf = build.current_source_sequence;
     const preview = pdfPreviewState(build);
-    const rebuilding = Boolean(build.active_build_id) || (source != null && pdf != null && source !== pdf);
+    const stale = source != null && pdf != null && source !== pdf;
     model.compileDiagnostic = build.latest_status === 'failed' && build.latest_error?.message
       ? { severity: 'error', code: 'compile', message: build.latest_error.message, path: null, file_id: null }
       : null;
@@ -915,15 +912,16 @@ async function refreshBuildStatus() {
     }
     ui.pdfFrame.hidden = !preview.viewer;
     ui.pdfEmpty.hidden = !preview.empty;
-    if (source == null) ui.pdfRelation.textContent = 'No exact source state submitted yet';
-    else if (pdf == null) ui.pdfRelation.textContent = `Source version ${source} · No PDF yet`;
-    else ui.pdfRelation.textContent = `Source version ${source} · PDF version ${pdf}${rebuilding ? ' · Rebuilding…' : ''}`;
+    if (pdf == null) ui.pdfRelation.textContent = 'Compile to generate a PDF.';
+    else if (stale) ui.pdfRelation.textContent = `PDF is out of date — Compile to refresh. Source version ${source} · PDF version ${pdf}`;
+    else ui.pdfRelation.textContent = `PDF matches source version ${pdf}`;
     if (build.active_build_id) ui.buildStatus.textContent = build.current_build_id ? 'Rebuilding…' : 'Building…';
     else if (build.latest_status === 'failed' && source !== pdf) {
       ui.buildStatus.textContent = build.current_build_id ? 'Build failed — showing last successful PDF' : 'Build failed';
       if (build.latest_error?.message) ui.pdfRelation.textContent += ` · ${build.latest_error.message}`;
-    } else if (build.current_build_id) ui.buildStatus.textContent = 'Current';
-    else ui.buildStatus.textContent = 'No PDF yet';
+    } else if (build.current_build_id && stale) ui.buildStatus.textContent = 'Out of date';
+    else if (build.current_build_id) ui.buildStatus.textContent = 'Current';
+    else ui.buildStatus.textContent = 'Compile to generate a PDF';
     renderProblems();
   } catch (error) {
     notice(error.message, true);
@@ -952,14 +950,24 @@ async function refreshReviewRounds() {
     return;
   }
   try {
+    const previousReviewOpen = Boolean(model.paperDetail?.review_open);
     const payload = await api.reviewRounds(model.paper.id);
     model.reviewRounds = payload.rounds;
     model.reviewOpen = payload.review_open;
     model.currentReviewRound = payload.current_review_round;
-    const leader = Boolean(model.paper.is_team_leader && model.paperDetail?.editable);
-    ui.sendReview.disabled = !leader || model.reviewOpen;
+    const leader = Boolean(model.paper.is_team_leader);
+    ui.sendReview.disabled = !leader || !model.paperDetail?.editable || model.reviewOpen;
     ui.endReview.disabled = !leader || !model.reviewOpen;
     ui.reviewStateBadge.textContent = model.reviewOpen ? 'In Review' : 'Draft';
+    if (previousReviewOpen !== model.reviewOpen) {
+      await openPaper(model.paper);
+      return;
+    }
+    if (model.reviewOpen) {
+      notice(leader
+        ? 'Under review — use End review to resume editing.'
+        : 'Under review — your Team Leader can end the review.');
+    }
   } catch (error) {
     notice(error.message, true);
   }
@@ -1525,7 +1533,7 @@ async function openDocumentDetails(prefetched = null) {
       label.append(input); form.append(label);
     });
     if (detail.can_edit) { const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save document details'; form.append(save); }
-    form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); if (result.auto_build_required) await requestBuild('auto'); notice('Document details saved. Front Matter was rebuilt.'); } catch (error) { notice(error.message, true); } });
+    form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); notice('Document details saved. Front Matter was rebuilt. Compile to refresh the PDF.'); } catch (error) { notice(error.message, true); } });
     ui.documentDetailsBody.append(form); openDrawer('documentDetails');
   } catch (error) { notice(error.message, true); }
 }
@@ -1619,7 +1627,7 @@ ui.sendReview.addEventListener('click', async () => {
   if (!model.paper?.is_team_leader || !await requireDurableFlush()) return;
   try {
     await api.sendForReview(model.paper.id);
-    await refreshReviewRounds();
+    await openPaper(model.paper);
     notice('Current report sent for Mentor review.');
   } catch (error) { notice(error.message, true); }
 });
@@ -1628,7 +1636,7 @@ ui.endReview.addEventListener('click', async () => {
   if (!open || !window.confirm('Withdraw the current review request? Unpublished Mentor drafts will stay private and published feedback will remain available.')) return;
   try {
     await api.endReview(model.paper.id, open.id);
-    await refreshReviewRounds();
+    await openPaper(model.paper);
     notice('Review request withdrawn. Published feedback remains available.');
   } catch (error) { notice(error.message, true); }
 });
@@ -1761,7 +1769,10 @@ ui.writerReviewFilters.addEventListener('click', (event) => {
 window.setInterval(() => {
   if (model.paper) {
     refreshBuildStatus();
-    if (model.paper.kind === 'team') refreshReviews();
+    if (model.paper.kind === 'team') {
+      refreshReviews();
+      refreshReviewRounds();
+    }
   }
 }, 1500);
 

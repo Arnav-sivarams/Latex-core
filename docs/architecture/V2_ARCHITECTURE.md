@@ -42,11 +42,11 @@ The API, parser, and collaboration gateway never execute user LaTeX. PostgreSQL 
 
 ```text
 Writer edit -> authenticated collaboration -> durable update -> broadcast
-            -> coalesced exact-state auto-build -> PDF/SyncTeX
+            -> explicit exact-state Compile -> PDF/SyncTeX
             -> Mentor live review and anchored feedback
 ```
 
-The update path acknowledges “Synced” only after durable persistence. Compilation is separate, begins after an initial idle debounce of approximately two seconds, and never promotes stale output. See [real-time collaboration](adr/ADR-001-REALTIME-COLLABORATION.md), [performance](adr/ADR-002-COLLABORATION-PERFORMANCE.md), [WebSocket protocol](V2_WEBSOCKET_PROTOCOL.md), and [versioned compile](adr/ADR-005-VERSIONED-COMPILE.md).
+The update path acknowledges “Synced” only after durable persistence. Compilation is separate and manual-only. It begins after an authorized Compile action flushes and captures exact durable state, and it never promotes stale output. See [real-time collaboration](adr/ADR-001-REALTIME-COLLABORATION.md), [performance](adr/ADR-002-COLLABORATION-PERFORMANCE.md), [WebSocket protocol](V2_WEBSOCKET_PROTOCOL.md), and [versioned compile](adr/ADR-005-VERSIONED-COMPILE.md).
 
 ## Undo and restoration
 

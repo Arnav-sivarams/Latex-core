@@ -949,6 +949,16 @@ impl V2Repository {
             .ok_or(V2Error::NotFound { entity: "paper" })
     }
 
+    pub async fn active_review_round(&self, paper_id: Uuid) -> Result<Option<Uuid>, V2Error> {
+        sqlx::query_scalar(
+            "SELECT id FROM latex_core.review_rounds WHERE paper_id=$1 AND status='OPEN_FOR_REVIEW' ORDER BY opened_at DESC,id DESC LIMIT 1",
+        )
+        .bind(paper_id)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(V2Error::Database)
+    }
+
     pub async fn list_live_paper_files(
         &self,
         workspace_id: WorkspaceId,
@@ -964,6 +974,9 @@ impl V2Repository {
         rows.into_iter().map(decode_paper_file).collect()
     }
 
+    // The access projection intentionally keeps every file-policy and review-state check
+    // together so HTTP and WebSocket callers receive one atomic capability decision.
+    #[allow(clippy::too_many_lines)]
     pub async fn collaboration_access(
         &self,
         user_id: UserId,
@@ -983,12 +996,14 @@ impl V2Repository {
             });
         }
         let rows = sqlx::query(
-            "SELECT workspace_id,status,'personal' AS kind,(owner_user_id=$2) AS assigned \
+            "SELECT workspace_id,status,'personal' AS kind,(owner_user_id=$2) AS assigned,FALSE AS review_open \
              FROM latex_core.personal_papers WHERE id=$1 \
              UNION ALL \
              SELECT t.workspace_id,t.status,'team' AS kind,EXISTS( \
                  SELECT 1 FROM latex_core.paper_team_members m \
-                 WHERE m.paper_team_id=t.id AND m.user_id=$2) AS assigned \
+                 WHERE m.paper_team_id=t.id AND m.user_id=$2) AS assigned,EXISTS( \
+                 SELECT 1 FROM latex_core.review_rounds rr \
+                 WHERE rr.paper_id=t.id AND rr.workspace_id=t.workspace_id AND rr.status='OPEN_FOR_REVIEW') AS review_open \
              FROM latex_core.paper_teams t WHERE t.id=$1",
         )
         .bind(paper_id)
@@ -1005,6 +1020,7 @@ impl V2Repository {
         let kind: String = row.try_get("kind").map_err(V2Error::Database)?;
         let status: String = row.try_get("status").map_err(V2Error::Database)?;
         let assigned: bool = row.try_get("assigned").map_err(V2Error::Database)?;
+        let review_open: bool = row.try_get("review_open").map_err(V2Error::Database)?;
         let permitted = assigned
             && matches!(
                 (kind.as_str(), role),
@@ -1054,6 +1070,7 @@ impl V2Repository {
         })?;
         let mode = if role == GlobalRole::Writer
             && status == PaperStatus::Active.as_str()
+            && !review_open
             && policy.content_editable()
         {
             CollaborationAccessMode::ReadWrite
@@ -1164,6 +1181,13 @@ impl V2Repository {
             .await
             .map_err(V2Error::Database)?;
         workspace_mutation_lock(&mut tx, workspace_id).await?;
+        let mut actors = updates
+            .iter()
+            .map(|update| update.actor_user_id)
+            .collect::<HashSet<_>>();
+        for actor in actors.drain() {
+            require_writer_workspace_access(&mut tx, actor, workspace_id, true).await?;
+        }
         let current = lock_live_file(&mut tx, file_id).await?;
         if current.workspace_id != workspace_id {
             return Err(V2Error::NotFound {
@@ -1898,11 +1922,13 @@ async fn require_writer_workspace_access(
     require_active: bool,
 ) -> Result<(), V2Error> {
     require_role(tx, actor, &[GlobalRole::Writer], "writer").await?;
-    let status = sqlx::query_scalar::<_, String>(
-        "SELECT status FROM latex_core.personal_papers \
+    let row = sqlx::query(
+        "SELECT status,'personal' AS kind,FALSE AS review_open FROM latex_core.personal_papers \
          WHERE workspace_id=$1 AND owner_user_id=$2 \
          UNION ALL \
-         SELECT t.status FROM latex_core.paper_teams t \
+         SELECT t.status,'team' AS kind,EXISTS(SELECT 1 FROM latex_core.review_rounds rr \
+             WHERE rr.paper_id=t.id AND rr.workspace_id=t.workspace_id AND rr.status='OPEN_FOR_REVIEW') AS review_open \
+         FROM latex_core.paper_teams t \
          JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id \
          WHERE t.workspace_id=$1 AND m.user_id=$2",
     )
@@ -1912,10 +1938,18 @@ async fn require_writer_workspace_access(
     .await
     .map_err(V2Error::Database)?
     .ok_or(V2Error::NotFound { entity: "paper" })?;
+    let status: String = row.try_get("status").map_err(V2Error::Database)?;
+    let kind: String = row.try_get("kind").map_err(V2Error::Database)?;
+    let review_open: bool = row.try_get("review_open").map_err(V2Error::Database)?;
     let status = PaperStatus::from_str(&status)?;
     if require_active && status != PaperStatus::Active {
         return Err(V2Error::Conflict {
             entity: "read-only paper",
+        });
+    }
+    if kind == "team" && review_open {
+        return Err(V2Error::Conflict {
+            entity: "paper under review",
         });
     }
     Ok(())

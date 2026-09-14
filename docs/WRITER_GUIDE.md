@@ -4,7 +4,7 @@
 
 For a Team report, use the compact **Document details** toolbar action to view its Front Matter Pack, status, section choices, automatic metadata, and custom fields. The Team Leader can toggle optional sections and save fields permitted by the pack. Required sections stay enabled. Regular Team Writers have the same view without editing controls; institution-assigned Front Matter cannot be removed by a Writer.
 
-Saving document details flushes current collaboration, safely escapes all entered text, atomically rebuilds hidden Front Matter files, adds one workspace revision/history boundary, and requests a normal automatic build. These generated files never appear in the file tree or enter an editable Yjs room. See [Front Matter Packs](FRONT_MATTER_PACKS.md).
+Saving document details flushes current collaboration, safely escapes all entered text, atomically rebuilds hidden Front Matter files, and adds one workspace revision/history boundary. It never compiles. These generated files never appear in the file tree or enter an editable Yjs room. See [Front Matter Packs](FRONT_MATTER_PACKS.md).
 
 Writers use `/write` for personal papers and assigned Team reports.
 
@@ -25,7 +25,9 @@ Offline state is stored per paper epoch. After a governed restoration, changes f
 
 ## Build and PDF
 
-After a durable local or remote source change becomes idle for about two seconds, the client requests an automatic exact-state build. The server remains authoritative for state barriers, hash deduplication, and queue coalescing. `Ctrl/Cmd+Enter` runs a manual compile. The last good PDF remains available when a later build fails.
+PDF compilation is manual. Editing, autosave, collaboration, file/image changes, Front Matter saves, history operations, opening, and reconnecting never submit a build. Choose **Compile** or press `Ctrl/Cmd+Enter`; this first flushes permitted collaboration changes, captures an immutable exact-state version, and submits the bounded idempotent job. The status shows the real Queued, Compiling, Compiled, or Failed state.
+
+Before the first successful build, the PDF pane says **Compile to generate a PDF.** If source or metadata changes later, the last successful PDF remains downloadable as historical output but is labelled **PDF is out of date — Compile to refresh.** It is not represented as current.
 
 ## History and restoration
 
@@ -35,7 +37,9 @@ For a Team report, a regular Writer chooses **Request Revert**, selects a versio
 
 ## Reviews and productivity
 
-The Team Leader can use **Send for review** only when the exact current source has a successful matching PDF. **Withdraw review** cancels an unfinished round without publishing any Mentor drafts. Writers receive feedback only after a Mentor uses **Push review**. The **Reviews** toolbar count includes published unresolved feedback even after its round closes. Selecting an item opens its stable file identity at the anchored range; if source drift prevents a trustworthy mapping, the original excerpt and reviewed PDF location are shown instead of highlighting unrelated text. **Done** resolves and hides one highlight without deleting history, and **Apply** uses the Writer-attributed suggestion flow.
+The Team Leader can use **Send for review** only when the exact current source and metadata have a successful matching PDF; otherwise the server says **Compile the latest changes before sending for review.** Sending never compiles. Once the round opens, every Writer—including the Leader—is read-only for source, files, Front Matter, restoration, compilation, and published-feedback Apply/Done actions. Reading, navigation, PDF/source download, and published feedback remain available. Regular Writers see **Under review — your Team Leader can end the review.** The Leader retains only **End review** as a report-changing action. Ending the round restores each Writer's normal role and file-policy permissions; it does not grant new permissions or publish/delete private Mentor drafts.
+
+Writers receive feedback only after a Mentor uses **Push review**. With multiple Mentors, one push publishes only that Mentor's feedback and does not unlock the report; the round closes only after the final required Mentor pushes or the Leader chooses **End review**. The **Reviews** toolbar count includes published unresolved feedback after closure. Selecting an item opens its stable file identity at the anchored range; if source drift prevents a trustworthy mapping, the original excerpt and reviewed PDF location are shown instead of highlighting unrelated text. Once editing resumes, **Done** resolves one highlight and **Apply** uses the Writer-attributed suggestion flow.
 
 The file-sidebar **Upload image** (`+`) action captures the currently open report before opening the picker and defaults to `assets/<filename>`. Every report has its own file manifest, so two reports—including two reports for the same Team—may each contain a different `assets/diagram.png`. The underlying immutable BlobStore may deduplicate identical bytes, but listing, preview, replacement, deletion, versions, export, compilation, and authorization remain report-local. If the path already exists, choose **Replace**, **Rename**, or **Cancel**; replacement keeps the stable file ID and creates a new report revision. PNG/JPEG uploads are limited to 1 MiB and must decode successfully with dimensions no greater than 8192×8192. Existing paths such as `images/chart.png` remain unchanged, appear as **Images (legacy)** with a truthful tooltip, and continue to compile. The sidebar no longer contains an Outline tab.
 

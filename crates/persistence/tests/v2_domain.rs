@@ -5,8 +5,14 @@
     reason = "integration test fixtures"
 )]
 
-use core_types::{LogicalPath, TenantId, UserId, WorkspaceId};
-use persistence::{Database, DatabaseConfig, GlobalRole, PaperStatus, V2Error, V2Repository};
+use core_types::{
+    BlobHash, CompileKey, LatexmkProfileId, LogicalPath, ShellPolicy, SnapshotId, TenantId,
+    TexEngine, TexEnvironmentId, UserId, WorkspaceId,
+};
+use persistence::{
+    CollaborationAccessMode, CollaborationUpdateInput, Database, DatabaseConfig, GlobalRole,
+    IntegrationError, IntegrationRepository, PaperStatus, V2BuildRequest, V2Error, V2Repository,
+};
 use sqlx::PgPool;
 use std::{env, time::Duration};
 use uuid::Uuid;
@@ -539,6 +545,339 @@ async fn statuses_are_closed_and_v1_schema_remains_independent() {
             .await
             .unwrap();
     assert_eq!(v2_paper_count, 0);
+
+    pool.close().await;
+    database.close().await;
+}
+
+#[tokio::test]
+async fn manual_build_review_lock_and_integration_reads_share_exact_state() {
+    let _guard = V2_TEST_LOCK.lock().await;
+    let (database, pool, repo) = connect().await;
+    let (admin, tenant) = insert_user_with_tenant(&pool).await;
+    let writer = insert_user(&pool).await;
+    let writer_two = insert_user(&pool).await;
+    let mentor = insert_user(&pool).await;
+    for (user, role, label) in [
+        (admin, GlobalRole::Admin, "admin"),
+        (writer, GlobalRole::Writer, "writer-a"),
+        (writer_two, GlobalRole::Writer, "writer-b"),
+        (mentor, GlobalRole::Mentor, "mentor"),
+    ] {
+        repo.set_global_role(user, role).await.unwrap();
+        sqlx::query(
+            "INSERT INTO latex_core.user_credentials (user_id,email,password_hash) VALUES ($1,$2,'test-only-hash')",
+        )
+        .bind(user.as_uuid())
+        .bind(format!("{label}-{}@example.test", user.as_uuid()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let workspace = insert_workspace(&pool, tenant, admin).await;
+    let team = repo
+        .create_paper_team(admin, workspace, "Populated review-lock report", writer)
+        .await
+        .unwrap();
+    repo.add_paper_team_member(team.id, writer_two, admin)
+        .await
+        .unwrap();
+    repo.add_paper_team_member(team.id, mentor, admin)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.workspace_heads (workspace_id) VALUES ($1)")
+        .bind(workspace.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (file, _) = repo
+        .create_file_with_event(
+            workspace,
+            writer,
+            0,
+            LogicalPath::parse("main.tex").unwrap(),
+            "0".repeat(64).parse().unwrap(),
+            32,
+        )
+        .await
+        .unwrap();
+    let starting_version: i64 = sqlx::query_scalar(
+        "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+    )
+    .bind(workspace.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let source_bytes = b"\\documentclass{article}\n\\begin{document}Qualified\\end{document}\n";
+    let source_hash = BlobHash::digest(source_bytes);
+    let (_, source_version) = repo
+        .save_file_with_event(
+            file.file_id,
+            writer,
+            u64::try_from(starting_version).unwrap(),
+            source_hash,
+            u64::try_from(source_bytes.len()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let jobs_after_save: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs_after_save, jobs_before,
+        "ordinary save must enqueue zero builds"
+    );
+
+    let snapshot_text = "2".repeat(64);
+    sqlx::query("INSERT INTO latex_core.snapshots (snapshot_id,manifest_blob_hash) VALUES ($1,$1) ON CONFLICT DO NOTHING")
+        .bind(&snapshot_text)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state_hash = snapshot_text.clone();
+    let manifest = serde_json::json!({
+        "schema_version":1,
+        "workspace":{"files":{"main.tex":{"blob_hash":source_hash.to_hex(),"size_bytes":source_bytes.len()}}},
+        "file_identities":[{"file_id":file.file_id,"path":"main.tex"}],
+        "template_policy_provenance":{"file_policies":[{"file_id":file.file_id,"policy":"EDITABLE"}]},
+        "front_matter":{"status":"not_configured"},
+        "front_matter_resolved":{"status":"not_configured","fields":[]}
+    });
+    let request = V2BuildRequest {
+        paper_id: team.id,
+        workspace_id: workspace,
+        document_epoch: 1,
+        source_sequence: source_version,
+        snapshot_id: snapshot_text.parse::<SnapshotId>().unwrap(),
+        manifest,
+        state_hash: state_hash.clone(),
+        tenant_id: tenant,
+        user_id: writer,
+        trigger_type: "manual".into(),
+        compile_key: "4".repeat(64).parse::<CompileKey>().unwrap(),
+        engine: TexEngine::PdfLatex,
+        tex_environment_id: TexEnvironmentId::parse("test-frozen-m7").unwrap(),
+        latexmk_profile: LatexmkProfileId::parse("safe-v1").unwrap(),
+        shell_policy: ShellPolicy::Safe,
+        synctex: true,
+    };
+    let submission = repo.submit_v2_build(&request).await.unwrap();
+    let build_id = submission.build_id.unwrap();
+    let (job_id, version_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT compile_job_id,version_id FROM latex_core.v2_paper_builds WHERE id=$1",
+    )
+    .bind(build_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE latex_core.compile_jobs SET state='succeeded',finished_at=statement_timestamp() WHERE id=$1")
+        .bind(job_id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE latex_core.v2_paper_builds SET status='succeeded' WHERE id=$1")
+        .bind(build_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pdf_bytes = b"%PDF-1.4\n% qualification artifact\n%%EOF\n";
+    for (kind, name, bytes, content_type) in [
+        ("pdf", "main.pdf", pdf_bytes.as_slice(), "application/pdf"),
+        ("log", "main.log", b"ok\n".as_slice(), "text/plain"),
+        (
+            "synctex",
+            "main.synctex.gz",
+            b"gz".as_slice(),
+            "application/gzip",
+        ),
+    ] {
+        let hash = BlobHash::digest(bytes).to_hex();
+        sqlx::query("INSERT INTO latex_core.compilation_artifacts (artifact_id,job_id,compile_key,kind,logical_name,blob_hash,size_bytes,content_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(Uuid::new_v4()).bind(job_id).bind("4".repeat(64)).bind(kind).bind(name).bind(hash).bind(i64::try_from(bytes.len()).unwrap()).bind(content_type)
+            .execute(&pool).await.unwrap();
+    }
+    sqlx::query("UPDATE latex_core.v2_paper_build_state SET active_build_id=NULL,current_build_id=$2 WHERE workspace_id=$1")
+        .bind(workspace.as_uuid()).bind(build_id).execute(&pool).await.unwrap();
+
+    let (round, created) = repo
+        .open_review_round(writer, team.id, &state_hash)
+        .await
+        .unwrap();
+    assert!(created);
+    let round_id = Uuid::parse_str(round["id"].as_str().unwrap()).unwrap();
+    for actor in [writer, writer_two] {
+        assert_eq!(
+            repo.collaboration_access(actor, team.id, file.file_id)
+                .await
+                .unwrap()
+                .mode,
+            CollaborationAccessMode::ReadOnly
+        );
+        assert!(matches!(
+            repo.save_file_with_event(
+                file.file_id,
+                actor,
+                source_version,
+                "8".repeat(64).parse().unwrap(),
+                3
+            )
+            .await,
+            Err(V2Error::Conflict {
+                entity: "paper under review"
+            })
+        ));
+    }
+    let yjs_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.collaboration_updates WHERE workspace_id=$1",
+    )
+    .bind(workspace.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        repo.persist_collaboration_batch(
+            workspace,
+            file.file_id,
+            1,
+            &[CollaborationUpdateInput {
+                actor_user_id: writer,
+                update_bytes: vec![1, 2, 3]
+            }],
+            "a".repeat(64).parse().unwrap(),
+            3
+        )
+        .await,
+        Err(V2Error::Conflict {
+            entity: "paper under review"
+        })
+    ));
+    let yjs_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.collaboration_updates WHERE workspace_id=$1",
+    )
+    .bind(workspace.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        yjs_after, yjs_before,
+        "denied Yjs update must not reach durable shared state"
+    );
+    assert!(matches!(
+        repo.submit_v2_build(&request).await,
+        Err(V2Error::Conflict {
+            entity: "paper under review"
+        })
+    ));
+    let jobs_during_review: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        jobs_during_review,
+        jobs_before + 1,
+        "denied review operations enqueue zero builds"
+    );
+
+    repo.close_review_round(writer, team.id, round_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.collaboration_access(writer_two, team.id, file.file_id)
+            .await
+            .unwrap()
+            .mode,
+        CollaborationAccessMode::ReadWrite
+    );
+    repo.save_file_with_event(
+        file.file_id,
+        writer_two,
+        source_version,
+        "9".repeat(64).parse().unwrap(),
+        3,
+    )
+    .await
+    .unwrap();
+
+    let integration = IntegrationRepository::new(database.clone());
+    let scopes = vec![
+        "reports.read".to_owned(),
+        "reports.files.read".to_owned(),
+        "reports.pdf.read".to_owned(),
+    ];
+    let mut token_hash = team.id.as_bytes().to_vec();
+    token_hash.extend_from_slice(team.id.as_bytes());
+    let client = integration
+        .create_client(
+            admin,
+            &format!("qualification archive {}", team.id),
+            "lcint_qualification",
+            &token_hash,
+            &scopes,
+            false,
+            &[team.id],
+            None,
+        )
+        .await
+        .unwrap();
+    let principal = integration.authenticate(&token_hash).await.unwrap();
+    assert!(principal.allows_report(team.id));
+    assert_eq!(
+        integration
+            .reports(&principal, None, 2, None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let projected = integration.report(team.id, false).await.unwrap();
+    assert!(
+        projected["relationships"]["members"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 3
+    );
+    assert!(
+        projected["relationships"]["members"][0]
+            .get("email")
+            .is_none()
+    );
+    let versions = integration.versions(team.id, None, 10).await.unwrap();
+    assert!(
+        versions
+            .iter()
+            .any(|version| version["id"] == version_id.to_string())
+    );
+    let builds = integration.builds(team.id, None, 10).await.unwrap();
+    assert_eq!(builds.len(), 1);
+    assert!(
+        !builds[0]["is_current"].as_bool().unwrap(),
+        "post-build edit makes PDF stale"
+    );
+    assert_eq!(
+        integration.pdf(team.id, build_id).await.unwrap()["version_id"],
+        version_id.to_string()
+    );
+    integration
+        .admit_read(client.id, "reports.read")
+        .await
+        .unwrap();
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM latex_core.integration_access_log WHERE client_id=$1",
+    )
+    .bind(client.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1);
+    integration.revoke_client(admin, client.id).await.unwrap();
+    assert!(matches!(
+        integration.authenticate(&token_hash).await,
+        Err(IntegrationError::Forbidden)
+    ));
 
     pool.close().await;
     database.close().await;

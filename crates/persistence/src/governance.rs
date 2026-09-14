@@ -513,6 +513,7 @@ impl V2Repository {
                 entity: "archived Paper Team template",
             });
         }
+        reject_active_review(&mut tx, request.paper_id, request.workspace_id).await?;
         let actual: i64 = sqlx::query_scalar(
             "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
         )
@@ -676,6 +677,7 @@ impl V2Repository {
         .await
         .map_err(V2Error::Database)?
         .ok_or(V2Error::NotFound { entity: "assigned Team Paper" })?;
+        reject_active_review(&mut tx, paper_id, WorkspaceId::from_uuid(workspace_id)).await?;
         ensure_target_version(&mut tx, paper_id, workspace_id, target_version_id).await?;
         let id = Uuid::new_v4();
         sqlx::query(
@@ -1055,6 +1057,7 @@ async fn apply_restore(
         });
     }
     workspace_mutation_lock(tx, workspace_id).await?;
+    reject_active_review(tx, paper_id, workspace_id).await?;
     let actual: i64 = sqlx::query_scalar(
         "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
     )
@@ -1224,6 +1227,28 @@ async fn apply_restore(
             message: "negative restored workspace version".to_owned(),
         })?,
     })
+}
+
+async fn reject_active_review(
+    tx: &mut Transaction<'_, Postgres>,
+    paper_id: Uuid,
+    workspace_id: WorkspaceId,
+) -> Result<(), V2Error> {
+    let review_open: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM latex_core.review_rounds WHERE paper_id=$1 AND workspace_id=$2 AND status='OPEN_FOR_REVIEW')",
+    )
+    .bind(paper_id)
+    .bind(workspace_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    if review_open {
+        Err(V2Error::Conflict {
+            entity: "paper under review",
+        })
+    } else {
+        Ok(())
+    }
 }
 
 async fn restore_front_matter_version_state(

@@ -735,20 +735,30 @@ async fn finalize_v2_build(
         let tenant: uuid::Uuid = required_pending(&scheduler, "pending_tenant_id")?;
         let user: uuid::Uuid = required_pending(&scheduler, "pending_user_id")?;
         let trigger: String = required_pending(&scheduler, "pending_trigger_type")?;
-        let compile_key: String = required_pending(&scheduler, "pending_compile_key")?;
-        let engine: String = required_pending(&scheduler, "pending_engine")?;
-        let environment: String = required_pending(&scheduler, "pending_tex_environment_id")?;
-        let profile: String = required_pending(&scheduler, "pending_latexmk_profile")?;
-        let shell: String = required_pending(&scheduler, "pending_shell_policy")?;
-        let synctex: bool = required_pending(&scheduler, "pending_synctex")?;
-        let number: i64 = sqlx::query_scalar(
+        // Keeping the legacy-discard branch first makes the migration safety rule explicit.
+        #[allow(clippy::if_not_else)]
+        if trigger != "manual" {
+            tracing::info!(
+                %workspace_id,
+                trigger_type = %trigger,
+                "discarded a pre-manual-policy pending automatic build without cancelling queued history"
+            );
+            None
+        } else {
+            let compile_key: String = required_pending(&scheduler, "pending_compile_key")?;
+            let engine: String = required_pending(&scheduler, "pending_engine")?;
+            let environment: String = required_pending(&scheduler, "pending_tex_environment_id")?;
+            let profile: String = required_pending(&scheduler, "pending_latexmk_profile")?;
+            let shell: String = required_pending(&scheduler, "pending_shell_policy")?;
+            let synctex: bool = required_pending(&scheduler, "pending_synctex")?;
+            let number: i64 = sqlx::query_scalar(
             "SELECT COALESCE(max(version_number),0)+1 FROM latex_core.paper_versions WHERE workspace_id=$1",
         )
         .bind(workspace_id)
         .fetch_one(&mut **tx)
         .await
         .map_err(QueueError::Database)?;
-        sqlx::query(
+            sqlx::query(
             "INSERT INTO latex_core.compile_jobs \
              (id,tenant_id,user_id,workspace_id,snapshot_id,compile_key,idempotency_key,engine,tex_environment_id,latexmk_profile,shell_policy,synctex,cost_class,priority,state) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'normal',$13,'queued')",
@@ -769,7 +779,7 @@ async fn finalize_v2_build(
         .execute(&mut **tx)
         .await
         .map_err(QueueError::Database)?;
-        sqlx::query(
+            sqlx::query(
             "INSERT INTO latex_core.paper_versions \
              (id,paper_id,workspace_id,document_epoch,version_number,version_type,created_by_user_id,workspace_version,snapshot_id,manifest,state_hash) \
              VALUES ($1,$2,$3,$4,$5,'compile_checkpoint',$6,$7,$8,$9,$10)",
@@ -787,7 +797,7 @@ async fn finalize_v2_build(
         .execute(&mut **tx)
         .await
         .map_err(QueueError::Database)?;
-        sqlx::query(
+            sqlx::query(
             "INSERT INTO latex_core.v2_paper_builds \
              (id,paper_id,workspace_id,compile_job_id,version_id,document_epoch,source_sequence,state_hash,trigger_type,status) \
              VALUES ($1,$2,$3,$1,$4,$5,$6,$7,$8,'queued')",
@@ -803,7 +813,8 @@ async fn finalize_v2_build(
         .execute(&mut **tx)
         .await
         .map_err(QueueError::Database)?;
-        Some(next_build)
+            Some(next_build)
+        }
     } else {
         None
     };

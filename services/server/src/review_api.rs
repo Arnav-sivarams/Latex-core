@@ -386,20 +386,26 @@ async fn open_round(
         .open_review_round(leader, paper_id, &state_hash)
         .await
     {
-        Ok((round, created)) => (
-            if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            },
-            Json(round),
-        )
-            .into_response(),
+        Ok((round, created)) => {
+            state
+                .collaboration
+                .review_state_changed(paper.workspace_id, true)
+                .await;
+            (
+                if created {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                Json(round),
+            )
+                .into_response()
+        }
         Err(V2Error::Conflict {
             entity: "current review PDF",
         }) => error(
             StatusCode::CONFLICT,
-            "Compile the current paper before sending it for review.",
+            "Compile the latest changes before sending for review.",
         ),
         Err(V2Error::Conflict {
             entity: "active Paper Team review submission",
@@ -429,12 +435,22 @@ async fn close_round(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let paper = match state.v2.review_paper(leader, paper_id).await {
+        Ok((paper, _)) => paper,
+        Err(value) => return v2_error(value),
+    };
     match state
         .v2
         .close_review_round(leader, paper_id, round_id)
         .await
     {
-        Ok(round) => Json(round).into_response(),
+        Ok(round) => {
+            state
+                .collaboration
+                .review_state_changed(paper.workspace_id, false)
+                .await;
+            Json(round).into_response()
+        }
         Err(value) => v2_error(value),
     }
 }
@@ -608,6 +624,12 @@ async fn publish_review(
                         publication.submission_id,
                         publication.published_count,
                     )
+                    .await;
+            }
+            if publication.round_completed {
+                state
+                    .collaboration
+                    .review_state_changed(paper.workspace_id, false)
                     .await;
             }
             Json(publication).into_response()

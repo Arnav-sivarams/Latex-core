@@ -20,6 +20,8 @@ Creating, editing, or deleting feedback saves a private server-side draft. **Dra
 
 With multiple assigned Mentors, one Mentor's submission becomes visible immediately and completes only that Mentor's participation. The round stays open for the others and closes after the last required Mentor submits. A Leader withdrawal does not publish private drafts. Published unresolved feedback remains available after round closure.
 
+While the round is open, all Team Writers, including the Leader, are read-only. The Leader can still choose **End review**. That action closes the round without publishing, erasing, or exporting any Mentor's unpublished draft. A normal last-required-Mentor **Push review** also closes the round; an earlier Mentor push does not.
+
 Submitted suggestions become source changes only when an authorized Writer accepts them. New feedback uses a simple Comment or Suggestion body; severity, category, assignment, and due date are not requested. Archived papers remain available for historical reading but do not accept new review actions.
 
 Mentors do not participate in Team revert authorization. Revert requests are handled within the Team by its Writer Leader.

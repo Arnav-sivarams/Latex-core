@@ -1,55 +1,17 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { AUTO_BUILD_IDLE_MS, createIdleBuildScheduler } from './auto-build.mjs';
 
-function clock() {
-  let now = 0;
-  let next = 0;
-  const timers = new Map();
-  return {
-    setTimer(fn, delay) { const id = ++next; timers.set(id, { at: now + delay, fn }); return id; },
-    clearTimer(id) { timers.delete(id); },
-    async advance(ms) {
-      now += ms;
-      const due = [...timers].filter(([, timer]) => timer.at <= now);
-      for (const [id, timer] of due) { timers.delete(id); await timer.fn(); }
-    },
-  };
-}
+const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
+const server = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
 
-test('durable local or remote state waits two idle seconds and requests auto build', async () => {
-  const fake = clock();
-  const requests = [];
-  const scheduler = createIdleBuildScheduler({
-    requestBuild: async (trigger) => requests.push(trigger),
-    setTimer: fake.setTimer,
-    clearTimer: fake.clearTimer,
-  });
-  scheduler.durableUpdate();
-  await fake.advance(AUTO_BUILD_IDLE_MS - 1);
-  assert.deepEqual(requests, []);
-  await fake.advance(1);
-  assert.deepEqual(requests, ['auto']);
-  scheduler.durableUpdate(); // the same entry point is used for REMOTE_DURABLE
-  await fake.advance(AUTO_BUILD_IDLE_MS);
-  assert.deepEqual(requests, ['auto', 'auto']);
+test('durable local and remote edits never schedule compilation', () => {
+  assert.doesNotMatch(writer, /createIdleBuildScheduler|autoBuild|requestBuild\('auto'\)/);
+  assert.match(writer, /DURABLE_ACK/);
+  assert.match(writer, /REMOTE_DURABLE/);
 });
 
-test('newer durable state resets debounce and manual cancellation prevents duplicate auto build', async () => {
-  const fake = clock();
-  const requests = [];
-  const scheduler = createIdleBuildScheduler({
-    requestBuild: async (trigger) => requests.push(trigger),
-    setTimer: fake.setTimer,
-    clearTimer: fake.clearTimer,
-  });
-  scheduler.durableUpdate();
-  await fake.advance(1500);
-  scheduler.durableUpdate();
-  await fake.advance(1999);
-  assert.deepEqual(requests, []);
-  scheduler.cancel();
-  requests.push('manual');
-  await fake.advance(1);
-  assert.deepEqual(requests, ['manual']);
+test('Front Matter and build submission expose manual compilation only', () => {
+  assert.doesNotMatch(server, /schedule_front_matter_auto_build|trigger_type: "auto"/);
+  assert.match(server, /trigger_type must be manual/);
 });

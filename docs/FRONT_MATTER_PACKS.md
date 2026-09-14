@@ -91,8 +91,10 @@ The Writer Team Leader uses the compact **Document details** action to enable op
 
 Rendered files live under `.latex-core/frontmatter/` with `HIDDEN_SYSTEM` policy. They are compiler-visible but absent from participant file lists and Yjs rooms; Writer, Mentor, structural undo, rename, and delete APIs cannot reach them.
 
-Assignment and save flush collaboration, resolve automatic/default/override values, validate required fields, render and BlobStore all outputs, then replace the managed subtree in one locked workspace event. Failure preserves the previous render. The workspace revision changes, so the normal exact-state build path includes Front Matter in compile hashes and schedules the next build from the Writer client.
+Assignment and save flush collaboration, resolve automatic/default/override values, validate required fields, render and BlobStore all outputs, then replace the managed subtree in one locked workspace event. Failure preserves the previous render. The workspace revision changes, so a later manual compile includes Front Matter in its exact-state hash; no build is scheduled by the save.
 
 Paper version manifests include both rendered managed files and Front Matter pin/value/section state. Team safe-revert restores the matching source, metadata, rendered files, and policies while retaining later history. Admin change/removal creates a `front_matter_update` safety version; removal leaves a safe empty managed entry file.
 
 Institutional identity edits enqueue affected pinned Teams in the bounded PostgreSQL rerender queue. No Redis or external broker is used.
+
+An open review freezes the materialized Front Matter in its reviewed snapshot. Institutional records may continue to change, but the rerender worker skips that report until the round ends. Writer and Admin Front Matter/template mutations are rejected during the round; a later rerender remains explicit report state and never compiles automatically.

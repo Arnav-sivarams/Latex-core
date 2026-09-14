@@ -37,6 +37,12 @@ mod governance;
 mod institution;
 #[allow(
     clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    reason = "integration projections keep explicit allowlisted SQL fields at the authorization boundary"
+)]
+mod integration;
+#[allow(
+    clippy::missing_errors_doc,
     reason = "outbox methods share the module's structured MailOutboxError contract"
 )]
 mod mail_outbox;
@@ -97,6 +103,10 @@ pub use institution::{
     InstitutionError, InstitutionImportBatch, InstitutionImportJob, InstitutionImportRow,
     InstitutionOperation, InstitutionPageFilter, InstitutionRepository, PaperTeamPage,
     PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
+};
+pub use integration::{
+    INTEGRATION_SCOPES, IntegrationClient, IntegrationError, IntegrationPrincipal,
+    IntegrationRepository, parse_blob_hash,
 };
 pub use mail_outbox::{
     ClaimedCredentialEmail, MailOutboxConfig, MailOutboxError, MailOutboxRepository,

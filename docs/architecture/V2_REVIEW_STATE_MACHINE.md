@@ -11,14 +11,15 @@ The primary V2.1 review types are `COMMENT` and `SUGGESTION`. New rows use compa
 ```text
 no open review -- Team Leader sends exact current build --> OPEN_FOR_REVIEW
 OPEN_FOR_REVIEW -- Team Leader ends review -------------> CLOSED
+OPEN_FOR_REVIEW -- last required Mentor pushes ---------> CLOSED
 ```
 
-Sending for review requires durable source and a successful PDF whose state hash exactly matches current desired source. Opening binds that immutable baseline and enables Mentor annotation. Closing disables new Mentor annotations and preserves all prior rounds, threads, anchors, and messages. A later submission creates a new baseline.
+Sending for review requires durable source and a successful PDF whose state hash and source sequence exactly match current desired source. Opening takes the workspace mutation lock, binds that immutable baseline, and makes every Writer read-only before later HTTP/Yjs writes can commit. It enables Mentor annotation. One Mentor push publishes only that Mentor's draft and leaves a multi-Mentor round open; the last required push closes it. The Leader may close it directly. Closing disables new Mentor annotations, restores only pre-existing Writer/file-policy capabilities, and preserves all rounds, threads, anchors, messages, and unpublished Mentor drafts. A later submission creates a new baseline.
 
 ## Thread lifecycle
 
 ```text
-OPEN -- Writer chooses Done --> RESOLVED
+OPEN -- Writer chooses Done after round closes --> RESOLVED
 ```
 
 Done hides the active highlight but retains the review row historically. Legacy lifecycle states and messages remain readable.
@@ -34,7 +35,7 @@ PROPOSED -- Writer accepts ----------> ACCEPTED
     +-- Writer rejects with reason ----> REJECTED
 ```
 
-The Mentor proposal never mutates source. Acceptance is validated as a current Writer action and becomes a Writer-authored CRDT transaction.
+The Mentor proposal never mutates source. Acceptance is disabled while its report is under review. After closure it is validated as a current Writer action and becomes a Writer-authored CRDT transaction.
 
 ## Anchors
 

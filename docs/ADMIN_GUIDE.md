@@ -23,6 +23,8 @@ The fixed Admin shell groups navigation into **People & data**, **Papers**, and 
 - **Reviews**, **Build Queue**, and **Audit** — read-only operational inspection using existing bounded APIs.
 - **System** — read-only health plus application branding. An Admin can upload, preview, replace, or reset the shared header logo.
 
+The authenticated institutional read API has a separate Admin HTTP control surface for named service clients, explicit read scopes, report or institution-wide coverage, expiry, revocation, and one-time secret rotation. It never turns a machine client into a Writer, Mentor, or Admin principal. See [Institutional API](INSTITUTIONAL_API.md).
+
 Branding accepts at most 512 KiB and decodes only PNG, JPEG, or WebP images with dimensions from 1×1 through 2048×2048. Filename extensions and submitted MIME types are not trusted. The approved blob is served from a fixed same-origin route; clients cannot provide filesystem paths or remote URLs. Branding affects application/login headers only and never changes Front Matter or existing PDFs.
 
 ## Templates and policies
@@ -30,6 +32,8 @@ Branding accepts at most 512 KiB and decodes only PNG, JPEG, or WebP images with
 Selecting a template during Paper Team creation clones its immutable blobs into a new workspace, registers stable files, sets the declared main file, and records a truthful template identity hash. Template default policy is applied to every cloned file. With no template, the normal `main.tex` bootstrap is used.
 
 Existing-Team changes appear as one **Change template** action. Internally, the server still previews the exact current workspace and validates a short-lived state token before apply. The Admin sees a plain file-count confirmation or a list of conflicting Writer-edited paths; a Main-document checkbox appears only when Main changes. A successful apply still creates `PRE_TEMPLATE_CHANGE`, updates only safe files, preserves all other files/history, changes the pin to `MANUAL_OVERRIDE`, and creates `TEMPLATE_UPDATE`.
+
+Template and Front Matter apply operations are rejected while a review round is open so the immutable reviewed state cannot drift.
 
 Policies are `EDITABLE`, `CONTENT_READ_ONLY`, `STRUCTURE_LOCKED`, `TEMPLATE_MANAGED`, and `HIDDEN_SYSTEM`. Changes take effect for open collaboration rooms; rejected edits return a policy/reload error rather than being silently discarded.
 

@@ -1,6 +1,6 @@
 //! S4 immutable paper versions and exact-state scheduling metadata.
 
-use crate::{V2Error, V2Repository};
+use crate::{V2Error, V2Repository, governance::workspace_mutation_lock};
 use core_types::{
     BlobHash, CompileKey, LatexmkProfileId, ShellPolicy, SnapshotId, TenantId, TexEngine,
     TexEnvironmentId, UserId, WorkspaceId,
@@ -152,6 +152,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        workspace_mutation_lock(&mut tx, workspace_id).await?;
         require_writer_access(&mut tx, actor, paper_id, workspace_id, true).await?;
         lock_scheduler(&mut tx, paper_id, workspace_id).await?;
         let number = next_version_number(&mut tx, workspace_id).await?;
@@ -229,6 +230,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        workspace_mutation_lock(&mut tx, request.workspace_id).await?;
         require_build_access(
             &mut tx,
             request.user_id,
@@ -237,6 +239,18 @@ impl V2Repository {
             true,
         )
         .await?;
+        let current_source_sequence: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
+        )
+        .bind(request.workspace_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if u64::try_from(current_source_sequence).ok() != Some(request.source_sequence) {
+            return Err(V2Error::Conflict {
+                entity: "compile source changed during submission",
+            });
+        }
         lock_scheduler(&mut tx, request.paper_id, request.workspace_id).await?;
         sqlx::query(
             "UPDATE latex_core.v2_paper_build_state SET desired_state_hash=$2,desired_source_sequence=$3,updated_at=statement_timestamp() WHERE workspace_id=$1",
@@ -335,10 +349,11 @@ impl V2Repository {
     ) -> Result<V2BuildView, V2Error> {
         let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
         let row = sqlx::query(
-            "SELECT s.desired_state_hash,s.desired_source_sequence,s.active_build_id,aj.state AS active_status, \
+            "SELECT s.desired_state_hash,h.durable_version AS source_sequence,s.active_build_id,aj.state AS active_status, \
                     s.current_build_id,cb.source_sequence AS current_source_sequence,cb.compile_job_id AS current_job_id, \
                     lb.status AS latest_status,lj.last_error AS latest_error \
              FROM latex_core.v2_paper_build_state s \
+             JOIN latex_core.workspace_heads h ON h.workspace_id=s.workspace_id \
              LEFT JOIN latex_core.v2_paper_builds ab ON ab.id=s.active_build_id \
              LEFT JOIN latex_core.compile_jobs aj ON aj.id=ab.compile_job_id \
              LEFT JOIN latex_core.v2_paper_builds cb ON cb.id=s.current_build_id \
@@ -367,7 +382,7 @@ impl V2Repository {
             desired_state_hash: row
                 .try_get("desired_state_hash")
                 .map_err(V2Error::Database)?,
-            source_sequence: optional_u64(&row, "desired_source_sequence")?,
+            source_sequence: optional_u64(&row, "source_sequence")?,
             active_build_id: row.try_get("active_build_id").map_err(V2Error::Database)?,
             active_status: row.try_get("active_status").map_err(V2Error::Database)?,
             current_build_id: row.try_get("current_build_id").map_err(V2Error::Database)?,
@@ -463,12 +478,14 @@ async fn require_writer_access(
     workspace_id: WorkspaceId,
     active: bool,
 ) -> Result<(), V2Error> {
-    let status = sqlx::query_scalar::<_, String>(
-        "SELECT p.status FROM latex_core.personal_papers p \
+    let row = sqlx::query(
+        "SELECT p.status,'personal' AS kind,FALSE AS review_open FROM latex_core.personal_papers p \
          JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role='writer' \
          WHERE p.id=$1 AND p.workspace_id=$2 AND p.owner_user_id=$3 \
          UNION ALL \
-         SELECT t.status FROM latex_core.paper_teams t \
+         SELECT t.status,'team' AS kind,EXISTS(SELECT 1 FROM latex_core.review_rounds rr \
+             WHERE rr.paper_id=t.id AND rr.workspace_id=t.workspace_id AND rr.status='OPEN_FOR_REVIEW') AS review_open \
+         FROM latex_core.paper_teams t \
          JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$3 \
          JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role='writer' \
          WHERE t.id=$1 AND t.workspace_id=$2",
@@ -480,9 +497,17 @@ async fn require_writer_access(
     .await
     .map_err(V2Error::Database)?
     .ok_or(V2Error::NotFound { entity: "paper" })?;
+    let status: String = row.try_get("status").map_err(V2Error::Database)?;
+    let kind: String = row.try_get("kind").map_err(V2Error::Database)?;
+    let review_open: bool = row.try_get("review_open").map_err(V2Error::Database)?;
     if active && status != "active" {
         return Err(V2Error::Conflict {
             entity: "read-only paper",
+        });
+    }
+    if kind == "team" && review_open {
+        return Err(V2Error::Conflict {
+            entity: "paper under review",
         });
     }
     Ok(())
@@ -495,12 +520,14 @@ async fn require_build_access(
     workspace_id: WorkspaceId,
     active: bool,
 ) -> Result<(), V2Error> {
-    let status = sqlx::query_scalar::<_, String>(
-        "SELECT p.status FROM latex_core.personal_papers p \
+    let row = sqlx::query(
+        "SELECT p.status,'writer' AS role,'personal' AS kind,FALSE AS review_open FROM latex_core.personal_papers p \
          JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role='writer' \
          WHERE p.id=$1 AND p.workspace_id=$2 AND p.owner_user_id=$3 \
          UNION ALL \
-         SELECT t.status FROM latex_core.paper_teams t \
+         SELECT t.status,r.role,'team' AS kind,EXISTS(SELECT 1 FROM latex_core.review_rounds rr \
+             WHERE rr.paper_id=t.id AND rr.workspace_id=t.workspace_id AND rr.status='OPEN_FOR_REVIEW') AS review_open \
+         FROM latex_core.paper_teams t \
          JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$3 \
          JOIN latex_core.global_user_roles r ON r.user_id=$3 AND r.role IN ('writer','mentor') \
          WHERE t.id=$1 AND t.workspace_id=$2",
@@ -512,9 +539,18 @@ async fn require_build_access(
     .await
     .map_err(V2Error::Database)?
     .ok_or(V2Error::NotFound { entity: "paper" })?;
+    let status: String = row.try_get("status").map_err(V2Error::Database)?;
+    let role: String = row.try_get("role").map_err(V2Error::Database)?;
+    let kind: String = row.try_get("kind").map_err(V2Error::Database)?;
+    let review_open: bool = row.try_get("review_open").map_err(V2Error::Database)?;
     if active && status != "active" {
         return Err(V2Error::Conflict {
             entity: "read-only paper",
+        });
+    }
+    if role == "writer" && kind == "team" && review_open {
+        return Err(V2Error::Conflict {
+            entity: "paper under review",
         });
     }
     Ok(())
@@ -700,7 +736,7 @@ async fn clear_pending_and_promote(
 }
 
 fn validate_build_request(request: &V2BuildRequest) -> Result<(), V2Error> {
-    if !matches!(request.trigger_type.as_str(), "auto" | "manual") {
+    if request.trigger_type != "manual" {
         return Err(V2Error::Integrity {
             message: "invalid V2 build trigger".to_owned(),
         });

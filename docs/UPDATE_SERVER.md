@@ -21,6 +21,8 @@ Use a narrower form when the release affects only one executable:
 
 ## Release with pending migrations
 
+This change adds migration `0027_institutional_read_api.sql`. It creates only integration-client verifier metadata and bounded access-audit rows; it does not rewrite reports, institutional records, build history, blobs, or review drafts. Apply it with the standard embedded migrator below. Keep the existing 9000/9001 host-port settings and Compose project/volumes unchanged.
+
 Schema changes require an explicit operator sequence:
 
 1. Create a verified database and BlobStore backup in approved off-host storage.

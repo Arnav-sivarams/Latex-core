@@ -2,7 +2,7 @@
 
 use crate::{
     GlobalRole, PaperKind, PaperStatus, V2Error, V2Repository, WriterPaper,
-    governance::assert_content_policy,
+    governance::{assert_content_policy, workspace_mutation_lock},
 };
 use core_types::{UserId, WorkspaceId};
 use serde::{Deserialize, Serialize};
@@ -256,6 +256,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
+        workspace_mutation_lock(&mut tx, paper.workspace_id).await?;
         if lock_paper_team(&mut tx, paper_id).await? != PaperStatus::Active {
             return Err(V2Error::Conflict {
                 entity: "active Paper Team review submission",
@@ -283,7 +284,7 @@ impl V2Repository {
             return Ok((round, false));
         }
         let baseline = sqlx::query(
-            "SELECT b.version_id,b.id AS build_id,b.state_hash FROM latex_core.v2_paper_build_state s \
+            "SELECT b.version_id,b.id AS build_id,b.state_hash,b.source_sequence FROM latex_core.v2_paper_build_state s \
              JOIN latex_core.v2_paper_builds b ON b.id=s.current_build_id \
              WHERE s.workspace_id=$1 AND b.status='succeeded' AND b.state_hash=$2 \
                AND s.desired_state_hash=$2 \
@@ -298,6 +299,21 @@ impl V2Repository {
         .ok_or(V2Error::Conflict {
             entity: "current review PDF",
         })?;
+        let baseline_source_sequence: i64 = baseline
+            .try_get("source_sequence")
+            .map_err(V2Error::Database)?;
+        let current_source_sequence: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE",
+        )
+        .bind(paper.workspace_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
+        if baseline_source_sequence != current_source_sequence {
+            return Err(V2Error::Conflict {
+                entity: "current review PDF",
+            });
+        }
         let baseline_version_id: Uuid =
             baseline.try_get("version_id").map_err(V2Error::Database)?;
         let baseline_build_id: Uuid = baseline.try_get("build_id").map_err(V2Error::Database)?;
@@ -933,6 +949,7 @@ impl V2Repository {
                 entity: "published review thread",
             });
         }
+        reject_writer_feedback_during_review(&mut tx, role, paper.workspace_id).await?;
         let id = insert_message(&mut tx, thread_id, actor, body).await?;
         sqlx::query(
             "UPDATE latex_core.review_threads SET updated_at=statement_timestamp() WHERE id=$1",
@@ -966,6 +983,7 @@ impl V2Repository {
                 entity: "published review thread",
             });
         }
+        reject_writer_feedback_during_review(&mut tx, role, paper.workspace_id).await?;
         let valid = match role {
             GlobalRole::Writer => match target {
                 "ADDRESSED" => matches!(current.as_str(), "OPEN" | "REOPENED"),
@@ -1080,6 +1098,7 @@ impl V2Repository {
             .await
             .map_err(V2Error::Database)?;
         require_published_thread(&mut tx, paper.workspace_id, thread_id).await?;
+        reject_writer_feedback_during_review(&mut tx, role, paper.workspace_id).await?;
         let file_id: Uuid = sqlx::query_scalar(
             "SELECT file_id FROM latex_core.review_source_anchors WHERE thread_id=$1",
         )
@@ -1153,6 +1172,7 @@ impl V2Repository {
             .await
             .map_err(V2Error::Database)?;
         require_published_thread(&mut tx, paper.workspace_id, thread_id).await?;
+        reject_writer_feedback_during_review(&mut tx, role, paper.workspace_id).await?;
         let changed = sqlx::query(
             "UPDATE latex_core.review_suggestions SET status='REJECTED',responded_at=statement_timestamp(),rejection_reason=$2 \
              WHERE thread_id=$1 AND status='PENDING'",
@@ -1428,6 +1448,30 @@ async fn lock_thread_state_and_type(
         row.try_get("publication_status")
             .map_err(V2Error::Database)?,
     ))
+}
+
+async fn reject_writer_feedback_during_review(
+    tx: &mut Transaction<'_, Postgres>,
+    role: GlobalRole,
+    workspace_id: WorkspaceId,
+) -> Result<(), V2Error> {
+    if role != GlobalRole::Writer {
+        return Ok(());
+    }
+    let open: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM latex_core.review_rounds WHERE workspace_id=$1 AND status='OPEN_FOR_REVIEW')",
+    )
+    .bind(workspace_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(V2Error::Database)?;
+    if open {
+        Err(V2Error::Conflict {
+            entity: "paper under review",
+        })
+    } else {
+        Ok(())
+    }
 }
 
 async fn require_published_thread(

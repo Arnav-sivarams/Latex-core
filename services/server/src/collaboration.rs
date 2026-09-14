@@ -21,7 +21,6 @@ const FLUSH: u8 = 0x02;
 pub(crate) const INITIAL_STATE: u8 = 0x10;
 pub(crate) const REMOTE_SOURCE_UPDATE: u8 = 0x11;
 const MAX_UPDATE_BYTES: usize = 1024 * 1024;
-const BATCH_BYTES: usize = 64 * 1024;
 const SNAPSHOT_BYTES: usize = 1024 * 1024;
 const SNAPSHOT_UPDATES: usize = 500;
 
@@ -179,6 +178,19 @@ impl CollaborationHub {
         }
     }
 
+    /// Publishes the committed review capability boundary to every local room.
+    /// Other API processes independently re-check `PostgreSQL` on every update.
+    pub async fn review_state_changed(&self, workspace_id: WorkspaceId, review_open: bool) {
+        let rooms = self.rooms.lock().await;
+        for (key, room) in rooms.iter() {
+            if key.workspace_id == workspace_id {
+                let _ = room
+                    .events
+                    .send(RoomEvent::ReviewStateChanged { review_open });
+            }
+        }
+    }
+
     /// Announces an already-committed report-local file change. The event
     /// carries identity only; each client refetches its authorized file list.
     pub async fn files_changed(&self, workspace_id: WorkspaceId, file_id: Uuid, revision: u64) {
@@ -229,6 +241,9 @@ enum RoomEvent {
     ReviewPublished {
         submission_id: Uuid,
         published_count: u64,
+    },
+    ReviewStateChanged {
+        review_open: bool,
     },
     FilesChanged {
         file_id: Uuid,
@@ -401,9 +416,9 @@ async fn room_actor(
                         let _ = reply.send(RoomJoin { initial_state, durable_sequence });
                     }
                     RoomCommand::Apply { source, actor, client_sequence, bytes, acknowledgements } => {
-                        match apply_update_if_changed(&doc, &bytes) {
-                            Ok(true) => {}
-                            Ok(false) => {
+                        let candidate = match candidate_source(&doc, &bytes) {
+                            Ok(Some(value)) => value,
+                            Ok(None) => {
                                 let _ = acknowledgements
                                     .send(
                                         serde_json::json!({
@@ -421,21 +436,43 @@ async fn room_actor(
                                 let _ = acknowledgements.send(error_json("malformed_update", &error)).await;
                                 continue;
                             }
-                        }
-                        pending_bytes += bytes.len();
-                        pending.push(PendingUpdate { actor, client_sequence, bytes: bytes.clone(), acknowledgements });
-                        let _ = events.send(RoomEvent::Update { source, bytes });
-                        if pending_bytes >= BATCH_BYTES {
-                            let flushed_updates = pending.len();
-                            let flushed_bytes = pending_bytes;
-                            if let Ok(sequence) = flush_batch(
-                                key, document_epoch, &doc, &text, &v2, blobs.as_ref(), &mut pending,
-                            ).await {
+                        };
+                        let stored = match blobs.put(Bytes::from(candidate)).await {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let _ = acknowledgements.send(error_json("durability", &error.to_string())).await;
+                                continue;
+                            }
+                        };
+                        let update = CollaborationUpdateInput { actor_user_id: actor, update_bytes: bytes.clone() };
+                        match v2.persist_collaboration_batch(
+                            key.workspace_id,
+                            key.file_id,
+                            document_epoch,
+                            std::slice::from_ref(&update),
+                            stored.hash(),
+                            stored.size_bytes(),
+                        ).await {
+                            Ok(sequence) => {
+                                if let Err(error) = apply_update(&doc, &bytes) {
+                                    tracing::error!(workspace_id=%key.workspace_id, file_id=%key.file_id, %error, "durable collaboration update could not be applied to room");
+                                    let _ = acknowledgements.send(error_json("reload_required", "durable update requires a room reload")).await;
+                                    break;
+                                }
                                 durable_sequence = sequence;
-                                updates_since_snapshot += flushed_updates;
-                                bytes_since_snapshot += flushed_bytes;
-                                pending_bytes = 0;
+                                updates_since_snapshot += 1;
+                                bytes_since_snapshot += bytes.len();
+                                let _ = acknowledgements.send(serde_json::json!({
+                                    "type":"DURABLE_ACK",
+                                    "client_seq":client_sequence,
+                                    "durable_seq":sequence
+                                }).to_string()).await;
+                                let _ = events.send(RoomEvent::Update { source, bytes });
                                 let _ = events.send(RoomEvent::Durable { sequence });
+                            }
+                            Err(error) => {
+                                tracing::warn!(workspace_id=%key.workspace_id, file_id=%key.file_id, %error, "collaboration update rejected before room application");
+                                let _ = acknowledgements.send(error_json("authority_revoked", "Under review — source updates are read-only until the review ends.")).await;
                             }
                         }
                     }
@@ -597,6 +634,20 @@ fn apply_update_if_changed(doc: &Doc, bytes: &[u8]) -> Result<bool, String> {
                     .transact()
                     .encode_state_as_update_v1(&StateVector::default())
         }))
+}
+
+fn candidate_source(doc: &Doc, bytes: &[u8]) -> Result<Option<String>, String> {
+    let current = doc
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default());
+    let candidate = Doc::new();
+    apply_update(&candidate, &current)?;
+    if !apply_update_if_changed(&candidate, bytes)? {
+        return Ok(None);
+    }
+    let text = candidate.get_or_insert_text("source");
+    let source = text.get_string(&candidate.transact());
+    Ok(Some(source))
 }
 
 fn validate_update(bytes: &[u8]) -> Result<(), String> {
@@ -784,6 +835,11 @@ pub async fn serve_socket(
                     Ok(RoomEvent::ReviewPublished { submission_id, published_count }) => {
                         let value = serde_json::json!({"type":"REVIEW_PUBLISHED","submission_id":submission_id,"published_count":published_count});
                         if sender.send(Message::Text(value.to_string().into())).await.is_err() { break; }
+                    }
+                    Ok(RoomEvent::ReviewStateChanged { review_open }) => {
+                        let value = serde_json::json!({"type":"CAPABILITIES_CHANGED","review_open":review_open,"access":if review_open { "read_only" } else { "refresh" }});
+                        let _ = sender.send(Message::Text(value.to_string().into())).await;
+                        break;
                     }
                     Ok(RoomEvent::FilesChanged { file_id, revision }) => {
                         let value = serde_json::json!({"type":"FILES_CHANGED","file_id":file_id,"revision":revision});

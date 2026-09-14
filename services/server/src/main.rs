@@ -12,6 +12,7 @@ mod archive;
 mod auth;
 mod collaboration;
 mod front_matter;
+mod integration_api;
 #[allow(
     dead_code,
     reason = "API shares mail configuration with the worker transport module"
@@ -1108,6 +1109,7 @@ fn router(state: AppState) -> Router {
         .route("/api/jobs/{id}/cancel", post(cancel))
         .route("/api/jobs/{id}/artifacts", get(artifacts))
         .route("/api/jobs/{id}/artifacts/{artifact}", get(artifact))
+        .merge(integration_api::router())
         .merge(review_api::router())
         .layer(RequestBodyLimitLayer::new(
             archive::MAX_ARCHIVE_BYTES + 64 * 1024,
@@ -3715,14 +3717,11 @@ async fn admin_remove_front_matter(
         )
         .await
     {
-        Ok(version) => {
-            schedule_front_matter_auto_build(state, paper_id).await;
-            Json(serde_json::json!({
-                "paper_team_id":paper_id,"front_matter_pack_id":null,
-                "workspace_version":version,"auto_build_required":false
-            }))
-            .into_response()
-        }
+        Ok(version) => Json(serde_json::json!({
+            "paper_team_id":paper_id,"front_matter_pack_id":null,
+            "workspace_version":version,"auto_build_required":false
+        }))
+        .into_response(),
         Err(error_value) => front_matter_repository_error(error_value),
     }
 }
@@ -3842,64 +3841,7 @@ async fn render_team_front_matter(
         )
         .await
         .map_err(front_matter_repository_error)?;
-    schedule_front_matter_auto_build(state, paper_id).await;
     Ok(version)
-}
-
-async fn schedule_front_matter_auto_build(state: &AppState, paper_id: uuid::Uuid) {
-    let result = async {
-        let (user_id, tenant_id) = state
-            .front_matter
-            .team_build_identity(paper_id)
-            .await
-            .map_err(front_matter_repository_error)?;
-        let paper = state
-            .v2
-            .writer_paper(user_id, paper_id)
-            .await
-            .map_err(v2_error)?;
-        let exact = capture_exact_v2_state(state, &paper).await?;
-        let engine = TexEngine::PdfLatex;
-        let profile = LatexmkProfileId::parse("safe-v1")
-            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "profile failure"))?;
-        let compile_key = CompileKeyMaterialV1::new(
-            exact.snapshot_id,
-            engine,
-            state.environment.clone(),
-            profile.clone(),
-            ShellPolicy::Safe,
-            true,
-        )
-        .compile_key()
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "compile key failure"))?;
-        state
-            .v2
-            .submit_v2_build(&V2BuildRequest {
-                paper_id,
-                workspace_id: paper.workspace_id,
-                document_epoch: exact.document_epoch,
-                source_sequence: exact.source_sequence,
-                snapshot_id: exact.snapshot_id,
-                manifest: exact.manifest,
-                state_hash: exact.state_hash,
-                tenant_id,
-                user_id,
-                trigger_type: "auto".to_owned(),
-                compile_key,
-                engine,
-                tex_environment_id: state.environment.clone(),
-                latexmk_profile: profile,
-                shell_policy: ShellPolicy::Safe,
-                synctex: true,
-            })
-            .await
-            .map_err(v2_error)?;
-        Ok::<(), Response>(())
-    }
-    .await;
-    if result.is_err() {
-        tracing::warn!(%paper_id, "Front Matter was saved but its automatic build could not be queued");
-    }
 }
 
 async fn load_front_matter_pack(
@@ -4546,12 +4488,30 @@ async fn v2_paper(
         Ok(value) => value,
         Err(error_value) => return v2_error(error_value),
     };
+    let review_round_id = if paper.kind == persistence::PaperKind::Team {
+        match state.v2.active_review_round(paper_id).await {
+            Ok(value) => value,
+            Err(error_value) => return v2_error(error_value),
+        }
+    } else {
+        None
+    };
+    let editable = paper.status == persistence::PaperStatus::Active && review_round_id.is_none();
     match state.workspaces.restore(paper.workspace_id).await {
         Ok(workspace) => Json(serde_json::json!({
             "paper":paper,
             "version":workspace.version().get(),
             "main_file":workspace.main_file().map(LogicalPath::as_str),
-            "editable":paper.status == persistence::PaperStatus::Active
+            "editable":editable,
+            "review_open":review_round_id.is_some(),
+            "review_round_id":review_round_id,
+            "capabilities":{
+                "read":true,
+                "edit":editable,
+                "compile":editable,
+                "send_for_review":editable && paper.kind == persistence::PaperKind::Team && paper.is_team_leader,
+                "end_review":review_round_id.is_some() && paper.is_team_leader
+            }
         }))
         .into_response(),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
@@ -4630,12 +4590,17 @@ async fn v2_file(
         Ok(value) => value,
         Err(error_value) => return v2_error(error_value),
     };
+    let review_open = paper.kind == persistence::PaperKind::Team
+        && match state.v2.active_review_round(paper_id).await {
+            Ok(value) => value.is_some(),
+            Err(error_value) => return v2_error(error_value),
+        };
     Json(serde_json::json!({
         "file":file,
         "content":content,
         "version":workspace.version().get(),
         "main":workspace.main_file() == Some(&file.path),
-        "editable":paper.status == persistence::PaperStatus::Active && policy.content_editable(),
+        "editable":paper.status == persistence::PaperStatus::Active && !review_open && policy.content_editable(),
         "policy":policy
     }))
     .into_response()
@@ -5572,11 +5537,17 @@ async fn capture_exact_v2_state(
             .version_state(paper.id)
             .await
             .map_err(front_matter_repository_error)?;
+        let resolved_front_matter = state
+            .front_matter
+            .archive_metadata(paper.id)
+            .await
+            .map_err(front_matter_repository_error)?;
         if let Some(object) = manifest.as_object_mut() {
             object.insert(
                 "front_matter".to_owned(),
                 front_matter_state.unwrap_or(serde_json::Value::Null),
             );
+            object.insert("front_matter_resolved".to_owned(), resolved_front_matter);
         }
     }
     let state_hash = checkpoint.snapshot_id().to_hex();
@@ -6079,21 +6050,13 @@ async fn v2_submit_build(
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    if !matches!(input.trigger_type.as_str(), "auto" | "manual") {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "trigger_type must be auto or manual",
-        );
+    if input.trigger_type != "manual" {
+        return error(StatusCode::BAD_REQUEST, "trigger_type must be manual");
     }
     let principal = match v2_paper_reader_session(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    if matches!(principal.kind, PrincipalKind::V2(GlobalRole::Mentor))
-        && input.trigger_type != "manual"
-    {
-        return error(StatusCode::FORBIDDEN, "Mentor builds must be manual");
-    }
     let paper = match principal.kind {
         PrincipalKind::V2(GlobalRole::Writer) => {
             match state.v2.writer_paper(principal.user_id(), paper_id).await {
@@ -6424,6 +6387,10 @@ fn front_matter_repository_error(error_value: FrontMatterRepositoryError) -> Res
             StatusCode::CONFLICT,
             "Paper changed during Front Matter rendering; try again.",
         ),
+        FrontMatterRepositoryError::ReviewLocked => error(
+            StatusCode::CONFLICT,
+            "Under review — Front Matter is read-only until the review ends.",
+        ),
         FrontMatterRepositoryError::Integrity(_) | FrontMatterRepositoryError::Database(_) => {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6438,6 +6405,17 @@ fn front_matter_repository_error(error_value: FrontMatterRepositoryError) -> Res
     reason = "owned V2 errors compose directly with Result::map_err at HTTP boundaries"
 )]
 fn v2_error(error_value: V2Error) -> Response {
+    if matches!(
+        &error_value,
+        V2Error::Conflict {
+            entity: "paper under review"
+        }
+    ) {
+        return error(
+            StatusCode::CONFLICT,
+            "Under review — report content and compilation are read-only until the review ends.",
+        );
+    }
     match error_value {
         V2Error::RoleMissing { .. } | V2Error::RoleForbidden { .. } => {
             error(StatusCode::FORBIDDEN, error_value.to_string())
@@ -11776,7 +11754,7 @@ mod database_tests {
         assert_eq!(missing_baseline.status(), StatusCode::CONFLICT);
         assert_eq!(
             test_json(missing_baseline).await["error"],
-            "Compile the current paper before sending it for review."
+            "Compile the latest changes before sending for review."
         );
 
         let build_path = format!("/api/v2/papers/{paper_id}/builds");
@@ -11791,7 +11769,7 @@ mod database_tests {
             )
             .await
             .status(),
-            StatusCode::FORBIDDEN
+            StatusCode::BAD_REQUEST
         );
         let build = request(
             &app,
@@ -13244,7 +13222,7 @@ mod database_tests {
                 Method::POST,
                 &build_path,
                 Some(&writer.cookie),
-                r#"{"trigger_type":"auto"}"#,
+                r#"{"trigger_type":"manual"}"#,
                 Some("application/json"),
             )
             .await,
@@ -13289,7 +13267,7 @@ mod database_tests {
                     Method::POST,
                     &build_path,
                     Some(&writer.cookie),
-                    r#"{"trigger_type":"auto"}"#,
+                    r#"{"trigger_type":"manual"}"#,
                     Some("application/json"),
                 )
                 .await,
@@ -13399,7 +13377,7 @@ mod database_tests {
                 Method::POST,
                 &build_path,
                 Some(&writer.cookie),
-                r#"{"trigger_type":"auto"}"#,
+                r#"{"trigger_type":"manual"}"#,
                 Some("application/json"),
             )
             .await,
@@ -15158,6 +15136,11 @@ mod database_tests {
         );
 
         let value_a = "A & 50% _ \\input{/etc/passwd} \\write18 <script>";
+        let jobs_before_metadata_save: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let saved_a = test_json(
             request(
                 &app,
@@ -15171,6 +15154,15 @@ mod database_tests {
         )
         .await;
         assert_eq!(saved_a["auto_build_required"], false);
+        let jobs_after_metadata_save: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            jobs_after_metadata_save, jobs_before_metadata_save,
+            "Front Matter save must enqueue zero builds"
+        );
         let cover_path = LogicalPath::parse(".latex-core/frontmatter/cover.tex").unwrap();
         let rendered_a = String::from_utf8(
             state
@@ -15422,6 +15414,233 @@ mod database_tests {
         database.close().await;
     }
 
+    #[tokio::test]
+    async fn institutional_api_admin_lifecycle_scope_and_read_only_routes() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+        let template_id = uuid::Uuid::new_v4();
+        let main = state
+            .blobs
+            .put(Bytes::from_static(b"\\documentclass{article}\n"))
+            .await
+            .unwrap();
+        state
+            .repo
+            .create_template(
+                template_id,
+                "Integration API fixture",
+                None,
+                Some("main.tex"),
+                &[AppTemplateFileRecord {
+                    path: "main.tex".into(),
+                    blob_hash: main.hash(),
+                    size_bytes: main.size_bytes(),
+                }],
+            )
+            .await
+            .unwrap();
+        state
+            .institution
+            .set_global_fallback(admin_id, template_id)
+            .await
+            .unwrap();
+        let writer_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT user_id FROM latex_core.user_credentials WHERE email=$1")
+                .bind(&writer.email)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({
+                    "name":format!("Integration API {}",uuid::Uuid::new_v4()),
+                    "writer_ids":[writer_id],
+                    "leader_writer_id":writer_id,
+                    "mentor_ids":[]
+                })
+                .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["team"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("team creation failed: {created}"));
+        let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let client_response = request(
+            &app,
+            Method::POST,
+            "/api/admin/integration/v1/clients",
+            Some(&admin.cookie),
+            &serde_json::json!({
+                "name":format!("restricted {}",uuid::Uuid::new_v4()),
+                "scopes":["reports.read"],
+                "institution_wide":false,
+                "report_ids":[paper_id],
+                "expires_at":null
+            })
+            .to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(client_response.status(), StatusCode::CREATED);
+        let client_response = test_json(client_response).await;
+        let client_id = client_response["client"]["id"].as_str().unwrap();
+        let secret = client_response["secret"].as_str().unwrap();
+        assert!(secret.starts_with("lcint_"));
+        assert_eq!(secret.len(), 70);
+
+        let listed = test_json(
+            get(
+                &app,
+                "/api/admin/integration/v1/clients",
+                Some(&admin.cookie),
+            )
+            .await,
+        )
+        .await;
+        let encoded = listed.to_string();
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("token_hash"));
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::GET,
+                "/api/integration/v1/reports?limit=1",
+                secret,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::GET,
+                "/api/integration/v1/reports?cursor=malformed",
+                secret,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::GET,
+                "/api/integration/v1/directory/students",
+                secret,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::GET,
+                "/api/integration/v1/reports/00000000-0000-4000-8000-000000000001",
+                secret,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/builds"),
+                secret,
+                r#"{"trigger_type":"manual"}"#
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let rotated = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/integration/v1/clients/{client_id}/rotate"),
+                Some(&admin.cookie),
+                "",
+                None,
+            )
+            .await,
+        )
+        .await;
+        let replacement = rotated["secret"].as_str().unwrap();
+        assert_eq!(
+            bearer_request(&app, Method::GET, "/api/integration/v1/reports", secret, "")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::GET,
+                "/api/integration/v1/reports",
+                replacement,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/integration/v1/clients/{client_id}/revoke"),
+                Some(&admin.cookie),
+                "",
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            bearer_request(
+                &app,
+                Method::GET,
+                "/api/integration/v1/reports",
+                replacement,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs_after, jobs_before,
+            "integration reads and rejected writes must not enqueue compilation"
+        );
+        pool.close().await;
+        database.close().await;
+    }
+
     async fn test_application() -> (Database, PgPool, Router, TempDir, AppState) {
         let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
         let database =
@@ -15604,6 +15823,27 @@ mod database_tests {
         }
         app.clone()
             .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn bearer_request(
+        app: &Router,
+        method: Method,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
             .await
             .unwrap()
     }

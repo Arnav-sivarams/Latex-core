@@ -1,0 +1,278 @@
+openapi: 3.0.3
+info:
+  title: LaTeX Core Institutional Read API
+  version: 1.0.0
+  description: Allowlisted, machine-authenticated, read-only institutional projections.
+servers:
+  - url: https://latex.example.edu
+security:
+  - bearerAuth: []
+tags:
+  - name: Reports
+  - name: Directory
+  - name: Integration administration
+paths:
+  /api/integration/v1/reports:
+    get:
+      tags: [Reports]
+      summary: List permitted Team reports
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/UuidCursor'
+        - {name: programme, in: query, schema: {type: string}}
+        - {name: academic_year, in: query, schema: {type: string}}
+        - {name: semester, in: query, schema: {type: string}}
+        - {name: state, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Stable ID-ordered page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Page'}
+              example:
+                schema_version: 1
+                data:
+                  - id: 11111111-1111-4111-8111-111111111111
+                    title: Compiler Design Report
+                    lifecycle_status: active
+                    review_open: false
+                    programme_code: CSE
+                    academic_year: 2026-27
+                    semester: Fall
+                    main_template: {id: null, name: null}
+                    front_matter_pack: {id: null, name: null}
+                    created_at: '2026-09-14 12:00:00+00'
+                    updated_at: '2026-09-14 12:00:00+00'
+                page: {limit: 50, next_cursor: null}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}:
+    get:
+      tags: [Reports]
+      summary: Get one permitted report and its ordered people relationships
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      responses:
+        '200':
+          description: Report projection; email appears only with contacts scope
+          content: {application/json: {schema: {type: object, additionalProperties: true}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/front-matter:
+    get:
+      tags: [Reports]
+      summary: Resolve current human-readable Front Matter through the application resolver
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      responses:
+        '200':
+          description: Current metadata, not historical metadata for an older PDF
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+              example:
+                schema_version: 1
+                report_id: 11111111-1111-4111-8111-111111111111
+                current:
+                  status: READY
+                  report_revision: 14
+                  pack: {id: 22222222-2222-4222-8222-222222222222, name: VIT 2026, content_hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, manifest_schema_version: 2}
+                  missing_fields: []
+                  selected_guide_identity: FAC-17
+                  selected_dean_identity: null
+                  fields:
+                    - {key: 'team.title', value: 'Compiler Design Report', origin: database, source_identity: 'team.name', status: resolved}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/versions:
+    get:
+      tags: [Reports]
+      summary: List immutable report versions
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/UuidCursor'
+      responses:
+        '200': {description: Version page, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/versions/{version_id}/files:
+    get:
+      tags: [Reports]
+      summary: Get the permitted file manifest for one immutable version
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/VersionId'
+      responses:
+        '200':
+          description: Hidden-system files are omitted
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+              example:
+                schema_version: 1
+                report_id: 11111111-1111-4111-8111-111111111111
+                version_id: 33333333-3333-4333-8333-333333333333
+                snapshot_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+                files:
+                  - file_id: 44444444-4444-4444-8444-444444444444
+                    path: main.tex
+                    sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+                    size_bytes: 42
+                    content_url: /api/integration/v1/reports/11111111-1111-4111-8111-111111111111/versions/33333333-3333-4333-8333-333333333333/files/44444444-4444-4444-8444-444444444444/content
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/versions/{version_id}/files/{file_id}/content:
+    get:
+      tags: [Reports]
+      summary: Download one permitted immutable source file or asset
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/VersionId'
+        - {name: file_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Immutable bytes; ETag is the unquoted SHA-256 value
+          headers: {ETag: {schema: {type: string}}}
+          content: {application/octet-stream: {schema: {type: string, format: binary}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/builds:
+    get:
+      tags: [Reports]
+      summary: List existing successful PDFs and exact version identities
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/UuidCursor'
+      responses:
+        '200':
+          description: "is_current=false identifies a stale last-good PDF"
+          content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/builds/{build_id}/pdf:
+    get:
+      tags: [Reports]
+      summary: Download an existing PDF without compiling
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - {name: build_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Existing immutable PDF
+          headers:
+            ETag: {schema: {type: string}}
+            X-Latex-Core-Version-Id: {schema: {type: string, format: uuid}}
+          content: {application/pdf: {schema: {type: string, format: binary}}}
+        '404': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/reports/{report_id}/reviews/published:
+    get:
+      tags: [Reports]
+      summary: List published feedback; unpublished Mentor drafts are never projected
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/UuidCursor'
+      responses:
+        '200': {description: Published feedback page, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/integration/v1/directory/{resource}:
+    get:
+      tags: [Directory]
+      summary: List one allowlisted institutional collection or relationship
+      parameters:
+        - name: resource
+          in: path
+          required: true
+          schema: {type: string, enum: [students, faculty, programmes, departments, schools, course-registrations, faculty-roles, department-roles]}
+        - $ref: '#/components/parameters/Limit'
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Deterministically ordered page, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/integration/v1/clients:
+    get:
+      tags: [Integration administration]
+      security: [{cookieAuth: []}]
+      summary: List nonsecret integration client metadata
+      responses:
+        '200': {description: Client catalogue, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      tags: [Integration administration]
+      security: [{cookieAuth: []}]
+      summary: Create a named integration client and show its secret once
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ClientInput'}
+      responses:
+        '201': {description: "Created; secret is returned once", content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/integration/v1/clients/{client_id}/rotate:
+    post:
+      tags: [Integration administration]
+      security: [{cookieAuth: []}]
+      summary: Rotate a credential and show the replacement once
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/Csrf'
+      responses:
+        '200': {description: Rotated, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/integration/v1/clients/{client_id}/revoke:
+    post:
+      tags: [Integration administration]
+      security: [{cookieAuth: []}]
+      summary: Revoke a credential immediately
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/Csrf'
+      responses:
+        '204': {description: Revoked}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+    cookieAuth: {type: apiKey, in: cookie, name: session}
+  parameters:
+    Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+    UuidCursor: {name: cursor, in: query, schema: {type: string, format: uuid}}
+    ReportId: {name: report_id, in: path, required: true, schema: {type: string, format: uuid}}
+    VersionId: {name: version_id, in: path, required: true, schema: {type: string, format: uuid}}
+    ClientId: {name: client_id, in: path, required: true, schema: {type: string, format: uuid}}
+    Csrf: {name: X-CSRF-Token, in: header, required: true, schema: {type: string}}
+  schemas:
+    Page:
+      type: object
+      required: [schema_version, data, page]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        data: {type: array, items: {type: object, additionalProperties: true}}
+        page:
+          type: object
+          required: [limit, next_cursor]
+          properties:
+            limit: {type: integer}
+            next_cursor: {type: string, nullable: true}
+    ClientInput:
+      type: object
+      required: [name, scopes]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 120}
+        scopes: {type: array, minItems: 1, uniqueItems: true, items: {type: string}}
+        institution_wide: {type: boolean, default: false}
+        report_ids: {type: array, items: {type: string, format: uuid}}
+        expires_at: {type: string, format: date-time, nullable: true}
+    Error:
+      type: object
+      required: [schema_version, code, error]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        code: {type: string}
+        error: {type: string}
+  responses:
+    Error:
+      description: Typed API error
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {schema_version: 1, code: scope_denied, error: 'required scope: reports.read'}
