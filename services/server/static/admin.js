@@ -333,7 +333,7 @@ async function renderTemplates(templates, frontMatterPacks) {
       const imported = await api('/api/admin/v2/templates/import', {
         method: 'POST', body,
       });
-      announce(`Imported ${imported.name}: ${imported.files.length} immutable files · ${imported.source_identity}`);
+      announce(imported.binding_warning || `Imported ${imported.name}: ${imported.files.length} immutable files · ${imported.source_identity}`, Boolean(imported.binding_warning));
       await showSection('Templates');
     } catch (error) { showError(error); }
   });

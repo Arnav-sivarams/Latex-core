@@ -45,6 +45,10 @@ pub struct ReviewSourceAnchorInput {
     pub source_sequence: u64,
     pub source_version_id: Option<Uuid>,
     pub document_epoch: u64,
+    #[serde(default)]
+    pub start_line: Option<i32>,
+    #[serde(default)]
+    pub end_line: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -503,8 +507,8 @@ impl V2Repository {
         if let Some(anchor) = &input.source_anchor {
             sqlx::query(
                 "INSERT INTO latex_core.review_source_anchors \
-                 (thread_id,file_id,encoded_relative_start,encoded_relative_end,quoted_text,context_hash,source_sequence,source_version_id,document_epoch) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                 (thread_id,file_id,encoded_relative_start,encoded_relative_end,quoted_text,context_hash,source_sequence,source_version_id,document_epoch,start_line,end_line) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             )
             .bind(id)
             .bind(anchor.file_id)
@@ -515,6 +519,8 @@ impl V2Repository {
             .bind(to_i64(anchor.source_sequence, "source sequence")?)
             .bind(anchor.source_version_id)
             .bind(to_i64(anchor.document_epoch, "document epoch")?)
+            .bind(anchor.start_line)
+            .bind(anchor.end_line)
             .execute(&mut *tx)
             .await
             .map_err(V2Error::Database)?;
@@ -890,7 +896,7 @@ impl V2Repository {
                     CASE WHEN sa.thread_id IS NULL THEN NULL ELSE jsonb_build_object('file_id',sa.file_id,'path',pf.path,'file_deleted',pf.tombstoned, \
                          'encoded_relative_start',CASE WHEN sa.encoded_relative_start IS NULL THEN NULL ELSE encode(sa.encoded_relative_start,'base64') END, \
                          'encoded_relative_end',CASE WHEN sa.encoded_relative_end IS NULL THEN NULL ELSE encode(sa.encoded_relative_end,'base64') END, \
-                         'quoted_text',sa.quoted_text,'context_hash',sa.context_hash,'source_sequence',sa.source_sequence,'source_version_id',sa.source_version_id,'document_epoch',sa.document_epoch) END AS source_anchor, \
+                         'quoted_text',sa.quoted_text,'context_hash',sa.context_hash,'source_sequence',sa.source_sequence,'source_version_id',sa.source_version_id,'document_epoch',sa.document_epoch,'start_line',sa.start_line,'end_line',sa.end_line) END AS source_anchor, \
                     pdf.anchor AS pdf_anchor, \
                     CASE WHEN suggestion.thread_id IS NULL THEN NULL ELSE jsonb_build_object('replacement_text',suggestion.replacement_text,'status',suggestion.status, \
                          'accepted_by_writer_user_id',suggestion.accepted_by_writer_user_id,'responded_at',suggestion.responded_at,'rejection_reason',suggestion.rejection_reason) END AS suggestion \

@@ -6,7 +6,7 @@ For a Team report, use the compact **Document details** toolbar action to view i
 
 Saving document details flushes current collaboration, safely escapes values only while rendering, atomically rebuilds managed Front Matter files, and adds one workspace revision/history boundary. It never compiles. The generated project-scoped path is `.latex-core/frontmatter/Front-Matter.tex`; it is not editable or shown in the ordinary tree, but it is included in authorized immutable exports. Existing `metadata.tex`/`frontmatter.tex` pack integration remains in place. See [Front Matter Packs](FRONT_MATTER_PACKS.md).
 
-Project metadata stores an executive summary (separate from abstract unless a pack explicitly maps it), project type, structured datasets, literal source-code snippets, and structured publications. **Insert → Publications** opens the categorized project-metadata editor and can insert its `\bibitem` entries only at a cursor already inside an existing `thebibliography` environment. Citation keys already present elsewhere in the report are rejected rather than duplicated.
+Project metadata stores an executive summary (separate from abstract unless a pack explicitly maps it), project type, structured datasets, literal source-code snippets, and structured publications. If an institutional Department or School has an identity but no authoritative display name, the Leader supplies a project-scoped label for each identity; the institutional ID and Team-override provenance remain visible. **Insert → Publications** opens the categorized project-metadata editor and can insert its `\bibitem` entries only at a cursor already inside an existing `thebibliography` environment. Citation keys already present elsewhere in the report are rejected rather than duplicated.
 
 Writers use `/write` for personal papers and assigned Team reports.
 
@@ -31,6 +31,8 @@ PDF compilation is manual. Editing, autosave, collaboration, file/image changes,
 
 Before the first successful build, the PDF pane says **Compile to generate a PDF.** If source or metadata changes later, the last successful PDF remains downloadable as historical output but is labelled **PDF is out of date — Compile to refresh.** It is not represented as current.
 
+The local PDF.js viewer remembers the observed page, zoom and within-page scroll separately for each report. A manual rebuild restores that reading position and clamps it when the replacement is shorter. **Locate source** is enabled only for a current exact build and uses that build's SyncTeX data; stale or unavailable mappings do not navigate.
+
 ## History and restoration
 
 History contains immutable versions. A Writer may directly restore an owned personal paper after confirmation; the old head is first retained as a safety version and restoration creates a new head.
@@ -47,7 +49,7 @@ The file-sidebar **Upload image** (`+`) action captures the currently open repor
 
 The single **Insert** catalogue contains each function once. It includes table/long table, figure, `listings` code blocks, inline/display math, a searchable keyboard-accessible symbol grid, publications, algorithms, citations, references, lists, and source comment/uncomment. Selection-based actions preserve a Yjs-relative editor range across menus and use one tracked transaction, so concurrent edits, collaboration, and undo apply; if the original file/range is no longer resolvable, insertion stops with an explicit message. Inline math avoids adding a second delimiter when the cursor is already in inline math. Source comment/uncomment applies TeX `%` prefixes to every selected line, including partial and blank-line selections.
 
-Table captions are generated above the `tabular`; figure captions stay below the image. Table column widths and minimum row height accept positive bounded LaTeX dimensions. Width applies to an entire column and minimum height to an entire row—the UI does not promise impossible independent cell geometry. **Long Table Builder** emits a bare `longtable` with repeated-heading markers; it never wraps the result in `table`, `minipage`, or `resizebox`, and reports two-column incompatibility. Code uses `listings`, never `minted` or shell escape.
+Table captions are generated above the `tabular`; figure captions stay below the image. In Table Builder, choose a cell as `row,column`, then set that cell's content, containing-column width, and containing-row minimum height using positive bounded LaTeX dimensions. The labels explain the shared row/column effect; the UI does not promise impossible independent cell geometry. **Long Table Builder** emits a bare `longtable` with repeated-heading markers; it never wraps the result in `table`, `minipage`, or `resizebox`, and reports two-column incompatibility. Code uses `listings`, never `minted` or shell escape.
 
 **Editor settings** changes only the signed-in account's source-editor font size (12–26 px) and Light/Dark editor theme. Reconfiguration keeps the active collaboration document, undo history, review decorations, and the surrounding light application shell intact.
 

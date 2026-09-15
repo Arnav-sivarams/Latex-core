@@ -21,8 +21,12 @@ test('Writer PDF empty and viewer states are mutually exclusive', () => {
 test('Writer DOM and CSS collapse the hidden PDF state', () => {
   const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../static/shells.css', import.meta.url), 'utf8');
-  assert.match(writer, /ui\.pdfFrame\.hidden = !preview\.viewer/);
+  assert.match(writer, /ui\.pdfScroll\.hidden = !preview\.viewer/);
   assert.match(writer, /ui\.pdfEmpty\.hidden = !preview\.empty/);
   assert.match(css, /\.pdf-foundation > \[hidden\] \{ display: none !important; \}/);
-  assert.match(css, /\.pdf-frame \{[^}]*display: block;/);
+  assert.match(css, /\.writer-pdf-scroll \{[^}]*overflow: auto;/);
+  assert.match(writer, /capturePdfView/);
+  assert.match(writer, /model\.pdfRestoring/);
+  assert.match(writer, /model\.pdfLoadingTask\?\.destroy\?\.\(\)/);
+  assert.match(writer, /model\.paper\?\.id !== paperId/);
 });

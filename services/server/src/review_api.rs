@@ -1119,6 +1119,12 @@ fn validate_thread(input: &ReviewThreadInput) -> Result<(), &'static str> {
             || anchor.encoded_relative_start.is_none()
             || anchor.encoded_relative_start.is_some() != anchor.encoded_relative_end.is_some()
             || anchor.quoted_text.is_empty()
+            || anchor.start_line.is_some() != anchor.end_line.is_some()
+            || anchor.start_line.is_some_and(|line| line < 1)
+            || anchor
+                .end_line
+                .zip(anchor.start_line)
+                .is_some_and(|(end, start)| end < start)
         {
             return Err("invalid source anchor");
         }

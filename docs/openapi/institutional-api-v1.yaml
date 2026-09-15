@@ -297,13 +297,15 @@ components:
         values:
           type: object
           additionalProperties: false
-          required: [executive_summary, project_type, datasets, source_code_snippets, publications]
+          required: [executive_summary, project_type, datasets, source_code_snippets, publications, department_display_names, school_display_names]
           properties:
             executive_summary: {type: string, nullable: true}
             project_type: {type: string, enum: [capstone, project-1], nullable: true}
             datasets: {type: array, items: {type: object, additionalProperties: false, required: [name, url, description], properties: {name: {type: string}, url: {type: string, nullable: true}, description: {type: string, nullable: true}}}}
             source_code_snippets: {type: array, items: {type: object, additionalProperties: false, required: [label, language, code], properties: {label: {type: string}, language: {type: string, nullable: true}, code: {type: string}}}}
             publications: {type: array, items: {type: object, additionalProperties: false, required: [citation_key, authors, title, venue, year, doi, url, status], properties: {citation_key: {type: string}, authors: {type: string}, title: {type: string}, venue: {type: string}, year: {type: integer}, doi: {type: string, nullable: true}, url: {type: string, nullable: true}, status: {type: string, enum: [communicated, accepted, published]}}}}
+            department_display_names: {type: array, items: {$ref: '#/components/schemas/InstitutionDisplayName'}}
+            school_display_names: {type: array, items: {$ref: '#/components/schemas/InstitutionDisplayName'}}
         fields:
           type: array
           items:
@@ -315,6 +317,13 @@ components:
               value: {nullable: true}
               origin: {type: string, enum: [database, team_override, unresolved]}
               source_identity: {type: string, nullable: true}
+    InstitutionDisplayName:
+      type: object
+      additionalProperties: false
+      required: [id, display_name]
+      properties:
+        id: {type: string}
+        display_name: {type: string}
     Error:
       type: object
       required: [schema_version, code, error]

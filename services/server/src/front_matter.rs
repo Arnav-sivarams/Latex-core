@@ -37,7 +37,65 @@ const ALLOWED_SOURCES: &[&str] = &[
     "project.type",
     "project.datasets",
     "project.source_code_snippets",
+    "project.department_names",
+    "project.school_names",
 ];
+
+pub const SINGLE_SOURCE_MARKER: &str = "% LATEX_CORE_SINGLE_SOURCE_BINDINGS";
+
+pub fn single_source_compatible(main: &[u8]) -> bool {
+    let Ok(source) = std::str::from_utf8(main) else {
+        return false;
+    };
+    let markers = source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| (line.trim() == SINGLE_SOURCE_MARKER).then_some(index))
+        .collect::<Vec<_>>();
+    let [marker] = markers.as_slice() else {
+        return false;
+    };
+    let lines = source.lines().collect::<Vec<_>>();
+    let begin = lines
+        .iter()
+        .position(|line| !line.trim_start().starts_with('%') && line.contains("\\begin{document}"));
+    let known_definition = legacy::REGISTRY.iter().any(|(command, _, _, _)| {
+        lines[..*marker].iter().any(|line| {
+            !line.trim_start().starts_with('%')
+                && (line.contains(&format!("\\newcommand{{\\{command}}}"))
+                    || line.contains(&format!("\\providecommand{{\\{command}}}")))
+        })
+    });
+    known_definition && begin.is_some_and(|index| *marker < index)
+}
+
+pub fn bind_single_source(main: &[u8], main_path: &LogicalPath) -> Result<Bytes, FrontMatterError> {
+    if !single_source_compatible(main) {
+        return Err(FrontMatterError::InvalidValue(
+            "unsupported single-source template structure".into(),
+        ));
+    }
+    let source = std::str::from_utf8(main).map_err(|_| FrontMatterError::InvalidManifest)?;
+    let depth = main_path.as_str().matches('/').count();
+    let input = format!(
+        "\\input{{{}.latex-core/frontmatter/Front-Matter.tex}} % LATEX_CORE_SINGLE_SOURCE_BINDINGS",
+        "../".repeat(depth)
+    );
+    Ok(Bytes::from(
+        source
+            .lines()
+            .map(|line| {
+                if line.trim() == SINGLE_SOURCE_MARKER {
+                    input.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    ))
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -742,6 +800,22 @@ mod tests {
         assert!(!main_template_compatible(
             b"\\input{.latex-core/frontmatter/frontmatter.tex}"
         ));
+    }
+
+    #[test]
+    fn single_source_binding_requires_known_declarations_and_one_verified_marker() {
+        let source = b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n\\thesistitle\n\\end{document}\n";
+        assert!(single_source_compatible(source));
+        let main = LogicalPath::parse("wrapper/main.tex").unwrap();
+        let bound = bind_single_source(source, &main).unwrap();
+        let text = std::str::from_utf8(&bound).unwrap();
+        assert_eq!(text.matches("LATEX_CORE_SINGLE_SOURCE_BINDINGS").count(), 1);
+        assert!(text.contains("\\input{../.latex-core/frontmatter/Front-Matter.tex}"));
+        assert!(!single_source_compatible(
+            b"% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n"
+        ));
+        assert!(!single_source_compatible(b"\\newcommand{\\thesistitle}{x}\n\\begin{document}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n"));
+        assert!(!single_source_compatible(b"\\newcommand{\\thesistitle}{x}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n"));
     }
 
     #[test]

@@ -16,7 +16,8 @@ test('Writer exposes exact-state PDF and History with manual compilation only', 
   assert.match(writer, /PDF is out of date — Compile to refresh\./);
   assert.match(writer, /Compile to generate a PDF\./);
   assert.match(html, /id="compilePaper"/);
-  assert.match(html, /id="pdfFrame"/);
+  assert.match(html, /id="pdfScroll"/);
+  assert.match(html, /id="pdfViewport"/);
   assert.match(html, /id="versionHistory"/);
   assert.match(html, /id="createCheckpoint"/);
   assert.doesNotMatch(html, /Restore/);

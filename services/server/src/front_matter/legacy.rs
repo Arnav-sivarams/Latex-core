@@ -326,6 +326,54 @@ pub fn render(
     Ok(files)
 }
 
+/// Bind only the explicitly allowlisted institutional zero-argument macros.
+/// The single-source template must declare its placeholders before the verified
+/// marker; this generated file is report-scoped and never changes the template.
+pub fn single_source_bindings(
+    values: &BTreeMap<String, Value>,
+) -> Result<String, FrontMatterError> {
+    let mut output = String::from("% Known institutional single-source bindings.\n");
+    for (word, source, _, _) in REGISTRY {
+        writeln!(output, "\\providecommand{{\\{word}}}{{}}")
+            .map_err(|_| FrontMatterError::InvalidManifest)?;
+        let Some(value) = values
+            .get(*source)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let value = match *word {
+            "thesismonth" if valid_date(value) => [
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November",
+                "December",
+            ][value[5..7]
+                .parse::<usize>()
+                .map_err(|_| FrontMatterError::InvalidValue("submission_date".into()))?
+                - 1],
+            "thesisyear" if valid_date(value) => &value[..4],
+            _ => value,
+        };
+        writeln!(
+            output,
+            "\\renewcommand{{\\{word}}}{{{}}}",
+            escape_latex_text(value)
+        )
+        .map_err(|_| FrontMatterError::InvalidManifest)?;
+    }
+    Ok(output)
+}
+
 /// Read-only status calculation: resolving data never creates a workspace version.
 pub fn details(
     pack: &ValidatedPack,
@@ -535,6 +583,18 @@ mod tests {
         assert!(metadata.contains(&escape_latex_text(automatic["team.name"].as_str().unwrap())));
         assert!(!metadata.contains(r"\write18"));
         assert!(!metadata.contains("gender"));
+    }
+
+    #[test]
+    fn single_source_bindings_are_allowlisted_and_escaped() {
+        let values = BTreeMap::from([
+            ("team.name".into(), Value::String("Safe & exact".into())),
+            ("student.a.name".into(), Value::String("Alice Alpha".into())),
+        ]);
+        let bindings = single_source_bindings(&values).unwrap();
+        assert!(bindings.contains("\\renewcommand{\\thesistitle}{Safe \\& exact}"));
+        assert!(bindings.contains("\\renewcommand{\\studentAname}{Alice Alpha}"));
+        assert!(!bindings.contains("write18"));
     }
 
     #[test]

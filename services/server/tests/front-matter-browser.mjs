@@ -131,9 +131,18 @@ try {
   }
   await leader.locator('[name="project_type"]').selectOption('capstone');
   await leader.locator('[name="executive_summary"]').fill('Browser-qualified executive summary.');
+  const departmentInputs = leader.locator('fieldset').filter({ hasText: 'Department display names' }).locator('input');
+  const schoolInputs = leader.locator('fieldset').filter({ hasText: 'School display names' }).locator('input');
+  assert.equal(await departmentInputs.count(), 2);
+  assert.equal(await schoolInputs.count(), 2);
+  await departmentInputs.nth(0).fill('Computer Science'); await departmentInputs.nth(1).fill('Data Science');
+  await schoolInputs.nth(0).fill('School of Computing'); await schoolInputs.nth(1).fill('School of Data');
   await leader.getByRole('button', { name: 'Save project metadata', exact: true }).click();
   await leader.getByText('Project metadata saved. Compile to refresh the PDF.', { exact: true }).waitFor();
-  for (const [key, value] of Object.entries(config.manual)) await leader.locator(`[name="field:${key}"]`).fill(value);
+  for (const [key, value] of Object.entries(config.manual)) {
+    const control = leader.locator(`[name="field:${key}"]`);
+    if (await control.count()) await control.fill(value);
+  }
   const guide = leader.locator('[name="field:guide_identity"]');
   await guide.selectOption({ label: 'Dr. Grace Guide' });
   await leader.getByRole('button', { name: 'Save document details', exact: true }).click();
@@ -153,6 +162,9 @@ try {
   await leader.waitForTimeout(500);
   assert.equal(await leader.getByText('Complete document details', { exact: true }).isVisible(), false);
   await leader.locator('#documentDetails').click();
+  const reloadedProject = await api(leader, `/api/v2/papers/${config.paper_id}/project-metadata`);
+  assert.deepEqual(reloadedProject.values.department_display_names.map((item) => item.display_name).sort(), ['Computer Science', 'Data Science']);
+  assert.deepEqual(reloadedProject.values.school_display_names.map((item) => item.display_name).sort(), ['School of Computing', 'School of Data']);
   assert.equal(await leader.locator('[name="field:course_code"]').inputValue(), 'CSE4999');
   const writer = await login(config.writer, 'write');
   await writer.locator('#documentDetails').click();
@@ -229,11 +241,15 @@ try {
   await fillBuilder(leader, 'Rows', 2);
   await fillBuilder(leader, 'Columns', 2);
   await fillBuilder(leader, 'Column alignments', 'left,left');
-  await fillBuilder(leader, 'Column widths', '3cm,6cm');
-  await fillBuilder(leader, 'Minimum height', '8mm');
+  await fillBuilder(leader, 'Column widths', ',6cm');
+  await fillBuilder(leader, 'Selected cell (row,column', '2,1');
+  await fillBuilder(leader, 'Selected cell content', 'Multiline first\nMultiline second');
+  await fillBuilder(leader, 'Selected cell’s shared column width', '3cm');
+  await fillBuilder(leader, 'Selected cell’s shared row minimum height', '8mm');
   await fillBuilder(leader, 'Caption', 'Browser sized table');
   await leader.locator('#dialogActions').getByRole('button', { name: 'Insert', exact: true }).click();
   assert.ok((await editorText(leader)).indexOf('\\caption{Browser sized table}') < (await editorText(leader)).indexOf('\\begin{tabular}{p{3cm}p{6cm}}'));
+  assert.ok((await editorText(leader)).includes('\\rule{0pt}{8mm}\\shortstack{Multiline first\\\\Multiline second}'));
 
   await selectLineRange(leader, 'FigureSlot', 0, 'FigureSlot'.length);
   const png = testPng();

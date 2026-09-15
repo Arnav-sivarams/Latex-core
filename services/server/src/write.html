@@ -75,7 +75,7 @@
     <section class="pdf-foundation workspace-pane pdf-pane" aria-labelledby="pdf-heading">
       <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><span id="pdfRelation">No PDF yet</span><span class="shell-spacer"></span><label class="pdf-location-control">Page <input id="pdfPage" type="number" min="1" value="1"></label><label class="pdf-location-control">Zoom <select id="pdfZoom"><option value="75">75%</option><option value="100" selected>100%</option><option value="125">125%</option><option value="150">150%</option></select></label><button id="locateInPdf" type="button" disabled>Locate source</button></div>
       <div id="pdfEmpty" class="foundation-empty"><strong>No PDF yet</strong><p>Compile the current paper to create an exact PDF.</p></div>
-      <iframe id="pdfFrame" class="pdf-frame" title="Current successful PDF" hidden></iframe>
+      <div id="pdfScroll" class="writer-pdf-scroll" aria-label="Current successful PDF" tabindex="0" hidden><div id="pdfViewport" class="writer-pdf-viewport"></div></div>
     </section>
   </div>
 

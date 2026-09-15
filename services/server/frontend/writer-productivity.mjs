@@ -64,6 +64,17 @@ export function buildTable(options = {}) {
   const rows = clamp(options.rows, 1, 30);
   const columns = clamp(options.columns, 1, 12);
   const widths = Array.isArray(options.columnWidths) ? options.columnWidths : String(options.columnWidths || '').split(',');
+  const selected = String(options.selectedCell || '').trim().match(/^(\d+)\s*,\s*(\d+)$/);
+  if (options.selectedCell && !selected) throw new Error('Selected cell must be a row and column such as 2,1.');
+  const selectedRow = selected ? Number(selected[1]) : null;
+  const selectedColumn = selected ? Number(selected[2]) : null;
+  if (selected && (selectedRow < 1 || selectedRow > rows || selectedColumn < 1 || selectedColumn > columns)) {
+    throw new Error(`Selected cell must be within the ${rows} by ${columns} table.`);
+  }
+  const selectedWidth = latexDimension(options.selectedColumnWidth, 'Selected cell column width');
+  const selectedHeight = latexDimension(options.selectedRowHeight, 'Selected cell row minimum height');
+  if ((selectedWidth || selectedHeight || options.selectedCellContent) && !selected) throw new Error('Choose a selected cell before setting its content, shared column width, or row height.');
+  if (selectedWidth) widths[selectedColumn - 1] = selectedWidth;
   const alignments = Array.from({ length: columns }, (_, index) => {
     const width = latexDimension(widths[index], `Column ${index + 1} width`);
     return width ? `p{${width}}` : ({ left: 'l', center: 'c', right: 'r' }[options.alignments?.[index]] || 'l');
@@ -77,7 +88,12 @@ export function buildTable(options = {}) {
   if (booktabs) lines.push('\\toprule');
   for (let row = 0; row < rows; row += 1) {
     const cells = Array.from({ length: columns }, (_, column) => options.header && row === 0 ? `Header ${column + 1}` : `Cell ${row + 1}.${column + 1}`);
-    if (minimumRowHeight) cells[0] = `\\rule{0pt}{${minimumRowHeight}}${cells[0]}`;
+    if (row + 1 === selectedRow && options.selectedCellContent) {
+      const lines = String(options.selectedCellContent).split(/\r?\n/).map(safeText);
+      cells[selectedColumn - 1] = lines.length > 1 ? `\\shortstack{${lines.join('\\\\')}}` : lines[0];
+    }
+    const rowHeight = row + 1 === selectedRow && selectedHeight ? selectedHeight : minimumRowHeight;
+    if (rowHeight) cells[0] = `\\rule{0pt}{${rowHeight}}${cells[0]}`;
     lines.push(cells.join(' & ') + ' \\\\');
     if (booktabs && options.header && row === 0) lines.push('\\midrule');
   }

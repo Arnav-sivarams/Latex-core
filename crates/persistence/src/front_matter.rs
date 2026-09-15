@@ -5,7 +5,10 @@ use core_types::{BlobHash, TenantId, UserId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -25,6 +28,8 @@ pub enum FrontMatterRepositoryError {
     VersionConflict,
     #[error("Paper is under review and its Front Matter is read-only")]
     ReviewLocked,
+    #[error("invalid project metadata: {0}")]
+    InvalidProjectMetadata(String),
     #[error("Front Matter persistence failed")]
     Database(#[source] sqlx::Error),
     #[error("persistent Front Matter data is invalid: {0}")]
@@ -97,6 +102,13 @@ pub struct ProjectPublication {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectInstitutionDisplayName {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectMetadataInput {
     pub executive_summary: Option<String>,
     pub project_type: Option<String>,
@@ -106,6 +118,10 @@ pub struct ProjectMetadataInput {
     pub source_code_snippets: Vec<ProjectSourceSnippet>,
     #[serde(default)]
     pub publications: Vec<ProjectPublication>,
+    #[serde(default)]
+    pub department_display_names: Vec<ProjectInstitutionDisplayName>,
+    #[serde(default)]
+    pub school_display_names: Vec<ProjectInstitutionDisplayName>,
     #[serde(default)]
     pub setup_complete: bool,
 }
@@ -143,6 +159,21 @@ impl FrontMatterRepository {
     #[must_use]
     pub const fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    pub async fn paper_template_arrangement(
+        &self,
+        paper_id: Uuid,
+    ) -> Result<(String, String), FrontMatterRepositoryError> {
+        let row = sqlx::query("SELECT template.front_matter_arrangement,template.main_file FROM latex_core.paper_template_pins pin JOIN latex_core.templates template ON template.id=pin.template_id WHERE pin.paper_id=$1")
+            .bind(paper_id).fetch_optional(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?
+            .ok_or(FrontMatterRepositoryError::NotFound)?;
+        Ok((
+            row.try_get("front_matter_arrangement")
+                .map_err(FrontMatterRepositoryError::Database)?,
+            row.try_get("main_file")
+                .map_err(FrontMatterRepositoryError::Database)?,
+        ))
     }
 
     #[allow(
@@ -393,7 +424,7 @@ impl FrontMatterRepository {
         paper_id: Uuid,
     ) -> Result<Value, FrontMatterRepositoryError> {
         let stored = sqlx::query(
-            "SELECT executive_summary,project_type,datasets,source_code_snippets,publications,setup_completed_at::text,revision,updated_at::text \
+            "SELECT executive_summary,project_type,datasets,source_code_snippets,publications,department_display_names,school_display_names,setup_completed_at::text,revision,updated_at::text \
              FROM latex_core.paper_project_metadata WHERE paper_team_id=$1",
         )
         .bind(paper_id)
@@ -401,7 +432,7 @@ impl FrontMatterRepository {
         .await
         .map_err(FrontMatterRepositoryError::Database)?;
         let automatic = self.automatic_values(paper_id).await?;
-        let departments = sqlx::query(
+        let mut departments = sqlx::query(
             "SELECT DISTINCT faculty.dept_id \
              FROM latex_core.paper_team_members member \
              JOIN latex_core.global_user_roles role ON role.user_id=member.user_id AND role.role='writer' \
@@ -445,7 +476,7 @@ impl FrontMatterRepository {
             }))
         })
         .collect::<Result<Vec<_>, FrontMatterRepositoryError>>()?;
-        let schools = sqlx::query(
+        let mut schools = sqlx::query(
             "SELECT DISTINCT faculty_role.school_id FROM latex_core.paper_team_members member \
              JOIN latex_core.global_user_roles role ON role.user_id=member.user_id AND role.role='mentor' \
              JOIN vcap.faculty_user_links link ON link.user_id=member.user_id AND link.status='LINKED' \
@@ -472,6 +503,8 @@ impl FrontMatterRepository {
             datasets,
             snippets,
             publications,
+            department_display_names,
+            school_display_names,
             setup_completed,
             revision,
             updated_at,
@@ -486,6 +519,10 @@ impl FrontMatterRepository {
                 row.try_get::<Value, _>("source_code_snippets")
                     .map_err(FrontMatterRepositoryError::Database)?,
                 row.try_get::<Value, _>("publications")
+                    .map_err(FrontMatterRepositoryError::Database)?,
+                row.try_get::<Value, _>("department_display_names")
+                    .map_err(FrontMatterRepositoryError::Database)?,
+                row.try_get::<Value, _>("school_display_names")
                     .map_err(FrontMatterRepositoryError::Database)?,
                 row.try_get::<Option<String>, _>("setup_completed_at")
                     .map_err(FrontMatterRepositoryError::Database)?
@@ -502,11 +539,44 @@ impl FrontMatterRepository {
                 json!([]),
                 json!([]),
                 json!([]),
+                json!([]),
+                json!([]),
                 false,
                 0,
                 String::new(),
             )
         };
+        let labels = |value: &Value| {
+            value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    Some((
+                        item.get("id")?.as_str()?.to_owned(),
+                        item.get("display_name")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let department_labels = labels(&department_display_names);
+        for department in &mut departments {
+            if let Some(id) = department.get("id").and_then(Value::as_str)
+                && let Some(name) = department_labels.get(id)
+            {
+                department["display_name"] = Value::String(name.clone());
+                department["origin"] = Value::String("team_override".into());
+            }
+        }
+        let school_labels = labels(&school_display_names);
+        for school in &mut schools {
+            if let Some(id) = school.get("id").and_then(Value::as_str)
+                && let Some(name) = school_labels.get(id)
+            {
+                school["display_name"] = Value::String(name.clone());
+                school["origin"] = Value::String("team_override".into());
+            }
+        }
         let names = automatic
             .get("writers.names")
             .cloned()
@@ -540,6 +610,8 @@ impl FrontMatterRepository {
                 "datasets":datasets,
                 "source_code_snippets":snippets,
                 "publications":publications
+                ,"department_display_names":department_display_names
+                ,"school_display_names":school_display_names
             },
             "fields":[
                 {"key":"project_title","value":automatic.get("team.name").cloned().unwrap_or(Value::Null),"origin":"database","source_identity":"team.name"},
@@ -586,14 +658,43 @@ impl FrontMatterRepository {
         let next = head.checked_add(1).ok_or_else(|| {
             FrontMatterRepositoryError::Integrity("workspace version overflow".into())
         })?;
+        let applicable_departments = sqlx::query_scalar::<_, Uuid>(
+            "SELECT DISTINCT faculty.dept_id FROM latex_core.paper_team_members member JOIN latex_core.global_user_roles role ON role.user_id=member.user_id AND role.role='writer' JOIN vcap.student_user_links link ON link.user_id=member.user_id AND link.status='LINKED' JOIN vcap.students student ON student.reg_no=link.reg_no JOIN vcap.programmes programme ON programme.programme_code=student.programme_code LEFT JOIN vcap.faculty faculty ON faculty.faculty_id=programme.hod_id WHERE member.paper_team_id=$1 AND faculty.dept_id IS NOT NULL",
+        ).bind(paper_id).fetch_all(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?
+            .into_iter().map(|id| id.to_string()).collect::<BTreeSet<_>>();
+        let applicable_schools = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT faculty_role.school_id FROM latex_core.paper_team_members member JOIN latex_core.global_user_roles role ON role.user_id=member.user_id AND role.role='mentor' JOIN vcap.faculty_user_links link ON link.user_id=member.user_id AND link.status='LINKED' JOIN vcap.faculty_roles faculty_role ON faculty_role.faculty_id=link.faculty_id WHERE member.paper_team_id=$1 AND faculty_role.school_id IS NOT NULL AND lower(faculty_role.status)='active'",
+        ).bind(paper_id).fetch_all(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?
+            .into_iter().collect::<BTreeSet<_>>();
+        let valid_labels = |items: &[ProjectInstitutionDisplayName],
+                            applicable: &BTreeSet<String>| {
+            let mut seen = BTreeSet::new();
+            items.iter().all(|item| {
+                applicable.contains(&item.id)
+                    && seen.insert(item.id.as_str())
+                    && !item.display_name.trim().is_empty()
+                    && item.display_name.chars().count() <= 300
+            })
+        };
+        if !valid_labels(&input.department_display_names, &applicable_departments)
+            || !valid_labels(&input.school_display_names, &applicable_schools)
+        {
+            return Err(FrontMatterRepositoryError::InvalidProjectMetadata(
+                "display names must identify unique departments or schools applicable to this report".into(),
+            ));
+        }
         let datasets = serde_json::to_value(&input.datasets)
             .map_err(|error| FrontMatterRepositoryError::Integrity(error.to_string()))?;
         let snippets = serde_json::to_value(&input.source_code_snippets)
             .map_err(|error| FrontMatterRepositoryError::Integrity(error.to_string()))?;
         let publications = serde_json::to_value(&input.publications)
             .map_err(|error| FrontMatterRepositoryError::Integrity(error.to_string()))?;
-        sqlx::query("INSERT INTO latex_core.paper_project_metadata(paper_team_id,executive_summary,project_type,datasets,source_code_snippets,publications,setup_completed_at,updated_by_user_id) VALUES($1,$2,$3,$4,$5,$6,CASE WHEN $7 THEN statement_timestamp() ELSE NULL END,$8) ON CONFLICT(paper_team_id) DO UPDATE SET executive_summary=EXCLUDED.executive_summary,project_type=EXCLUDED.project_type,datasets=EXCLUDED.datasets,source_code_snippets=EXCLUDED.source_code_snippets,publications=EXCLUDED.publications,setup_completed_at=CASE WHEN $7 THEN COALESCE(latex_core.paper_project_metadata.setup_completed_at,statement_timestamp()) ELSE latex_core.paper_project_metadata.setup_completed_at END,revision=latex_core.paper_project_metadata.revision+1,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=statement_timestamp()")
-            .bind(paper_id).bind(&input.executive_summary).bind(&input.project_type).bind(datasets).bind(snippets).bind(publications).bind(input.setup_complete).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
+        let department_names = serde_json::to_value(&input.department_display_names)
+            .map_err(|error| FrontMatterRepositoryError::Integrity(error.to_string()))?;
+        let school_names = serde_json::to_value(&input.school_display_names)
+            .map_err(|error| FrontMatterRepositoryError::Integrity(error.to_string()))?;
+        sqlx::query("INSERT INTO latex_core.paper_project_metadata(paper_team_id,executive_summary,project_type,datasets,source_code_snippets,publications,department_display_names,school_display_names,setup_completed_at,updated_by_user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $9 THEN statement_timestamp() ELSE NULL END,$10) ON CONFLICT(paper_team_id) DO UPDATE SET executive_summary=EXCLUDED.executive_summary,project_type=EXCLUDED.project_type,datasets=EXCLUDED.datasets,source_code_snippets=EXCLUDED.source_code_snippets,publications=EXCLUDED.publications,department_display_names=EXCLUDED.department_display_names,school_display_names=EXCLUDED.school_display_names,setup_completed_at=CASE WHEN $9 THEN COALESCE(latex_core.paper_project_metadata.setup_completed_at,statement_timestamp()) ELSE latex_core.paper_project_metadata.setup_completed_at END,revision=latex_core.paper_project_metadata.revision+1,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=statement_timestamp()")
+            .bind(paper_id).bind(&input.executive_summary).bind(&input.project_type).bind(datasets).bind(snippets).bind(publications).bind(department_names).bind(school_names).bind(input.setup_complete).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
         if definition.path != format!("{MANAGED_PREFIX}Front-Matter.tex") {
             return Err(FrontMatterRepositoryError::Integrity(
                 "invalid project metadata materialization path".into(),
@@ -886,7 +987,7 @@ impl FrontMatterRepository {
             "writers.names_and_registration_numbers".into(),
             Value::Array(pairs),
         );
-        if let Some(project) = sqlx::query("SELECT executive_summary,project_type,datasets,source_code_snippets FROM latex_core.paper_project_metadata WHERE paper_team_id=$1")
+        if let Some(project) = sqlx::query("SELECT executive_summary,project_type,datasets,source_code_snippets,department_display_names,school_display_names FROM latex_core.paper_project_metadata WHERE paper_team_id=$1")
             .bind(paper_id).fetch_optional(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)? {
             optional_string(&project, "executive_summary", "project.executive_summary", &mut output)?;
             optional_string(&project, "project_type", "project.type", &mut output)?;
@@ -894,6 +995,18 @@ impl FrontMatterRepository {
             output.insert("project.datasets".into(), Value::Array(datasets.as_array().into_iter().flatten().filter_map(|item| item.get("name").and_then(Value::as_str).map(|name| Value::String(name.to_owned()))).collect()));
             let snippets: Value = project.try_get("source_code_snippets").map_err(FrontMatterRepositoryError::Database)?;
             output.insert("project.source_code_snippets".into(), Value::Array(snippets.as_array().into_iter().flatten().filter_map(|item| item.get("code").and_then(Value::as_str).map(|code| Value::String(code.to_owned()))).collect()));
+            let department_names: Value = project.try_get("department_display_names").map_err(FrontMatterRepositoryError::Database)?;
+            let departments = department_names.as_array().into_iter().flatten().filter_map(|item| item.get("display_name").and_then(Value::as_str)).collect::<Vec<_>>();
+            if !departments.is_empty() {
+                output.insert("project.department_names".into(), Value::Array(departments.iter().map(|name| Value::String((*name).to_owned())).collect()));
+                output.insert("department_name".into(), Value::String(departments.join(" / ")));
+            }
+            let school_names: Value = project.try_get("school_display_names").map_err(FrontMatterRepositoryError::Database)?;
+            let schools = school_names.as_array().into_iter().flatten().filter_map(|item| item.get("display_name").and_then(Value::as_str)).collect::<Vec<_>>();
+            if !schools.is_empty() {
+                output.insert("project.school_names".into(), Value::Array(schools.iter().map(|name| Value::String((*name).to_owned())).collect()));
+                output.insert("school_name".into(), Value::String(schools.join(" / ")));
+            }
         }
         Ok(output)
     }
@@ -1059,7 +1172,7 @@ impl FrontMatterRepository {
             .files
             .iter()
             .map(|file| file.path.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         let mut operations = Vec::new();
         for (path, file_id) in &by_path {
             if !requested.contains(path.as_str()) {

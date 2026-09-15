@@ -27,6 +27,13 @@ test('table dimensions are explicit and bounded', () => {
   assert.equal(latexDimension('2.5 cm'), '2.5cm');
   assert.throws(() => latexDimension('-1cm'), /positive number/);
   assert.throws(() => buildTable({ columnWidths: ['2\\linewidth'] }), /positive number/);
+  const selected = buildTable({ rows: 3, columns: 2, selectedCell: '2,1', selectedCellContent: 'First line\nSecond & line', selectedColumnWidth: '4cm', selectedRowHeight: '11mm' });
+  assert.match(selected, /\\begin\{tabular\}\{p\{4cm\}l\}/);
+  assert.match(selected, /\\rule\{0pt\}\{11mm\}\\shortstack/);
+  assert.match(selected, /\\shortstack\{First line\\\\Second \\& line\}/);
+  assert.doesNotMatch(selected.split('Cell 1.1')[0], /11mm/);
+  assert.throws(() => buildTable({ rows: 2, columns: 2, selectedCell: '3,1', selectedColumnWidth: '2cm' }), /within the 2 by 2 table/);
+  assert.throws(() => buildTable({ selectedColumnWidth: '2cm' }), /Choose a selected cell/);
 });
 
 test('source line comments, inline math, and template-aware destinations are deterministic', () => {

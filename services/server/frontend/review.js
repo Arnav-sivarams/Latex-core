@@ -187,6 +187,8 @@ async function sourceSelected(state) {
     file_id: model.file.file_id, encoded_relative_start: [...relativeStart], encoded_relative_end: [...relativeEnd],
     quoted_text: quoted, context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq,
     source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch,
+    start_line: state.doc.lineAt(range.from).number,
+    end_line: state.doc.lineAt(Math.max(range.from, range.to - 1)).number,
   };
   const pending = { source_anchor: sourceAnchor, pdf_anchor: null };
   model.pendingAnchor = pending;
@@ -316,7 +318,7 @@ async function anchorMappedLine(mapping) {
   const target = model.files.find((file) => file.file_id === mapping.mapped_file_id); if (!target) return null; if (model.file?.file_id !== target.file_id) await openFile(target);
   const lineNumber = Math.min(Math.max(mapping.mapped_line, 1), model.view.state.doc.lines); const line = model.view.state.doc.line(lineNumber); const from = Math.min(line.to, line.from + (mapping.mapped_column || 0)); const to = line.to;
   const context = model.view.state.sliceDoc(Math.max(0, from - 80), Math.min(model.view.state.doc.length, to + 80));
-  return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch };
+  return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch, start_line: lineNumber, end_line: lineNumber };
 }
 
 function reviewOpen() { return model.reviewOpen; }

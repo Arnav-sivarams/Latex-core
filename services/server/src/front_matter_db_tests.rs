@@ -9,20 +9,28 @@ async fn legacy_front_matter_institutional_api_contract() {
     let mut writer_ids = Vec::new();
     let suffix = uuid::Uuid::new_v4().to_string();
     let programme = format!("FM-{suffix}");
+    let programme_two = format!("FM2-{suffix}");
     let hod = format!("HOD-{suffix}");
+    let hod_two = format!("HOD2-{suffix}");
     let dean = format!("DEAN-{suffix}");
-    sqlx::query("INSERT INTO vcap.faculty (faculty_id,name,honorific) VALUES ($1,'Helen Head','Dr.'),($2,'Dana Dean','Prof.')")
-        .bind(&hod).bind(&dean).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO vcap.programmes (programme_code,hod_id) VALUES ($1,$2)")
+    let department = uuid::Uuid::new_v4();
+    let department_two = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO vcap.departments (department_id) VALUES ($1),($2)").bind(department).bind(department_two).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.faculty (faculty_id,name,honorific,dept_id) VALUES ($1,'Helen Head','Dr.',$4),($2,'Dana Dean','Prof.',NULL),($3,'Harriet Head','Dr.',$5)")
+        .bind(&hod).bind(&dean).bind(&hod_two).bind(department).bind(department_two).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.programmes (programme_code,hod_id) VALUES ($1,$2),($3,$4)")
         .bind(&programme)
         .bind(&hod)
+        .bind(&programme_two)
+        .bind(&hod_two)
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query("INSERT INTO vcap.faculty_roles (role_id,faculty_id,role_type,programme_code,status) VALUES ($1,$2,'Dean',$3,'ACTIVE')").bind(uuid::Uuid::new_v4()).bind(&dean).bind(&programme).execute(&pool).await.unwrap();
     let school = format!("SCHOOL-{suffix}");
-    sqlx::query("INSERT INTO vcap.schools (school_id) VALUES ($1)")
-        .bind(&school)
+    let school_two = format!("SCHOOL2-{suffix}");
+    sqlx::query("INSERT INTO vcap.schools (school_id) VALUES ($1),($2)")
+        .bind(&school).bind(&school_two)
         .execute(&pool)
         .await
         .unwrap();
@@ -44,7 +52,7 @@ async fn legacy_front_matter_institutional_api_contract() {
         sqlx::query("INSERT INTO vcap.students (reg_no,name,programme_code) VALUES ($1,$2,$3)")
             .bind(&reg)
             .bind(name)
-            .bind(&programme)
+            .bind(if index == 1 { &programme_two } else { &programme })
             .execute(&pool)
             .await
             .unwrap();
@@ -60,6 +68,10 @@ async fn legacy_front_matter_institutional_api_contract() {
         let faculty = format!("GUIDE{index}-{suffix}");
         sqlx::query("INSERT INTO vcap.faculty (faculty_id,name,honorific,designation) VALUES ($1,$2,'Dr.','Associate Professor')").bind(&faculty).bind(name).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO vcap.faculty_user_links (faculty_id,user_id,status,linked_at) VALUES ($1,$2,'LINKED',now())").bind(&faculty).bind(id.as_uuid()).execute(&pool).await.unwrap();
+        if index == 0 {
+            sqlx::query("INSERT INTO vcap.faculty_roles (role_id,faculty_id,role_type,school_id,status) VALUES ($1,$2,'Guide',$3,'ACTIVE'),($4,$2,'Guide',$5,'ACTIVE')")
+                .bind(uuid::Uuid::new_v4()).bind(&faculty).bind(&school).bind(uuid::Uuid::new_v4()).bind(&school_two).execute(&pool).await.unwrap();
+        }
         mentors.push(mentor);
         mentor_ids.push(id);
     }
@@ -193,6 +205,14 @@ async fn legacy_front_matter_institutional_api_contract() {
             {"citation_key":"solar-accepted","authors":"B. Beta","title":"Accepted Solar Work","venue":"Example Venue","year":2026,"doi":null,"url":null,"status":"accepted"},
             {"citation_key":"solar-published","authors":"C. Gamma","title":"Published Solar Work","venue":"Example Venue","year":2026,"doi":"10.1/example","url":null,"status":"published"}
         ],
+        "department_display_names":[
+            {"id":department.to_string(),"display_name":"Computer Science"},
+            {"id":department_two.to_string(),"display_name":"Data Science"}
+        ],
+        "school_display_names":[
+            {"id":school,"display_name":"School of Computing"},
+            {"id":school_two,"display_name":"School of Data"}
+        ],
         "setup_complete":true
     });
     assert_eq!(request(&app, Method::PUT, &project_path, Some(&writers[0].cookie), &project_input.to_string(), Some("application/json")).await.status(), StatusCode::OK);
@@ -200,6 +220,9 @@ async fn legacy_front_matter_institutional_api_contract() {
     assert_eq!(project_after["values"]["project_type"], "capstone");
     assert_eq!(project_after["values"]["source_code_snippets"][0]["code"], "fn main() {\n    println!(\"# % & _\");\n}");
     assert_eq!(project_after["values"]["publications"].as_array().unwrap().len(), 3);
+    assert_eq!(project_after["values"]["department_display_names"].as_array().unwrap().len(), 2);
+    assert_eq!(project_after["values"]["school_display_names"].as_array().unwrap().len(), 2);
+    assert!(project_after["fields"].as_array().unwrap().iter().find(|field| field["key"] == "departments").unwrap()["value"].as_array().unwrap().iter().all(|item| item["display_name"].is_string() && item["origin"] == "team_override"));
     let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1")
         .bind(uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap()).fetch_one(&pool).await.unwrap();
     assert_eq!(jobs_before, jobs_after, "project metadata saves must not compile");
@@ -222,7 +245,9 @@ async fn legacy_front_matter_institutional_api_contract() {
             .await
             .unwrap();
     assert_eq!(before, after, "AUTO reads must not create versions");
-    let manual = serde_json::json!({"course_code":"CSE4999","course_name":"Capstone Project","degree_name":"Bachelor of Technology","programme_name":"Computer Science and Engineering","specialization":"Intelligent Systems","submission_date":"2026-09-13","school_name":"School of Computing","department_name":"Computer Science"});
+    // Project-scoped labels now resolve these identities authoritatively for this
+    // report. The legacy pack form must not override the same resolved fields.
+    let manual = serde_json::json!({"course_code":"CSE4999","course_name":"Capstone Project","degree_name":"Bachelor of Technology","programme_name":"Computer Science and Engineering","specialization":"Intelligent Systems","submission_date":"2026-09-13"});
     let body = serde_json::json!({"values":manual,"sections":{}}).to_string();
     for cookie in [&writers[1].cookie, &mentors[0].cookie] {
         assert_eq!(
@@ -421,6 +446,77 @@ async fn legacy_front_matter_institutional_api_contract() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn professor_remaining_single_source_annotations_and_pdf_browser() {
+    if env::var_os("PROFESSOR_REMAINING_BROWSER").is_none() {
+        return;
+    }
+    let _guard = SERVER_TEST_LOCK.lock().await;
+    let (database, pool, mut app, _storage, mut state) = test_application().await;
+    let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+    let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+    let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+    let writer_id = test_user_id(&pool, &writer.email).await;
+    let mentor_id = test_user_id(&pool, &mentor.email).await;
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let programme = format!("REMAIN-{suffix}");
+    let registration = format!("REG-{suffix}");
+    let faculty = format!("FAC-{suffix}");
+    let school = format!("SCHOOL-{suffix}");
+    let department = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO vcap.departments(department_id) VALUES($1)")
+        .bind(department).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.faculty(faculty_id,name,honorific,designation,dept_id) VALUES($1,'Grace Guide','Dr.','Professor',$2)")
+        .bind(&faculty).bind(department).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.programmes(programme_code,hod_id) VALUES($1,$2)")
+        .bind(&programme).bind(&faculty).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.students(reg_no,name,programme_code) VALUES($1,'Alice Single',$2)")
+        .bind(&registration).bind(&programme).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.student_user_links(reg_no,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())")
+        .bind(&registration).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.faculty_user_links(faculty_id,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())")
+        .bind(&faculty).bind(mentor_id.as_uuid()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.schools(school_id) VALUES($1)").bind(&school).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.faculty_roles(role_id,faculty_id,role_type,school_id,status) VALUES($1,$2,'Guide',$3,'ACTIVE')")
+        .bind(uuid::Uuid::new_v4()).bind(&faculty).bind(&school).execute(&pool).await.unwrap();
+
+    let staging = tempfile::tempdir().unwrap();
+    let runtime = compiler::DockerCliRuntime::new("latex-core-texlive@sha256:8db804f76b8e80e5be9fb28ba14b0938df5989b7a8250ca6b0e9f3c200c4ee38").unwrap();
+    let compiler = compiler::CompilerService::new(state.blobs.clone(), runtime, compiler::CompilerConfig::new(compiler::CompileLimits::development_default()).with_staging_root(staging.path().to_path_buf())).unwrap();
+    state.environment = compiler.environment_id().clone();
+    app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served = app.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, served).await.unwrap(); });
+    let worker = queue::CompilationWorker::new(state.queue.clone(), state.blobs.clone(), Arc::new(compiler), core_types::WorkerId::new(), queue::WorkerConfig::new(1, Duration::from_millis(100)).unwrap());
+    let shutdown = queue::WorkerShutdown::new();
+    let worker_shutdown = shutdown.clone();
+    let worker_task = tokio::spawn(async move { worker.run_until_shutdown(worker_shutdown).await.unwrap(); });
+    let config = serde_json::json!({"base":format!("http://{address}"),"admin":admin.email,"writer":writer.email,"mentor":mentor.email,"password":PASSWORD,"template_name":format!("Supported single source {suffix}"),"report_one":format!("Single Source Alpha {suffix}"),"report_two":format!("Single Source Beta {suffix}"),"department_id":department,"school_id":school,"environment":state.environment.to_string()});
+    let output = tokio::task::spawn_blocking(move || std::process::Command::new("node").arg("tests/professor-remaining-browser.mjs").env("PROFESSOR_REMAINING_CONFIG", config.to_string()).output().unwrap()).await.unwrap();
+    assert!(output.status.success(), "browser stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+
+    let template_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM latex_core.templates WHERE name LIKE 'Supported single source %'").fetch_one(&pool).await.unwrap();
+    let original_hash: String = sqlx::query_scalar("SELECT blob_hash FROM latex_core.template_files WHERE template_id=$1 AND path='main.tex'").bind(template_id).fetch_one(&pool).await.unwrap();
+    let original = state
+        .blobs
+        .get(original_hash.parse::<core_types::BlobHash>().unwrap())
+        .await
+        .unwrap();
+    let original = String::from_utf8(original.to_vec()).unwrap();
+    assert!(original.contains(front_matter::SINGLE_SOURCE_MARKER));
+    assert!(!original.contains(".latex-core/frontmatter/Front-Matter.tex"));
+    let reports: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as("SELECT id,workspace_id FROM latex_core.paper_teams WHERE name LIKE 'Single Source %' ORDER BY name").fetch_all(&pool).await.unwrap();
+    assert_eq!(reports.len(), 2);
+    for (_, workspace) in &reports {
+        let main = state.workspaces.read_file(WorkspaceId::from_uuid(*workspace), &LogicalPath::parse("main.tex").unwrap()).await.unwrap();
+        assert_eq!(String::from_utf8(main.to_vec()).unwrap().matches("LATEX_CORE_SINGLE_SOURCE_BINDINGS").count(), 1);
+    }
+    shutdown.request(); worker_task.await.unwrap(); server.abort();
 }
 
 #[allow(clippy::too_many_arguments)]

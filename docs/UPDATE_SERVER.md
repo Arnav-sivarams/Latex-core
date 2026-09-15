@@ -32,7 +32,7 @@ Use a narrower form when the release affects only one executable:
 
 ## Release with pending migrations
 
-This branch contains additive migrations `0027_institutional_read_api.sql` and `0028_professor_project_metadata.sql`. Migration 0027 creates integration-client verifier metadata and bounded access-audit rows. Migration 0028 records each template's explicit Front Matter arrangement and adds typed project-specific metadata; it does not change the institutional VCAP schema or rewrite reports, institutional records, build history, blobs, or review drafts. Existing compatible templates are classified as separate-file arrangements. Apply both with the standard embedded migrator below. Keep the existing 9000/9001 host-port settings and Compose project/volumes unchanged.
+This branch contains additive migrations `0027_institutional_read_api.sql`, `0028_professor_project_metadata.sql`, and `0029_professor_remaining_metadata_and_anchors.sql`. Migration 0027 creates integration-client verifier metadata and bounded access-audit rows. Migration 0028 records each template's explicit Front Matter arrangement and adds typed project-specific metadata. Migration 0029 adds project-scoped Department/School display-name arrays and optional reviewed source start/end lines; it does not change VCAP, rewrite historical captures, or expose private drafts. Existing compatible templates remain classified as separate-file arrangements. Apply all pending migrations with the standard embedded migrator below. None rewrites reports, institutional records, build history, or blobs. Keep the existing 9000/9001 host-port settings and Compose project/volumes unchanged.
 
 Schema changes require an explicit operator sequence:
 

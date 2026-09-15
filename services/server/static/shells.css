@@ -106,7 +106,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .pdf-foundation > [hidden] { display: none !important; }
 .pdf-actions, .history-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .pdf-relation { min-height: 30px; padding: 6px 14px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; }
-.pdf-frame { display: block; width: 100%; height: calc(100% - 74px); min-height: 350px; margin: 0; border: 0; background: var(--surface-subtle); }
+.writer-pdf-scroll { width: 100%; height: calc(100% - 42px); min-height: 350px; overflow: auto; background: #d5d6d2; }
+.writer-pdf-viewport { width: max-content; min-width: 100%; padding: 12px 0; }
+.writer-pdf-page { width: max-content; margin: 0 auto 12px; background: #fff; box-shadow: 0 2px 12px #1113; }
+.writer-pdf-page canvas { display: block; }
 .version-history { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 7px; margin-top: 12px; }
 .version-row { display: flex; align-items: start; gap: 8px; padding: 9px; border: 1px solid var(--border); border-radius: 6px; }
 .version-row span { display: grid; }
@@ -452,7 +455,7 @@ html:has(body.workspace-shell), body.workspace-shell { overflow: hidden; }
 .source-pane .editor-mount { flex: 1 1 auto; height: auto; min-height: 0; overflow: hidden; }
 .source-pane .editor-mount .cm-editor { height: 100%; min-height: 0; }
 .source-pane .editor-mount .cm-scroller { overflow: auto; }
-.pdf-pane .pdf-frame { flex: 1 1 auto; width: 100%; height: auto; min-height: 0; overflow: auto; }
+.pdf-pane .writer-pdf-scroll { flex: 1 1 auto; height: auto; min-height: 0; }
 .pdf-pane .foundation-empty { flex: 1 1 auto; min-height: 0; }
 .pdf-pane #pdfRelation { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .pdf-location-control { display: inline-flex; align-items: center; gap: 3px; margin: 0; color: var(--muted); font-size: 10px; }

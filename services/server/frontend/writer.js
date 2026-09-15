@@ -8,6 +8,7 @@ import { stex } from '@codemirror/legacy-modes/mode/stex';
 import * as Y from 'yjs';
 import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
+import * as pdfjsLib from '/static/pdf.min.mjs';
 import { resolveSuggestionRange } from './review-helpers.mjs';
 import { pdfPreviewState } from './writer-pdf.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
@@ -18,6 +19,8 @@ import {
   compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
   packageRequirement, suggestedInsertionPath,
 } from './writer-productivity.mjs';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
 
 const SOURCE_UPDATE = 0x01;
 const FLUSH = 0x02;
@@ -109,7 +112,7 @@ const ui = Object.fromEntries([
   'myPapers', 'teamPapers', 'fileTree', 'newPaper', 'newFile', 'renameFile', 'deleteFile',
   'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
   'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'pdfRelation', 'pdfEmpty',
-  'pdfFrame', 'createCheckpoint', 'versionHistory', 'versionDiff',
+  'pdfScroll', 'pdfViewport', 'createCheckpoint', 'versionHistory', 'versionDiff',
   'pdfPage', 'pdfZoom', 'locateInPdf',
   'reviewCounts', 'writerReviewFilters', 'writerReviewList',
     'quickOpen', 'commandPalette', 'uploadImage', 'assetInput',
@@ -156,6 +159,13 @@ const model = {
   insertionSelection: null,
   pdfView: { page: 1, zoom: 100, x: 0, y: 0 },
   pdfCurrent: false,
+  pdfLoadingTask: null,
+  pdfDocument: null,
+  pdfDisplayBuildId: null,
+  pdfRenderTasks: [],
+  pdfLoadToken: 0,
+  pdfRestoring: false,
+  pdfScrollTimer: null,
 };
 
 function pdfViewKey() { return model.paper ? `latex-core-pdf-view:${model.paper.id}` : null; }
@@ -166,8 +176,77 @@ function loadPdfView() {
   ui.pdfPage.value = model.pdfView.page; ui.pdfZoom.value = model.pdfView.zoom;
 }
 function savePdfView() { const key = pdfViewKey(); if (key) sessionStorage.setItem(key, JSON.stringify(model.pdfView)); }
-function currentPdfUrl(buildId) { return `/api/v2/papers/${model.paper.id}/artifacts/pdf?build=${buildId}#page=${model.pdfView.page}&zoom=${model.pdfView.zoom},${Math.max(0, model.pdfView.x || 0)},${Math.max(0, model.pdfView.y || 0)}`; }
-function applyPdfView() { if (model.currentBuildId) { savePdfView(); ui.pdfFrame.src = currentPdfUrl(model.currentBuildId); } }
+function currentPdfUrl(buildId) { return `/api/v2/papers/${model.paper.id}/artifacts/pdf?build=${buildId}`; }
+function capturePdfView() {
+  if (ui.pdfScroll.hidden || model.pdfRestoring) return;
+  const pages = [...ui.pdfViewport.querySelectorAll('.writer-pdf-page')];
+  const observed = pages.filter((page) => page.offsetTop <= ui.pdfScroll.scrollTop + 2).at(-1) || pages[0];
+  if (!observed) return;
+  model.pdfView.page = Number(observed.dataset.page);
+  model.pdfView.y = Math.max(0, Math.min(1, (ui.pdfScroll.scrollTop - observed.offsetTop) / Math.max(1, observed.offsetHeight)));
+  model.pdfView.x = ui.pdfScroll.scrollLeft;
+  ui.pdfPage.value = model.pdfView.page;
+  savePdfView();
+}
+function disposeWriterPdf(capture = true) {
+  if (capture) capturePdfView();
+  model.pdfLoadToken += 1;
+  model.pdfRenderTasks.forEach((task) => task.cancel()); model.pdfRenderTasks = [];
+  model.pdfLoadingTask?.destroy?.(); model.pdfLoadingTask = null;
+  model.pdfDocument = null;
+  model.pdfDisplayBuildId = null;
+  delete ui.pdfViewport.dataset.buildId;
+  ui.pdfViewport.replaceChildren();
+}
+async function restorePdfView() {
+  const page = ui.pdfViewport.querySelector(`[data-page="${model.pdfView.page}"]`) || ui.pdfViewport.lastElementChild;
+  if (!page) return;
+  model.pdfView.page = Number(page.dataset.page);
+  ui.pdfPage.max = String(ui.pdfViewport.children.length); ui.pdfPage.value = String(model.pdfView.page);
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  ui.pdfScroll.scrollTop = page.offsetTop + Math.max(0, Math.min(1, Number(model.pdfView.y) || 0)) * page.offsetHeight;
+  ui.pdfScroll.scrollLeft = Math.max(0, Number(model.pdfView.x) || 0);
+  capturePdfView();
+}
+async function showPdfLocation(pageNumber, x = 0, y = 0, normalized = false) {
+  model.pdfView.page = Math.max(1, Math.min(model.pdfDocument?.numPages || pageNumber, Number(pageNumber) || 1));
+  const page = ui.pdfViewport.querySelector(`[data-page="${model.pdfView.page}"]`);
+  if (page) {
+    model.pdfView.y = normalized ? Math.max(0, Math.min(1, Number(y) || 0)) : Math.max(0, Math.min(1, (Number(y) || 0) * ((Number(model.pdfView.zoom) || 100) / 100) / Math.max(1, page.offsetHeight)));
+    model.pdfView.x = Math.max(0, Number(x) || 0);
+  }
+  await restorePdfView();
+}
+async function loadWriterPdf(buildId, historical = false) {
+  capturePdfView();
+  const paperId = model.paper?.id; const token = model.pdfLoadToken + 1;
+  disposeWriterPdf(false); model.pdfLoadToken = token;
+  model.pdfRestoring = true;
+  try {
+    const loadingTask = pdfjsLib.getDocument({ url: currentPdfUrl(buildId), withCredentials: true });
+    const pdf = await loadingTask.promise;
+    if (model.pdfLoadToken !== token || model.paper?.id !== paperId || (!historical && model.currentBuildId !== buildId)) { await loadingTask.destroy(); return; }
+    model.pdfLoadingTask = loadingTask; model.pdfDocument = pdf; model.pdfDisplayBuildId = buildId;
+    const scale = (Number(model.pdfView.zoom) || 100) / 100;
+    for (let number = 1; number <= pdf.numPages; number += 1) {
+      const page = await pdf.getPage(number); const viewport = page.getViewport({ scale });
+      const shell = document.createElement('section'); shell.className = 'writer-pdf-page'; shell.dataset.page = String(number); shell.setAttribute('aria-label', `PDF page ${number}`);
+      const canvas = document.createElement('canvas'); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height); shell.append(canvas); ui.pdfViewport.append(shell);
+      const task = page.render({ canvasContext: canvas.getContext('2d'), viewport }); model.pdfRenderTasks.push(task); await task.promise;
+    }
+    if (model.pdfLoadToken !== token || model.paper?.id !== paperId) return;
+    ui.pdfScroll.hidden = false; ui.pdfEmpty.hidden = true;
+    await restorePdfView();
+    ui.pdfViewport.dataset.buildId = buildId;
+    model.pdfRestoring = false;
+    capturePdfView();
+  } catch (failure) {
+    if (failure.name !== 'RenderingCancelledException' && model.pdfLoadToken === token) notice(`PDF preview failed: ${failure.message}`, true);
+  } finally {
+    if (model.pdfLoadToken === token) model.pdfRestoring = false;
+  }
+}
+async function applyPdfView() { if (model.currentBuildId) { savePdfView(); await loadWriterPdf(model.currentBuildId); } }
 
 function notice(message, failed = false) {
   ui.writerNotice.textContent = message;
@@ -670,9 +749,9 @@ const promptedDocumentDetails = new Set();
 
 async function openPaper(paper) {
   closeEditor();
+  disposeWriterPdf();
   model.currentBuildId = null;
-  ui.pdfFrame.removeAttribute('src');
-  ui.pdfFrame.hidden = true;
+  ui.pdfScroll.hidden = true;
   ui.pdfEmpty.hidden = false;
   model.paper = paper;
   loadPdfView();
@@ -928,9 +1007,9 @@ async function refreshBuildStatus() {
       : null;
     if (build.current_build_id && build.current_build_id !== model.currentBuildId) {
       model.currentBuildId = build.current_build_id;
-      ui.pdfFrame.src = currentPdfUrl(build.current_build_id);
+      await loadWriterPdf(build.current_build_id);
     }
-    ui.pdfFrame.hidden = !preview.viewer;
+    ui.pdfScroll.hidden = !preview.viewer;
     ui.pdfEmpty.hidden = !preview.empty;
     ui.locateInPdf.disabled = !model.pdfCurrent || !model.file || !/\.tex$/i.test(model.file.path);
     if (pdf == null) ui.pdfRelation.textContent = 'Compile to generate a PDF.';
@@ -1133,10 +1212,18 @@ function renderReviews() {
     card.className = `thread-card severity-${thread.severity.toLowerCase()}`;
     const heading = button(`${thread.thread_type.replaceAll('_', ' ')} · ${thread.severity} · ${thread.state}`, () => focusWriterReview(thread));
     heading.className = 'thread-title';
+    heading.disabled = Boolean(thread._anchorUnavailable) || (!thread.source_anchor && !thread.pdf_anchor);
+    heading.title = heading.disabled ? 'Exact navigation is unavailable; reviewed location details remain below.' : 'Open the exact reviewed location';
     const metadata = document.createElement('p');
     const fileName = thread.source_anchor?.path?.split('/').at(-1) || `PDF page ${thread.pdf_anchor?.page || '?'}`;
     const excerpt = thread.source_anchor?.quoted_text ? `“${thread.source_anchor.quoted_text.slice(0, 100)}”` : 'PDF-only annotation';
     metadata.textContent = `${fileName} · ${excerpt} · ${thread.category} · ${thread.mentor_email}${thread.assigned_writer_email ? ` · assigned to ${thread.assigned_writer_email}` : ''}${thread.due_at ? ` · due ${new Date(thread.due_at).toLocaleDateString()}` : ''} · ${writerAnchorStatus(thread)}`;
+    const location = document.createElement('p'); location.className = 'reviewed-location';
+    const lineRange = thread.source_anchor?.start_line
+      ? `reviewed lines ${thread.source_anchor.start_line}${thread.source_anchor.end_line !== thread.source_anchor.start_line ? `–${thread.source_anchor.end_line}` : ''}`
+      : 'reviewed line range not recorded';
+    const pdfLocation = thread.pdf_anchor?.page ? ` · reviewed PDF page ${thread.pdf_anchor.page}` : ' · PDF location not recorded';
+    location.textContent = `${thread.source_anchor?.path || 'Source file not recorded'} · ${lineRange}${pdfLocation} · ${excerpt}`;
     const discussion = document.createElement('div');
     discussion.className = 'discussion';
     thread.messages.forEach((message) => {
@@ -1151,7 +1238,7 @@ function renderReviews() {
     actions.append(button('Reply', () => writerReply(thread)));
     if (['OPEN', 'REOPENED', 'ADDRESSED'].includes(thread.state)) actions.append(button('Done', () => writerDone(thread)));
     if (thread.suggestion?.status === 'PENDING') actions.append(button('Accept', () => writerAcceptSuggestion(thread)), button('Reject', () => writerRejectSuggestion(thread)));
-    card.append(heading, metadata, discussion, actions);
+    card.append(heading, metadata, location, discussion, actions);
     ui.writerReviewList.append(card);
   });
 }
@@ -1254,10 +1341,14 @@ async function focusWriterReview(thread) {
         return;
       }
       showReviewedPdf(thread);
+      thread._anchorUnavailable = true;
+      renderReviews();
       return notice(`Source changed. Original reviewed excerpt: “${anchor.quoted_text.slice(0, 160)}”. Showing the reviewed version/PDF location when available.`, true);
     }
   }
   showReviewedPdf(thread);
+  thread._anchorUnavailable = true;
+  renderReviews();
   if (thread.pdf_anchor) notice(`PDF-only annotation on reviewed PDF page ${thread.pdf_anchor.page}; exact source mapping is unavailable.`);
   else notice(`Source changed. Original reviewed excerpt: “${anchor?.quoted_text?.slice(0, 160) || 'unavailable'}”.`, true);
 }
@@ -1265,10 +1356,9 @@ async function focusWriterReview(thread) {
 function showReviewedPdf(thread) {
   if (!thread.pdf_anchor) return;
   const build = thread.pdf_anchor.build_id || model.currentBuildId;
-  model.pdfView.page = thread.pdf_anchor.page; model.pdfView.x = thread.pdf_anchor.x || 0; model.pdfView.y = thread.pdf_anchor.y || 0;
-  ui.pdfPage.value = model.pdfView.page; savePdfView();
-  ui.pdfFrame.src = currentPdfUrl(build);
-  ui.pdfFrame.hidden = false; ui.pdfEmpty.hidden = true;
+  const rectangle = thread.pdf_anchor.normalized_rectangles?.[0];
+  loadWriterPdf(build, true).then(() => showPdfLocation(thread.pdf_anchor.page, rectangle?.x || 0, rectangle?.y || 0, true)).catch((failure) => notice(failure.message, true));
+  ui.pdfScroll.hidden = false; ui.pdfEmpty.hidden = true;
 }
 
 async function writerAcceptSuggestion(thread) {
@@ -1436,7 +1526,7 @@ function insertInlineMath() {
 }
 
 const builderSchemas = {
-  table: [['rows', 'Rows', 'number', 3], ['columns', 'Columns', 'number', 3], ['header', 'Header row', 'checkbox', true], ['alignments', 'Column alignments (shared by each column)', 'text', 'left,center,left'], ['columnWidths', 'Column widths, comma-separated (for example 3cm,,5cm)', 'text', ''], ['minimumRowHeight', 'Minimum height shared by each row (for example 8mm)', 'text', ''], ['booktabs', 'Booktabs', 'checkbox', false], ['caption', 'Caption (placed above table)', 'text', ''], ['label', 'Label', 'text', 'tab:'], ['placement', 'Placement', 'text', 'htbp']],
+  table: [['rows', 'Rows', 'number', 3], ['columns', 'Columns', 'number', 3], ['header', 'Header row', 'checkbox', true], ['alignments', 'Column alignments (shared by each column)', 'text', 'left,center,left'], ['columnWidths', 'Column widths, comma-separated (for example 3cm,,5cm)', 'text', ''], ['minimumRowHeight', 'Minimum height shared by every row (for example 8mm)', 'text', ''], ['selectedCell', 'Selected cell (row,column; for example 2,1)', 'text', ''], ['selectedCellContent', 'Selected cell content (multiple lines supported)', 'textarea', ''], ['selectedColumnWidth', 'Selected cell’s shared column width', 'text', ''], ['selectedRowHeight', 'Selected cell’s shared row minimum height', 'text', ''], ['booktabs', 'Booktabs', 'checkbox', false], ['caption', 'Caption (placed above table)', 'text', ''], ['label', 'Label', 'text', 'tab:'], ['placement', 'Placement', 'text', 'htbp']],
   longtable: [['rows', 'Rows', 'number', 40], ['columns', 'Columns', 'number', 3], ['header', 'Repeat header on later pages', 'checkbox', true], ['alignments', 'Column alignments', 'text', 'left,center,left'], ['caption', 'Caption', 'text', 'Long table'], ['label', 'Label', 'text', 'tab:long']],
   figure: [['asset', 'Asset', 'asset', ''], ['width', 'Width', 'select', ['\\linewidth', '0.75\\linewidth', '0.5\\linewidth', 'custom']], ['customWidth', 'Custom width', 'text', ''], ['placement', 'Placement', 'text', 'htbp'], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:']],
   equation: [['type', 'Type', 'select', ['inline', 'display', 'aligned', 'matrix', 'cases']], ['body', 'Expression / body', 'textarea', 'x = y'], ['rows', 'Rows', 'number', 2], ['columns', 'Columns', 'number', 2], ['delimiter', 'Matrix delimiter', 'select', ['()', '[]', '||', 'none']], ['label', 'Label', 'text', 'eq:']],
@@ -1514,7 +1604,7 @@ function openBuilder(kind, defaults = {}) {
     ui.dialogBody.append(helpers);
   }
   const note = document.createElement('div');
-  if (kind === 'table') ui.dialogBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: 'Widths apply to whole columns and minimum height applies to whole rows; LaTeX tables do not have independent per-cell grid geometry.' }));
+  if (kind === 'table') ui.dialogBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: 'Choose a cell as row,column. Its width changes the containing column and its minimum height changes the containing row; LaTeX tables do not have independent per-cell grid geometry.' }));
   const values = () => Object.fromEntries(Object.entries(controls).map(([name, control]) => [name, control.type === 'checkbox' ? control.checked : control.value]));
   let source = '';
   const refresh = () => {
@@ -1649,6 +1739,22 @@ function projectMetadataEditor(detail) {
   const type = document.createElement('select'); type.name = 'project_type'; type.append(new Option('Choose project type', ''), new Option('Capstone', 'capstone'), new Option('Project 1', 'project-1')); type.value = values.project_type || ''; type.required = true; type.disabled = !detail.can_edit; typeLabel.append(type); form.append(typeLabel);
   const summaryLabel = document.createElement('label'); summaryLabel.textContent = 'Executive summary';
   const summary = document.createElement('textarea'); summary.name = 'executive_summary'; summary.maxLength = 20000; summary.value = values.executive_summary || ''; summary.disabled = !detail.can_edit; summaryLabel.append(summary); form.append(summaryLabel);
+  const displayNames = (key, heading, stored = []) => {
+    const canonicalField = (project.fields || []).find((field) => field.key === key);
+    const existing = new Map((stored || []).map((item) => [item.id, item.display_name]));
+    const host = document.createElement('fieldset'); host.append(Object.assign(document.createElement('legend'), { textContent: heading }));
+    const controls = [];
+    for (const item of canonicalField?.value || []) {
+      const label = document.createElement('label'); label.textContent = `${item.id} display name${item.display_name ? ' · authoritative' : ' · required because the institutional record has no name'}`;
+      const input = document.createElement('input'); input.value = item.display_name || existing.get(item.id) || ''; input.maxLength = 300;
+      input.disabled = !detail.can_edit || (item.origin === 'database' && Boolean(item.display_name)); input.required = !item.display_name; input.dataset.identity = item.id;
+      label.append(input); host.append(label); controls.push({ item, input });
+    }
+    if (controls.length) form.append(host);
+    return () => controls.filter(({ input }) => input.value.trim()).map(({ item, input }) => ({ id: item.id, display_name: input.value.trim() }));
+  };
+  const readDepartmentNames = displayNames('departments', 'Department display names', values.department_display_names);
+  const readSchoolNames = displayNames('schools', 'School display names', values.school_display_names);
   const collection = (heading, entries, fields) => {
     const host = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = heading; host.append(legend);
     const rows = document.createElement('div'); rows.className = 'metadata-collection'; host.append(rows);
@@ -1673,7 +1779,7 @@ function projectMetadataEditor(detail) {
   const readDatasets = collection('Datasets', values.datasets, [['name', 'Name'], ['url', 'URL (optional)', 'url'], ['description', 'Description (optional)', 'textarea']]);
   const readSnippets = collection('Source code snippets', values.source_code_snippets, [['label', 'Label'], ['language', 'Language (optional)'], ['code', 'Code', 'textarea']]);
   const readPublications = collection('Publications', values.publications, [['citation_key', 'Citation key'], ['authors', 'Authors'], ['title', 'Title'], ['venue', 'Venue'], ['year', 'Year', 'number'], ['doi', 'DOI (optional)'], ['url', 'URL (optional)', 'url'], ['status', 'Status', [['Communicated', 'communicated'], ['Accepted', 'accepted'], ['Published', 'published']]]]);
-  const payload = () => ({ executive_summary: summary.value || null, project_type: type.value || null, datasets: readDatasets(), source_code_snippets: readSnippets(), publications: readPublications(), setup_complete: true });
+  const payload = () => ({ executive_summary: summary.value || null, project_type: type.value || null, datasets: readDatasets(), source_code_snippets: readSnippets(), publications: readPublications(), department_display_names: readDepartmentNames(), school_display_names: readSchoolNames(), setup_complete: true });
   if (detail.can_edit) {
     const insertPublications = button('Insert categorized bibitems', () => {
       const text = model.view?.state.doc.toString() || '';
@@ -1834,7 +1940,8 @@ ui.setMain.addEventListener('click', async () => {
 
 ui.saveFile.addEventListener('click', syncCurrent);
 ui.compilePaper.addEventListener('click', manualCompile);
-ui.pdfPage.addEventListener('change', () => { model.pdfView.page = Math.max(1, Number(ui.pdfPage.value) || 1); model.pdfView.x = 0; model.pdfView.y = 0; applyPdfView(); });
+ui.pdfScroll.addEventListener('scroll', () => { window.clearTimeout(model.pdfScrollTimer); model.pdfScrollTimer = window.setTimeout(capturePdfView, 80); });
+ui.pdfPage.addEventListener('change', async () => { model.pdfView.page = Math.max(1, Math.min(model.pdfDocument?.numPages || 1, Number(ui.pdfPage.value) || 1)); model.pdfView.x = 0; model.pdfView.y = 0; await restorePdfView(); });
 ui.pdfZoom.addEventListener('change', () => { model.pdfView.zoom = Number(ui.pdfZoom.value) || 100; applyPdfView(); });
 ui.locateInPdf.addEventListener('click', async () => {
   if (!model.view || !model.file || !model.currentBuildId || !model.pdfCurrent) return notice('Compile the latest source before locating it in the PDF.', true);
@@ -1843,8 +1950,7 @@ ui.locateInPdf.addEventListener('click', async () => {
   try {
     const mapping = await api.map(model.paper.id, { direction: 'FORWARD', file_id: model.file.file_id, line: line.number, column: position - line.from });
     if (!mapping.page || mapping.mapping_status === 'PDF_ONLY') return notice('No exact source/PDF location is available for this build.', true);
-    model.pdfView = { ...model.pdfView, page: mapping.page, x: mapping.x || 0, y: mapping.y || 0 };
-    ui.pdfPage.value = mapping.page; applyPdfView();
+    await showPdfLocation(mapping.page, mapping.x || 0, mapping.y || 0);
     notice(`${mapping.mapping_status === 'EXACT' ? 'Located' : 'Approximately located'} ${model.file.path}:${line.number} on PDF page ${mapping.page}.`);
   } catch (error) { notice(error.message || 'Source/PDF location is unavailable.', true); }
 });

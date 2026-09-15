@@ -61,7 +61,7 @@ Manifests can use only this allow-list:
 - `mentor.name`, `mentor.honorific`, `mentor.designation`, `mentor.faculty_id`
 - `department.id`, `school.id`
 
-The VCAP schema has no human-readable Department or School names. `institution_name`, `campus_name`, `department_display_name`, and `school_display_name` must therefore be pack defaults or permitted Team overrides. Manifests cannot contain SQL or arbitrary source expressions.
+When VCAP supplies only Department/School identities, Document details requires project-scoped display names for every applicable identity. The canonical IDs remain intact and the labels are stored with Team-override provenance; global VCAP records are not edited. Resolved labels materialize as `project.department_names`/`project.school_names` and the compatible singular legacy values. `institution_name`, `campus_name`, `department_display_name`, and `school_display_name` may also come from pack defaults or permitted Team overrides. Manifests cannot contain SQL or arbitrary source expressions.
 
 ## Placeholders and safety
 
@@ -79,7 +79,9 @@ A compatible immutable Main Content Template contains this exact line at its int
 
 Template import and listing report either “Front Matter compatible” or “Front Matter not enabled.” Assignment is blocked with “This template is not configured for Front Matter.” when the marker is absent. LaTeX Core never searches for or rewrites a guessed insertion point.
 
-For a main file inside a bounded wrapper directory, the same exact managed suffix may have the required relative prefix, for example `\input{../.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER`. The renderer rebases only the generated managed wrapper to match that verified main-file depth. It does not rewrite the immutable uploaded template or guess other integration points. `SINGLE_SOURCE` templates without this explicit contract remain metadata-only and report a compatibility warning.
+For a main file inside a bounded wrapper directory, the same exact managed suffix may have the required relative prefix, for example `\input{../.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER`. The renderer rebases only the generated managed wrapper to match that verified main-file depth. It does not rewrite the immutable uploaded template or guess other integration points.
+
+For `SINGLE_SOURCE`, the separate exact contract is `% LATEX_CORE_SINGLE_SOURCE_BINDINGS` after known placeholder declarations and before their first use/`\begin{document}`. Only the report-specific main-file copy is bound to `.latex-core/frontmatter/Front-Matter.tex`; saving Document details rematerializes that managed file without reinjecting the main source. Unsupported structures remain metadata-only and report a compatibility warning.
 
 ## Defaults, assignment, and document details
 
