@@ -3,7 +3,7 @@ use super::{
     BTreeMap, BTreeSet, Bytes, FrontMatterError, FrontMatterField, FrontMatterFieldType,
     FrontMatterManifest, FrontMatterSection, ImportedFile, LogicalPath, MANAGED_ROOT,
     MANIFEST_PATH, RenderedFile, ResolvedValue, ValidatedPack, Value, empty_value,
-    escape_latex_text, resolve_and_render, valid_date,
+    escape_latex_text, is_application_owned_path, resolve_and_render, valid_date,
 };
 use std::fmt::Write as _;
 
@@ -160,10 +160,11 @@ pub fn normalize(files: &[ImportedFile]) -> Result<FrontMatterManifest, FrontMat
     if sections.is_empty() {
         return Err(FrontMatterError::MissingManifest);
     }
-    if files
-        .iter()
-        .any(|file| matches!(file.path.as_str(), "metadata.tex" | "frontmatter.tex"))
-    {
+    // The legacy renderer materializes generated metadata.tex under MANAGED_ROOT;
+    // retaining a root metadata.tex would collide with that generated file.
+    if files.iter().any(|file| {
+        file.path.as_str() == "metadata.tex" || is_application_owned_path(file.path.as_str())
+    }) {
         return Err(FrontMatterError::InvalidPath(
             "reserved generated Front Matter path".into(),
         ));
@@ -243,6 +244,21 @@ pub fn warnings(pack: &ValidatedPack) -> Result<Vec<String>, FrontMatterError> {
                 "Unmapped Front Matter field: \\{word}. It will be blank."
             ));
         }
+    }
+    if pack
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "frontmatter.tex")
+        .and_then(|file| std::str::from_utf8(&file.bytes).ok())
+        .is_some_and(|source| {
+            ["\\documentclass", "\\begin{document}", "\\end{document}"]
+                .iter()
+                .all(|marker| source.contains(marker))
+        })
+    {
+        warnings.push(
+            "Root frontmatter.tex is a standalone document; composition with a Main Content Template requires the separate composition path.".into(),
+        );
     }
     Ok(warnings)
 }
@@ -537,6 +553,133 @@ mod tests {
         assert!(words.contains("semester"));
         assert!(!words.contains("studentBgender"));
         assert!(!words.contains("projguidegender"));
+    }
+
+    #[test]
+    fn real_vit_archive_with_root_frontmatter_is_preserved() {
+        let files: Vec<ImportedFile> = [
+            (
+                "frontmatter.tex",
+                include_bytes!("../../tests/fixtures/vit-front-matter/frontmatter.tex").as_slice(),
+            ),
+            (
+                "VITSCOPEThesis.cls",
+                include_bytes!("../../tests/fixtures/vit-front-matter/VITSCOPEThesis.cls")
+                    .as_slice(),
+            ),
+            (
+                "cover.tex",
+                include_bytes!("../../tests/fixtures/vit-front-matter/cover.tex").as_slice(),
+            ),
+            (
+                "certificate.tex",
+                include_bytes!("../../tests/fixtures/vit-front-matter/certificate.tex").as_slice(),
+            ),
+            (
+                "declaration.tex",
+                include_bytes!("../../tests/fixtures/vit-front-matter/declaration.tex").as_slice(),
+            ),
+            (
+                "acknowledgements.tex",
+                include_bytes!("../../tests/fixtures/vit-front-matter/acknowledgements.tex")
+                    .as_slice(),
+            ),
+            (
+                "images/test-logo.png",
+                include_bytes!("../../tests/fixtures/vit-front-matter/images/test-logo.png")
+                    .as_slice(),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| ImportedFile {
+            path: LogicalPath::parse(path).unwrap(),
+            bytes: Bytes::copy_from_slice(bytes),
+        })
+        .collect();
+        let root_source = files
+            .iter()
+            .find(|file| file.path.as_str() == "frontmatter.tex")
+            .unwrap()
+            .bytes
+            .clone();
+        let pack = validate_archive(ImportedArchive {
+            files,
+            detected_main: None,
+        })
+        .unwrap();
+
+        assert_eq!(pack.manifest.schema_version, 2);
+        assert_eq!(
+            pack.manifest
+                .sections
+                .iter()
+                .map(|section| section.key.as_str())
+                .collect::<Vec<_>>(),
+            ["cover", "certificate", "declaration", "acknowledgement"]
+        );
+        assert_eq!(
+            pack.files
+                .iter()
+                .find(|file| file.path.as_str() == "frontmatter.tex")
+                .unwrap()
+                .bytes,
+            root_source
+        );
+        assert_eq!(
+            pack.files
+                .iter()
+                .find(|file| file.path.as_str() == "VITSCOPEThesis.cls")
+                .unwrap()
+                .bytes
+                .as_ref(),
+            include_bytes!("../../tests/fixtures/vit-front-matter/VITSCOPEThesis.cls")
+        );
+        assert_eq!(
+            pack.files
+                .iter()
+                .find(|file| file.path.as_str() == "images/test-logo.png")
+                .unwrap()
+                .bytes
+                .as_ref(),
+            include_bytes!("../../tests/fixtures/vit-front-matter/images/test-logo.png")
+        );
+        let words = referenced(&pack.files).unwrap();
+        assert!(words.contains("thesistitle"));
+        assert!(words.contains("projguidename"));
+        assert!(
+            warnings(&pack)
+                .unwrap()
+                .iter()
+                .any(|warning| warning.contains("standalone document"))
+        );
+    }
+
+    #[test]
+    fn managed_frontmatter_paths_and_root_metadata_remain_reserved() {
+        let base = vec![
+            ImportedFile {
+                path: LogicalPath::parse("cover.tex").unwrap(),
+                bytes: Bytes::from_static(b"cover"),
+            },
+            ImportedFile {
+                path: LogicalPath::parse("certificate.tex").unwrap(),
+                bytes: Bytes::from_static(b"certificate"),
+            },
+        ];
+        for reserved in [".latex-core/frontmatter/frontmatter.tex", "metadata.tex"] {
+            let mut files = base.clone();
+            files.push(ImportedFile {
+                path: LogicalPath::parse(reserved).unwrap(),
+                bytes: Bytes::from_static(b"reserved"),
+            });
+            assert!(matches!(
+                validate_archive(ImportedArchive {
+                    files,
+                    detected_main: None,
+                }),
+                Err(FrontMatterError::InvalidPath(_))
+            ));
+        }
     }
 
     #[test]

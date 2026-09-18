@@ -1,14 +1,18 @@
 # Synthetic VIT Front Matter compatibility fixture
 
-These four files are synthetic. They contain no uploaded archive or institutional data.
+These files are synthetic. They contain no uploaded archive or institutional data.
 
 The tested compatibility contract is a ZIP containing recognized root-level sections:
 `coverpage.tex` or `cover.tex`, `certificate.tex`, `declaration.tex`, and
-`acknowledgement.tex` or `acknowledgements.tex`. A subset is accepted with warnings;
-conflicting aliases are rejected. Section order is cover, certificate, declaration,
-acknowledgement. Existing schema-v1 `frontmatter.json` packs retain their manifest
-and placeholder renderer. Legacy imports receive an immutable internal schema-v2
-manifest; imported TeX bytes remain unchanged.
+`acknowledgement.tex` or `acknowledgements.tex`. The VIT-shaped variant also includes
+a root `frontmatter.tex`, local `VITSCOPEThesis.cls`, and
+`images/test-logo.png`; these are retained as imported files. A subset is accepted
+with warnings; conflicting aliases are rejected. Section order is cover, certificate,
+declaration, acknowledgement. Existing schema-v1 `frontmatter.json` packs retain
+their manifest and placeholder renderer. Legacy imports receive an immutable internal
+schema-v2 manifest; imported TeX bytes remain unchanged. A standalone root
+`frontmatter.tex` is validated and preserved, but warns that composition with a Main
+Content Template requires the separate composition path.
 
 The registry in `src/front_matter/legacy.rs` covers the VIT zero-argument macros in
 this fixture. Scanning recognizes normal TeX control words and `%` comments,

@@ -14,6 +14,7 @@ pub mod legacy;
 
 pub const MANIFEST_PATH: &str = "frontmatter.json";
 pub const MANAGED_ROOT: &str = ".latex-core/frontmatter";
+const MANAGED_NAMESPACE: &str = ".latex-core";
 pub const INTEGRATION_MARKER: &str =
     "\\input{.latex-core/frontmatter/frontmatter.tex} % LATEX_CORE_FRONT_MATTER";
 
@@ -237,7 +238,7 @@ pub fn validate_archive(mut archive: ImportedArchive) -> Result<ValidatedPack, F
         let extension = file.path.extension().unwrap_or("").to_ascii_lowercase();
         let allowed = matches!(
             extension.as_str(),
-            "tex" | "png" | "jpg" | "jpeg" | "pdf" | "bib"
+            "tex" | "cls" | "png" | "jpg" | "jpeg" | "pdf" | "bib"
         ) || path == MANIFEST_PATH;
         if !allowed {
             return Err(FrontMatterError::UnsupportedFile(path.to_owned()));
@@ -256,6 +257,14 @@ pub fn validate_manifest(
     manifest: &FrontMatterManifest,
     files: &[ImportedFile],
 ) -> Result<(), FrontMatterError> {
+    if files
+        .iter()
+        .any(|file| is_application_owned_path(file.path.as_str()))
+    {
+        return Err(FrontMatterError::InvalidPath(
+            "reserved generated Front Matter path".into(),
+        ));
+    }
     if !matches!(manifest.schema_version, 1 | 2) {
         return Err(FrontMatterError::SchemaVersion);
     }
@@ -316,6 +325,10 @@ pub fn validate_manifest(
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_application_owned_path(path: &str) -> bool {
+    path == MANAGED_NAMESPACE || path.starts_with(".latex-core/")
 }
 
 pub fn main_template_compatible(main: &[u8]) -> bool {
