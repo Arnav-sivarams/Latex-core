@@ -11,6 +11,7 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 import * as pdfjsLib from '/static/pdf.min.mjs';
 import { resolveSuggestionRange } from './review-helpers.mjs';
 import { pdfPreviewState } from './writer-pdf.mjs';
+import { buildIsStale, recognizedBuildProblems, renderBuildLog, shortBuildState } from './writer-build.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
@@ -27,6 +28,7 @@ const FLUSH = 0x02;
 const INITIAL_STATE = 0x10;
 const REMOTE_SOURCE_UPDATE = 0x11;
 const REMOTE_ORIGIN = Symbol('server-remote');
+const LAST_GOOD_PDF_FAILURE = 'Build failed — showing last successful PDF';
 const setReviewMarks = StateEffect.define();
 const reviewMarkField = StateField.define({
   create: () => Decoration.none,
@@ -75,6 +77,10 @@ class PaperApi {
     return this.request(`/api/v2/papers/${paperId}/assets?${query}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
   }
   map(paperId, body) { return this.json(`/api/v2/reviews/papers/${paperId}/synctex`, 'POST', body); }
+  sourcePosition(paperId, buildId, file, line, column) {
+    const query = new URLSearchParams({ file, line: String(line), column: String(column) });
+    return this.request(`/api/v2/papers/${paperId}/builds/${buildId}/source-position?${query}`);
+  }
   versions(paperId) { return this.request(`/api/v2/papers/${paperId}/versions`); }
   checkpoint(paperId, name) { return this.json(`/api/v2/papers/${paperId}/versions`, 'POST', { name }); }
   compare(paperId, from, to) { return this.request(`/api/v2/papers/${paperId}/versions/compare?from=${from}&to=${to}`); }
@@ -86,6 +92,11 @@ class PaperApi {
   restorePersonal(paperId, versionId) { return this.json(`/api/v2/papers/${paperId}/versions/${versionId}/restore`, 'POST', {}); }
   build(paperId, triggerType) { return this.json(`/api/v2/papers/${paperId}/builds`, 'POST', { trigger_type: triggerType }); }
   buildStatus(paperId) { return this.request(`/api/v2/papers/${paperId}/builds`); }
+  async buildLog(paperId, buildId) {
+    const response = await fetch(`/api/v2/papers/${paperId}/artifacts/log?build=${buildId}`, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`Build log unavailable (${response.status})`);
+    return response.text();
+  }
   reviews(paperId) { return this.request(`/api/v2/reviews/papers/${paperId}/threads`); }
   reviewRounds(paperId) { return this.request(`/api/v2/reviews/papers/${paperId}/rounds`); }
   sendForReview(paperId) { return this.json(`/api/v2/reviews/papers/${paperId}/rounds`, 'POST', {}); }
@@ -112,7 +123,8 @@ const ui = Object.fromEntries([
   'myPapers', 'teamPapers', 'fileTree', 'newPaper', 'newFile', 'renameFile', 'deleteFile',
   'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
   'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'pdfRelation', 'pdfEmpty',
-  'pdfScroll', 'pdfViewport', 'createCheckpoint', 'versionHistory', 'versionDiff',
+  'buildFooter', 'buildFooterBody', 'buildFooterState', 'buildFooterCount', 'buildFooterToggle', 'buildProblemsTab', 'buildLogTab', 'buildProblemsPanel', 'buildProblemsList', 'buildLogPanel', 'buildLogText',
+  'pdfScroll', 'pdfViewport', 'downloadPdf', 'createCheckpoint', 'versionHistory', 'versionDiff',
   'pdfPage', 'pdfZoom', 'locateInPdf',
   'reviewCounts', 'writerReviewFilters', 'writerReviewList',
     'quickOpen', 'commandPalette', 'uploadImage', 'assetInput',
@@ -166,6 +178,13 @@ const model = {
   pdfLoadToken: 0,
   pdfRestoring: false,
   pdfScrollTimer: null,
+  forwardSyncTimer: null,
+  forwardSyncRequest: 0,
+  buildLog: '',
+  buildLogBuildId: null,
+  latestBuildId: null,
+  lastBuildStatus: null,
+  buildFooterTab: 'problems',
 };
 
 function pdfViewKey() { return model.paper ? `latex-core-pdf-view:${model.paper.id}` : null; }
@@ -177,6 +196,7 @@ function loadPdfView() {
 }
 function savePdfView() { const key = pdfViewKey(); if (key) sessionStorage.setItem(key, JSON.stringify(model.pdfView)); }
 function currentPdfUrl(buildId) { return `/api/v2/papers/${model.paper.id}/artifacts/pdf?build=${buildId}`; }
+function downloadPdfUrl(buildId) { return `${currentPdfUrl(buildId)}&download=true`; }
 function capturePdfView() {
   if (ui.pdfScroll.hidden || model.pdfRestoring) return;
   const pages = [...ui.pdfViewport.querySelectorAll('.writer-pdf-page')];
@@ -217,6 +237,54 @@ async function showPdfLocation(pageNumber, x = 0, y = 0, normalized = false) {
   }
   await restorePdfView();
 }
+async function navigatePdfLocation(mapping) {
+  if (!mapping?.page || !model.pdfDocument) return false;
+  const page = ui.pdfViewport.querySelector(`[data-page="${mapping.page}"]`);
+  if (!page) return false;
+  const scale = (Number(model.pdfView.zoom) || 100) / 100;
+  const top = Math.max(0, (Number(mapping.y) - Number(mapping.height || 0)) * scale);
+  const left = Math.max(0, Number(mapping.x || 0) * scale);
+  model.pdfView.page = Math.max(1, Math.min(model.pdfDocument.numPages, Number(mapping.page)));
+  model.pdfView.y = Math.max(0, Math.min(1, top / Math.max(1, page.offsetHeight)));
+  model.pdfView.x = left;
+  await restorePdfView();
+  page.querySelector('.writer-pdf-location')?.remove();
+  const highlight = document.createElement('div');
+  highlight.className = 'writer-pdf-location';
+  Object.assign(highlight.style, {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${Math.max(8, Number(mapping.width || 0) * scale)}px`,
+    height: `${Math.max(8, Number(mapping.height || 0) * scale)}px`,
+  });
+  page.append(highlight);
+  window.setTimeout(() => highlight.remove(), 1800);
+  return true;
+}
+function scheduleForwardSync(delay = 160) {
+  window.clearTimeout(model.forwardSyncTimer);
+  model.forwardSyncTimer = window.setTimeout(() => { forwardSyncFromEditor(); }, delay);
+}
+async function forwardSyncFromEditor() {
+  if (!model.paper || !model.file || !model.view || !model.currentBuildId || !model.pdfCurrent
+      || !/\.tex$/i.test(model.file.path)) return;
+  const selection = model.view.state.selection.main;
+  const line = model.view.state.doc.lineAt(selection.head);
+  const request = ++model.forwardSyncRequest;
+  const paperId = model.paper.id;
+  const fileId = model.file.file_id;
+  const buildId = model.currentBuildId;
+  try {
+    const mapping = await api.sourcePosition(paperId, buildId, model.file.path, line.number, selection.head - line.from);
+    if (request !== model.forwardSyncRequest || model.paper?.id !== paperId || model.file?.file_id !== fileId
+        || model.currentBuildId !== buildId || !model.pdfCurrent) return;
+    await navigatePdfLocation(mapping);
+  } catch (error) {
+    if (request !== model.forwardSyncRequest || model.paper?.id !== paperId) return;
+    if (error.status === 409) ui.pdfRelation.textContent = 'PDF is stale — Compile current source to synchronize PDF.';
+    else if (error.status === 404) ui.pdfRelation.textContent = 'Source position unavailable.';
+  }
+}
 async function loadWriterPdf(buildId, historical = false) {
   capturePdfView();
   const paperId = model.paper?.id; const token = model.pdfLoadToken + 1;
@@ -240,6 +308,7 @@ async function loadWriterPdf(buildId, historical = false) {
     ui.pdfViewport.dataset.buildId = buildId;
     model.pdfRestoring = false;
     capturePdfView();
+    if (!historical) scheduleForwardSync(0);
   } catch (failure) {
     if (failure.name !== 'RenderingCancelledException' && model.pdfLoadToken === token) notice(`PDF preview failed: ${failure.message}`, true);
   } finally {
@@ -260,7 +329,8 @@ function editorAppearance(preference) {
     '.cm-gutters': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
     '.cm-content': { fontSize: `${preference.font_size_px}px`, caretColor: dark ? '#f0f6fc' : '#111827' },
     '.cm-activeLine,.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
-    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#bfdcff' },
+    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground': { backgroundColor: 'color-mix(in srgb, var(--accent) 32%, transparent)' },
+    '.cm-content ::selection': { backgroundColor: 'color-mix(in srgb, var(--accent) 32%, transparent)', color: 'var(--text)' },
     '.review-source-highlight': { color: dark ? '#fff2b2' : '#241a00' },
   }, { dark });
 }
@@ -279,12 +349,14 @@ function applyIdentity(identity) {
 
 async function loadPreferences() {
   model.preferences = await api.preferences();
+  window.LatexCoreTheme?.apply(model.preferences.theme);
   ui.editorFontSize.value = model.preferences.font_size_px;
   ui.editorTheme.value = model.preferences.theme;
 }
 
 async function persistPreferences(preferences) {
   model.preferences = await api.savePreferences(preferences);
+  window.LatexCoreTheme?.apply(model.preferences.theme);
   if (model.view) model.view.dispatch({ effects: model.editorAppearance.reconfigure(editorAppearance(model.preferences)) });
 }
 
@@ -387,22 +459,70 @@ function renderTree(node) {
   return list;
 }
 
-function renderProblems() {
+function buildDiagnostics() {
   const diagnostics = [...(model.intelligence.diagnostics || [])];
   if (model.compileDiagnostic) diagnostics.push(model.compileDiagnostic);
-  ui.problemsCount.textContent = diagnostics.length;
-  ui.problemsList.replaceChildren();
+  recognizedBuildProblems(model.buildLog).forEach((problem) => diagnostics.push({ ...problem, path: 'Build log' }));
+  return diagnostics;
+}
+
+function renderProblemList(host, diagnostics) {
+  host.replaceChildren();
   if (!diagnostics.length) {
-    ui.problemsList.innerHTML = '<p class="empty-copy">No current problems.</p>';
+    host.innerHTML = '<p class="empty-copy">No current problems.</p>';
     return;
   }
   diagnostics.forEach((diagnostic) => {
     const row = button(diagnostic.message, () => diagnostic.file_id && openLocation(diagnostic));
-    row.className = `problem-row ${diagnostic.severity || 'error'}`;
+    row.className = `problem-row build-problem-${diagnostic.severity || 'info'}`;
     const line = diagnostic.range?.start_line;
-    row.append(Object.assign(document.createElement('small'), { textContent: `${diagnostic.path || 'Build'}${line ? `:${line}` : ''} · ${diagnostic.code || diagnostic.severity}` }));
-    ui.problemsList.append(row);
+    row.append(Object.assign(document.createElement('small'), { textContent: `${diagnostic.path || 'Build'}${line ? `:${line}` : ''} · ${diagnostic.code || diagnostic.severity || 'info'}` }));
+    host.append(row);
   });
+}
+
+function renderProblems() {
+  const diagnostics = buildDiagnostics();
+  ui.problemsCount.textContent = diagnostics.length;
+  ui.buildFooterCount.textContent = diagnostics.length;
+  renderProblemList(ui.buildProblemsList, diagnostics);
+  if (ui.problemsList) renderProblemList(ui.problemsList, diagnostics);
+}
+
+function selectBuildFooterTab(tab) {
+  model.buildFooterTab = tab;
+  const problems = tab === 'problems';
+  ui.buildProblemsTab.setAttribute('aria-selected', String(problems));
+  ui.buildLogTab.setAttribute('aria-selected', String(!problems));
+  ui.buildProblemsPanel.hidden = !problems;
+  ui.buildLogPanel.hidden = problems;
+  if (!problems) loadBuildLog();
+}
+
+function expandBuildFooter(tab = model.buildFooterTab) {
+  selectBuildFooterTab(tab);
+  ui.buildFooter.dataset.expanded = 'true';
+  ui.buildFooterToggle.setAttribute('aria-expanded', 'true');
+  ui.buildFooterToggle.setAttribute('aria-label', 'Collapse diagnostics');
+}
+
+function collapseBuildFooter() {
+  ui.buildFooter.dataset.expanded = 'false';
+  ui.buildFooterToggle.setAttribute('aria-expanded', 'false');
+  ui.buildFooterToggle.setAttribute('aria-label', 'Expand diagnostics');
+}
+
+async function loadBuildLog() {
+  if (!model.paper || !model.latestBuildId || model.buildLogBuildId === model.latestBuildId && model.buildLog) return;
+  const buildId = model.latestBuildId;
+  model.buildLogBuildId = buildId;
+  try {
+    model.buildLog = await api.buildLog(model.paper.id, buildId);
+    renderBuildLog(ui.buildLogText, model.buildLog || 'Compiler returned an empty log.');
+    renderProblems();
+  } catch (error) {
+    renderBuildLog(ui.buildLogText, error.message);
+  }
 }
 
 async function openLocation(location) {
@@ -743,6 +863,9 @@ async function refreshReportFiles(changedFileId, revision) {
 async function refreshPapers() {
   model.papers = await api.papers();
   renderPapers();
+  const requestedId = new URLSearchParams(window.location.search).get('paper');
+  const requestedPaper = requestedId && model.papers.find((paper) => paper.id === requestedId);
+  if (requestedPaper && model.paper?.id !== requestedPaper.id) await openPaper(requestedPaper);
 }
 
 const promptedDocumentDetails = new Set();
@@ -751,8 +874,13 @@ async function openPaper(paper) {
   closeEditor();
   disposeWriterPdf();
   model.currentBuildId = null;
+  model.latestBuildId = null;
+  model.lastBuildStatus = null;
+  model.buildLogBuildId = null;
+  model.buildLog = '';
   ui.pdfScroll.hidden = true;
   ui.pdfEmpty.hidden = false;
+  ui.downloadPdf.disabled = true;
   model.paper = paper;
   loadPdfView();
   model.file = null;
@@ -785,8 +913,8 @@ async function openPaper(paper) {
   if (paper.kind === 'team') {
     const detail = await api.documentDetails(paper.id);
     if (model.paper.id !== paper.id) return;
-    ui.documentDetails.title = detail.pack_id ? frontMatterStatus(detail) : 'Document details';
-    const key = `${paper.id}:${detail.pack_id}`;
+    ui.documentDetails.title = detail.single_source ? 'Complete report metadata' : detail.pack_id ? frontMatterStatus(detail) : 'Document details';
+    const key = `${paper.id}:${detail.pack_id || detail.template_arrangement || 'none'}`;
     if (needsFirstUseDetails(detail) && !promptedDocumentDetails.has(key)) {
       promptedDocumentDetails.add(key);
       await openDocumentDetails(detail);
@@ -899,7 +1027,15 @@ function mountEditor(ytext, editable, latex) {
     EditorView.theme({ '&': { height: '100%' }, '.cm-scroller': { overflow: 'auto' } }),
     model.editorAppearance.of(editorAppearance(model.preferences)),
   ];
-  if (latex) extensions.push(StreamLanguage.define(stex), autocompletion({ override: [latexCompletionSource] }));
+  if (latex) {
+    extensions.push(
+      StreamLanguage.define(stex),
+      autocompletion({ override: [latexCompletionSource] }),
+      EditorView.updateListener.of((update) => {
+        if (update.selectionSet && !update.docChanged) scheduleForwardSync();
+      }),
+    );
+  }
   model.view = new EditorView({
     state: EditorState.create({ doc: ytext.toString(), extensions }),
     parent: ui.editorMount,
@@ -977,11 +1113,14 @@ async function reloadPaperAndFile(fileId) {
 async function requestBuild() {
   if (!model.paper) return;
   try {
-    ui.buildStatus.textContent = model.currentBuildId ? 'Rebuilding…' : 'Building…';
+    ui.buildStatus.textContent = 'Queued';
+    ui.buildFooterState.textContent = 'Queued';
     await api.build(model.paper.id, 'manual');
     await Promise.all([refreshBuildStatus(), refreshHistory()]);
   } catch (error) {
-    ui.buildStatus.textContent = model.currentBuildId ? 'Build failed — showing last successful PDF' : 'Build failed';
+    ui.buildStatus.textContent = 'Compilation failed';
+    ui.buildFooterState.textContent = 'Compilation failed';
+    expandBuildFooter('problems');
     notice(error.message, true);
   }
 }
@@ -1000,28 +1139,36 @@ async function refreshBuildStatus() {
     const source = build.source_sequence;
     const pdf = build.current_source_sequence;
     const preview = pdfPreviewState(build);
-    const stale = source != null && pdf != null && source !== pdf;
+    model.latestBuildId = build.latest_build_id || build.active_build_id || build.current_build_id || null;
+    const shortState = shortBuildState(build);
+    ui.buildFooterState.textContent = shortState;
+    const stale = buildIsStale(build);
     model.pdfCurrent = Boolean(build.current_build_id && !stale);
     model.compileDiagnostic = build.latest_status === 'failed' && build.latest_error?.message
       ? { severity: 'error', code: 'compile', message: build.latest_error.message, path: null, file_id: null }
       : null;
+    if (model.buildLogBuildId !== model.latestBuildId) {
+      model.buildLog = '';
+      ui.buildLogText.textContent = 'Open Build Log to load the compiler output.';
+    }
     if (build.current_build_id && build.current_build_id !== model.currentBuildId) {
       model.currentBuildId = build.current_build_id;
       await loadWriterPdf(build.current_build_id);
     }
+    ui.downloadPdf.disabled = !model.currentBuildId;
     ui.pdfScroll.hidden = !preview.viewer;
     ui.pdfEmpty.hidden = !preview.empty;
     ui.locateInPdf.disabled = !model.pdfCurrent || !model.file || !/\.tex$/i.test(model.file.path);
     if (pdf == null) ui.pdfRelation.textContent = 'Compile to generate a PDF.';
     else if (stale) ui.pdfRelation.textContent = `PDF is out of date — Compile to refresh. Source version ${source} · PDF version ${pdf}`;
     else ui.pdfRelation.textContent = `PDF matches source version ${pdf}`;
-    if (build.active_build_id) ui.buildStatus.textContent = build.current_build_id ? 'Rebuilding…' : 'Building…';
-    else if (build.latest_status === 'failed' && source !== pdf) {
-      ui.buildStatus.textContent = build.current_build_id ? 'Build failed — showing last successful PDF' : 'Build failed';
+    if (build.latest_status === 'failed' && model.lastBuildStatus !== 'failed') expandBuildFooter('problems');
+    if (build.latest_status === 'failed') {
+      ui.buildStatus.textContent = 'Compilation failed';
+      if (build.current_build_id) ui.pdfRelation.textContent += ` · ${LAST_GOOD_PDF_FAILURE}`;
       if (build.latest_error?.message) ui.pdfRelation.textContent += ` · ${build.latest_error.message}`;
-    } else if (build.current_build_id && stale) ui.buildStatus.textContent = 'Out of date';
-    else if (build.current_build_id) ui.buildStatus.textContent = 'Current';
-    else ui.buildStatus.textContent = 'Compile to generate a PDF';
+    } else ui.buildStatus.textContent = shortState;
+    model.lastBuildStatus = build.latest_status;
     renderProblems();
   } catch (error) {
     notice(error.message, true);
@@ -1813,19 +1960,19 @@ async function openDocumentDetails(prefetched = null) {
   try {
     const detail = prefetched?.pack_id ? prefetched : await api.documentDetails(model.paper.id);
     ui.documentDetailsBody.replaceChildren();
-    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: `Front Matter Pack: ${detail.pack_name || 'None'}` }));
+    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: detail.single_source ? 'Complete report template · one source controls cover, front matter, and body.' : `Front Matter Pack: ${detail.pack_name || 'None'}` }));
     ui.documentDetailsBody.append(projectMetadataEditor(detail));
-    if (!detail.pack_id) {
+    if (!detail.pack_id && !detail.single_source) {
       ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter pages are assigned. Project metadata remains available for institutional records.' }));
       openDrawer('documentDetails'); return;
     }
-    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: 'Managed definitions: .latex-core/frontmatter/Front-Matter.tex (generated; edit values here).' }));
+    if (!detail.single_source) ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: 'Managed definitions: .latex-core/frontmatter/Front-Matter.tex (generated; edit values here).' }));
     ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: frontMatterStatus(detail) }));
     for (const warning of detail.warnings || []) ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'muted-note', textContent: warning }));
     const currentValues = Object.fromEntries((detail.values || []).map((item) => [item.field_key, item.value]));
     const currentSections = Object.fromEntries((detail.sections || []).map((item) => [item.section_key, item.enabled]));
     const form = document.createElement('form'); form.className = 'document-details-form';
-    const sectionsHeading = document.createElement('h4'); sectionsHeading.textContent = 'Sections'; form.append(sectionsHeading);
+    const sectionsHeading = document.createElement('h4'); sectionsHeading.textContent = 'Sections'; if ((detail.manifest.sections || []).length) form.append(sectionsHeading);
     (detail.manifest.sections || []).forEach((section) => { const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.name = `section:${section.key}`; checkbox.checked = section.required || (currentSections[section.key] ?? section.default_enabled); checkbox.disabled = section.required || !detail.can_edit; label.append(checkbox, document.createTextNode(` ${section.label}${section.required ? ' · Required' : ' · Optional'}`)); form.append(label); });
     const fieldsHeading = document.createElement('h4'); fieldsHeading.textContent = 'Metadata'; form.append(fieldsHeading);
     (detail.manifest.fields || []).forEach((field) => {
@@ -1847,7 +1994,7 @@ async function openDocumentDetails(prefetched = null) {
       label.append(input); form.append(label);
     });
     if (detail.can_edit) { const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save document details'; form.append(save); }
-    form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); notice('Document details saved. Front Matter was rebuilt. Compile to refresh the PDF.'); } catch (error) { notice(error.message, true); } });
+    form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); notice(detail.single_source ? 'Complete report metadata saved. Compile to refresh the PDF.' : 'Document details saved. Front Matter was rebuilt. Compile to refresh the PDF.'); } catch (error) { notice(error.message, true); } });
     ui.documentDetailsBody.append(form); openDrawer('documentDetails');
   } catch (error) { notice(error.message, true); }
 }
@@ -1871,7 +2018,7 @@ function commandItems() {
     ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ['Set Main', () => ui.setMain.click()],
     ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
     ['Insert…', openInsertMenu],
-    ['Open Problems', () => openDrawer('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
+    ['Open Problems', () => expandBuildFooter('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
     ['Document details', openDocumentDetails],
   ];
   if (model.paper?.kind !== 'team' || model.paper?.is_team_leader) items.push(['Create Checkpoint', () => ui.createCheckpoint.click()]);
@@ -1954,6 +2101,13 @@ ui.locateInPdf.addEventListener('click', async () => {
     notice(`${mapping.mapping_status === 'EXACT' ? 'Located' : 'Approximately located'} ${model.file.path}:${line.number} on PDF page ${mapping.page}.`);
   } catch (error) { notice(error.message || 'Source/PDF location is unavailable.', true); }
 });
+ui.downloadPdf.addEventListener('click', () => {
+  if (!model.paper || !model.currentBuildId) return;
+  const link = document.createElement('a');
+  link.href = downloadPdfUrl(model.currentBuildId);
+  link.download = `${(model.paper.name || 'report').replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'report'}.pdf`;
+  link.click();
+});
 ui.sendReview.addEventListener('click', async () => {
   if (!model.paper?.is_team_leader || !await requireDurableFlush()) return;
   try {
@@ -1982,7 +2136,10 @@ ui.figureBuilder.addEventListener('click', () => openBuilder('figure'));
 ui.plotBuilder.addEventListener('click', () => openBuilder('plot'));
 ui.undoText.addEventListener('click', () => model.undoManager?.undo());
 ui.redoText.addEventListener('click', () => model.undoManager?.redo());
-ui.problemsToggle.addEventListener('click', () => openDrawer('problems'));
+ui.problemsToggle.addEventListener('click', () => expandBuildFooter('problems'));
+ui.buildProblemsTab.addEventListener('click', () => expandBuildFooter('problems'));
+ui.buildLogTab.addEventListener('click', () => expandBuildFooter('log'));
+ui.buildFooterToggle.addEventListener('click', () => ui.buildFooter.dataset.expanded === 'true' ? collapseBuildFooter() : expandBuildFooter());
 ui.historyToggle.addEventListener('click', () => openDrawer('history'));
 ui.commentsToggle.addEventListener('click', () => openDrawer('reviews'));
 ui.documentDetails.addEventListener('click', openDocumentDetails);
@@ -2071,7 +2228,7 @@ ui.projectSearch.addEventListener('input', () => {
 });
 ui.caseSensitive.addEventListener('change', () => ui.projectSearch.dispatchEvent(new Event('input')));
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') { closeDrawer(); closeTransientMenus(); return; }
+  if (event.key === 'Escape') { closeDrawer(); closeTransientMenus(); if (ui.buildFooter.dataset.expanded === 'true') collapseBuildFooter(); return; }
   if (!(event.ctrlKey || event.metaKey)) return;
   if (event.key.toLowerCase() === 'p') { event.preventDefault(); quickOpen(); }
   if (event.key.toLowerCase() === 'k') { event.preventDefault(); showPalette('Command Palette', commandItems()); }

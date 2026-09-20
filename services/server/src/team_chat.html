@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Team Chat — LaTeX Core</title>
+  <link rel="stylesheet" href="/static/shells.css?v=team-chat-1">
+  <script src="/static/theme.js?v=team-chat-1"></script>
+</head>
+<body class="projects-shell team-chat-shell">
+  <header class="shell-topbar">
+    <a class="shell-brand branded-wordmark" href="/home"><span>LaTeX Core</span></a>
+    <span class="header-divider" aria-hidden="true">|</span><span id="chatAccount" class="header-identity">Loading…</span>
+    <span class="header-divider" aria-hidden="true">|</span><span id="chatRole" class="role-badge">Loading…</span>
+    <span class="shell-spacer"></span>
+    <a class="quiet-button" href="/home">Projects</a>
+    <a class="quiet-button" href="/team-chat" aria-current="page">Team Chat</a>
+    <form method="post" action="/logout"><button class="quiet-button" type="submit">Log out</button></form>
+  </header>
+  <main class="team-chat-layout">
+    <nav class="team-chat-list" aria-label="Your Teams"><p class="projects-sidebar-label">TEAMS</p><div id="chatTeams"><p class="empty-copy">Loading…</p></div></nav>
+    <section class="team-chat-conversation" aria-labelledby="chatTitle">
+      <header class="team-chat-heading"><div><p class="eyebrow">Team Chat</p><h1 id="chatTitle">Choose a Team</h1></div></header>
+      <div id="chatMessages" class="team-chat-messages" aria-live="polite"><p class="empty-copy">Choose a Team to read its conversation.</p></div>
+      <form id="chatForm" class="team-chat-compose"><label class="sr-only" for="chatBody">Message your team</label><textarea id="chatBody" maxlength="4000" rows="2" placeholder="Message your team..." disabled></textarea><button class="primary" type="submit" disabled>Send</button></form>
+      <p id="chatNotice" class="inline-error" role="status"></p>
+    </section>
+  </main>
+  <script type="module" src="/static/team-chat.js?v=team-chat-1"></script>
+</body></html>

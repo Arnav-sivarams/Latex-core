@@ -31,6 +31,10 @@ services:
       BIND_ADDR: 0.0.0.0:8080
     volumes:
       - latex_core_blob_data:/var/lib/latex-core/blobs
+      # The API uses a narrow, server-owned log inspection command; the socket is never sent to browsers.
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/api/readiness"]
       interval: 5s

@@ -29,8 +29,8 @@ use axum::{
 };
 use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
 use core_types::{
-    ArtifactId, CompileKeyMaterialV1, CostClass, IdempotencyKey, JobId, LatexmkProfileId,
-    LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
+    ArtifactId, CompileKeyMaterialV1, CostClass, FileEntryV1, IdempotencyKey, JobId,
+    LatexmkProfileId, LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
     WorkspaceManifestV1, WorkspaceVersion,
 };
 use image::{GenericImageView, ImageFormat, ImageReader, Limits};
@@ -54,6 +54,7 @@ use std::{
     env,
     fmt::Write as _,
     net::SocketAddr,
+    process::Command,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -103,6 +104,10 @@ struct PasswordChangeInput {
 #[derive(Deserialize)]
 struct NewProject {
     name: String,
+}
+#[derive(Deserialize)]
+struct TeamChatInput {
+    body: String,
 }
 #[derive(Deserialize)]
 struct NewTeam {
@@ -684,6 +689,8 @@ fn router(state: AppState) -> Router {
             get(change_password_ui).post(browser_change_password),
         )
         .route("/admin", get(admin_ui))
+        .route("/home", get(home_ui))
+        .route("/team-chat", get(team_chat_ui))
         .route("/write", get(writer_ui))
         .route("/review", get(mentor_ui))
         .route("/account-setup", get(account_setup_ui))
@@ -692,6 +699,10 @@ fn router(state: AppState) -> Router {
         .route("/static/shells.css", get(shells_css))
         .route("/static/admin.js", get(admin_js))
         .route("/static/writer.js", get(writer_js))
+        .route("/static/theme.js", get(theme_js))
+        .route("/static/home.js", get(home_js))
+        .route("/static/home-preview.mjs", get(home_preview_js))
+        .route("/static/team-chat.js", get(team_chat_js))
         .route("/static/app.js", get(app_js))
         .route("/static/api.js", get(api_js))
         .route("/static/state.js", get(state_js))
@@ -701,6 +712,11 @@ fn router(state: AppState) -> Router {
         .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/me", get(me))
         .route("/api/v2/me", get(v2_me))
+        .route("/api/v2/team-chats", get(v2_team_chats))
+        .route(
+            "/api/v2/team-chats/{team_id}/messages",
+            get(v2_team_chat_messages).post(v2_send_team_chat_message),
+        )
         .route(
             "/api/v2/preferences/editor",
             get(v2_editor_preferences).put(v2_set_editor_preferences),
@@ -922,6 +938,7 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/admin/v2/versions", get(admin_v2_versions))
         .route("/api/admin/v2/reviews", get(admin_v2_reviews))
+        .route("/api/admin/v2/runtime-logs", get(admin_runtime_logs))
         .route("/api/v2/writer/papers", get(v2_writer_papers))
         .route(
             "/api/v2/writer/personal-papers",
@@ -969,6 +986,10 @@ fn router(state: AppState) -> Router {
             get(v2_paper_intelligence),
         )
         .route("/api/v2/papers/{paper_id}/search", get(v2_project_search))
+        .route(
+            "/api/v2/papers/{paper_id}/builds/{build_id}/source-position",
+            get(v2_source_position),
+        )
         .route("/api/v2/papers/{paper_id}/assets", post(v2_upload_asset))
         .route(
             "/api/v2/papers/{paper_id}/files/{file_id}/raw",
@@ -3795,7 +3816,30 @@ async fn v2_document_details(
                 Ok(project) => value["project_metadata"] = project,
                 Err(error_value) => return front_matter_repository_error(error_value),
             }
-            if value["manifest"]["schema_version"] == 2 {
+            if state
+                .front_matter
+                .paper_template_arrangement(paper_id)
+                .await
+                .is_ok_and(|(arrangement, _)| arrangement == "SINGLE_SOURCE")
+            {
+                match single_source_document_details(&state, paper_id, &value).await {
+                    Ok(details) => {
+                        value
+                            .as_object_mut()
+                            .expect("team detail is an object")
+                            .extend(
+                                details
+                                    .as_object()
+                                    .expect("single-source detail is an object")
+                                    .clone(),
+                            );
+                    }
+                    Err(response) => return response,
+                }
+            }
+            if value["manifest"]["schema_version"] == 2
+                && value["single_source"] != serde_json::Value::Bool(true)
+            {
                 match resolve_legacy_details(&state, paper_id, &value).await {
                     Ok(details) => {
                         value["manifest"]["fields"] = details["fields"].clone();
@@ -3882,6 +3926,176 @@ async fn resolve_legacy_details(
         .map_err(|value| error(StatusCode::BAD_REQUEST, value.to_string()))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete-report metadata projection keeps registry resolution and serializable UI fields together"
+)]
+async fn single_source_document_details(
+    state: &AppState,
+    paper_id: uuid::Uuid,
+    detail: &serde_json::Value,
+) -> Result<serde_json::Value, Response> {
+    let (_, main_name) = state
+        .front_matter
+        .paper_template_arrangement(paper_id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let workspace = detail["workspace_id"]
+        .as_str()
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(WorkspaceId::from_uuid)
+        .ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "complete report template has no workspace",
+            )
+        })?;
+    let path = LogicalPath::parse(&main_name).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "complete report template has an invalid main path",
+        )
+    })?;
+    let main = state
+        .workspaces
+        .read_file(workspace, &path)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "complete report main source is unavailable",
+            )
+        })?;
+    if !front_matter::single_source_compatible(&main) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "Complete report template metadata compatibility: no safe binding point is available before \\begin{document}.",
+        ));
+    }
+    // Complete-report fields are often consumed by included front-matter files
+    // (for example, certificate.tex), rather than the root source itself.
+    // Project the union of the declared macros without mutating the immutable
+    // template workspace.
+    let workspace_state = state.workspaces.restore(workspace).await.map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "complete report template workspace is unavailable",
+        )
+    })?;
+    let mut commands = BTreeSet::new();
+    for source_path in workspace_state
+        .files()
+        .keys()
+        .filter(|source_path| source_path.extension() == Some("tex"))
+    {
+        let source = state
+            .workspaces
+            .read_file(workspace, source_path)
+            .await
+            .map_err(|_| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "complete report template source is unavailable",
+                )
+            })?;
+        let source = std::str::from_utf8(&source).map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "complete report template source is not UTF-8",
+            )
+        })?;
+        commands.extend(front_matter::legacy::commands(source));
+    }
+    let overrides = state
+        .front_matter
+        .single_source_values(paper_id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let automatic = state
+        .front_matter
+        .legacy_automatic_values(
+            paper_id,
+            overrides
+                .get("guide_identity")
+                .and_then(serde_json::Value::as_str),
+            overrides
+                .get("dean_identity")
+                .and_then(serde_json::Value::as_str),
+        )
+        .await
+        .map_err(front_matter_repository_error)?;
+    let mut fields = BTreeMap::new();
+    let mut values = BTreeMap::new();
+    let mut missing = BTreeSet::new();
+    for (command, source, label, editable) in front_matter::legacy::REGISTRY {
+        if !commands.contains(*command) {
+            continue;
+        }
+        let key = source.replace('.', "_");
+        let value = overrides
+            .get(&key)
+            .cloned()
+            .or_else(|| automatic.get(*source).cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let source_name = if overrides.contains_key(&key) {
+            "TEAM_OVERRIDE"
+        } else {
+            "AUTO"
+        };
+        let resolved = value.as_str().is_some_and(|value| !value.trim().is_empty());
+        if !resolved {
+            missing.insert(key.clone());
+        }
+        if *command == "projguidename" || *command == "projguidedesignation" {
+            let options = automatic
+                .get("guide.options")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let selection_required =
+                !resolved && options.as_array().is_some_and(|options| options.len() > 1);
+            fields.entry("guide_identity".to_owned()).or_insert_with(|| serde_json::json!({
+                "key":"guide_identity","label":"Project guide selection","type":"TEXT","required":selection_required,"source":null,"allow_team_override":true,"options":options
+            }));
+            values.entry("guide_identity".to_owned()).or_insert_with(|| serde_json::json!({"field_key":"guide_identity","value":overrides.get("guide_identity").cloned().unwrap_or(serde_json::Value::Null),"value_source":"TEAM_OVERRIDE"}));
+        } else if *command == "deanname" {
+            let options = automatic
+                .get("dean.options")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let selection_required =
+                !resolved && options.as_array().is_some_and(|options| options.len() > 1);
+            fields.entry("dean_identity".to_owned()).or_insert_with(|| serde_json::json!({
+                "key":"dean_identity","label":"Dean selection","type":"TEXT","required":selection_required,"source":null,"allow_team_override":true,"options":options
+            }));
+            values.entry("dean_identity".to_owned()).or_insert_with(|| serde_json::json!({"field_key":"dean_identity","value":overrides.get("dean_identity").cloned().unwrap_or(serde_json::Value::Null),"value_source":"TEAM_OVERRIDE"}));
+        }
+        fields.entry(key.clone()).or_insert_with(|| serde_json::json!({
+                "key":key,
+                "label":label,
+                "type":if *source == "submission_date" { "DATE" } else { "TEXT" },
+                "required":true,
+                "source":source,
+                "allow_team_override":*editable && !matches!(*source, "guide.name" | "guide.designation" | "dean.name"),
+            }));
+        values.entry(key.clone()).or_insert_with(
+            || serde_json::json!({"field_key":key,"value":value,"value_source":source_name}),
+        );
+    }
+    let missing = missing.into_iter().collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "template_arrangement":"SINGLE_SOURCE",
+        "single_source":true,
+        "pack_id":null,
+        "pack_name":"Complete report template",
+        "status":if missing.is_empty() { "READY" } else { "NEEDS_INFORMATION" },
+        "missing_required_fields":missing,
+        "warnings":[],
+        "manifest":{"schema_version":2,"sections":[],"fields":fields.into_values().collect::<Vec<_>>()},
+        "values":values.into_values().collect::<Vec<_>>(),
+        "sections":[],
+    }))
+}
+
 async fn validate_legacy_input(
     state: &AppState,
     paper_id: uuid::Uuid,
@@ -3960,6 +4174,10 @@ async fn validate_legacy_input(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "document details retain one authorization and persistence boundary for legacy packs and complete reports"
+)]
 async fn v2_save_document_details(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3989,6 +4207,101 @@ async fn v2_save_document_details(
         }
         Err(error_value) => return front_matter_repository_error(error_value),
     };
+    if state
+        .front_matter
+        .paper_template_arrangement(paper_id)
+        .await
+        .is_ok_and(|(arrangement, _)| arrangement == "SINGLE_SOURCE")
+    {
+        let source_detail = match single_source_document_details(&state, paper_id, &detail).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let fields = source_detail["manifest"]["fields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let allowed = fields
+            .iter()
+            .filter_map(|field| Some((field["key"].as_str()?.to_owned(), field.clone())))
+            .collect::<BTreeMap<_, _>>();
+        for (key, value) in &input.values {
+            let Some(field) = allowed.get(key) else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Unknown complete report metadata field",
+                );
+            };
+            if field["allow_team_override"] != serde_json::Value::Bool(true) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Automatically resolved complete report metadata cannot be overridden",
+                );
+            }
+            if matches!(key.as_str(), "guide_identity" | "dean_identity")
+                && value.as_str().is_some_and(|value| !value.is_empty())
+                && !field["options"].as_array().is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|option| option.get("value") == Some(value))
+                })
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Choose an applicable institutional identity",
+                );
+            }
+        }
+        let mut submitted = BTreeMap::new();
+        if let Some(items) = source_detail["values"].as_array() {
+            for item in items {
+                if let (Some(key), Some(value)) =
+                    (item["field_key"].as_str(), item.get("value").cloned())
+                {
+                    submitted.insert(key.to_owned(), value);
+                }
+            }
+        }
+        submitted.extend(input.values.clone());
+        if let (Some(semester), Some(submission_date)) = (
+            submitted
+                .get("team_semester")
+                .and_then(serde_json::Value::as_str),
+            submitted
+                .get("submission_date")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            if let Err(value) = front_matter::legacy::derive_semester_metadata(
+                semester,
+                submission_date,
+                submitted
+                    .get("team_academic_year")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                return error(StatusCode::BAD_REQUEST, value.to_string());
+            }
+        }
+        let version = match state
+            .front_matter
+            .save_single_source_values(principal.user_id(), paper_id, &input.values)
+            .await
+        {
+            Ok(value) => value,
+            Err(error_value) => return front_matter_repository_error(error_value),
+        };
+        let refreshed = match single_source_document_details(&state, paper_id, &detail).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        return Json(serde_json::json!({
+            "paper_team_id":paper_id,
+            "workspace_version":version,
+            "status":refreshed["status"],
+            "missing_required_fields":refreshed["missing_required_fields"],
+            "auto_build_required":false,
+        }))
+        .into_response();
+    }
     let Some(pack_id) = detail
         .get("pack_id")
         .and_then(serde_json::Value::as_str)
@@ -4871,6 +5184,59 @@ async fn v2_writer_papers(State(state): State<AppState>, headers: HeaderMap) -> 
     };
     match state.v2.writer_papers(principal.user_id()).await {
         Ok(papers) => Json(papers).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_team_chats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.team_chat_teams(principal.user_id()).await {
+        Ok(teams) => Json(teams).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_team_chat_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(team_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match v2_paper_reader_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .team_chat_messages(principal.user_id(), team_id)
+        .await
+    {
+        Ok(messages) => Json(messages).into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+async fn v2_send_team_chat_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(team_id): Path<uuid::Uuid>,
+    Json(input): Json<TeamChatInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match v2_paper_reader_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state
+        .v2
+        .send_team_chat_message(principal.user_id(), team_id, &input.body)
+        .await
+    {
+        Ok(message) => (StatusCode::CREATED, Json(message)).into_response(),
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -6025,6 +6391,130 @@ async fn capture_exact_v2_state(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "compile-only binding keeps snapshot validation, metadata resolution, and immutable blob construction together"
+)]
+async fn prepare_single_source_compile_snapshot(
+    state: &AppState,
+    paper: &persistence::WriterPaper,
+    exact: &mut ExactV2State,
+) -> Result<(), Response> {
+    let arrangement = state
+        .front_matter
+        .paper_template_arrangement(paper.id)
+        .await
+        .map_err(front_matter_repository_error)?
+        .0;
+    if arrangement != "SINGLE_SOURCE" {
+        return Ok(());
+    }
+    let workspace: WorkspaceManifestV1 =
+        serde_json::from_value(exact.manifest.get("workspace").cloned().ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "compile snapshot has no workspace manifest",
+            )
+        })?)
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "compile snapshot has an invalid workspace manifest",
+            )
+        })?;
+    let main_path = workspace.main_file().clone();
+    let source_workspace = serde_json::to_value(&workspace).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "single-source source manifest serialization failed",
+        )
+    })?;
+    let main_entry = workspace.files().get(&main_path).ok_or_else(|| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "compile snapshot has no main file",
+        )
+    })?;
+    let main = state.blobs.get(main_entry.blob_hash).await.map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "single-source main file is unavailable",
+        )
+    })?;
+    let overrides = state
+        .front_matter
+        .single_source_values(paper.id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let automatic = state
+        .front_matter
+        .legacy_automatic_values(
+            paper.id,
+            overrides
+                .get("guide_identity")
+                .and_then(serde_json::Value::as_str),
+            overrides
+                .get("dean_identity")
+                .and_then(serde_json::Value::as_str),
+        )
+        .await
+        .map_err(front_matter_repository_error)?;
+    let mut values = automatic;
+    for (_, source, _, _) in front_matter::legacy::REGISTRY {
+        let key = source.replace('.', "_");
+        if let Some(value) = overrides.get(&key) {
+            values.insert((*source).to_owned(), value.clone());
+        }
+    }
+    let bound = front_matter::bind_single_source_values(&main, &values).map_err(|value| {
+        error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Complete report template metadata compatibility: {value}"),
+        )
+    })?;
+    let stored = state.blobs.put(bound).await.map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "single-source binding storage failure",
+        )
+    })?;
+    let mut files = workspace.files().clone();
+    files.insert(
+        main_path.clone(),
+        FileEntryV1 {
+            blob_hash: stored.hash(),
+            size_bytes: stored.size_bytes(),
+        },
+    );
+    let compile_manifest = WorkspaceManifestV1::new(main_path, files).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "single-source compile manifest is invalid",
+        )
+    })?;
+    let snapshot_id = state
+        .workspaces
+        .store_compile_snapshot(&compile_manifest)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "single-source compile snapshot storage failure",
+            )
+        })?;
+    exact.manifest["workspace"] = serde_json::to_value(&compile_manifest).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "single-source compile manifest serialization failed",
+        )
+    })?;
+    exact.manifest["source_workspace"] = source_workspace;
+    exact.snapshot_id = snapshot_id;
+    exact.state_hash = snapshot_id.to_hex();
+    tracing::info!(paper_id=%paper.id, snapshot_id=%snapshot_id, "single-source compile snapshot prepared");
+    Ok(())
+}
+
 async fn v2_create_checkpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6539,10 +7029,14 @@ async fn v2_submit_build(
             return error(StatusCode::FORBIDDEN, "Writer or assigned Mentor required");
         }
     };
-    let exact = match capture_exact_v2_state(&state, &paper).await {
+    let mut exact = match capture_exact_v2_state(&state, &paper).await {
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Err(response) = prepare_single_source_compile_snapshot(&state, &paper, &mut exact).await
+    {
+        return response;
+    }
     let engine = TexEngine::PdfLatex;
     let profile = LatexmkProfileId::parse("safe-v1").expect("static profile is valid");
     let compile_key = match CompileKeyMaterialV1::new(
@@ -6595,7 +7089,7 @@ async fn v2_build_status(
         Ok(view) => Json(serde_json::json!({
             "build": view,
             "pdf_url": view.current_build_id.map(|_| format!("/api/v2/papers/{paper_id}/artifacts/pdf")),
-            "log_url": view.current_build_id.map(|_| format!("/api/v2/papers/{paper_id}/artifacts/log")),
+            "log_url": view.latest_build_id.map(|build| format!("/api/v2/papers/{paper_id}/artifacts/log?build={build}")),
             "synctex_url": view.current_build_id.map(|_| format!("/api/v2/papers/{paper_id}/artifacts/synctex")),
         })).into_response(),
         Err(error_value) => v2_error(error_value),
@@ -6635,7 +7129,7 @@ async fn v2_current_artifact(
                         header::CONTENT_DISPOSITION,
                         format!(
                             "{}; filename=\"{}\"",
-                            if kind == "pdf" {
+                            if kind == "pdf" && !query.download {
                                 "inline"
                             } else {
                                 "attachment"
@@ -6661,8 +7155,192 @@ async fn v2_current_artifact(
 }
 
 #[derive(Deserialize)]
+struct SourcePositionQuery {
+    file: String,
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
+async fn v2_source_position(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((paper_id, build_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Query(query): Query<SourcePositionQuery>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let line = match query.line {
+        Some(value) if value > 0 => value,
+        _ => return error(StatusCode::BAD_REQUEST, "line must be positive"),
+    };
+    let column = query.column.unwrap_or(0);
+    if column > 1_000_000 {
+        return error(StatusCode::BAD_REQUEST, "column is out of range");
+    }
+    let path = match LogicalPath::parse(&query.file) {
+        Ok(value) if value.file_name().to_ascii_lowercase().ends_with(".tex") => value,
+        Ok(_) => return error(StatusCode::BAD_REQUEST, "file must be a TeX source path"),
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "file must be a relative source path",
+            );
+        }
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let files = match state.v2.visible_paper_files(paper.workspace_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    if !files.iter().any(|file| file.path == path) {
+        return error(StatusCode::NOT_FOUND, "source file not found");
+    }
+    let build = match state.v2.v2_build_view(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let exact = build.current_build_id == Some(build_id)
+        && build.source_sequence == build.current_source_sequence
+        && build.desired_state_hash == build.current_state_hash;
+    if !exact {
+        return error(
+            StatusCode::CONFLICT,
+            "PDF is stale; compile current source to synchronize PDF",
+        );
+    }
+    let artifact = match state
+        .v2
+        .v2_artifact_for_build(principal.user_id(), paper_id, build_id, "synctex")
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "source position unavailable"),
+    };
+    let bytes = match state.blobs.get(artifact.blob_hash).await {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact storage failure",
+            );
+        }
+    };
+    let index = match compiler::SyncTexIndex::from_gzip(&bytes) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::NOT_FOUND, "source position unavailable"),
+    };
+    let Some(location) = index.forward(path.as_str(), line, column) else {
+        return error(StatusCode::NOT_FOUND, "source position unavailable");
+    };
+    Json(serde_json::json!({
+        "build_id": build_id,
+        "file": path,
+        "line": line,
+        "page": location.page,
+        "x": location.x,
+        "y": location.y,
+        "width": location.width,
+        "height": location.height,
+        "exact": location.exact,
+        "mapped_line": location.line,
+        "mapped_column": location.column,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
 struct ArtifactQuery {
     build: Option<uuid::Uuid>,
+    #[serde(default)]
+    download: bool,
+}
+
+#[derive(Deserialize)]
+struct RuntimeLogsQuery {
+    limit: Option<usize>,
+    service: Option<String>,
+    query: Option<String>,
+}
+
+fn runtime_log_command(project: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    let output = Command::new("docker")
+        .args(args)
+        .env("COMPOSE_PROJECT_NAME", project)
+        .output()
+        .map_err(|error| format!("runtime log command unavailable: {error}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+async fn admin_runtime_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(input): Query<RuntimeLogsQuery>,
+) -> Response {
+    if let Err(response) = admin_session(&state, &headers).await {
+        return response;
+    }
+    let limit = input.limit.unwrap_or(100).clamp(1, 100);
+    let project = env::var("LATEX_CORE_COMPOSE_PROJECT").unwrap_or_else(|_| "latex-core".into());
+    let service_filter = input.service.filter(|value| !value.trim().is_empty());
+    let query = input.query.filter(|value| !value.trim().is_empty());
+    let result = tokio::task::spawn_blocking(move || {
+        let listing = runtime_log_command(
+            &project,
+            &[
+                "ps", "-a", "--filter",
+                &format!("label=com.docker.compose.project={project}"),
+                "--format", "{{.ID}}\t{{.Label \"com.docker.compose.service\"}}",
+            ],
+        )?;
+        let mut records = Vec::new();
+        let mut services = BTreeSet::new();
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            let Some((container, service)) = line.split_once('\t') else { continue };
+            services.insert(service.to_owned());
+            if service_filter.as_deref().is_some_and(|wanted| wanted != service) { continue; }
+            let logs = runtime_log_command(&project, &["logs", "--timestamps", container])?;
+            let mut current: Option<(String, String)> = None;
+            for log_line in String::from_utf8_lossy(&logs.stdout).lines() {
+                let timestamped = log_line.split_once(' ').filter(|(prefix, _)| prefix.contains('T'));
+                if let Some((timestamp, message)) = timestamped {
+                    if let Some((old_timestamp, old_message)) = current.take() {
+                        if query.as_deref().is_none_or(|needle| old_message.to_lowercase().contains(&needle.to_lowercase())) {
+                            records.push(serde_json::json!({"timestamp": old_timestamp, "service": service, "container": container, "message": old_message}));
+                        }
+                    }
+                    current = Some((timestamp.to_owned(), message.to_owned()));
+                } else if let Some((_, message)) = current.as_mut() {
+                    message.push('\n');
+                    message.push_str(log_line);
+                }
+            }
+            if let Some((timestamp, message)) = current {
+                if query.as_deref().is_none_or(|needle| message.to_lowercase().contains(&needle.to_lowercase())) {
+                    records.push(serde_json::json!({"timestamp": timestamp, "service": service, "container": container, "message": message}));
+                }
+            }
+        }
+        records.sort_by(|left, right| right["timestamp"].as_str().cmp(&left["timestamp"].as_str()));
+        records.truncate(limit);
+        Ok::<_, String>(serde_json::json!({"records": records, "services": services, "next_cursor": null, "retention": "Search available retained container logs"}))
+    }).await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(message)) => error(StatusCode::SERVICE_UNAVAILABLE, message),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime log inspection unavailable",
+        ),
+    }
 }
 
 fn default_manual_trigger() -> String {
@@ -6777,35 +7455,10 @@ async fn template_seeds(
             record.blob_hash,
             record.size_bytes
         );
-        let (blob_hash, size_bytes) = if template.front_matter_arrangement == "SINGLE_SOURCE"
-            && path == main_path
-        {
-            let original = state.blobs.get(record.blob_hash).await.map_err(|_| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "template blob storage failure",
-                )
-            })?;
-            let bound = front_matter::bind_single_source(&original, &main_path).map_err(|_| {
-                error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Single-source template requires known institutional macro declarations followed by the exact LATEX_CORE_SINGLE_SOURCE_BINDINGS marker before \\begin{document}.",
-                )
-            })?;
-            let stored = state.blobs.put(bound).await.map_err(|_| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "template materialization storage failure",
-                )
-            })?;
-            (stored.hash(), stored.size_bytes())
-        } else {
-            (record.blob_hash, record.size_bytes)
-        };
         seeds.push(TemplateSeedFile {
             path,
-            blob_hash,
-            size_bytes,
+            blob_hash: record.blob_hash,
+            size_bytes: record.size_bytes,
             policy,
         });
     }
@@ -6923,7 +7576,8 @@ fn v2_error(error_value: V2Error) -> Response {
         V2Error::InvalidRole { .. }
         | V2Error::InvalidStatus { .. }
         | V2Error::InvalidPath { .. }
-        | V2Error::InvalidName => error(StatusCode::BAD_REQUEST, error_value.to_string()),
+        | V2Error::InvalidName
+        | V2Error::InvalidChatMessage => error(StatusCode::BAD_REQUEST, error_value.to_string()),
         V2Error::Integrity { .. } | V2Error::Database(_) => {
             error(StatusCode::INTERNAL_SERVER_ERROR, "V2 persistence failure")
         }
@@ -7205,6 +7859,28 @@ async fn admin_templates(State(state): State<AppState>, headers: HeaderMap) -> R
     }
     Json(response).into_response()
 }
+
+fn complete_report_candidates(imported: &archive::ImportedArchive) -> Vec<LogicalPath> {
+    imported
+        .files
+        .iter()
+        .filter(|file| {
+            file.path.extension() == Some("tex")
+                && front_matter::single_source_compatible(&file.bytes)
+        })
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn recommended_template_main(imported: &archive::ImportedArchive) -> Option<LogicalPath> {
+    let candidates = complete_report_candidates(imported);
+    match candidates.as_slice() {
+        [only] => Some(only.clone()),
+        [] => imported.detected_main.clone(),
+        _ => None,
+    }
+}
+
 async fn admin_v2_template_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7234,15 +7910,18 @@ async fn admin_v2_template_preview(
             "template archive contains no TeX file",
         );
     }
+    let detected_main = recommended_template_main(&imported);
     Json(serde_json::json!({
         "schema_version": 1,
-        "detected_main": imported.detected_main.as_ref().map(LogicalPath::as_str),
+        "detected_main": detected_main.as_ref().map(LogicalPath::as_str),
         "files": imported.files.iter().map(|file| serde_json::json!({
             "path": file.path.as_str(),
             "size_bytes": file.bytes.len(),
             "is_tex": file.path.extension() == Some("tex"),
             "front_matter_compatible": file.path.extension() == Some("tex")
                 && front_matter::main_template_compatible(&file.bytes),
+            "single_source_compatible": file.path.extension() == Some("tex")
+                && front_matter::single_source_compatible(&file.bytes),
         })).collect::<Vec<_>>(),
     }))
     .into_response()
@@ -7300,31 +7979,45 @@ async fn admin_v2_template_import(
             "template archives cannot own the managed Front Matter subtree",
         );
     }
-    let main = match upload.main.as_deref().filter(|value| !value.is_empty()) {
+    let complete_candidates = complete_report_candidates(&imported);
+    let mut binding_warning = None;
+    let selected_main = match upload.main.as_deref().filter(|value| !value.is_empty()) {
         Some(value) => match LogicalPath::parse(value) {
-            Ok(path) => path,
+            Ok(path) => Some(path),
             Err(_) => return error(StatusCode::BAD_REQUEST, "invalid template main path"),
         },
-        None => {
-            if let Some(path) = imported.detected_main.clone() {
-                path
-            } else {
-                if !imported
-                    .files
-                    .iter()
-                    .any(|file| file.path.extension() == Some("tex"))
-                {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "template archive contains no TeX file",
-                    );
-                }
-                return error(
-                    StatusCode::CONFLICT,
-                    "select a main TeX file for this template",
-                );
-            }
+        None => None,
+    };
+    let main = if let Some(selected) = selected_main {
+        let selected_is_complete = complete_candidates.iter().any(|path| path == &selected);
+        if selected_is_complete || complete_candidates.len() != 1 {
+            selected
+        } else {
+            let recovered = complete_candidates[0].clone();
+            binding_warning = Some(format!(
+                "Selected Main {} is not a compatible complete report; recovered to the only safe complete report candidate {}.",
+                selected.as_str(),
+                recovered.as_str()
+            ));
+            recovered
         }
+    } else if let Some(path) = recommended_template_main(&imported) {
+        path
+    } else {
+        if !imported
+            .files
+            .iter()
+            .any(|file| file.path.extension() == Some("tex"))
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "template archive contains no TeX file",
+            );
+        }
+        return error(
+            StatusCode::CONFLICT,
+            "select a main TeX file for this template",
+        );
     };
     if main.extension() != Some("tex") || !imported.files.iter().any(|file| file.path == main) {
         return error(
@@ -7345,7 +8038,9 @@ async fn admin_v2_template_import(
     let arrangement = upload
         .arrangement
         .as_deref()
-        .unwrap_or(if front_matter_compatible {
+        .unwrap_or(if single_source_compatible {
+            "SINGLE_SOURCE"
+        } else if front_matter_compatible {
             "SEPARATE_FILES"
         } else {
             "REPORT_CONTENT_ONLY"
@@ -7360,6 +8055,12 @@ async fn admin_v2_template_import(
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Separate-file Front Matter requires the verified LATEX_CORE_FRONT_MATTER input marker in Main.",
+        );
+    }
+    if arrangement == "SINGLE_SOURCE" && !single_source_compatible {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Complete report template metadata compatibility: select a source with exactly one uncommented \\begin{document} and a recognized institutional macro declaration before it, or use the exact LATEX_CORE_SINGLE_SOURCE_BINDINGS marker before the document.",
         );
     }
     let mut records = Vec::with_capacity(imported.files.len());
@@ -7416,9 +8117,10 @@ async fn admin_v2_template_import(
                     "name": name,
                     "description": description,
                     "main_file": main.as_str(),
-                    "front_matter_compatible": arrangement == "SEPARATE_FILES",
+                    "front_matter_compatible": front_matter_compatible,
                     "front_matter_arrangement": arrangement,
-                    "binding_warning": if arrangement == "SINGLE_SOURCE" && !single_source_compatible { Some("Unsupported single-source structure: declare a known institutional macro, then place the exact LATEX_CORE_SINGLE_SOURCE_BINDINGS marker before \\begin{document}.") } else { None },
+                    "single_source_compatible": single_source_compatible,
+                    "binding_warning": binding_warning,
                     "source_identity": digest(&identity_material),
                     "files": records.iter().map(|file| serde_json::json!({
                         "path": file.path,
@@ -7567,8 +8269,11 @@ async fn admin_v2_template_edit(
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failure"),
     };
     let compatible = front_matter::main_template_compatible(&main_bytes);
+    let single_source_compatible = front_matter::single_source_compatible(&main_bytes);
     let arrangement = if input.front_matter_arrangement.is_empty() {
-        if compatible {
+        if single_source_compatible {
+            "SINGLE_SOURCE"
+        } else if compatible {
             "SEPARATE_FILES"
         } else {
             "REPORT_CONTENT_ONLY"
@@ -7586,6 +8291,12 @@ async fn admin_v2_template_edit(
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Separate-file Front Matter requires the verified LATEX_CORE_FRONT_MATTER input marker in Main.",
+        );
+    }
+    if arrangement == "SINGLE_SOURCE" && !single_source_compatible {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Complete report template metadata compatibility: the selected main source has no safe binding point.",
         );
     }
     match state
@@ -10144,8 +10855,7 @@ async fn principal_kind_for_user(
 
 const fn landing_path(kind: PrincipalKind) -> &'static str {
     match kind {
-        PrincipalKind::V2(GlobalRole::Writer) => "/write",
-        PrincipalKind::V2(GlobalRole::Mentor) => "/review",
+        PrincipalKind::V2(GlobalRole::Writer | GlobalRole::Mentor) => "/home",
         PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => {
             "/admin"
         }
@@ -10352,6 +11062,34 @@ fn writer_html() -> &'static str {
     include_str!("write.html")
 }
 
+fn home_html(role: GlobalRole) -> String {
+    let (title, intro, cta, cta_href) = match role {
+        GlobalRole::Mentor => (
+            "Review Workspace",
+            "Open an assigned report to review its source, PDF, and feedback.",
+            "Open Review",
+            "/review",
+        ),
+        GlobalRole::Writer => (
+            "Your Projects",
+            "Open a report to continue writing or reviewing.",
+            "Open Writer",
+            "/write",
+        ),
+        GlobalRole::Admin => unreachable!("admin users do not render the shared home"),
+    };
+    include_str!("home.html")
+        .replace("{{HOME_ROLE}}", role.as_str())
+        .replace("{{HOME_TITLE}}", title)
+        .replace("{{HOME_INTRO}}", intro)
+        .replace("{{HOME_CTA}}", cta)
+        .replace("{{HOME_CTA_HREF}}", cta_href)
+}
+
+fn team_chat_html() -> &'static str {
+    include_str!("team_chat.html")
+}
+
 fn mentor_html() -> &'static str {
     include_str!("review.html")
 }
@@ -10414,6 +11152,51 @@ async fn admin_ui(State(state): State<AppState>, headers: HeaderMap) -> Response
 
 async fn writer_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
     role_ui(&state, &headers, GlobalRole::Writer, writer_html()).await
+}
+
+async fn home_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match principal_auth_allow_temporary(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
+        Err(response) => return response,
+    };
+    if principal.session.must_change_password {
+        return redirect_with_cookies("/change-password", HeaderMap::new());
+    }
+    match principal.kind {
+        PrincipalKind::V2(role @ (GlobalRole::Writer | GlobalRole::Mentor)) => {
+            Html(home_html(role)).into_response()
+        }
+        PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => {
+            redirect_with_cookies("/admin", HeaderMap::new())
+        }
+        PrincipalKind::Legacy(_) => error(StatusCode::FORBIDDEN, "V2 Writer or Mentor required"),
+    }
+}
+
+async fn team_chat_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match principal_auth_allow_temporary(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Html(login_html(None)).into_response();
+        }
+        Err(response) => return response,
+    };
+    if principal.session.must_change_password {
+        return redirect_with_cookies("/change-password", HeaderMap::new());
+    }
+    match principal.kind {
+        PrincipalKind::V2(GlobalRole::Writer | GlobalRole::Mentor) => {
+            Html(team_chat_html()).into_response()
+        }
+        PrincipalKind::V2(GlobalRole::Admin) | PrincipalKind::Legacy(AccountType::Admin) => error(
+            StatusCode::FORBIDDEN,
+            "Team chat is available only to assigned Writers and Mentors",
+        ),
+        PrincipalKind::Legacy(_) => error(StatusCode::FORBIDDEN, "V2 Writer or Mentor required"),
+    }
 }
 
 async fn mentor_ui(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -10518,6 +11301,38 @@ async fn writer_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../static/writer.js"),
+    )
+        .into_response()
+}
+
+async fn theme_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/theme.js"),
+    )
+        .into_response()
+}
+
+async fn home_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/home.js"),
+    )
+        .into_response()
+}
+
+async fn home_preview_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../frontend/home-preview.mjs"),
+    )
+        .into_response()
+}
+
+async fn team_chat_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/team-chat.js"),
     )
         .into_response()
 }
@@ -10838,8 +11653,8 @@ mod database_tests {
         let legacy_professor = fixture(&app, &database, "professor", None).await;
         let legacy_admin = fixture(&app, &database, "admin", None).await;
 
-        assert_login_redirect(&app, &writer.email, "/write").await;
-        assert_login_redirect(&app, &mentor.email, "/review").await;
+        assert_login_redirect(&app, &writer.email, "/home").await;
+        assert_login_redirect(&app, &mentor.email, "/home").await;
         assert_login_redirect(&app, &admin.email, "/admin").await;
         assert_login_redirect(&app, &legacy_student.email, "/account-setup").await;
         assert_login_redirect(&app, &legacy_professor.email, "/account-setup").await;
@@ -11057,7 +11872,7 @@ mod database_tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        assert_login_redirect(&app, &legacy_student.email, "/write").await;
+        assert_login_redirect(&app, &legacy_student.email, "/home").await;
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM latex_core.global_user_roles WHERE user_id IN ((SELECT user_id FROM latex_core.user_credentials WHERE email=$1),(SELECT user_id FROM latex_core.user_credentials WHERE email=$2))")
             .bind(&legacy_professor.email).bind(&legacy_admin.email).fetch_one(&pool).await.unwrap(), 0);
 
@@ -11126,7 +11941,7 @@ mod database_tests {
         )
         .await;
         assert_eq!(changed.status(), StatusCode::SEE_OTHER);
-        assert_eq!(changed.headers()[header::LOCATION], "/write");
+        assert_eq!(changed.headers()[header::LOCATION], "/home");
         let active_cookie = response_cookie(&changed);
         assert_eq!(
             get(&app, "/write", Some(&active_cookie)).await.status(),
@@ -11149,7 +11964,7 @@ mod database_tests {
         );
         let permanent_login = login_request(&app, &email, new_password).await;
         assert_eq!(permanent_login.status(), StatusCode::SEE_OTHER);
-        assert_eq!(permanent_login.headers()[header::LOCATION], "/write");
+        assert_eq!(permanent_login.headers()[header::LOCATION], "/home");
 
         pool.close().await;
         database.close().await;
@@ -11962,6 +12777,481 @@ mod database_tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+
+        let complete_report = test_zip(&[
+            (
+                "wrapper/Full_Report_v1.0.tex",
+                b"\\documentclass{report}\n\\newcommand{\\thesistitle}{Title}\n\\begin{document}Complete report\\end{document}",
+            ),
+            (
+                "wrapper/thesis.tex",
+                b"\\documentclass{report}\\begin{document}Body only\\end{document}",
+            ),
+            ("wrapper/VITSCOPEThesis.cls", b"class"),
+            ("wrapper/acronym.tex", b"acronyms"),
+            ("wrapper/chapters/chapter1.tex", b"chapter"),
+            ("wrapper/references.bib", b"@book{x,title={X}}"),
+            ("wrapper/Full_Report_v1.0.aux", b"stale aux"),
+            ("wrapper/Full_Report_v1.0.log", b"stale log"),
+            ("wrapper/Full_Report_v1.0.synctex.gz", b"stale synctex"),
+            ("wrapper/Full_Report_v1.0.bbl", b"retained bbl"),
+            ("wrapper/images/sample-graph.pdf", b"source pdf"),
+        ]);
+        let (preview_body, preview_type) = template_multipart(&[], &complete_report);
+        let preview = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/preview",
+                Some(&admin.cookie),
+                preview_body,
+                Some(&preview_type),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(preview["detected_main"], "wrapper/Full_Report_v1.0.tex");
+        assert_eq!(preview["files"].as_array().unwrap().len(), 8);
+
+        let (import_body, import_type) = template_multipart(
+            &[
+                ("name", "Recovered complete report"),
+                ("main", "wrapper/thesis.tex"),
+                ("arrangement", "SINGLE_SOURCE"),
+            ],
+            &complete_report,
+        );
+        let recovered = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/import",
+                Some(&admin.cookie),
+                import_body,
+                Some(&import_type),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(recovered["main_file"], "wrapper/Full_Report_v1.0.tex");
+        assert_eq!(recovered["front_matter_arrangement"], "SINGLE_SOURCE");
+        assert!(
+            recovered["binding_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("recovered"))
+        );
+        let recovered_paths = recovered["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(recovered_paths.contains(&"wrapper/Full_Report_v1.0.bbl"));
+        assert!(recovered_paths.contains(&"wrapper/images/sample-graph.pdf"));
+        assert!(!recovered_paths.iter().any(|path| path.ends_with(".aux")));
+        assert!(!recovered_paths.iter().any(|path| path.ends_with(".log")));
+        assert!(
+            !recovered_paths
+                .iter()
+                .any(|path| path.ends_with(".synctex.gz"))
+        );
+
+        let two_complete_reports = test_zip(&[
+            (
+                "one.tex",
+                b"\\newcommand{\\thesistitle}{One}\\begin{document}One\\end{document}",
+            ),
+            (
+                "two.tex",
+                b"\\newcommand{\\thesistitle}{Two}\\begin{document}Two\\end{document}",
+            ),
+        ]);
+        let (preview_body, preview_type) = template_multipart(&[], &two_complete_reports);
+        let preview = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/preview",
+                Some(&admin.cookie),
+                preview_body,
+                Some(&preview_type),
+            )
+            .await,
+        )
+        .await;
+        assert!(preview["detected_main"].is_null());
+        let (import_body, import_type) = template_multipart(
+            &[("name", "Ambiguous complete reports")],
+            &two_complete_reports,
+        );
+        assert_eq!(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/templates/import",
+                Some(&admin.cookie),
+                import_body,
+                Some(&import_type),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn single_source_compile_snapshot_keeps_writer_history_and_review_source_original() {
+        use core_types::WorkerId;
+
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let archive = test_zip(&[
+            (
+                "project.tex",
+                include_bytes!("../tests/fixtures/vit-complete-report/project.tex"),
+            ),
+            (
+                "chapters/body.tex",
+                include_bytes!("../tests/fixtures/vit-complete-report/chapters/body.tex"),
+            ),
+            (
+                "acronym.tex",
+                include_bytes!("../tests/fixtures/vit-complete-report/acronym.tex"),
+            ),
+            (
+                "vit-report.cls",
+                include_bytes!("../tests/fixtures/vit-complete-report/vit-report.cls"),
+            ),
+            (
+                "images/synthetic-logo.svg",
+                include_bytes!("../tests/fixtures/vit-complete-report/images/synthetic-logo.svg"),
+            ),
+        ]);
+        let (body, content_type) = template_multipart(
+            &[
+                ("name", "Synthetic complete report"),
+                ("main", "project.tex"),
+                ("arrangement", "SINGLE_SOURCE"),
+            ],
+            &archive,
+        );
+        let imported = request_bytes(
+            &app,
+            Method::POST,
+            "/api/admin/v2/templates/import",
+            Some(&admin.cookie),
+            body,
+            Some(&content_type),
+        )
+        .await;
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let imported = test_json(imported).await;
+        assert_eq!(imported["front_matter_arrangement"], "SINGLE_SOURCE");
+        let template_id = imported["id"].as_str().unwrap();
+        let team = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/admin/v2/paper-teams",
+                Some(&admin.cookie),
+                &serde_json::json!({
+                    "name":"Compile snapshot invariant",
+                    "writer_ids":[writer_id],
+                    "leader_writer_id":writer_id,
+                    "mentor_ids":[mentor_id],
+                    "template_id":template_id,
+                })
+                .to_string(),
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = uuid::Uuid::parse_str(team["team"]["id"].as_str().unwrap()).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(team["team"]["workspace_id"].as_str().unwrap()).unwrap(),
+        );
+        let source_path = LogicalPath::parse("project.tex").unwrap();
+        let source = state
+            .workspaces
+            .read_file(workspace_id, &source_path)
+            .await
+            .unwrap();
+        let source_checkpoint = state.workspaces.force_snapshot(workspace_id).await.unwrap();
+        let source_version = source_checkpoint.workspace_version().get();
+        let jobs_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let versions_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.paper_versions WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let detail_path = format!("/api/v2/papers/{paper_id}/document-details");
+        let detail = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        assert_eq!(detail["single_source"], true);
+        assert!(detail["pack_id"].is_null());
+        assert_eq!(detail["status"], "NEEDS_INFORMATION");
+        let saved = test_json(
+            request(
+                &app,
+                Method::PUT,
+                &detail_path,
+                Some(&writer.cookie),
+                r#"{"values":{"school_name":"School One"},"sections":{}}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(saved["workspace_version"], source_version);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1",
+            )
+            .bind(workspace_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            jobs_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM latex_core.paper_versions WHERE workspace_id=$1",
+            )
+            .bind(workspace_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            versions_before
+        );
+        assert_eq!(
+            state
+                .workspaces
+                .read_file(workspace_id, &source_path)
+                .await
+                .unwrap(),
+            source
+        );
+
+        let build_path = format!("/api/v2/papers/{paper_id}/builds");
+        let first = test_json(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&writer.cookie),
+                r#"{"trigger_type":"manual"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let first_build = uuid::Uuid::parse_str(first["build_id"].as_str().unwrap()).unwrap();
+        let worker = WorkerId::new();
+        let claimed = state.queue.claim(worker).await.unwrap().unwrap();
+        assert_eq!(*claimed.id.as_uuid(), first_build);
+        assert_ne!(claimed.snapshot_id, source_checkpoint.snapshot_id());
+        let compile_manifest_hash: String = sqlx::query_scalar(
+            "SELECT manifest_blob_hash FROM latex_core.snapshots WHERE snapshot_id=$1",
+        )
+        .bind(claimed.snapshot_id.to_hex())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let compile_manifest: WorkspaceManifestV1 = serde_json::from_slice(
+            &state
+                .blobs
+                .get(core_types::BlobHash::from_str(&compile_manifest_hash).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let compiled_main = state
+            .blobs
+            .get(compile_manifest.files()[&source_path].blob_hash)
+            .await
+            .unwrap();
+        let compiled_main = String::from_utf8(compiled_main.to_vec()).unwrap();
+        assert!(compiled_main.contains(r"\renewcommand{\schoolname}{School One}"));
+        assert!(compiled_main.contains(r"\input{chapters/body.tex}"));
+        let version_row: (String, serde_json::Value) = sqlx::query_as(
+            "SELECT v.snapshot_id,v.manifest FROM latex_core.v2_paper_builds b JOIN latex_core.paper_versions v ON v.id=b.version_id WHERE b.id=$1",
+        )
+        .bind(first_build)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version_row.0, source_checkpoint.snapshot_id().to_hex());
+        assert!(version_row.1.get("source_workspace").is_none());
+        let historical: WorkspaceManifestV1 =
+            serde_json::from_value(version_row.1["workspace"].clone()).unwrap();
+        let historical_main = state
+            .blobs
+            .get(historical.files()[&source_path].blob_hash)
+            .await
+            .unwrap();
+        assert_eq!(historical_main, source);
+        state
+            .queue
+            .complete_success(
+                claimed.id,
+                worker,
+                &test_artifacts(&state, "metadata-one").await,
+                core_types::BlobHash::digest(b"metadata-one"),
+            )
+            .await
+            .unwrap();
+
+        let jobs_after_first: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1",
+        )
+        .bind(workspace_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let saved = request(
+            &app,
+            Method::PUT,
+            &detail_path,
+            Some(&writer.cookie),
+            r#"{"values":{"school_name":"School Two"},"sections":{}}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1",
+            )
+            .bind(workspace_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            jobs_after_first
+        );
+        let stale = test_json(get(&app, &build_path, Some(&writer.cookie)).await).await;
+        assert_eq!(stale["build"]["current_build_id"], first_build.to_string());
+        assert!(stale["build"]["desired_state_hash"].is_null());
+        assert_eq!(
+            state
+                .workspaces
+                .read_file(workspace_id, &source_path)
+                .await
+                .unwrap(),
+            source
+        );
+        let second = test_json(
+            request(
+                &app,
+                Method::POST,
+                &build_path,
+                Some(&writer.cookie),
+                r#"{"trigger_type":"manual"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let second_build = uuid::Uuid::parse_str(second["build_id"].as_str().unwrap()).unwrap();
+        assert_ne!(second_build, first_build);
+        let worker = WorkerId::new();
+        let claimed = state.queue.claim(worker).await.unwrap().unwrap();
+        let compile_manifest_hash: String = sqlx::query_scalar(
+            "SELECT manifest_blob_hash FROM latex_core.snapshots WHERE snapshot_id=$1",
+        )
+        .bind(claimed.snapshot_id.to_hex())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let compile_manifest: WorkspaceManifestV1 = serde_json::from_slice(
+            &state
+                .blobs
+                .get(core_types::BlobHash::from_str(&compile_manifest_hash).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let compiled_main = state
+            .blobs
+            .get(compile_manifest.files()[&source_path].blob_hash)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(compiled_main.to_vec())
+                .unwrap()
+                .contains(r"\renewcommand{\schoolname}{School Two}")
+        );
+        state
+            .queue
+            .complete_success(
+                claimed.id,
+                worker,
+                &test_artifacts(&state, "metadata-two").await,
+                core_types::BlobHash::digest(b"metadata-two"),
+            )
+            .await
+            .unwrap();
+        let review = request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/reviews/papers/{paper_id}/rounds"),
+            Some(&writer.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(review.status(), StatusCode::CREATED);
+        let files = test_json(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        let main_file_id = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "project.tex")
+            .unwrap()["file_id"]
+            .as_str()
+            .unwrap();
+        let mentor_source = test_json(
+            get(
+                &app,
+                &format!("/api/v2/reviews/papers/{paper_id}/files/{main_file_id}"),
+                Some(&mentor.cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            mentor_source["content"].as_str().unwrap().as_bytes(),
+            source.as_ref()
+        );
+        assert!(
+            !mentor_source["content"]
+                .as_str()
+                .unwrap()
+                .contains(r"\renewcommand{\schoolname}")
+        );
+
         pool.close().await;
         database.close().await;
     }
@@ -13930,6 +15220,21 @@ mod database_tests {
         .await;
         assert_eq!(exact_pdf.status(), StatusCode::OK);
         assert_eq!(test_bytes(exact_pdf).await, b"pdf-h4");
+        let downloaded = get(
+            &app,
+            &format!("/api/v2/papers/{paper_id}/artifacts/pdf?build={h4_id}&download=true"),
+            Some(&writer.cookie),
+        )
+        .await;
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            downloaded
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok()),
+            Some("attachment; filename=\"paper.pdf\"")
+        );
+        assert_eq!(test_bytes(downloaded).await, b"pdf-h4");
 
         let reused = test_json(
             request(

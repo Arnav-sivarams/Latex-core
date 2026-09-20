@@ -341,6 +341,44 @@ impl PostgresWorkspaceRepository {
             .bind(workspace_id.as_uuid()).bind(version_db).execute(&mut *tx).await.map_err(PersistenceError::Database)?;
         tx.commit().await.map_err(PersistenceError::Database)
     }
+
+    /// Stores a compile-only manifest without changing the workspace head or
+    /// creating a workspace version. This keeps generated compile bindings out
+    /// of ordinary Writer source while still giving the durable queue an
+    /// immutable snapshot it can claim later.
+    pub async fn record_compile_snapshot(
+        &self,
+        snapshot_id: SnapshotId,
+        manifest_hash: BlobHash,
+    ) -> Result<(), PersistenceError> {
+        let snapshot_text = snapshot_id.to_hex();
+        let manifest_text = manifest_hash.to_hex();
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(PersistenceError::Database)?;
+        sqlx::query("INSERT INTO latex_core.snapshots (snapshot_id,manifest_blob_hash) VALUES ($1,$2) ON CONFLICT (snapshot_id) DO NOTHING")
+            .bind(&snapshot_text)
+            .bind(&manifest_text)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Database)?;
+        let stored_manifest: String = sqlx::query_scalar(
+            "SELECT manifest_blob_hash FROM latex_core.snapshots WHERE snapshot_id=$1",
+        )
+        .bind(&snapshot_text)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PersistenceError::Database)?;
+        if stored_manifest != manifest_text {
+            return Err(integrity(
+                "compile snapshot identity maps to a different manifest blob",
+            ));
+        }
+        tx.commit().await.map_err(PersistenceError::Database)
+    }
 }
 
 fn version_to_db(version: WorkspaceVersion) -> Result<i64, PersistenceError> {

@@ -1,0 +1,46 @@
+\begin{center}
+	{\Large \textbf{Appendix A}}-\vspace*{0.5 cm}
+	{\Large \textbf{Sample Code}}
+	
+\end{center}
+\begin{lstlisting}
+	/* C or C++ programming **/
+	#include <iostream>
+	using namespace std;
+	int main() {
+		int a = 5, b = 10;
+		cout << "Before swap: a = " << a << ", b = " << b << endl;
+		int temp = a;
+		a = b;
+		b = temp;
+		cout << "After swap: a = " << a << ", b = " << b << endl;
+		return 0;
+	}
+	
+	/* Java programming **/
+	public class SwapNumbers {
+		public static void main(String[] args) {
+			int a = 5, b = 10;
+			System.out.println("Before swap: a = " + a + ", b = " + b);
+			int temp = a;
+			a = b;
+			b = temp;
+			System.out.println("After swap: a = " + a + ", b = " + b);
+		}
+	}
+	
+	/* Python programming **/
+	a = 5
+	b = 10
+	print(f"Before swap: a = {a}, b = {b}")
+	a, b = b, a  # Pythonic swap
+	print(f"After swap: a = {a}, b = {b}")
+	
+	/* Javascript programming **/
+	let a = 5, b = 10;
+	console.log(`Before swap: a = ${a}, b = ${b}`);
+	let temp = a;
+	a = b;
+	b = temp;
+	console.log(`After swap: a = ${a}, b = ${b}`);
+\end{lstlisting}

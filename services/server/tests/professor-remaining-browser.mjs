@@ -152,7 +152,7 @@ try {
   await templateForm.locator('[name="name"]').fill(config.template_name); await templateForm.locator('[name="arrangement"]').selectOption('SINGLE_SOURCE');
   await templateForm.locator('[name="archive"]').setInputFiles(join(temp, 'single-source.zip')); await templateForm.locator('[data-action="validate-template"]').click();
   await templateForm.locator('[name="main"]').waitFor({ state: 'visible' }); await templateForm.locator('[name="main"]').selectOption('main.tex');
-  await templateForm.getByRole('button', { name: '+ Import Main Template' }).click(); await admin.locator('#adminStatus').filter({ hasText: `Imported ${config.template_name}` }).waitFor();
+  await templateForm.getByRole('button', { name: '+ Import Complete Report Template' }).click(); await admin.locator('#adminStatus').filter({ hasText: `Imported ${config.template_name}` }).waitFor();
   assert.ok(!(await admin.locator('#adminStatus').textContent()).includes('unsupported'));
   await createTeam(admin, config.report_one); await createTeam(admin, config.report_two);
   const teams = await json(admin, '/api/admin/v2/paper-teams/query?page=1&limit=100');
@@ -164,7 +164,7 @@ try {
   await compile(writer, paperOne); let text = await pdfText(writer, paperOne);
   for (const value of [config.report_one, 'Alice Single', 'Grace Guide', 'Department Alpha', 'School Alpha']) assert.ok(text.includes(value), `first report PDF missing ${value}: ${text}`);
   assert.equal((await editorText(writer)).match(/LATEX_CORE_SINGLE_SOURCE_BINDINGS/g)?.length, 1);
-  assert.ok((await editorText(writer)).includes('\\input{.latex-core/frontmatter/Front-Matter.tex}'));
+  assert.ok(!(await editorText(writer)).includes('\\input{.latex-core/frontmatter/Front-Matter.tex}'));
 
   assert.ok(await pdfPageCount(writer, paperOne) >= 3, 'the initial manual PDF must have a later reading page');
   await writer.locator('#pdfViewport [data-page="3"]').waitFor({ state: 'attached' });

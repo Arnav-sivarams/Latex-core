@@ -1,0 +1,37 @@
+\begin{thebibliography}{}
+
+\bibitem[Duzdevich et~al., 2014]{duzdevich2014dna}
+Duzdevich, D., Redding, S., and Greene, E.~C. (2014).
+\newblock Dna dynamics and single-molecule biology.
+\newblock {\em Chemical reviews}, 114(6):3072--3086.
+
+\bibitem[Gilbarg and Trudinger, 1977]{gilbarg1977elliptic}
+Gilbarg, D. and Trudinger, N.~S. (1977).
+\newblock {\em Elliptic partial differential equations of second order}.
+\newblock Grundlehren der mathematischen Wissenschaften ; 224. Springer-Verlag,
+  Berlin ; New York.
+
+\bibitem[Haykin, 2004]{haykin2004kalman}
+Haykin, S. (2004).
+\newblock {\em Kalman filtering and neural networks}.
+\newblock John Wiley \& Sons.
+
+\bibitem[Haykin, 2005]{haykin2005cognitive}
+Haykin, S. (2005).
+\newblock Cognitive radio: brain-empowered wireless communications.
+\newblock {\em IEEE journal on selected areas in communications},
+  23(2):201--220.
+
+\bibitem[Knuth, 1986]{knuth1986computers}
+Knuth, D.~E. (1986).
+\newblock {\em The Computers \& Typesetting, Vol. A: The Texbook}.
+\newblock Addison-Wesley Longman Publishing Co., Inc.
+
+\bibitem[Mohanaprasad et~al., 2017]{mohanaprasad2017optimized}
+Mohanaprasad, K., Jayaprakash, A., Sathasivam, S., et~al. (2017).
+\newblock Optimized-fuzzy-logic-based bit loading algorithms.
+\newblock In {\em Handbook of Research on Fuzzy and Rough Set Theory in
+  Organizational Decision Making}, pages 305--315. IGI Global Scientific
+  Publishing.
+
+\end{thebibliography}

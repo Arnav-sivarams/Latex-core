@@ -1,0 +1,46 @@
+\documentclass{VITSCOPEThesis}
+\input{acronym.tex} % for Symbols and notation
+\begin{document}
+	\pagestyle{plain}
+	\pagenumbering{roman}
+	%-----------------------------------------------------------------
+	% Table of contents include List of Tables, Figures, Abbreviations, Symbols and Chapters.
+	\setcounter{page}{-1}
+	\tableofcontents
+	\newpage
+	\addcontentsline{toc}{section}{Executive Summary}
+	\input{execsummary.tex}
+	\newpage
+	\listoftables
+	\addcontentsline{toc}{section}{List of Tables}
+	\newpage
+	\listoffigures	
+	\addcontentsline{toc}{section}{List of Figures}
+	\newpage
+	\addcontentsline{toc}{section}{List of Abbreviations}
+	\printacronyms[include=abbr, name=List of Abbreviations]
+	\newpage
+	\addcontentsline{toc}{section}{List of Symbols}
+	\printacronyms[include=symbol, name=Symbols and Notations]
+	\newpage
+	%--------  Thesis contents -----------------------------------
+	\pagenumbering{arabic}
+	\setcounter{page}{1}
+	\include{chapters/chapter1}
+	\include{chapters/chapter2}
+	\include{chapters/chapter3}
+	\include{chapters/chapter4}
+	\include{chapters/chapter5}
+	\include{chapters/chapter6}
+	\include{chapters/chapter7} % included 
+	\include{chapters/chapter8} % included 
+	
+	%------ Bibliography ----------------------------------------
+	\bibliography{references.bib} % Replace with your .bib filename 
+	%------ Appendices ----------------------------------------
+	\newpage
+	\include{appendix/sourcecode}	% comment if not necessary
+	\newpage
+	\include{appendix/publication}	% comment if not necessary
+	
+\end{document}

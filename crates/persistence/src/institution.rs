@@ -1868,15 +1868,15 @@ impl InstitutionRepository {
         let page = filter.page.max(1);
         let offset = (page - 1).saturating_mul(limit);
         let rows = sqlx::query(
-            r"SELECT p.programme_code,p.hod_id,f.name AS hod_name,
+            r"SELECT p.programme_code,p.programme_name,p.degree_name,p.specialization,p.hod_id,f.name AS hod_name,
                      count(s.reg_no) AS student_count,d.template_id,t.name AS template_name,
                      count(*) OVER() AS total
               FROM vcap.programmes p LEFT JOIN vcap.faculty f ON f.faculty_id=p.hod_id
               LEFT JOIN vcap.students s USING(programme_code)
               LEFT JOIN latex_core.programme_template_defaults d USING(programme_code)
               LEFT JOIN latex_core.templates t ON t.id=d.template_id
-              WHERE ($1::text IS NULL OR p.programme_code ILIKE '%' || $1 || '%' OR f.name ILIKE '%' || $1 || '%')
-              GROUP BY p.programme_code,p.hod_id,f.name,d.template_id,t.name
+              WHERE ($1::text IS NULL OR p.programme_code ILIKE '%' || $1 || '%' OR p.programme_name ILIKE '%' || $1 || '%' OR f.name ILIKE '%' || $1 || '%')
+              GROUP BY p.programme_code,p.programme_name,p.degree_name,p.specialization,p.hod_id,f.name,d.template_id,t.name
               ORDER BY p.programme_code LIMIT $2 OFFSET $3",
         )
         .bind(clean_filter(filter.search.as_deref()))
@@ -1888,6 +1888,9 @@ impl InstitutionRepository {
         page_from_rows(rows, page, limit, offset, |row| {
             Ok(json!({
                 "programme_code":row.try_get::<String,_>("programme_code").map_err(InstitutionError::Database)?,
+                "programme_name":row.try_get::<Option<String>,_>("programme_name").map_err(InstitutionError::Database)?,
+                "degree_name":row.try_get::<Option<String>,_>("degree_name").map_err(InstitutionError::Database)?,
+                "specialization":row.try_get::<Option<String>,_>("specialization").map_err(InstitutionError::Database)?,
                 "hod_id":row.try_get::<Option<String>,_>("hod_id").map_err(InstitutionError::Database)?,
                 "hod_name":row.try_get::<Option<String>,_>("hod_name").map_err(InstitutionError::Database)?,
                 "student_count":row.try_get::<i64,_>("student_count").map_err(InstitutionError::Database)?,
@@ -3638,7 +3641,7 @@ struct TableSpec {
 fn spec(table: &str) -> TableSpec {
     match table {
         "departments" => TableSpec {
-            columns: &["department_id"],
+            columns: &["department_id", "department_name"],
             required: &["department_id"],
             keys: &["department_id"],
             uuids: &["department_id"],
@@ -3670,7 +3673,13 @@ fn spec(table: &str) -> TableSpec {
             emails: &["email"],
         },
         "programmes" => TableSpec {
-            columns: &["programme_code", "hod_id"],
+            columns: &[
+                "programme_code",
+                "programme_name",
+                "degree_name",
+                "specialization",
+                "hod_id",
+            ],
             required: &["programme_code"],
             keys: &["programme_code"],
             uuids: &[],
@@ -3678,7 +3687,7 @@ fn spec(table: &str) -> TableSpec {
             emails: &[],
         },
         "schools" => TableSpec {
-            columns: &["school_id"],
+            columns: &["school_id", "school_name"],
             required: &["school_id"],
             keys: &["school_id"],
             uuids: &[],
@@ -3877,6 +3886,21 @@ fn source_row(
         for field in required {
             if text_value(&payload, field).is_none_or(str::is_empty) {
                 error = Some(("MISSING_VALUE", format!("required value {field} is empty")));
+                break;
+            }
+        }
+    }
+    if error.is_none() {
+        for field in [
+            "school_name",
+            "department_name",
+            "programme_name",
+            "degree_name",
+            "specialization",
+        ] {
+            if payload.contains_key(field) && text_value(&payload, field).is_none_or(str::is_empty)
+            {
+                error = Some(("MISSING_VALUE", format!("supplied value {field} is empty")));
                 break;
             }
         }
@@ -4113,7 +4137,7 @@ async fn apply_table(
 fn update_query(table: &str) -> &'static str {
     match table {
         "departments" => {
-            "UPDATE vcap.departments record SET department_id=record.department_id FROM jsonb_array_elements($1) item(payload) WHERE record.department_id::text=item.payload->>'department_id'"
+            "UPDATE vcap.departments record SET department_name=CASE WHEN item.payload ? 'department_name' THEN item.payload->>'department_name' ELSE record.department_name END FROM jsonb_array_elements($1) item(payload) WHERE record.department_id::text=item.payload->>'department_id'"
         }
         "admins" => {
             "UPDATE vcap.admins record SET email=CASE WHEN item.payload ? 'email' THEN item.payload->>'email' ELSE record.email END,name=CASE WHEN item.payload ? 'name' THEN item.payload->>'name' ELSE record.name END,pfp=CASE WHEN item.payload ? 'pfp' THEN item.payload->>'pfp' ELSE record.pfp END FROM jsonb_array_elements($1) item(payload) WHERE record.admin_id=item.payload->>'admin_id'"
@@ -4122,10 +4146,10 @@ fn update_query(table: &str) -> &'static str {
             "UPDATE vcap.faculty record SET name=CASE WHEN item.payload ? 'name' THEN item.payload->>'name' ELSE record.name END,email=CASE WHEN item.payload ? 'email' THEN item.payload->>'email' ELSE record.email END,dept_id=CASE WHEN item.payload ? 'dept_id' THEN (item.payload->>'dept_id')::uuid ELSE record.dept_id END,honorific=CASE WHEN item.payload ? 'honorific' THEN item.payload->>'honorific' ELSE record.honorific END,designation=CASE WHEN item.payload ? 'designation' THEN item.payload->>'designation' ELSE record.designation END,status=CASE WHEN item.payload ? 'status' THEN item.payload->>'status' ELSE record.status END FROM jsonb_array_elements($1) item(payload) WHERE record.faculty_id=item.payload->>'faculty_id'"
         }
         "programmes" => {
-            "UPDATE vcap.programmes record SET hod_id=CASE WHEN item.payload ? 'hod_id' THEN item.payload->>'hod_id' ELSE record.hod_id END FROM jsonb_array_elements($1) item(payload) WHERE record.programme_code=item.payload->>'programme_code'"
+            "UPDATE vcap.programmes record SET programme_name=CASE WHEN item.payload ? 'programme_name' THEN item.payload->>'programme_name' ELSE record.programme_name END,degree_name=CASE WHEN item.payload ? 'degree_name' THEN item.payload->>'degree_name' ELSE record.degree_name END,specialization=CASE WHEN item.payload ? 'specialization' THEN item.payload->>'specialization' ELSE record.specialization END,hod_id=CASE WHEN item.payload ? 'hod_id' THEN item.payload->>'hod_id' ELSE record.hod_id END FROM jsonb_array_elements($1) item(payload) WHERE record.programme_code=item.payload->>'programme_code'"
         }
         "schools" => {
-            "UPDATE vcap.schools record SET school_id=record.school_id FROM jsonb_array_elements($1) item(payload) WHERE record.school_id=item.payload->>'school_id'"
+            "UPDATE vcap.schools record SET school_name=CASE WHEN item.payload ? 'school_name' THEN item.payload->>'school_name' ELSE record.school_name END FROM jsonb_array_elements($1) item(payload) WHERE record.school_id=item.payload->>'school_id'"
         }
         "students" => {
             "UPDATE vcap.students record SET name=CASE WHEN item.payload ? 'name' THEN item.payload->>'name' ELSE record.name END,email=CASE WHEN item.payload ? 'email' THEN item.payload->>'email' ELSE record.email END,programme_code=CASE WHEN item.payload ? 'programme_code' THEN item.payload->>'programme_code' ELSE record.programme_code END FROM jsonb_array_elements($1) item(payload) WHERE record.reg_no=item.payload->>'reg_no'"
@@ -4202,8 +4226,11 @@ fn delete_query(table: &str) -> &'static str {
 
 fn apply_query(table: &str, merge: bool) -> &'static str {
     match (table, merge) {
-        ("departments", false | true) => {
-            "INSERT INTO vcap.departments SELECT x.department_id::uuid FROM jsonb_to_recordset($1) x(department_id text) ON CONFLICT DO NOTHING"
+        ("departments", false) => {
+            "INSERT INTO vcap.departments SELECT x.department_id::uuid,x.department_name FROM jsonb_to_recordset($1) x(department_id text,department_name text) ON CONFLICT DO NOTHING"
+        }
+        ("departments", true) => {
+            "INSERT INTO vcap.departments SELECT x.department_id::uuid,x.department_name FROM jsonb_to_recordset($1) x(department_id text,department_name text) ON CONFLICT(department_id) DO UPDATE SET department_name=COALESCE(EXCLUDED.department_name,vcap.departments.department_name)"
         }
         ("admins", false) => {
             "INSERT INTO vcap.admins SELECT x.admin_id,x.email,x.name,x.pfp FROM jsonb_to_recordset($1) x(admin_id varchar,email varchar,name varchar,pfp varchar) ON CONFLICT DO NOTHING"
@@ -4218,13 +4245,16 @@ fn apply_query(table: &str, merge: bool) -> &'static str {
             "INSERT INTO vcap.faculty SELECT x.faculty_id,x.name,x.email,x.dept_id::uuid,x.honorific,x.designation,x.status FROM jsonb_to_recordset($1) x(faculty_id varchar,name varchar,email varchar,dept_id text,honorific text,designation text,status text) ON CONFLICT(faculty_id) DO UPDATE SET name=EXCLUDED.name,email=EXCLUDED.email,dept_id=EXCLUDED.dept_id,honorific=EXCLUDED.honorific,designation=EXCLUDED.designation,status=EXCLUDED.status"
         }
         ("programmes", false) => {
-            "INSERT INTO vcap.programmes SELECT x.programme_code,x.hod_id FROM jsonb_to_recordset($1) x(programme_code text,hod_id text) ON CONFLICT DO NOTHING"
+            "INSERT INTO vcap.programmes (programme_code,programme_name,degree_name,specialization,hod_id) SELECT x.programme_code,x.programme_name,x.degree_name,x.specialization,x.hod_id FROM jsonb_to_recordset($1) x(programme_code text,programme_name text,degree_name text,specialization text,hod_id text) ON CONFLICT DO NOTHING"
         }
         ("programmes", true) => {
-            "INSERT INTO vcap.programmes SELECT x.programme_code,x.hod_id FROM jsonb_to_recordset($1) x(programme_code text,hod_id text) ON CONFLICT(programme_code) DO UPDATE SET hod_id=EXCLUDED.hod_id"
+            "INSERT INTO vcap.programmes (programme_code,programme_name,degree_name,specialization,hod_id) SELECT x.programme_code,x.programme_name,x.degree_name,x.specialization,x.hod_id FROM jsonb_to_recordset($1) x(programme_code text,programme_name text,degree_name text,specialization text,hod_id text) ON CONFLICT(programme_code) DO UPDATE SET programme_name=COALESCE(EXCLUDED.programme_name,vcap.programmes.programme_name),degree_name=COALESCE(EXCLUDED.degree_name,vcap.programmes.degree_name),specialization=COALESCE(EXCLUDED.specialization,vcap.programmes.specialization),hod_id=COALESCE(EXCLUDED.hod_id,vcap.programmes.hod_id)"
         }
-        ("schools", false | true) => {
-            "INSERT INTO vcap.schools SELECT x.school_id FROM jsonb_to_recordset($1) x(school_id text) ON CONFLICT DO NOTHING"
+        ("schools", false) => {
+            "INSERT INTO vcap.schools SELECT x.school_id,x.school_name FROM jsonb_to_recordset($1) x(school_id text,school_name text) ON CONFLICT DO NOTHING"
+        }
+        ("schools", true) => {
+            "INSERT INTO vcap.schools SELECT x.school_id,x.school_name FROM jsonb_to_recordset($1) x(school_id text,school_name text) ON CONFLICT(school_id) DO UPDATE SET school_name=COALESCE(EXCLUDED.school_name,vcap.schools.school_name)"
         }
         ("students", false) => {
             "INSERT INTO vcap.students SELECT x.reg_no,x.name,x.email,x.programme_code FROM jsonb_to_recordset($1) x(reg_no varchar,name varchar,email varchar,programme_code text) ON CONFLICT DO NOTHING"
@@ -4835,6 +4865,35 @@ mod tests {
         assert_eq!(
             rows[0].error.as_ref().map(|value| value.0),
             Some("MALFORMED_UUID")
+        );
+    }
+
+    #[test]
+    fn csv_parser_accepts_trimmed_canonical_display_metadata() {
+        let rows = parse_csv(
+            "programmes.csv",
+            None,
+            b"programme_code,programme_name,degree_name,specialization,hod_id\n CSE , Computer Science , Bachelor of Technology , AI , GUIDE-1 \n",
+            ImportLimits::default(),
+            ImportMode::AddOnly,
+            0,
+        )
+        .expect("CSV shape parses");
+        assert!(rows[0].error.is_none());
+        assert_eq!(rows[0].payload["programme_name"], "Computer Science");
+
+        let blank_name = parse_csv(
+            "schools.csv",
+            None,
+            b"school_id,school_name\nSCOPE,  \n",
+            ImportLimits::default(),
+            ImportMode::AddOnly,
+            0,
+        )
+        .expect("CSV shape parses");
+        assert_eq!(
+            blank_name[0].error.as_ref().map(|value| value.0),
+            Some("MISSING_VALUE")
         );
     }
 

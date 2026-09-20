@@ -44,58 +44,136 @@ const ALLOWED_SOURCES: &[&str] = &[
 
 pub const SINGLE_SOURCE_MARKER: &str = "% LATEX_CORE_SINGLE_SOURCE_BINDINGS";
 
-pub fn single_source_compatible(main: &[u8]) -> bool {
-    let Ok(source) = std::str::from_utf8(main) else {
-        return false;
-    };
-    let markers = source
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SingleSourceBindingPoint {
+    ExplicitMarker,
+    AutomaticBeforeDocument,
+}
+
+fn tex_code_line(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let mut backslashes = 0;
+            let mut previous = index;
+            while previous > 0 && bytes[previous - 1] == b'\\' {
+                backslashes += 1;
+                previous -= 1;
+            }
+            if backslashes % 2 == 0 {
+                return &line[..index];
+            }
+        }
+        index += 1;
+    }
+    line
+}
+
+fn uncommented_document_lines(source: &str) -> Vec<usize> {
+    source
         .lines()
+        .enumerate()
+        .flat_map(|(index, line)| {
+            tex_code_line(line)
+                .match_indices(r"\begin{document}")
+                .map(move |_| index)
+        })
+        .collect()
+}
+
+fn declaration_present(line: &str, command: &str) -> bool {
+    let code = tex_code_line(line);
+    [r"\newcommand", r"\providecommand", r"\DeclareRobustCommand"]
+        .iter()
+        .any(|declaration| {
+            code.match_indices(declaration).any(|(index, _)| {
+                let after = &code[index + declaration.len()..];
+                !after
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphabetic())
+                    && after.trim_start().starts_with(&format!(r"{{\{command}}}"))
+            })
+        })
+}
+
+fn known_declaration_before(lines: &[&str], end: usize) -> bool {
+    legacy::REGISTRY.iter().any(|(command, _, _, _)| {
+        lines[..end]
+            .iter()
+            .any(|line| declaration_present(line, command))
+    })
+}
+
+pub fn single_source_binding_point(main: &[u8]) -> Option<SingleSourceBindingPoint> {
+    let source = std::str::from_utf8(main).ok()?;
+    let lines = source.lines().collect::<Vec<_>>();
+    let documents = uncommented_document_lines(source);
+    let [document_line] = documents.as_slice() else {
+        return None;
+    };
+    let markers = lines
+        .iter()
         .enumerate()
         .filter_map(|(index, line)| (line.trim() == SINGLE_SOURCE_MARKER).then_some(index))
         .collect::<Vec<_>>();
-    let [marker] = markers.as_slice() else {
-        return false;
-    };
-    let lines = source.lines().collect::<Vec<_>>();
-    let begin = lines
-        .iter()
-        .position(|line| !line.trim_start().starts_with('%') && line.contains("\\begin{document}"));
-    let known_definition = legacy::REGISTRY.iter().any(|(command, _, _, _)| {
-        lines[..*marker].iter().any(|line| {
-            !line.trim_start().starts_with('%')
-                && (line.contains(&format!("\\newcommand{{\\{command}}}"))
-                    || line.contains(&format!("\\providecommand{{\\{command}}}")))
-        })
-    });
-    known_definition && begin.is_some_and(|index| *marker < index)
+    if let [marker] = markers.as_slice()
+        && *marker < *document_line
+        && known_declaration_before(&lines, *marker)
+    {
+        return Some(SingleSourceBindingPoint::ExplicitMarker);
+    }
+    if markers.is_empty() && known_declaration_before(&lines, *document_line) {
+        return Some(SingleSourceBindingPoint::AutomaticBeforeDocument);
+    }
+    None
 }
 
-pub fn bind_single_source(main: &[u8], main_path: &LogicalPath) -> Result<Bytes, FrontMatterError> {
-    if !single_source_compatible(main) {
-        return Err(FrontMatterError::InvalidValue(
-            "unsupported single-source template structure".into(),
-        ));
-    }
+pub fn single_source_compatible(main: &[u8]) -> bool {
+    single_source_binding_point(main).is_some()
+}
+
+pub fn bind_single_source_values(
+    main: &[u8],
+    values: &BTreeMap<String, Value>,
+) -> Result<Bytes, FrontMatterError> {
     let source = std::str::from_utf8(main).map_err(|_| FrontMatterError::InvalidManifest)?;
-    let depth = main_path.as_str().matches('/').count();
-    let input = format!(
-        "\\input{{{}.latex-core/frontmatter/Front-Matter.tex}} % LATEX_CORE_SINGLE_SOURCE_BINDINGS",
-        "../".repeat(depth)
+    let point = single_source_binding_point(main).ok_or_else(|| {
+        FrontMatterError::InvalidValue(
+            "complete report template metadata compatibility: exactly one safe pre-document binding point and a recognized institutional macro declaration are required".into(),
+        )
+    })?;
+    let binding = format!(
+        "{}\n{}",
+        legacy::single_source_bindings(values)?,
+        SINGLE_SOURCE_MARKER
     );
-    Ok(Bytes::from(
-        source
-            .lines()
-            .map(|line| {
-                if line.trim() == SINGLE_SOURCE_MARKER {
-                    input.as_str()
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    ))
+    let lines = source.lines().collect::<Vec<_>>();
+    let document_line = uncommented_document_lines(source)
+        .first()
+        .copied()
+        .unwrap_or_default();
+    let target = match point {
+        SingleSourceBindingPoint::ExplicitMarker => lines
+            .iter()
+            .position(|line| line.trim() == SINGLE_SOURCE_MARKER)
+            .ok_or(FrontMatterError::InvalidManifest)?,
+        SingleSourceBindingPoint::AutomaticBeforeDocument => document_line,
+    };
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index == target {
+            output.push_str(&binding);
+            output.push('\n');
+            if matches!(point, SingleSourceBindingPoint::ExplicitMarker) {
+                continue;
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    Ok(Bytes::from(output))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -388,7 +466,13 @@ pub fn resolve_and_render(
             .iter()
             .find(|field| &field.key == key)
             .ok_or_else(|| FrontMatterError::InvalidValue(key.clone()))?;
-        if !field.allow_team_override || !value_matches(field.field_type, &overrides[key]) {
+        let team_metadata = matches!(
+            field.source.as_deref(),
+            Some("team.semester" | "team.academic_year")
+        );
+        if !(field.allow_team_override || team_metadata)
+            || !value_matches(field.field_type, &overrides[key])
+        {
             return Err(FrontMatterError::InvalidValue(key.clone()));
         }
     }
@@ -417,8 +501,11 @@ pub fn resolve_and_render(
             .as_ref()
             .and_then(|source| automatic.get(source))
             .map(|value| (value, "AUTO"));
-        let team = field
-            .allow_team_override
+        let team_metadata = matches!(
+            field.source.as_deref(),
+            Some("team.semester" | "team.academic_year")
+        );
+        let team = (field.allow_team_override || team_metadata)
             .then(|| overrides.get(&field.key))
             .flatten()
             .map(|value| (value, "TEAM_OVERRIDE"));
@@ -816,19 +903,65 @@ mod tests {
     }
 
     #[test]
-    fn single_source_binding_requires_known_declarations_and_one_verified_marker() {
+    fn single_source_binding_supports_marker_and_safe_automatic_mode_without_mutation() {
         let source = b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n\\thesistitle\n\\end{document}\n";
         assert!(single_source_compatible(source));
-        let main = LogicalPath::parse("wrapper/main.tex").unwrap();
-        let bound = bind_single_source(source, &main).unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("team.name".into(), Value::String("A & B_%".into()));
+        let bound = bind_single_source_values(source, &values).unwrap();
         let text = std::str::from_utf8(&bound).unwrap();
         assert_eq!(text.matches("LATEX_CORE_SINGLE_SOURCE_BINDINGS").count(), 1);
-        assert!(text.contains("\\input{../.latex-core/frontmatter/Front-Matter.tex}"));
+        assert!(text.contains(r"\renewcommand{\thesistitle}{A \& B\_\%}"));
+        assert_eq!(source, b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n\\thesistitle\n\\end{document}\n");
+        let automatic = b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n\\newcommand{\\studentAname}{Student}\n\\begin{document}\n\\thesistitle\n\\end{document}\n";
+        assert_eq!(
+            single_source_binding_point(automatic),
+            Some(SingleSourceBindingPoint::AutomaticBeforeDocument)
+        );
+        let automatic_bound = bind_single_source_values(automatic, &BTreeMap::new()).unwrap();
+        let automatic_text = std::str::from_utf8(&automatic_bound).unwrap();
+        assert!(automatic_text.contains("% Known institutional single-source bindings."));
+        assert!(
+            automatic_text
+                .find("% Known institutional single-source bindings.")
+                .unwrap()
+                < automatic_text.find("\\begin{document}").unwrap()
+        );
         assert!(!single_source_compatible(
             b"% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n"
         ));
         assert!(!single_source_compatible(b"\\newcommand{\\thesistitle}{x}\n\\begin{document}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n"));
         assert!(!single_source_compatible(b"\\newcommand{\\thesistitle}{x}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n"));
+        assert!(!single_source_compatible(
+            b"\\newcommand{\\thesistitle}{x}\n\\begin{document}\n\\begin{document}\n"
+        ));
+        assert!(!single_source_compatible(
+            b"\\newcommand{\\thesistitle}{x}\n\\begin{document}\\begin{document}\n"
+        ));
+        assert!(!single_source_compatible(
+            b"\\newcommandish{\\thesistitle}{x}\n\\begin{document}\n"
+        ));
+        assert!(single_source_compatible(
+            b"\\newcommand{\\thesistitle}{x}\n% \\begin{document}\n\\begin{document}\n"
+        ));
+    }
+
+    #[test]
+    fn synthetic_complete_report_fixture_keeps_body_and_assets_in_compile_only_binding() {
+        let source = include_bytes!("../tests/fixtures/vit-complete-report/project.tex");
+        assert!(single_source_compatible(source));
+        let original = String::from_utf8(source.to_vec()).unwrap();
+        let bound = bind_single_source_values(source, &BTreeMap::new()).unwrap();
+        let bound = String::from_utf8(bound.to_vec()).unwrap();
+        assert_eq!(original, String::from_utf8(source.to_vec()).unwrap());
+        assert!(bound.contains(r"\input{chapters/body.tex}"));
+        assert!(bound.contains(r"\input{acronym.tex}"));
+        assert!(
+            bound
+                .find("% Known institutional single-source bindings.")
+                .unwrap()
+                < bound.find(r"\begin{document}").unwrap()
+        );
     }
 
     #[test]

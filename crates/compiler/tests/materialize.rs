@@ -373,6 +373,20 @@ fn nested_outputs(output: &std::path::Path) {
     fs::write(output.join("logs/build.log"), b"log").expect("log");
 }
 
+fn warning_outputs(output: &std::path::Path) {
+    fs::write(output.join("main.pdf"), b"%PDF-valid").expect("pdf");
+    fs::write(
+        output.join("main.log"),
+        b"file:line:error style messages enabled.\nPackage acro Warning: Unknown option `sort'\nPackage natbib Warning: Citation `x' undefined\nOverfull \\hbox\nUnderfull \\hbox\nLaTeX Warning: Label(s) may have changed.\n",
+    )
+    .expect("log");
+}
+
+fn stale_pdf_output(output: &std::path::Path) {
+    fs::write(output.join("main.pdf"), b"%PDF-stale-or-partial").expect("pdf");
+    fs::write(output.join("main.log"), b"Output written on main.pdf").expect("log");
+}
+
 fn no_outputs(_: &std::path::Path) {}
 
 fn oversized_file(output: &std::path::Path) {
@@ -437,6 +451,33 @@ async fn document_failure_without_pdf_remains_failed() {
         .await
         .expect("failed execution");
     assert_eq!(execution.status(), compiler::CompileStatus::Failed);
+}
+
+#[tokio::test]
+async fn process_exit_is_authoritative_even_with_warnings_or_a_pdf() {
+    let success = compile_outputs(warning_outputs, 0, CompileLimits::development_default())
+        .await
+        .expect("successful warning-bearing execution");
+    assert_eq!(success.status(), compiler::CompileStatus::Succeeded);
+    assert_eq!(success.exit_code(), Some(0));
+    assert!(
+        success
+            .artifacts()
+            .iter()
+            .any(|artifact| artifact.kind() == core_types::ArtifactKind::Pdf)
+    );
+
+    let failed = compile_outputs(stale_pdf_output, 12, CompileLimits::development_default())
+        .await
+        .expect("nonzero execution is a compile result");
+    assert_eq!(failed.status(), compiler::CompileStatus::Failed);
+    assert_eq!(failed.exit_code(), Some(12));
+    assert!(
+        failed
+            .artifacts()
+            .iter()
+            .any(|artifact| artifact.kind() == core_types::ArtifactKind::Pdf)
+    );
 }
 
 #[tokio::test]

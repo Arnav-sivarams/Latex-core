@@ -7,9 +7,10 @@ export function frontMatterStatus(detail) {
 }
 
 export function editableDetail(detail, field) {
-  return Boolean(detail.can_edit && (field.editable ?? (!field.source || field.allow_team_override)));
+  const teamMetadata = field.source === 'team.semester' || field.source === 'team.academic_year';
+  return Boolean(detail.can_edit && (field.editable ?? (!field.source || field.allow_team_override || teamMetadata)));
 }
 
 export function needsFirstUseDetails(detail) {
-  return Boolean(detail.can_edit && (!detail.project_metadata?.setup_complete || (detail.pack_id && detail.missing_required_fields?.length)));
+  return Boolean(detail.can_edit && (!detail.project_metadata?.setup_complete || ((detail.pack_id || detail.single_source) && detail.missing_required_fields?.length)));
 }

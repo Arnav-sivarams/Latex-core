@@ -176,6 +176,99 @@ impl FrontMatterRepository {
         ))
     }
 
+    pub async fn single_source_values(
+        &self,
+        paper_id: Uuid,
+    ) -> Result<BTreeMap<String, Value>, FrontMatterRepositoryError> {
+        let rows = sqlx::query(
+            "SELECT field_key,value_json FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1 AND value_source='TEAM_OVERRIDE' ORDER BY field_key",
+        )
+        .bind(paper_id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(FrontMatterRepositoryError::Database)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("field_key")
+                        .map_err(FrontMatterRepositoryError::Database)?,
+                    row.try_get("value_json")
+                        .map_err(FrontMatterRepositoryError::Database)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn save_single_source_values(
+        &self,
+        actor: UserId,
+        paper_id: Uuid,
+        values: &BTreeMap<String, Value>,
+    ) -> Result<u64, FrontMatterRepositoryError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(FrontMatterRepositoryError::Database)?;
+        require_front_matter_editor(&mut tx, actor, paper_id).await?;
+        reject_open_review(&mut tx, paper_id).await?;
+        let workspace: Uuid = sqlx::query_scalar(
+            "SELECT workspace_id FROM latex_core.paper_teams WHERE id=$1 FOR UPDATE",
+        )
+        .bind(paper_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(FrontMatterRepositoryError::Database)?;
+        sqlx::query("DELETE FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1")
+            .bind(paper_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(FrontMatterRepositoryError::Database)?;
+        for (key, value) in values {
+            sqlx::query("INSERT INTO latex_core.paper_front_matter_values (paper_team_id,field_key,value_json,value_source,updated_by_user_id) VALUES ($1,$2,$3,'TEAM_OVERRIDE',$4)")
+                .bind(paper_id)
+                .bind(key)
+                .bind(value)
+                .bind(actor.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(FrontMatterRepositoryError::Database)?;
+        }
+        sqlx::query(
+            "UPDATE latex_core.v2_paper_build_state SET desired_state_hash=NULL, \
+             pending_snapshot_id=NULL,pending_manifest=NULL,pending_state_hash=NULL,pending_source_sequence=NULL, \
+             pending_document_epoch=NULL,pending_tenant_id=NULL,pending_user_id=NULL,pending_trigger_type=NULL, \
+             pending_compile_key=NULL,pending_engine=NULL,pending_tex_environment_id=NULL,pending_latexmk_profile=NULL, \
+             pending_shell_policy=NULL,pending_synctex=NULL,updated_at=statement_timestamp() WHERE workspace_id=$1",
+        )
+        .bind(workspace)
+        .execute(&mut *tx)
+        .await
+        .map_err(FrontMatterRepositoryError::Database)?;
+        audit(
+            &mut tx,
+            actor,
+            "front_matter.single_source_details.updated",
+            "paper_team",
+            paper_id,
+            json!({"workspace_id": workspace, "field_count": values.len()}),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(FrontMatterRepositoryError::Database)?;
+        let version: i64 = sqlx::query_scalar(
+            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+        )
+        .bind(workspace)
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(FrontMatterRepositoryError::Database)?;
+        u64::try_from(version)
+            .map_err(|_| FrontMatterRepositoryError::Integrity("negative workspace version".into()))
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "pack identity, metadata, immutable manifest, and file records are committed together"
@@ -882,16 +975,21 @@ impl FrontMatterRepository {
         paper_id: Uuid,
     ) -> Result<BTreeMap<String, Value>, FrontMatterRepositoryError> {
         let team = sqlx::query(r"SELECT t.name,g.academic_year,g.semester,
-                    COALESCE(pin.dominant_programme_code,res.dominant_programme_code) AS dominant_programme_code
+                    COALESCE(pin.dominant_programme_code,res.dominant_programme_code) AS dominant_programme_code,
+                    programme.programme_name,programme.degree_name,programme.specialization
              FROM latex_core.paper_teams t
              LEFT JOIN latex_core.external_paper_team_links link ON link.paper_team_id=t.id
              LEFT JOIN vcap.paper_assignment_groups g ON g.external_team_key=link.external_team_key
              LEFT JOIN latex_core.paper_front_matter_pins pin ON pin.paper_team_id=t.id
-             LEFT JOIN latex_core.paper_template_resolutions res ON res.paper_team_id=t.id WHERE t.id=$1")
+             LEFT JOIN latex_core.paper_template_resolutions res ON res.paper_team_id=t.id
+             LEFT JOIN vcap.programmes programme ON programme.programme_code=COALESCE(pin.dominant_programme_code,res.dominant_programme_code)
+             WHERE t.id=$1")
             .bind(paper_id).fetch_optional(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?.ok_or(FrontMatterRepositoryError::NotFound)?;
         let people = sqlx::query(r"SELECT m.is_leader,m.writer_order,role.role,c.email,s.name AS student_name,s.reg_no,
                     f.name AS faculty_name,f.honorific,f.designation,f.faculty_id,f.dept_id,
-                    (SELECT fr.school_id FROM vcap.faculty_roles fr WHERE fr.faculty_id=f.faculty_id AND fr.school_id IS NOT NULL ORDER BY fr.role_id LIMIT 1) AS school_id
+                    department.department_name,
+                    (SELECT fr.school_id FROM vcap.faculty_roles fr WHERE fr.faculty_id=f.faculty_id AND fr.school_id IS NOT NULL ORDER BY fr.role_id LIMIT 1) AS school_id,
+                    (SELECT school.school_name FROM vcap.faculty_roles fr JOIN vcap.schools school ON school.school_id=fr.school_id WHERE fr.faculty_id=f.faculty_id AND fr.school_id IS NOT NULL ORDER BY fr.role_id LIMIT 1) AS school_name
              FROM latex_core.paper_team_members m
              JOIN latex_core.global_user_roles role ON role.user_id=m.user_id
              JOIN latex_core.user_credentials c ON c.user_id=m.user_id
@@ -899,6 +997,7 @@ impl FrontMatterRepository {
              LEFT JOIN vcap.students s ON s.reg_no=sl.reg_no
              LEFT JOIN vcap.faculty_user_links fl ON fl.user_id=m.user_id AND fl.status='LINKED'
              LEFT JOIN vcap.faculty f ON f.faculty_id=fl.faculty_id
+             LEFT JOIN vcap.departments department ON department.department_id=f.dept_id
              WHERE m.paper_team_id=$1 ORDER BY CASE WHEN role.role='writer' THEN 0 ELSE 1 END,m.writer_order NULLS LAST,m.created_at,m.user_id")
             .bind(paper_id).fetch_all(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?;
         let mut output = BTreeMap::new();
@@ -917,6 +1016,9 @@ impl FrontMatterRepository {
             "team.dominant_programme_code",
             &mut output,
         )?;
+        optional_string(&team, "programme_name", "programme_name", &mut output)?;
+        optional_string(&team, "degree_name", "degree_name", &mut output)?;
+        optional_string(&team, "specialization", "specialization", &mut output)?;
         let mut writer_names = Vec::new();
         let mut registration_numbers = Vec::new();
         let mut pairs = Vec::new();
@@ -974,7 +1076,9 @@ impl FrontMatterRepository {
                         Value::String(department.to_string()),
                     );
                 }
+                optional_string(&row, "department_name", "department_name", &mut output)?;
                 optional_string(&row, "school_id", "school.id", &mut output)?;
+                optional_string(&row, "school_name", "school_name", &mut output)?;
                 mentor_done = true;
             }
         }

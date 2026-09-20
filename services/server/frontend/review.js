@@ -100,12 +100,14 @@ function applyIdentity(identity) {
 
 async function loadPreferences() {
   model.preferences = await api.preferences();
+  window.LatexCoreTheme?.apply(model.preferences.theme);
   ui.editorFontSize.value = model.preferences.font_size_px;
   ui.editorTheme.value = model.preferences.theme;
 }
 
 async function persistPreferences(preferences) {
   model.preferences = await api.savePreferences(preferences);
+  window.LatexCoreTheme?.apply(model.preferences.theme);
   if (model.view) model.view.dispatch({ effects: model.editorAppearance.reconfigure(editorAppearance(model.preferences)) });
 }
 
@@ -220,6 +222,9 @@ async function refreshPapers() {
   const list = document.createElement('div'); list.className = 'paper-list';
   model.papers.forEach((paper) => { const item = button(paper.name, () => openPaper(paper), model.paper?.id === paper.id); const count = document.createElement('small'); count.textContent = `${paper.open_review_count} open`; item.append(count); list.append(item); });
   ui.assignedPapers.append(list);
+  const requestedId = new URLSearchParams(window.location.search).get('paper');
+  const requestedPaper = requestedId && model.papers.find((paper) => paper.id === requestedId);
+  if (requestedPaper && model.paper?.id !== requestedPaper.id) await openPaper(requestedPaper);
 }
 
 async function openPaper(paper) {

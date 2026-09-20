@@ -1,0 +1,94 @@
+% ----- This Latex project is developed by Dr. SUDHAKAR P under the 
+% --- guidance of Dr. KALYANARAMAN P towards the SCOPE school
+% ---- initiative at  Vellore Institute of Technology - 
+% ---- Vellore campus. Comments and suggestions can be sent to 
+% ---- sudhakar.p@vit.ac 
+\documentclass{VITSCOPEThesis}
+%---- Course and program configuration - Carefully configure the below section to generate the front page / cover page, declaration, cerfificate and acknowledgement
+\newcommand{\coursecode}{BCSXXXX}
+\newcommand{\coursename}{Captsone project - II}
+\newcommand{\programdegree}{Bachelor of Technology}
+\newcommand{\programname}{Computer Science and Engineering}
+\newcommand{\specialization}{} %  (Programme specialization)
+\newcommand{\semester}{Winter Semester 2025-2026}
+% ---- thesis information  ---------------- 
+\newcommand{\thesistitle}{This is a very long thesis title span for three rows to accomodate enough space.    ...............................     ..................................... }  % This is a very long thesis title span for three rows to accomodate enough space.    ...............................     ..................................... 
+\newcommand{\thesismonth}{Month}
+\newcommand{\thesisyear}{Year}
+\newcommand{\teamsize}{4} % number of team members
+%----- Student A --------------------
+\newcommand{\studentAname}{Student A name }
+\newcommand{\studentAregno}{22BDS0063}
+%----- Student B --------------------
+\newcommand{\studentBname}{Student B name }
+\newcommand{\studentBregno}{22BCE0931}
+%----- Student C --------------------
+\newcommand{\studentCname}{Student C name }
+\newcommand{\studentCregno}{22BCI0067}
+%----- Student D --------------------
+\newcommand{\studentDname}{Student D name }
+\newcommand{\studentDregno}{22BKT0145}
+%----- Project Guide Info --------------------
+\newcommand{\projguidename}{Dr. Project guide name}
+\newcommand{\projguidedesignation}{designation}
+%----- Hod and Dean Info  --------------------
+\newcommand{\hodname}{Dr. Hod }
+\newcommand{\hoddept}{Department of departmentname}
+\newcommand{\deanname}{Dr. Jaisankar N}
+\newcommand{\schoolname}{School of Computer Science and Engineering}
+% ----- Thesis Cover page and certificate  --------- 
+\input{acronym.tex}
+\begin{document}
+\pagestyle{plain}
+\pagenumbering{roman}
+\include{coverpage.tex}
+\newpage
+\include{declaration.tex}	
+\newpage
+\include{certificate.tex}	
+\newpage
+\include{acknowledgement.tex}	
+\newpage
+\newpage
+\pagestyle{plain}
+\pagenumbering{roman}
+%-----------------------------------------------------------------
+% Table of contents include List of Tables, Figures, Abbreviations, Symbols and Chapters.
+\setcounter{page}{-1}
+\tableofcontents
+\newpage
+\addcontentsline{toc}{section}{Executive Summary}
+\input{execsummary.tex}
+\newpage
+\listoftables
+\addcontentsline{toc}{section}{List of Tables}
+\newpage
+\listoffigures	
+\addcontentsline{toc}{section}{List of Figures}
+\newpage
+\addcontentsline{toc}{section}{List of Abbreviations}
+\printacronyms[include=abbr, name=List of Abbreviations]
+\newpage
+\addcontentsline{toc}{section}{List of Symbols}
+\printacronyms[include=symbol, name=Symbols and Notations]
+\newpage
+%--------  Thesis contents -----------------------------------
+\pagenumbering{arabic}
+\setcounter{page}{1}
+\include{chapters/chapter1}
+\include{chapters/chapter2}
+\include{chapters/chapter3}
+\include{chapters/chapter4}
+\include{chapters/chapter5}
+\include{chapters/chapter6}
+\include{chapters/chapter7} % included 
+\include{chapters/chapter8} % included 
+
+%------ Bibliography ----------------------------------------
+\bibliography{references.bib} % Replace with your .bib filename 
+%------ Appendices ----------------------------------------
+\newpage
+\include{appendix/sourcecode}	% comment if not necessary
+\newpage
+\include{appendix/publication}	% comment if not necessary
+\end{document}

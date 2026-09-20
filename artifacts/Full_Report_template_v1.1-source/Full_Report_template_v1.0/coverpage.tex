@@ -1,0 +1,72 @@
+\addtocounter{page}{-1}
+\thispagestyle{empty}
+\centering 
+\begin{spacing}{1.5}
+\vspace{0.5em}
+\LARGE{\textbf{\coursecode - \coursename}} 
+\vspace{1em} \linebreak
+\Large{\textbf{\MakeUppercase{\thesistitle}}} 
+\vspace{1em} \linebreak
+\large{\textit{Submitted in partial fulfilment of the requirements for the degree of}} 
+\vspace{2em} \linebreak
+\begin{tabular}[!h]{c}
+	\LARGE{\textbf{\programdegree}} \\ [0.5ex]
+		\textit{in}  \\ [0.5ex]
+	\LARGE{\textbf{\programname}} \\ [0.5ex]
+	\LARGE{\textbf{\specialization}} \\ [0.5ex]
+\end{tabular}
+\vspace{0.5em} \linebreak
+\textit{by}  
+\vspace{0.5em} \linebreak
+% student(s) name 
+\ifthenelse{\equal{\teamsize}{1}}{
+	\begin{tabular}[!h]{p{3cm}l}
+		\large{\textbf{\studentAregno}}  & \large{\textbf{\MakeUppercase{\studentAname }}} \\ 
+		& \\
+		& \\
+	\end{tabular}	
+}{
+	\ifthenelse{\equal{\teamsize}{2}}{
+		\begin{tabular}[!h]{p{3cm}l}
+			\large{\textbf{\studentAregno}}  & \large{\textbf{\MakeUppercase{\studentAname }}} \\ 
+			\large{\textbf{\studentBregno}} &\large{\textbf{\MakeUppercase{\studentBname }}} \\ 
+			& \\
+		\end{tabular}
+	}{
+		\ifthenelse{\equal{\teamsize}{3}}{
+			\begin{tabular}[!h]{p{3cm}l}
+				\large{\textbf{\studentAregno}}  & \large{\textbf{\MakeUppercase{\studentAname }}} \\
+				\large{\textbf{\studentBregno}} &\large{\textbf{\MakeUppercase{\studentBname }}} \\
+				\large{\textbf{\studentCregno}} &\large{\textbf{\MakeUppercase{\studentCname }}} \\
+			\end{tabular}	
+				
+		}{
+			\begin{tabular}[!h]{p{3cm}l}
+				\large{\textbf{\studentAregno}}  & \large{\textbf{\MakeUppercase{\studentAname }}} \\
+				\large{\textbf{\studentBregno}} &\large{\textbf{\MakeUppercase{\studentBname }}} \\
+				\large{\textbf{\studentCregno}} &\large{\textbf{\MakeUppercase{\studentCname }}} \\
+				\large{\textbf{\studentDregno}} &\large{\textbf{\MakeUppercase{\studentDname }}} \\ 
+			\end{tabular}
+			
+		}
+	}
+}
+\vspace{0.5em} \mbox{} 
+\linebreak
+%\vspace{1cm} \linebreak
+\large{Under the Supervision of} 
+\vspace{0.5em} \linebreak
+\begin{tabular}[!h]{c}
+		\large{\textbf{\projguidename}} \\ 
+		\large{\textbf{\projguidedesignation}} \\ 
+		\large{\textbf{\schoolname}} \\ 
+\end{tabular}
+\vspace*{1.5em} \linebreak
+\begin{figure}[!h]
+	\centering
+	\includegraphics[scale=1]{./images/vit\_logo.png}
+\end{figure}
+\linebreak 
+\textbf{\thesismonth, \thesisyear}
+\end{spacing}
+\pagebreak

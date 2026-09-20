@@ -65,10 +65,12 @@ pub struct V2BuildView {
     pub active_build_id: Option<Uuid>,
     pub active_status: Option<String>,
     pub current_build_id: Option<Uuid>,
+    pub current_state_hash: Option<String>,
     pub current_source_sequence: Option<u64>,
     pub current_job_id: Option<Uuid>,
     pub latest_status: Option<String>,
     pub latest_error: Option<Value>,
+    pub latest_build_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -369,8 +371,8 @@ impl V2Repository {
         let workspace_id = participant_workspace(self.database.pool(), actor, paper_id).await?;
         let row = sqlx::query(
             "SELECT s.desired_state_hash,h.durable_version AS source_sequence,s.active_build_id,aj.state AS active_status, \
-                    s.current_build_id,cb.source_sequence AS current_source_sequence,cb.compile_job_id AS current_job_id, \
-                    lb.status AS latest_status,lj.last_error AS latest_error \
+                    s.current_build_id,cb.state_hash AS current_state_hash,cb.source_sequence AS current_source_sequence,cb.compile_job_id AS current_job_id, \
+                    lb.status AS latest_status,lj.last_error AS latest_error,lb.id AS latest_build_id \
              FROM latex_core.v2_paper_build_state s \
              JOIN latex_core.workspace_heads h ON h.workspace_id=s.workspace_id \
              LEFT JOIN latex_core.v2_paper_builds ab ON ab.id=s.active_build_id \
@@ -391,10 +393,12 @@ impl V2Repository {
                 active_build_id: None,
                 active_status: None,
                 current_build_id: None,
+                current_state_hash: None,
                 current_source_sequence: None,
                 current_job_id: None,
                 latest_status: None,
                 latest_error: None,
+                latest_build_id: None,
             });
         };
         Ok(V2BuildView {
@@ -405,10 +409,14 @@ impl V2Repository {
             active_build_id: row.try_get("active_build_id").map_err(V2Error::Database)?,
             active_status: row.try_get("active_status").map_err(V2Error::Database)?,
             current_build_id: row.try_get("current_build_id").map_err(V2Error::Database)?,
+            current_state_hash: row
+                .try_get("current_state_hash")
+                .map_err(V2Error::Database)?,
             current_source_sequence: optional_u64(&row, "current_source_sequence")?,
             current_job_id: row.try_get("current_job_id").map_err(V2Error::Database)?,
             latest_status: row.try_get("latest_status").map_err(V2Error::Database)?,
             latest_error: row.try_get("latest_error").map_err(V2Error::Database)?,
+            latest_build_id: row.try_get("latest_build_id").map_err(V2Error::Database)?,
         })
     }
 
@@ -453,7 +461,7 @@ impl V2Repository {
             "SELECT a.artifact_id,a.job_id,a.logical_name,a.blob_hash,a.size_bytes,a.content_type \
              FROM latex_core.v2_paper_builds b \
              JOIN latex_core.compilation_artifacts a ON a.job_id=b.compile_job_id \
-             WHERE b.workspace_id=$1 AND b.id=$2 AND b.status='succeeded' AND a.kind=$3 \
+             WHERE b.workspace_id=$1 AND b.id=$2 AND (b.status='succeeded' OR $3='log') AND a.kind=$3 \
              ORDER BY a.logical_name LIMIT 1",
         )
         .bind(workspace_id.as_uuid())
@@ -627,6 +635,8 @@ async fn enqueue_build(
     let build_id = Uuid::new_v4();
     let version_id = Uuid::new_v4();
     let number = next_version_number(tx, request.workspace_id).await?;
+    let (version_manifest, version_snapshot) =
+        source_version(&request.manifest, &request.snapshot_id.to_hex());
     sqlx::query(
         "INSERT INTO latex_core.compile_jobs \
          (id,tenant_id,user_id,workspace_id,snapshot_id,compile_key,idempotency_key,engine,tex_environment_id,latexmk_profile,shell_policy,synctex,cost_class,priority,state) \
@@ -660,8 +670,8 @@ async fn enqueue_build(
     .bind(to_i64(number, "version number")?)
     .bind(request.user_id.as_uuid())
     .bind(to_i64(request.source_sequence, "source sequence")?)
-    .bind(request.snapshot_id.to_hex())
-    .bind(&request.manifest)
+    .bind(version_snapshot)
+    .bind(&version_manifest)
     .bind(&request.state_hash)
     .execute(&mut **tx)
     .await
@@ -683,6 +693,25 @@ async fn enqueue_build(
     .await
     .map_err(V2Error::Database)?;
     Ok(build_id)
+}
+
+pub(crate) fn source_version(manifest: &Value, compile_snapshot: &str) -> (Value, String) {
+    let mut version_manifest = manifest.clone();
+    let mut version_snapshot = compile_snapshot.to_owned();
+    if let Some(source_workspace) = version_manifest.get("source_workspace").cloned() {
+        version_manifest["workspace"] = source_workspace;
+        version_manifest
+            .as_object_mut()
+            .expect("build manifest is an object")
+            .remove("source_workspace");
+        if let Some(source_snapshot) = version_manifest
+            .get("workspace_snapshot_id")
+            .and_then(Value::as_str)
+        {
+            source_snapshot.clone_into(&mut version_snapshot);
+        }
+    }
+    (version_manifest, version_snapshot)
 }
 
 async fn set_pending(
@@ -836,4 +865,27 @@ fn to_i64(value: u64, name: &str) -> Result<i64, V2Error> {
     i64::try_from(value).map_err(|_| V2Error::Integrity {
         message: format!("{name} exceeds PostgreSQL BIGINT"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_version;
+    use serde_json::json;
+
+    #[test]
+    fn compile_only_manifest_becomes_an_original_source_version() {
+        let source = json!({"main_file":"main.tex","files":{"main.tex":{"blob_hash":"source","size_bytes":6}}});
+        let generated = json!({"main_file":"main.tex","files":{"main.tex":{"blob_hash":"bound","size_bytes":7}}});
+        let (manifest, snapshot) = source_version(
+            &json!({
+                "workspace":generated,
+                "source_workspace":source.clone(),
+                "workspace_snapshot_id":"source-snapshot",
+            }),
+            "compile-snapshot",
+        );
+        assert_eq!(snapshot, "source-snapshot");
+        assert_eq!(manifest["workspace"], source);
+        assert!(manifest.get("source_workspace").is_none());
+    }
 }

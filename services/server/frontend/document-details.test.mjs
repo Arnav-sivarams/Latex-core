@@ -8,6 +8,7 @@ test('first use only prompts a Leader with missing input', () => {
   assert.equal(needsFirstUseDetails({ ...detail, can_edit: false }), false);
   assert.equal(needsFirstUseDetails({ ...detail, missing_required_fields: [] }), false);
   assert.equal(needsFirstUseDetails({ ...detail, pack_id: null, project_metadata: { setup_complete: false } }), true);
+  assert.equal(needsFirstUseDetails({ ...detail, pack_id: null, single_source: true }), true);
   assert.equal(frontMatterStatus(detail), 'Front Matter needs 1 details');
 });
 
@@ -18,4 +19,10 @@ test('AUTO values and nonleaders are read-only; manual fields and modern packs r
   assert.equal(editableDetail({ can_edit: true }, { source: 'team.name', allow_team_override: true }), true);
   assert.equal(frontMatterStatus({ status: 'READY', warnings: ['missing section'] }), 'Front Matter has 1 template warnings');
   assert.equal(frontMatterStatus({ status: 'READY' }), 'Front Matter ready');
+});
+
+test('semester and academic year are explicit team metadata overrides', () => {
+  assert.equal(editableDetail({ can_edit: true }, { source: 'team.semester', allow_team_override: false }), true);
+  assert.equal(editableDetail({ can_edit: true }, { source: 'team.academic_year', allow_team_override: false }), true);
+  assert.equal(editableDetail({ can_edit: false }, { source: 'team.semester', allow_team_override: false }), false);
 });

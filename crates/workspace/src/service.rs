@@ -318,6 +318,40 @@ impl WorkspaceService {
         })
     }
 
+    /// Persists an immutable compile manifest without changing ordinary
+    /// workspace source or its durable version.
+    pub async fn store_compile_snapshot(
+        &self,
+        manifest: &WorkspaceManifestV1,
+    ) -> Result<SnapshotId, WorkspaceError> {
+        let canonical =
+            manifest
+                .canonical_json_bytes()
+                .map_err(|error| WorkspaceError::Manifest {
+                    message: error.to_string(),
+                })?;
+        let snapshot_id = manifest
+            .snapshot_id()
+            .map_err(|error| WorkspaceError::Manifest {
+                message: error.to_string(),
+            })?;
+        let manifest_blob_hash = BlobHash::digest(&canonical);
+        let stored = self
+            .blobs
+            .put_verified(manifest_blob_hash, Bytes::from(canonical))
+            .await?;
+        if stored.hash() != manifest_blob_hash {
+            return Err(WorkspaceError::CorruptPersistentEvent {
+                message: "blob store returned a different compile manifest hash".to_owned(),
+            });
+        }
+        self.repository
+            .record_compile_snapshot(snapshot_id, manifest_blob_hash)
+            .await
+            .map_err(WorkspaceError::map_persistence)?;
+        Ok(snapshot_id)
+    }
+
     pub fn replay_event(
         state: &mut WorkspaceState,
         event: &WorkspaceEventRecord,

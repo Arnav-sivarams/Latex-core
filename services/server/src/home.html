@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{HOME_TITLE}} — LaTeX Core</title>
+  <link rel="stylesheet" href="/static/shells.css?v=ui-consistency-theme-1">
+  <script src="/static/theme.js?v=ui-consistency-theme-1"></script>
+</head>
+<body class="projects-shell" data-role="{{HOME_ROLE}}">
+  <header class="shell-topbar">
+    <a class="shell-brand branded-wordmark" href="/home" aria-current="page"><img id="homeLogo" class="header-logo" alt="Institution logo" hidden><span>LaTeX Core</span></a>
+    <span class="header-divider" aria-hidden="true">|</span><span id="homeAccount" class="header-identity">Loading…</span>
+    <span class="header-divider" aria-hidden="true">|</span><span id="homeRole" class="role-badge">Loading…</span>
+    <span class="shell-spacer"></span>
+    <a class="quiet-button" href="/home" aria-current="page">Projects</a>
+    <a id="teamChatLink" class="quiet-button" href="/team-chat">Team Chat</a>
+    <form method="post" action="/logout"><button class="quiet-button" type="submit">Log out</button></form>
+  </header>
+  <div class="projects-layout">
+    <nav class="projects-sidebar" aria-label="Workspace navigation">
+      <p class="projects-sidebar-label">WORKSPACE</p>
+      <a class="projects-nav-item active" href="/home" aria-current="page"><span aria-hidden="true">▦</span>Projects</a>
+      <a class="projects-nav-item" href="/team-chat"><span aria-hidden="true">◌</span>Team Chat</a>
+    </nav>
+    <main class="projects-main" aria-labelledby="projects-heading">
+      <div class="projects-heading">
+        <div><p class="eyebrow">Workspace</p><h1 id="projects-heading">{{HOME_TITLE}}</h1><p class="projects-intro">{{HOME_INTRO}}</p></div>
+        <a id="openWorkspace" class="primary projects-open-button" href="{{HOME_CTA_HREF}}">{{HOME_CTA}}</a>
+      </div>
+      <div id="projectsNotice" class="projects-notice" role="status" aria-live="polite">Loading projects…</div>
+      <section id="projectGrid" class="project-card-grid" aria-label="Your projects"></section>
+    </main>
+  </div>
+  <script type="module" src="/static/home.js?v=projects-home"></script>
+</body>
+</html>

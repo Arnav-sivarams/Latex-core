@@ -123,6 +123,9 @@ pub fn read_archive(bytes: &[u8]) -> Result<ImportedArchive, ArchiveError> {
         if actual > entry.size() {
             return Err(ArchiveError::ExpandedTooLarge);
         }
+        if is_transient_tex_artifact(&path) {
+            continue;
+        }
         files.push(ImportedFile {
             path,
             bytes: Bytes::from(content),
@@ -136,6 +139,25 @@ pub fn read_archive(bytes: &[u8]) -> Result<ImportedArchive, ArchiveError> {
         files,
         detected_main,
     })
+}
+
+fn is_transient_tex_artifact(path: &LogicalPath) -> bool {
+    let name = path.file_name().to_ascii_lowercase();
+    [
+        ".aux",
+        ".log",
+        ".toc",
+        ".lof",
+        ".lot",
+        ".out",
+        ".fls",
+        ".fdb_latexmk",
+        ".synctex",
+        ".synctex.gz",
+        ".blg",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
 }
 
 fn reserve_declared_size(expanded: u64, size: u64) -> Result<u64, ArchiveError> {
@@ -253,6 +275,42 @@ mod tests {
         assert_eq!(archive.files.len(), 5);
         assert_eq!(archive.detected_main.expect("main").as_str(), "main.tex");
         assert_eq!(archive.files[4].bytes.as_ref(), &[0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn excludes_transient_tex_outputs_but_keeps_source_pdfs_and_bbl() {
+        let fixture = zip(&[
+            ("wrapper/Full_Report_v1.0.tex", b"source"),
+            ("wrapper/Full_Report_v1.0.aux", b"stale aux"),
+            ("wrapper/Full_Report_v1.0.log", b"stale log"),
+            ("wrapper/Full_Report_v1.0.toc", b"stale toc"),
+            ("wrapper/Full_Report_v1.0.lof", b"stale lof"),
+            ("wrapper/Full_Report_v1.0.lot", b"stale lot"),
+            ("wrapper/Full_Report_v1.0.out", b"stale out"),
+            ("wrapper/Full_Report_v1.0.fls", b"stale fls"),
+            ("wrapper/Full_Report_v1.0.fdb_latexmk", b"stale database"),
+            ("wrapper/Full_Report_v1.0.synctex", b"stale synctex"),
+            ("wrapper/Full_Report_v1.0.synctex.gz", b"stale synctex gzip"),
+            ("wrapper/Full_Report_v1.0.blg", b"stale bibtex log"),
+            ("wrapper/Full_Report_v1.0.bbl", b"retained bibliography"),
+            ("wrapper/Full_Report_v1.0.pdf", b"retained root pdf"),
+            ("wrapper/images/sample-graph.pdf", b"retained source asset"),
+        ]);
+        let archive = read_archive(&fixture).expect("safe archive");
+        let paths = archive
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "wrapper/Full_Report_v1.0.tex",
+                "wrapper/Full_Report_v1.0.bbl",
+                "wrapper/Full_Report_v1.0.pdf",
+                "wrapper/images/sample-graph.pdf",
+            ]
+        );
     }
 
     #[test]

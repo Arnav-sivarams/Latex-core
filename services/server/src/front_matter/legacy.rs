@@ -7,6 +7,101 @@ use super::{
 };
 use std::fmt::Write as _;
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SemesterMetadata {
+    pub label: String,
+    pub academic_year_start: u32,
+    pub academic_year_end: u32,
+    pub academic_year: String,
+    pub academic_year_display: String,
+}
+
+/// Resolve the institutional semester number and submission date into the
+/// values consumed by Front Matter macros. The stored academic year remains
+/// full-width; TeX formatting is applied only when bindings are emitted.
+pub fn derive_semester_metadata(
+    semester: &str,
+    submission_date: &str,
+    existing_academic_year: Option<&str>,
+) -> Result<SemesterMetadata, FrontMatterError> {
+    let semester = semester
+        .parse::<u8>()
+        .ok()
+        .filter(|semester| (1..=8).contains(semester))
+        .ok_or_else(|| FrontMatterError::InvalidValue("team.semester".into()))?;
+    if !valid_date(submission_date) {
+        return Err(FrontMatterError::InvalidValue("submission_date".into()));
+    }
+    let submission_year = submission_date[0..4]
+        .parse::<u32>()
+        .map_err(|_| FrontMatterError::InvalidValue("submission_date".into()))?;
+    let (label, start, end) = if semester % 2 == 1 {
+        ("Winter Semester", submission_year, submission_year + 1)
+    } else {
+        let start = submission_year
+            .checked_sub(1)
+            .ok_or_else(|| FrontMatterError::InvalidValue("submission_date".into()))?;
+        ("Fall Semester", start, submission_year)
+    };
+    let academic_year = format!("{start}-{end}");
+    if let Some(existing) = existing_academic_year.filter(|value| !value.trim().is_empty())
+        && !matches!(existing, value if value == academic_year
+            || value == format!("{start}-{:02}", end % 100)
+            || value == format!("{start}--{}", end % 100)
+            || value == format!("{start}\u{2013}{:02}", end % 100))
+    {
+        return Err(FrontMatterError::InvalidValue(
+            "team.academic_year contradicts team.semester and submission_date".into(),
+        ));
+    }
+    Ok(SemesterMetadata {
+        label: label.into(),
+        academic_year_start: start,
+        academic_year_end: end,
+        academic_year: academic_year.clone(),
+        academic_year_display: format!("{start}\u{2013}{:02}", end % 100),
+    })
+}
+
+fn apply_semester_metadata(
+    values: &mut BTreeMap<String, ResolvedValue>,
+) -> Result<(), FrontMatterError> {
+    let Some(semester) = values
+        .get("team.semester")
+        .and_then(|value| value.value.as_str())
+    else {
+        return Ok(());
+    };
+    let Some(submission_date) = values
+        .get("submission_date")
+        .and_then(|value| value.value.as_str())
+    else {
+        return Ok(());
+    };
+    let metadata = derive_semester_metadata(
+        semester,
+        submission_date,
+        values
+            .get("team.academic_year")
+            .and_then(|value| value.value.as_str()),
+    )?;
+    values.insert(
+        "team.semester".into(),
+        ResolvedValue {
+            value: Value::String(metadata.label),
+            source: "DERIVED",
+        },
+    );
+    values.insert(
+        "team.academic_year".into(),
+        ResolvedValue {
+            value: Value::String(metadata.academic_year),
+            source: "DERIVED",
+        },
+    );
+    Ok(())
+}
+
 pub const REGISTRY: &[(&str, &str, &str, bool)] = &[
     ("coursecode", "course_code", "Course code", true),
     ("coursename", "course_name", "Course name", true),
@@ -49,19 +144,20 @@ pub const REGISTRY: &[(&str, &str, &str, bool)] = &[
         "Guide designation",
         false,
     ),
-    ("schoolname", "school_name", "School name", true),
-    ("programdegree", "degree_name", "Degree display name", true),
+    ("schoolname", "school_name", "School name", false),
+    ("programdegree", "degree_name", "Degree display name", false),
     (
         "programname",
         "programme_name",
         "Programme display name",
-        true,
+        false,
     ),
-    ("specialization", "specialization", "Specialization", true),
-    ("semester", "team.semester", "Semester", false),
+    ("specialization", "specialization", "Specialization", false),
+    ("semester", "team.semester", "Semester", true),
+    ("academicyear", "team.academic_year", "Academic Year", true),
     ("deanname", "dean.name", "Dean name", true),
     ("hodname", "hod.name", "HOD name", true),
-    ("hoddept", "department_name", "Department name", true),
+    ("hoddept", "department_name", "Department name", false),
 ];
 
 const SECTIONS: &[(&str, &[&str])] = &[
@@ -117,7 +213,7 @@ fn metadata_like(word: &str) -> bool {
     ]
     .iter()
     .any(|prefix| word.starts_with(prefix))
-        || matches!(word, "semester" | "specialization")
+        || matches!(word, "semester" | "specialization" | "academicyear")
 }
 
 pub fn referenced(files: &[ImportedFile]) -> Result<BTreeSet<String>, FrontMatterError> {
@@ -268,6 +364,8 @@ pub fn render(
     values: &BTreeMap<String, ResolvedValue>,
     enabled: &BTreeMap<String, bool>,
 ) -> Result<Vec<RenderedFile>, FrontMatterError> {
+    let mut values = values.clone();
+    apply_semester_metadata(&mut values)?;
     let mut metadata = String::from("% Generated by LaTeX Core.\n");
     let mut words = referenced(&pack.files)?;
     words.extend(REGISTRY.iter().map(|item| item.0.to_owned()));
@@ -301,14 +399,18 @@ pub fn render(
             ][value[5..7]
                 .parse::<usize>()
                 .map_err(|_| FrontMatterError::InvalidValue("submission_date".into()))?
-                - 1],
-            "thesisyear" if valid_date(value) => &value[..4],
-            _ => value,
+                - 1]
+            .to_owned(),
+            "thesisyear" if valid_date(value) => value[..4].to_owned(),
+            "academicyear" if value.len() == 9 && value.as_bytes()[4] == b'-' => {
+                format!("{}--{}", &value[..4], &value[7..9])
+            }
+            _ => value.to_owned(),
         };
         writeln!(
             metadata,
             "\\renewcommand{{\\{word}}}{{{}}}",
-            escape_latex_text(value)
+            escape_latex_text(&value)
         )
         .map_err(|_| FrontMatterError::InvalidManifest)?;
     }
@@ -348,6 +450,22 @@ pub fn render(
 pub fn single_source_bindings(
     values: &BTreeMap<String, Value>,
 ) -> Result<String, FrontMatterError> {
+    let mut values = values.clone();
+    if let (Some(semester), Some(submission_date)) = (
+        values.get("team.semester").and_then(Value::as_str),
+        values.get("submission_date").and_then(Value::as_str),
+    ) {
+        let metadata = derive_semester_metadata(
+            semester,
+            submission_date,
+            values.get("team.academic_year").and_then(Value::as_str),
+        )?;
+        values.insert("team.semester".into(), Value::String(metadata.label));
+        values.insert(
+            "team.academic_year".into(),
+            Value::String(metadata.academic_year),
+        );
+    }
     let mut output = String::from("% Known institutional single-source bindings.\n");
     for (word, source, _, _) in REGISTRY {
         writeln!(output, "\\providecommand{{\\{word}}}{{}}")
@@ -376,14 +494,18 @@ pub fn single_source_bindings(
             ][value[5..7]
                 .parse::<usize>()
                 .map_err(|_| FrontMatterError::InvalidValue("submission_date".into()))?
-                - 1],
-            "thesisyear" if valid_date(value) => &value[..4],
-            _ => value,
+                - 1]
+            .to_owned(),
+            "thesisyear" if valid_date(value) => value[..4].to_owned(),
+            "academicyear" if value.len() == 9 && value.as_bytes()[4] == b'-' => {
+                format!("{}--{}", &value[..4], &value[7..9])
+            }
+            _ => value.to_owned(),
         };
         writeln!(
             output,
             "\\renewcommand{{\\{word}}}{{{}}}",
-            escape_latex_text(value)
+            escape_latex_text(&value)
         )
         .map_err(|_| FrontMatterError::InvalidManifest)?;
     }
@@ -421,8 +543,12 @@ pub fn details(
         let resolved = rendered.resolved.get(&field.key);
         let value = resolved.map(|value| &value.value);
         let has_value = value.is_some_and(|value| !empty_value(value));
-        let mut editable =
-            field.allow_team_override && resolved.is_none_or(|value| value.source != "AUTO");
+        let team_metadata = matches!(
+            field.source.as_deref(),
+            Some("team.semester" | "team.academic_year")
+        );
+        let mut editable = (field.allow_team_override || team_metadata)
+            && resolved.is_none_or(|value| value.source != "AUTO");
         let dean_options = automatic
             .get("dean.options")
             .and_then(Value::as_array)
@@ -738,6 +864,41 @@ mod tests {
         assert!(bindings.contains("\\renewcommand{\\thesistitle}{Safe \\& exact}"));
         assert!(bindings.contains("\\renewcommand{\\studentAname}{Alice Alpha}"));
         assert!(!bindings.contains("write18"));
+    }
+
+    #[test]
+    fn semester_metadata_uses_submission_year_and_rejects_invalid_numbers() {
+        for (semester, date, expected_label, expected_year, expected_display) in [
+            ("1", "2026-09-01", "Winter Semester", "2026-2027", "2026–27"),
+            ("3", "2026-09-01", "Winter Semester", "2026-2027", "2026–27"),
+            ("7", "2026-09-01", "Winter Semester", "2026-2027", "2026–27"),
+            ("2", "2026-09-01", "Fall Semester", "2025-2026", "2025–26"),
+            ("4", "2026-09-01", "Fall Semester", "2025-2026", "2025–26"),
+            ("8", "2026-09-01", "Fall Semester", "2025-2026", "2025–26"),
+            ("1", "2027-09-01", "Winter Semester", "2027-2028", "2027–28"),
+            ("2", "2027-09-01", "Fall Semester", "2026-2027", "2026–27"),
+        ] {
+            let metadata = derive_semester_metadata(semester, date, None).unwrap();
+            assert_eq!(metadata.label, expected_label);
+            assert_eq!(metadata.academic_year, expected_year);
+            assert_eq!(metadata.academic_year_display, expected_display);
+        }
+        assert!(derive_semester_metadata("0", "2026-09-01", None).is_err());
+        assert!(derive_semester_metadata("9", "2026-09-01", None).is_err());
+        assert!(derive_semester_metadata("4", "2026-09-01", Some("2025-26")).is_ok());
+        assert!(derive_semester_metadata("1", "2026-09-01", Some("2025-2026")).is_err());
+    }
+
+    #[test]
+    fn semester_bindings_keep_submission_year_separate_from_academic_year() {
+        let bindings = single_source_bindings(&BTreeMap::from([
+            ("team.semester".into(), Value::String("4".into())),
+            ("submission_date".into(), Value::String("2026-09-01".into())),
+        ]))
+        .unwrap();
+        assert!(bindings.contains(r"\renewcommand{\semester}{Fall Semester}"));
+        assert!(bindings.contains(r"\renewcommand{\academicyear}{2025--26}"));
+        assert!(bindings.contains(r"\renewcommand{\thesisyear}{2026}"));
     }
 
     #[test]

@@ -140,6 +140,37 @@ function renderJson(value) {
   return pre;
 }
 
+async function renderRuntimeLogs() {
+  const controls = element('div', 'admin-toolbar');
+  const service = document.createElement('select'); service.setAttribute('aria-label', 'Service');
+  const search = document.createElement('input'); search.type = 'search'; search.placeholder = 'Search retained logs'; search.setAttribute('aria-label', 'Search available retained container logs');
+  const refresh = buttonAction('Refresh', () => load());
+  const host = element('div');
+  controls.append(element('label', '', 'Service'), service, search, refresh);
+  content.append(element('p', 'muted-note', 'Search available retained container logs. Docker retention may exclude older records.'), controls, host);
+  const load = async () => {
+    refresh.disabled = true;
+    try {
+      const params = new URLSearchParams({ limit: '100' });
+      if (service.value) params.set('service', service.value);
+      if (search.value.trim()) params.set('query', search.value.trim());
+      const data = await api(`/api/admin/v2/runtime-logs?${params}`);
+      const services = [...new Set(data.services || (data.records || []).map((record) => record.service))].sort();
+      const selected = service.value;
+      service.replaceChildren(new Option('All services', '')); services.forEach((name) => service.append(new Option(name, name)));
+      service.value = services.includes(selected) ? selected : '';
+      if (!data.records?.length) { host.replaceChildren(element('p', 'empty-copy', 'No retained log records matched.')); return; }
+      const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table');
+      table.innerHTML = '<thead><tr><th>Timestamp</th><th>Service / container</th><th>Message</th></tr></thead>';
+      const body = document.createElement('tbody');
+      data.records.forEach((record) => { const row = document.createElement('tr'); const message = element('pre', 'admin-data', record.message || ''); message.className = 'admin-log-message'; const messageCell = element('td'); messageCell.append(message); row.append(element('td', '', record.timestamp), element('td', '', `${record.service} · ${record.container || 'container'}`), messageCell); body.append(row); });
+      table.append(body); wrap.append(table); host.replaceChildren(wrap);
+    } finally { refresh.disabled = false; }
+  };
+  service.addEventListener('change', () => load().catch(showError)); search.addEventListener('keydown', (event) => { if (event.key === 'Enter') load().catch(showError); });
+  await load();
+}
+
 function renderOverview(data) {
   const metrics = [
     ['active_paper_teams', 'Paper Teams'], ['teams_in_review', 'Teams in Review'],
@@ -288,10 +319,10 @@ function renderSystem(data, overview, branding) {
 }
 
 async function renderTemplates(templates, frontMatterPacks) {
-  const heading = element('h2', 'admin-section-anchor', 'Main templates'); heading.id = 'main-templates'; content.append(heading);
-  const intro = element('p', 'empty-copy', 'Import a bounded local ZIP, inspect its safe file tree, select Main when detection is ambiguous, then save an immutable template. Existing-Team changes use the separate conflict-safe preview workflow.');
+  const heading = element('h2', 'admin-section-anchor', 'Complete report templates'); heading.id = 'main-templates'; content.append(heading);
+  const intro = element('p', 'empty-copy', 'Import one complete report ZIP when the selected source controls cover, front matter, and body. Existing separate-file Front Matter support remains available for older templates.');
   const form = element('form', 'admin-template-form');
-  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Front Matter arrangement<select name="arrangement"><option value="REPORT_CONTENT_ONLY">Report content only</option><option value="SEPARATE_FILES">Report and Front Matter in separate files</option><option value="SINGLE_SOURCE">One source containing the entire report</option></select></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>+ Import Main Template</button>';
+  form.innerHTML = '<label>Name<input name="name" required maxlength="200"></label><label>Description (optional)<input name="description" maxlength="2000"></label><label>Template type<select name="arrangement"><option value="SINGLE_SOURCE">Complete report template (recommended)</option><option value="REPORT_CONTENT_ONLY">Report content only</option><option value="SEPARATE_FILES">Legacy separate Front Matter files</option></select></label><label>Template ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label><label>Main .tex file<select name="main" required disabled><option value="">Validate a ZIP first…</option></select></label><button type="button" data-action="validate-template">Validate</button><button class="primary" type="submit" disabled>+ Import Complete Report Template</button>';
   const archiveInput = form.elements.archive;
   const mainSelect = form.elements.main;
   const validate = form.querySelector('[data-action="validate-template"]');
@@ -312,16 +343,18 @@ async function renderTemplates(templates, frontMatterPacks) {
     mainSelect.value = preview.detected_main || '';
     mainSelect.disabled = false;
     submit.disabled = !mainSelect.value;
+    const selectedEntry = preview.files.find((entry) => entry.path === mainSelect.value);
+    if (selectedEntry?.single_source_compatible) form.elements.arrangement.value = 'SINGLE_SOURCE';
     const heading = element('strong', '', `${preview.files.length} safe files`);
     const tree = element('ul', 'template-file-tree');
     preview.files.forEach((entry) => tree.append(element('li', '', `${entry.path} · ${entry.size_bytes} bytes`)));
     const selected = preview.files.find((entry) => entry.path === mainSelect.value);
-    const hint = element('p', 'empty-copy', `${preview.detected_main ? `Detected Main: ${preview.detected_main}` : 'Main is ambiguous; choose one TeX file.'} ${selected?.front_matter_compatible ? 'Front Matter compatible.' : 'Front Matter not enabled.'}`);
+    const hint = element('p', 'empty-copy', `${preview.detected_main ? `Detected Main: ${preview.detected_main}` : 'Main is ambiguous; choose one TeX file.'} ${selected?.single_source_compatible ? 'Complete report binding is safe.' : selected?.front_matter_compatible ? 'Legacy separate Front Matter marker detected.' : 'No metadata binding detected.'}`);
     previewHost.replaceChildren(heading, hint, tree);
   };
   archiveInput.addEventListener('change', () => { preview = null; mainSelect.disabled = true; submit.disabled = true; previewHost.replaceChildren(); });
   validate.addEventListener('click', () => previewArchive().catch(showError));
-  mainSelect.addEventListener('change', () => { submit.disabled = !preview || !mainSelect.value; });
+  mainSelect.addEventListener('change', () => { submit.disabled = !preview || !mainSelect.value; const selected = preview?.files.find((entry) => entry.path === mainSelect.value); if (selected?.single_source_compatible) form.elements.arrangement.value = 'SINGLE_SOURCE'; });
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     try {
@@ -364,7 +397,7 @@ async function renderTemplates(templates, frontMatterPacks) {
         await api(`/api/admin/v2/templates/${template.id}`, { method: 'DELETE' }); announce(`Removed ${template.name}.`); await showSection('Templates');
       }, 'danger'),
     );
-    row.append(metadata, mainCell, element('td', '', template.front_matter_arrangement === 'SEPARATE_FILES' ? 'Separate managed Front Matter' : template.front_matter_arrangement === 'SINGLE_SOURCE' ? 'Single source · verified bindings required' : 'Metadata only · no forced pages'), element('td', '', new Date(template.created_at).toLocaleString()), element('td', '', usage), actions);
+    row.append(metadata, mainCell, element('td', '', template.front_matter_arrangement === 'SEPARATE_FILES' ? 'Legacy separate Front Matter' : template.front_matter_arrangement === 'SINGLE_SOURCE' ? 'Complete report · single source' : 'Report content only'), element('td', '', new Date(template.created_at).toLocaleString()), element('td', '', usage), actions);
     body.append(row);
   });
   table.append(body); wrap.append(table); content.append(wrap); await renderFrontMatterPacks(frontMatterPacks); await renderAutomaticDefaults(templates, frontMatterPacks);
@@ -978,6 +1011,11 @@ async function showSection(section, options = {}) {
     if (section === 'System') {
       const [data, overview, branding] = await Promise.all([api(endpoints.System), api(endpoints.Overview), api('/api/admin/v2/branding')]);
       content.replaceChildren(element('h1', '', 'System')); renderSystem(data, overview, branding); return;
+    }
+    if (section === 'Runtime Logs') {
+      content.replaceChildren(element('h1', '', 'Runtime Logs'));
+      await renderRuntimeLogs();
+      return;
     }
     const data = await api(endpoints[section]);
     content.replaceChildren(element('h1', '', section));

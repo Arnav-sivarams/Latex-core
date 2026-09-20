@@ -290,8 +290,10 @@ impl V2Repository {
         let baseline = sqlx::query(
             "SELECT b.version_id,b.id AS build_id,b.state_hash,b.source_sequence FROM latex_core.v2_paper_build_state s \
              JOIN latex_core.v2_paper_builds b ON b.id=s.current_build_id \
-             WHERE s.workspace_id=$1 AND b.status='succeeded' AND b.state_hash=$2 \
-               AND s.desired_state_hash=$2 \
+             JOIN latex_core.paper_versions v ON v.id=b.version_id \
+             WHERE s.workspace_id=$1 AND b.status='succeeded' \
+               AND v.manifest->>'workspace_snapshot_id'=$2 \
+               AND s.desired_state_hash=b.state_hash \
                AND EXISTS (SELECT 1 FROM latex_core.compilation_artifacts a \
                            WHERE a.job_id=b.compile_job_id AND a.kind='pdf')",
         )

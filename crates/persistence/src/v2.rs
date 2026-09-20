@@ -217,6 +217,23 @@ pub struct PaperTeamMemberView {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TeamChatTeam {
+    pub id: Uuid,
+    pub name: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TeamChatMessage {
+    pub id: Uuid,
+    pub team_id: Uuid,
+    pub author_user_id: UserId,
+    pub author_name: String,
+    pub body: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Error)]
 pub enum V2Error {
     #[error("V2 global role is missing for user {user_id}")]
@@ -250,6 +267,8 @@ pub enum V2Error {
     InvalidPath { message: String },
     #[error("paper name must contain between 1 and 200 characters")]
     InvalidName,
+    #[error("team chat message must contain between 1 and 4000 characters")]
+    InvalidChatMessage,
     #[error("persistent V2 data is invalid: {message}")]
     Integrity { message: String },
     #[error("workspace version conflict: expected {expected}, actual {actual}")]
@@ -267,6 +286,107 @@ impl V2Repository {
     #[must_use]
     pub const fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    /// Lists the implicit chat channels the caller may access.  Administrators
+    /// deliberately do not receive ambient access: chat follows team membership.
+    pub async fn team_chat_teams(&self, actor: UserId) -> Result<Vec<TeamChatTeam>, V2Error> {
+        let rows = sqlx::query(
+            "SELECT t.id,t.name,t.updated_at::text AS updated_at \
+             FROM latex_core.paper_teams t \
+             JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id AND m.user_id=$1 \
+             JOIN latex_core.global_user_roles role ON role.user_id=m.user_id AND role.role IN ('writer','mentor') \
+             ORDER BY t.updated_at DESC,t.id",
+        )
+        .bind(actor.as_uuid())
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TeamChatTeam {
+                    id: row.try_get("id").map_err(V2Error::Database)?,
+                    name: row.try_get("name").map_err(V2Error::Database)?,
+                    updated_at: row.try_get("updated_at").map_err(V2Error::Database)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn team_chat_messages(
+        &self,
+        actor: UserId,
+        team_id: Uuid,
+    ) -> Result<Vec<TeamChatMessage>, V2Error> {
+        self.require_team_chat_access(actor, team_id).await?;
+        let rows = sqlx::query(
+            "SELECT message.id,message.team_id,message.author_user_id,\
+                    COALESCE(student.name,faculty.name,credentials.email) AS author_name,\
+                    message.body,message.created_at::text AS created_at \
+             FROM (SELECT * FROM latex_core.team_chat_messages WHERE team_id=$1 ORDER BY created_at DESC,id DESC LIMIT 100) message \
+             JOIN latex_core.user_credentials credentials ON credentials.user_id=message.author_user_id \
+             LEFT JOIN vcap.student_user_links student_link ON student_link.user_id=message.author_user_id AND student_link.status='LINKED' \
+             LEFT JOIN vcap.students student ON student.reg_no=student_link.reg_no \
+             LEFT JOIN vcap.faculty_user_links faculty_link ON faculty_link.user_id=message.author_user_id AND faculty_link.status='LINKED' \
+             LEFT JOIN vcap.faculty faculty ON faculty.faculty_id=faculty_link.faculty_id \
+             ORDER BY message.created_at,message.id",
+        )
+        .bind(team_id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        rows.into_iter().map(decode_team_chat_message).collect()
+    }
+
+    pub async fn send_team_chat_message(
+        &self,
+        actor: UserId,
+        team_id: Uuid,
+        body: &str,
+    ) -> Result<TeamChatMessage, V2Error> {
+        let body = body.trim();
+        if body.is_empty() || body.chars().count() > 4_000 {
+            return Err(V2Error::InvalidChatMessage);
+        }
+        self.require_team_chat_access(actor, team_id).await?;
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO latex_core.team_chat_messages (id,team_id,author_user_id,body) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(id)
+        .bind(team_id)
+        .bind(actor.as_uuid())
+        .bind(body)
+        .execute(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        self.team_chat_messages(actor, team_id)
+            .await?
+            .into_iter()
+            .find(|message| message.id == id)
+            .ok_or(V2Error::Integrity {
+                message: "new team chat message was not readable".into(),
+            })
+    }
+
+    async fn require_team_chat_access(&self, actor: UserId, team_id: Uuid) -> Result<(), V2Error> {
+        let allowed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.paper_team_members member \
+             JOIN latex_core.global_user_roles role ON role.user_id=member.user_id AND role.role IN ('writer','mentor') \
+             WHERE member.paper_team_id=$1 AND member.user_id=$2)",
+        )
+        .bind(team_id)
+        .bind(actor.as_uuid())
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(V2Error::Database)?;
+        if allowed {
+            Ok(())
+        } else {
+            Err(V2Error::NotFound {
+                entity: "Team chat",
+            })
+        }
     }
 
     pub async fn get_global_role(
@@ -2647,6 +2767,19 @@ fn decode_team_member_view(row: PgRow) -> Result<PaperTeamMemberView, V2Error> {
         role: GlobalRole::from_str(&role)?,
         is_leader: row.try_get("is_leader").map_err(V2Error::Database)?,
         writer_order: row.try_get("writer_order").map_err(V2Error::Database)?,
+        created_at: row.try_get("created_at").map_err(V2Error::Database)?,
+    })
+}
+
+fn decode_team_chat_message(row: PgRow) -> Result<TeamChatMessage, V2Error> {
+    Ok(TeamChatMessage {
+        id: row.try_get("id").map_err(V2Error::Database)?,
+        team_id: row.try_get("team_id").map_err(V2Error::Database)?,
+        author_user_id: UserId::from_uuid(
+            row.try_get("author_user_id").map_err(V2Error::Database)?,
+        ),
+        author_name: row.try_get("author_name").map_err(V2Error::Database)?,
+        body: row.try_get("body").map_err(V2Error::Database)?,
         created_at: row.try_get("created_at").map_err(V2Error::Database)?,
     })
 }

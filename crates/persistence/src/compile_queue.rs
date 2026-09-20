@@ -758,6 +758,8 @@ async fn finalize_v2_build(
         .fetch_one(&mut **tx)
         .await
         .map_err(QueueError::Database)?;
+            let (version_manifest, version_snapshot) =
+                crate::versions::source_version(&manifest, &snapshot);
             sqlx::query(
             "INSERT INTO latex_core.compile_jobs \
              (id,tenant_id,user_id,workspace_id,snapshot_id,compile_key,idempotency_key,engine,tex_environment_id,latexmk_profile,shell_policy,synctex,cost_class,priority,state) \
@@ -791,8 +793,8 @@ async fn finalize_v2_build(
         .bind(number)
         .bind(user)
         .bind(sequence)
-        .bind(&snapshot)
-        .bind(manifest)
+        .bind(version_snapshot)
+        .bind(version_manifest)
         .bind(&pending_hash)
         .execute(&mut **tx)
         .await
