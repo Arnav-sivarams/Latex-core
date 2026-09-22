@@ -1,6 +1,6 @@
 # Professor test guide
 
-This walkthrough assumes `./install.sh` completed and printed a healthy URL.
+This walkthrough assumes `./latex-core install` completed and printed a healthy URL.
 
 1. Open the URL and sign in as the Admin created by the installer.
 2. Build the two importable ZIPs:

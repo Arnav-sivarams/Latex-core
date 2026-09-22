@@ -32,7 +32,7 @@ latex_core_init() {
   LATEX_CORE_ROOT="$(cd "$repository_root" && pwd)"
   LATEX_CORE_ENV_FILE="$LATEX_CORE_ROOT/.env"
   [[ -f "$LATEX_CORE_ENV_FILE" ]] || {
-    echo "LaTeX Core is not installed: $LATEX_CORE_ENV_FILE is missing. Run ./install.sh." >&2
+    echo "LaTeX Core is not installed: $LATEX_CORE_ENV_FILE is missing. Run ./latex-core install from this checkout." >&2
     return 1
   }
   LATEX_CORE_PROJECT="$(latex_core_env_value COMPOSE_PROJECT_NAME "$LATEX_CORE_ENV_FILE")"
@@ -51,4 +51,23 @@ latex_core_init() {
 
 latex_core_container_id() {
   "${LATEX_CORE_COMPOSE[@]}" ps -aq "$1" 2>/dev/null | head -n1
+}
+
+latex_core_prepare_staging() {
+  local staging parent
+  staging="$(latex_core_env_value WORKER_STAGING_HOST_ROOT "$LATEX_CORE_ENV_FILE")"
+  [[ -n "$staging" ]] || { echo 'WORKER_STAGING_HOST_ROOT is missing.' >&2; return 1; }
+  if [[ -e "$staging" && ! -d "$staging" ]]; then
+    echo "Worker staging path is not a directory: $staging. Set WORKER_STAGING_HOST_ROOT to a writable dedicated directory." >&2
+    return 1
+  fi
+  parent="$staging"
+  while [[ ! -e "$parent" ]]; do parent="$(dirname "$parent")"; done
+  if [[ ! -w "$parent" || ( -d "$staging" && ! -w "$staging" ) ]]; then
+    echo "Worker staging path is not writable: $staging. Set WORKER_STAGING_HOST_ROOT to a writable dedicated directory." >&2
+    return 1
+  fi
+  mkdir -p -- "$staging" || { echo "Could not create worker staging path: $staging" >&2; return 1; }
+  [[ -w "$staging" ]] || { echo "Worker staging path is not writable: $staging" >&2; return 1; }
+  chmod 700 -- "$staging"
 }

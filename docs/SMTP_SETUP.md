@@ -5,7 +5,7 @@ LaTeX Core has a provider-neutral SMTP client. Basic installation works with `LA
 Configure it interactively without opening `.env`:
 
 ```sh
-./install.sh --configure-mail
+./latex-core install --configure-mail
 ```
 
 The helper updates only mail-related `.env` keys, hides the password, and validates the same security values as the server: `starttls` and `tls`.

@@ -30,7 +30,7 @@ The installer automatically retains useful evidence under `.install-diagnostics/
 For a healthy installation, this final check must pass:
 
 ```sh
-./install.sh --verify-only
+./latex-core install --verify-only
 ```
 
 Do not delete volumes or regenerate `.env` to address a diagnostic error. Correct the named configuration, port, permission, image, database, or service failure and rerun the relevant check.

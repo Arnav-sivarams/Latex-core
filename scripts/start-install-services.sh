@@ -65,14 +65,7 @@ wait_running_stable() {
 python3 "$root/scripts/validate-install-config.py" "$LATEX_CORE_ENV_FILE"
 "${LATEX_CORE_COMPOSE[@]}" config --quiet
 "$root/scripts/check-install-ports.sh"
-staging="$(latex_core_env_value WORKER_STAGING_HOST_ROOT "$LATEX_CORE_ENV_FILE")"
-mkdir -p "$staging"
-[[ -d "$staging" && -w "$staging" ]] || { echo "Worker staging path is not writable by the installer account: $staging" >&2; exit 1; }
-chmod 700 "$staging"
-docker run --rm --network none --user 0:0 --entrypoint /bin/sh \
-  --mount "type=bind,source=$staging,target=$staging" \
-  sha256:8db804f76b8e80e5be9fb28ba14b0938df5989b7a8250ca6b0e9f3c200c4ee38 \
-  -c 'test -d "$1" && test -w "$1"' sh "$staging"
+latex_core_prepare_staging
 
 phase=image-acquisition
 echo 'PHASE image acquisition: PostgreSQL and Caddy'
@@ -93,7 +86,7 @@ wait_healthy postgres 150
 
 phase=schema-migration
 echo 'PHASE schema initialization/migration'
-"${LATEX_CORE_COMPOSE[@]}" run --rm --no-deps api /usr/local/bin/latex-core-admin database migrate
+"${LATEX_CORE_COMPOSE[@]}" run -T --rm --no-deps api /usr/local/bin/latex-core-admin database migrate
 
 phase=api-readiness
 echo 'PHASE API readiness'

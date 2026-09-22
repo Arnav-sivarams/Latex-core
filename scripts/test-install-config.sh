@@ -51,5 +51,15 @@ grep -qx 'HTTP_PORT=9000' "$test_root/defaults.env"
 grep -qx 'LATEX_CORE_POSTGRES_PORT=9001' "$test_root/defaults.env"
 grep -qx 'HTTP_BIND_ADDRESS=127.0.0.1' "$test_root/defaults.env"
 grep -qx 'LATEX_CORE_PUBLIC_BASE_URL=http://localhost:9000' "$test_root/defaults.env"
+default_name="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$test_root/defaults.env")"
+[[ "$default_name" =~ ^latex-core-[0-9a-f]{12}$ ]]
+"$root/scripts/generate-local-env.sh" --output "$test_root/defaults.env" >/dev/null
+grep -qx "COMPOSE_PROJECT_NAME=$default_name" "$test_root/defaults.env"
+mkdir -p "$test_root/other-checkout/scripts"
+cp "$root/scripts/generate-local-env.sh" "$test_root/other-checkout/scripts/"
+cp "$root/.env.example" "$test_root/other-checkout/"
+"$test_root/other-checkout/scripts/generate-local-env.sh" >/dev/null
+other_name="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$test_root/other-checkout/.env")"
+[[ "$other_name" =~ ^latex-core-[0-9a-f]{12}$ && "$other_name" != "$default_name" ]]
 
 echo 'Installer configuration tests passed.'

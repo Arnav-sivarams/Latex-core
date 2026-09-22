@@ -7,8 +7,8 @@ password_stdin=false
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/bootstrap-admin.sh
-  ./scripts/bootstrap-admin.sh --email EMAIL --password-stdin
+  ./latex-core admin create
+  ./latex-core admin create --email EMAIL --password-stdin
 
 The automation form reads exactly one password line from standard input.
 Passwords are never accepted as command-line arguments.
@@ -30,7 +30,7 @@ fi
 user_list="$("$root/latex-core" user list </dev/null)"
 if grep -q 'v2=admin' <<<"$user_list"; then
   unset password 2>/dev/null || true
-  echo 'Admin account already exists; skipping bootstrap.'
+  echo 'Administrator account already exists. Skipping bootstrap.'
   exit 0
 fi
 if [[ "$password_stdin" != true ]]; then

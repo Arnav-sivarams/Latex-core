@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-for command in git docker awk sed grep mktemp chmod mv python3 curl ss df sha384sum; do
+for command in git docker awk sed grep mktemp chmod mv python3 curl ss df sha256sum sha384sum; do
   command -v "$command" >/dev/null 2>&1 || { echo "Unsupported host: required utility '$command' is missing." >&2; exit 1; }
 done
 [[ "$(uname -s)" == Linux ]] || { echo 'Unsupported host: this server release supports Linux only.' >&2; exit 1; }
@@ -16,10 +16,10 @@ if [[ -r /etc/os-release ]]; then
   }
 fi
 if [[ -n "${SUDO_USER:-}" ]]; then
-  echo 'Do not run ./install.sh through sudo. Configure Docker access for the login account and rerun without sudo.' >&2
+  echo 'Do not run ./latex-core install through sudo. Configure Docker access for the login account and rerun without sudo.' >&2
   exit 1
 fi
-docker info >/dev/null 2>&1 || { echo 'Docker daemon is not reachable by the current account.' >&2; exit 1; }
+docker info >/dev/null 2>&1 || { printf 'Docker is installed, but its daemon is unreachable by the current account.\nCheck Docker is running and that your account can access /var/run/docker.sock, then rerun ./latex-core install.\n' >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo 'Docker Compose v2 is required.' >&2; exit 1; }
 engine_version="$(docker version --format '{{.Server.Version}}')"
 engine_major="${engine_version%%.*}"

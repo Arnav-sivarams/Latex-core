@@ -3,7 +3,7 @@
 From a checkout on the server, run the supported root installer:
 
 ```sh
-./install.sh
+./latex-core install
 ```
 
 The installer anonymously pulls the public frozen compiler image from GHCR when it is absent, verifies its exact image ID, creates a private `.env`, and starts the service. The repository-local `./latex-core` provides all operator commands.

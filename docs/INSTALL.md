@@ -13,7 +13,7 @@ The compiler image is digest-pinned. Do not replace it with an unreviewed TeX im
 From the repository root:
 
 ```sh
-./install.sh
+./latex-core install
 ./latex-core start
 ./latex-core status
 ./latex-core doctor

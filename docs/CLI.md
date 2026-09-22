@@ -4,6 +4,8 @@
 
 | Command | Purpose |
 | --- | --- |
+| `install` | Prepare configuration, build/start services, migrate, and bootstrap the first administrator. |
+| `admin create` | Create the first administrator interactively if installation deferred it. |
 | `start`, `stop`, `restart` | Manage the LaTeX Core service. |
 | `status`, `doctor`, `url` | Show product health or the service URL. |
 | `logs [api\|worker\|database]` | Read recent service logs. |

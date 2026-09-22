@@ -5,10 +5,10 @@
 Run these commands on a new Ubuntu Server 24.04 LTS x86_64 host:
 
 ```sh
-git clone --branch release/complete-candidate-20260913 --single-branch \
+git clone --branch feature/manual-compile-review-lock-institutional-api --single-branch \
   https://github.com/Arnav-sivarams/latex-core.git
 cd latex-core
-./install.sh
+./latex-core install
 ```
 
 You may skip SMTP when prompted. Create the first Admin when prompted. The installer generates `.env` once with restrictive permissions and preserves it on later runs.
@@ -18,7 +18,7 @@ Verify the result:
 ```sh
 ./latex-core status
 ./latex-core doctor
-./install.sh --verify-only
+./latex-core install --verify-only
 ```
 
 The local server URL is `http://127.0.0.1:9000`. For access from a laptop:
@@ -41,7 +41,7 @@ The preflight warns below 10 GiB free source or Docker storage and below 4 GiB a
 
 ## Created resources and ports
 
-The installer creates a mode-600 `.env`, a dedicated Worker staging directory, and Compose-managed PostgreSQL and BlobStore volumes. Rerunning it preserves those resources, credentials, accounts, and data. Invalid existing settings produce a named error; the installer does not silently regenerate `.env` or reset volumes.
+The installer creates a mode-600 `.env`, a dedicated Worker staging directory, and Compose-managed PostgreSQL and BlobStore volumes. A new checkout gets a stable project name derived from its canonical path, avoiding collisions with other checkouts; existing `.env` project names are preserved. Rerunning preserves resources, credentials, accounts, and data. Invalid existing settings produce a named error; the installer does not silently regenerate `.env` or reset volumes.
 
 Fresh defaults resolve to:
 
@@ -63,7 +63,7 @@ SESSION_COOKIE_SECURE=true
 LATEX_CORE_PUBLIC_BASE_URL=https://latex.example.edu
 ```
 
-Use `./install.sh --configure-mail` when SMTP and the public URL are ready. See [SMTP setup](SMTP_SETUP.md). Mail-disabled startup requires no SMTP credentials and retains the generated mail encryption key for later configuration.
+Use `./latex-core install --configure-mail` when SMTP and the public URL are ready. See [SMTP setup](SMTP_SETUP.md). Mail-disabled startup requires no SMTP credentials and retains the generated mail encryption key for later configuration.
 
 ## Failure handling
 

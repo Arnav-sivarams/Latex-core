@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/install-common.sh
 source "$root/scripts/install-common.sh"
 usage() {
   cat <<'EOF'
 LaTeX Core server administration
-Usage: latex-core {start|stop|restart|status|doctor|diagnose|url|logs|backup|user|template|config|version}
+Usage: latex-core {install|start|stop|restart|status|doctor|diagnose|url|logs|admin|backup|user|template|config|version}
 EOF
 }
 require_env() { latex_core_init "$root"; }
@@ -15,9 +15,22 @@ url() { local port; port="$(latex_core_env_value HTTP_PORT "$LATEX_CORE_ENV_FILE
 service_state() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf missing; }
 service_health() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || printf none; }
 case "${1:-}" in
-  start|restart)
+  install) shift; exec "$root/install.sh" "$@" ;;
+  admin)
+    [[ "${2:-}" == create ]] || { echo 'usage: latex-core admin create [--email EMAIL --password-stdin]' >&2; exit 2; }
+    shift 2
+    require_env
+    exec "$root/scripts/bootstrap-admin.sh" "$@" ;;
+  start)
     require_env; "$root/scripts/start-install-services.sh"
     echo 'LaTeX Core is running.'; printf 'URL          '; url ;;
+  restart)
+    require_env
+    python3 "$root/scripts/validate-install-config.py" "$LATEX_CORE_ENV_FILE"
+    "${LATEX_CORE_COMPOSE[@]}" config --quiet
+    "${LATEX_CORE_COMPOSE[@]}" restart
+    "$root/scripts/start-install-services.sh"
+    echo 'LaTeX Core restarted.'; printf 'URL          '; url ;;
   stop)
     require_env; "${LATEX_CORE_COMPOSE[@]}" down
     echo 'LaTeX Core stopped. Persistent volumes were retained.' ;;

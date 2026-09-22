@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 force=false
 target=''
 usage() {
@@ -40,7 +40,12 @@ random_base64_32() {
 }
 postgres_password="$(random_hex)"
 mail_key="$(random_base64_32)"
-project_name="${COMPOSE_PROJECT_NAME:-latex-core}"
+if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  project_name="$COMPOSE_PROJECT_NAME"
+else
+  root_hash="$(printf '%s' "$root" | sha256sum)"
+  project_name="latex-core-${root_hash:0:12}"
+fi
 staging_default="$root/.runtime/${project_name}-worker-staging"
 target_directory="$(dirname "$target")"
 [[ -d "$target_directory" ]] || { echo 'Output directory does not exist.' >&2; exit 1; }

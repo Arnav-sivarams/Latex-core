@@ -1,6 +1,6 @@
 # Server updates
 
-`./install.sh` is for initial installation and repair of the same deployment. Ordinary code updates use the incremental Compose workflow and preserve the existing `.env`, Compose project, PostgreSQL container, PostgreSQL volume, and BlobStore volume.
+`./latex-core install` is for initial installation and repair of the same deployment. Ordinary code updates use the incremental Compose workflow and preserve the existing `.env`, Compose project, PostgreSQL container, PostgreSQL volume, and BlobStore volume.
 
 Fetch only the reviewed feature branch and switch without rewriting local history:
 
@@ -47,17 +47,15 @@ Schema changes require an explicit operator sequence:
 ./latex-core backup /operator-approved/off-host/latex-core-backups
 ./scripts/verify-backup.sh /exact/timestamped/backup/path
 
-source scripts/install-common.sh
-latex_core_init "$PWD"
-"${LATEX_CORE_COMPOSE[@]}" build api worker
-"${LATEX_CORE_COMPOSE[@]}" run --rm --no-deps api \
+./scripts/compose.sh build api worker
+./scripts/compose.sh run -T --rm --no-deps api \
   /usr/local/bin/latex-core-admin database migrate
 ./scripts/check-deployment-migrations.sh
 ./scripts/update-deployment.sh api worker
 
 ./latex-core status
 ./latex-core doctor
-./install.sh --verify-only
+./latex-core install --verify-only
 ```
 
 Use the exact backup path printed by `./latex-core backup`; do not proceed unless independent verification passes. An older application image does not reverse a schema migration. Any image rollback requires a separate schema-compatibility review, and data rollback requires a deliberate restore procedure.

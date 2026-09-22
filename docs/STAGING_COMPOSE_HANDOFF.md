@@ -62,9 +62,7 @@ the key already exists or mail will be enabled. Validate without executing `.env
 
 ```sh
 python3 scripts/validate-install-config.py .env
-source scripts/install-common.sh
-latex_core_init "$PWD"
-"${LATEX_CORE_COMPOSE[@]}" config --quiet
+./scripts/compose.sh config --quiet
 ```
 
 Candidate migrations 0025 and 0026 are additive, but the staging database must
@@ -75,8 +73,8 @@ Running an older image does not reverse a schema change.
 ```sh
 ./latex-core backup /operator-approved/off-host/latex-core-pre-candidate
 ./scripts/verify-backup.sh /exact/verified/backup/path/printed/by/the/previous/command
-"${LATEX_CORE_COMPOSE[@]}" build api worker
-"${LATEX_CORE_COMPOSE[@]}" run --rm --no-deps api /usr/local/bin/latex-core-admin database migrate
+./scripts/compose.sh build api worker
+./scripts/compose.sh run -T --rm --no-deps api /usr/local/bin/latex-core-admin database migrate
 ./scripts/check-deployment-migrations.sh
 ./scripts/update-deployment.sh api worker
 ```
@@ -105,20 +103,20 @@ checks pass:
 ./scripts/update-deployment.sh api worker
 ```
 
-Equivalent explicit commands, after the validation/initialization block above:
+Equivalent explicit commands, after the validation block above:
 
 ```sh
-"${LATEX_CORE_COMPOSE[@]}" build api
+./scripts/compose.sh build api
 ./scripts/check-deployment-migrations.sh
-"${LATEX_CORE_COMPOSE[@]}" up -d --no-deps api
+./scripts/compose.sh up -d --no-deps api
 
-"${LATEX_CORE_COMPOSE[@]}" build worker
+./scripts/compose.sh build worker
 ./scripts/check-deployment-migrations.sh
-"${LATEX_CORE_COMPOSE[@]}" up -d --no-deps worker
+./scripts/compose.sh up -d --no-deps worker
 
-"${LATEX_CORE_COMPOSE[@]}" build api worker
+./scripts/compose.sh build api worker
 ./scripts/check-deployment-migrations.sh
-"${LATEX_CORE_COMPOSE[@]}" up -d --no-deps api worker
+./scripts/compose.sh up -d --no-deps api worker
 ```
 
 A failed build occurs before `up` and leaves running application containers in
@@ -131,20 +129,18 @@ No application build is needed. After changing only `.env`, resolve the final
 ports and recreate only services whose published mappings changed:
 
 ```sh
-source scripts/install-common.sh
-latex_core_init "$PWD"
-python3 scripts/validate-install-config.py "$LATEX_CORE_ENV_FILE"
-"${LATEX_CORE_COMPOSE[@]}" config --format json | python3 -c 'import json,sys; data=json.load(sys.stdin); print("\n".join("{} {}:{} -> {}/{}".format(name,port.get("host_ip","*"),port.get("published"),port.get("target"),port.get("protocol","tcp")) for name,service in data["services"].items() for port in service.get("ports", [])))'
-"${LATEX_CORE_COMPOSE[@]}" up -d --no-deps caddy
+python3 scripts/validate-install-config.py .env
+./scripts/compose.sh config --format json | python3 -c 'import json,sys; data=json.load(sys.stdin); print("\n".join("{} {}:{} -> {}/{}".format(name,port.get("host_ip","*"),port.get("published"),port.get("target"),port.get("protocol","tcp")) for name,service in data["services"].items() for port in service.get("ports", [])))'
+./scripts/compose.sh up -d --no-deps caddy
 ```
 
 If the diagnostic PostgreSQL port also changed, plan a brief database connection
 interruption, take the required backup, and run:
 
 ```sh
-"${LATEX_CORE_COMPOSE[@]}" up -d --no-deps postgres
-"${LATEX_CORE_COMPOSE[@]}" up -d --no-deps caddy
-./scripts/verify-install.sh
+./scripts/compose.sh up -d --no-deps postgres
+./scripts/compose.sh up -d --no-deps caddy
+./latex-core install --verify-only
 ```
 
 The Compose project name must remain the existing value (legacy default
@@ -161,7 +157,7 @@ The Compose project name must remain the existing value (legacy default
 ./latex-core logs database
 ./latex-core logs caddy
 ./latex-core diagnose
-./scripts/verify-install.sh
+./latex-core install --verify-only
 ```
 
 Fresh loopback access is `http://127.0.0.1:9000`. From an operator workstation:
