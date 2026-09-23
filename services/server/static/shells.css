@@ -781,16 +781,27 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .workspace-shell .icon-link,
 .workspace-shell .mini-icon,
 .workspace-shell .toolbar-menu > summary {
+  box-sizing: border-box;
   min-height: var(--workspace-control-height);
   height: var(--workspace-control-height);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border);
   border-radius: var(--workspace-radius);
+  background: var(--surface);
   font-size: 12px;
+  line-height: 1;
+  vertical-align: middle;
 }
 .workspace-shell .ui-button,
-.workspace-shell .workflow-button { padding-inline: 11px; }
-.workspace-shell .icon-button,
+.workspace-shell .workflow-button,
+.workspace-shell .menu-button,
+.workspace-shell .toolbar-menu > summary { width: auto; min-width: max-content; padding: 0 10px; }
+.workspace-shell .icon-button:not(.menu-button),
 .workspace-shell .icon-link,
-.workspace-shell .mini-icon { width: var(--workspace-control-height); min-width: var(--workspace-control-height); padding: 0; }
+.workspace-shell .mini-icon { width: var(--workspace-control-height); min-width: var(--workspace-control-height); gap: 0; padding: 0; }
 .workspace-shell .icon-button > span { font-size: 15px; }
 .workspace-shell .quiet-button { padding-inline: 9px; }
 .workspace-shell button:hover:not(:disabled),
@@ -800,7 +811,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .workspace-shell .ui-button-primary:hover:not(:disabled),
 .workspace-shell .primary:hover:not(:disabled) { border-color: var(--accent-hover); background: var(--accent-hover); }
 .workspace-shell .toolbar-status { font-size: 11px; }
-.workspace-shell .toolbar-menu > summary { padding: 0 9px; }
+.workspace-shell .toolbar-menu > summary { list-style: none; }
+.workspace-shell .toolbar-menu > summary::-webkit-details-marker { display: none; }
 .workspace-shell .header-search > summary { color: var(--muted); font-size: 12px; }
 .workspace-shell .header-search > summary:hover { color: var(--text); }
 
