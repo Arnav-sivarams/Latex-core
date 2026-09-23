@@ -7,11 +7,12 @@ for command in git docker awk sed grep mktemp chmod mv python3 curl ss df sha256
 done
 [[ "$(uname -s)" == Linux ]] || { echo 'Unsupported host: this server release supports Linux only.' >&2; exit 1; }
 [[ "$(uname -m)" == x86_64 ]] || { echo "Unsupported host architecture: $(uname -m); frozen M7 requires x86_64/amd64." >&2; exit 1; }
-if [[ -r /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04 ]] || {
-    echo "Unsupported server distribution: ${ID:-unknown} ${VERSION_ID:-unknown}; this candidate supports Ubuntu 24.04 LTS." >&2
+os_release_file="${LATEX_CORE_OS_RELEASE_FILE:-/etc/os-release}"
+if [[ -r "$os_release_file" ]]; then
+  # shellcheck disable=SC1090
+  source "$os_release_file"
+  [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" =~ ^(22\.04|24\.04)$ ]] || {
+    echo "Unsupported server distribution: ${ID:-unknown} ${VERSION_ID:-unknown}; supported releases are Ubuntu 22.04 LTS and Ubuntu 24.04 LTS." >&2
     exit 1
   }
 fi
@@ -60,4 +61,4 @@ else
 fi
 daemon_memory_bytes="$(docker info --format '{{.MemTotal}}')"
 ((daemon_memory_bytes >= 4 * 1024 * 1024 * 1024)) || echo 'WARNING: Docker exposes less than 4 GiB memory; builds or TeX jobs may be OOM-killed.' >&2
-printf 'Host contract: Ubuntu 24.04 x86_64, local Docker context %s, Engine %s, Compose %s.\n' "$context" "$engine_version" "$compose_version"
+printf 'Host contract: Ubuntu 22.04 or 24.04 x86_64, local Docker context %s, Engine %s, Compose %s.\n' "$context" "$engine_version" "$compose_version"

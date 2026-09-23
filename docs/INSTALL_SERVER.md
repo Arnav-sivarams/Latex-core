@@ -2,7 +2,7 @@
 
 ## Fresh install
 
-Run these commands on a new Ubuntu Server 24.04 LTS x86_64 host:
+Run these commands on a new Ubuntu Server 22.04 or 24.04 LTS x86_64 host:
 
 ```sh
 git clone --branch feature/manual-compile-review-lock-institutional-api --single-branch \
@@ -31,7 +31,7 @@ Open `http://localhost:9000` on the laptop. A normal fresh install requires no m
 
 ## Supported host contract
 
-The supported host is Ubuntu Server 24.04 LTS on x86_64 with Docker Engine 24 or newer and Docker Compose 2.20 or newer. Run installation as the normal login account with access to the local, rootful Docker daemon at `unix:///var/run/docker.sock`; do not run it through `sudo`. Rootless Docker, remote Docker contexts, alternate sockets, and CPU emulation do not satisfy the Worker compiler-mount contract.
+The supported host is Ubuntu Server 22.04 LTS or Ubuntu Server 24.04 LTS on x86_64 with Docker Engine 24 or newer and Docker Compose 2.20 or newer. Run installation as the normal login account with access to the local, rootful Docker daemon at `unix:///var/run/docker.sock`; do not run it through `sudo`. Rootless Docker, remote Docker contexts, alternate sockets, and CPU emulation do not satisfy the Worker compiler-mount contract.
 
 The host commands checked by the installer are Git, Docker, the Docker Compose plugin, `awk`, `sed`, `grep`, `mktemp`, `chmod`, `mv`, Python 3, `curl`, `ss`, `df`, and `sha384sum`. OpenSSL is optional because Python 3 can generate secrets. The host does not need PostgreSQL Server, `psql`, Rust, Cargo, Node, npm, generated frontend files, or prior LaTeX Core state.
 

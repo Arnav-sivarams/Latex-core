@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Mentor Review — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=ui-consistency-theme-1">
+  <link rel="stylesheet" href="/static/shells.css?v=workspace-release-refresh-1">
   <script src="/static/theme.js?v=ui-consistency-theme-1"></script>
 </head>
 <body class="workspace-shell mentor-shell">
@@ -20,7 +20,7 @@
 
   <nav class="action-toolbar" aria-label="Mentor review actions">
     <div class="toolbar-group">
-      <button id="compileReview" class="workflow-button" type="button" disabled aria-label="Compile" title="Compile latest report"><span aria-hidden="true">▶</span><span>Compile</span></button>
+      <button id="compileReview" class="ui-button ui-button-primary workflow-button primary" type="button" disabled aria-label="Compile" title="Compile latest report"><span aria-hidden="true">▶</span><span>Compile</span></button>
       <span id="buildStatus" class="toolbar-status">No PDF yet</span>
     </div>
     <div class="toolbar-group">
@@ -29,7 +29,7 @@
       <button id="mentorCommentsToggle" class="icon-button" type="button" aria-label="Comments and review history" title="Comments and review history"><span aria-hidden="true">☰</span></button>
       <a id="csvExport" class="icon-link" href="#" aria-disabled="true" aria-label="Export comments as CSV" title="Export comments as CSV">⇩</a>
       <a id="printExport" class="icon-link" href="#" aria-disabled="true" target="_blank" aria-label="Print review report" title="Print review report">▤</a>
-      <button id="pushReview" class="workflow-button primary" type="button" disabled aria-label="Push review" title="Publish saved feedback to Writers"><span aria-hidden="true">➤</span><span>Push review</span></button>
+      <button id="pushReview" class="ui-button ui-button-secondary workflow-button" type="button" disabled aria-label="Push review" title="Publish saved feedback to Writers"><span aria-hidden="true">➤</span><span>Push review</span></button>
       <span id="draftStatus" class="toolbar-status">No active review</span>
       <details id="editorSettings" class="toolbar-menu"><summary>Editor settings</summary><div class="compact-settings"><label>Font size <input id="editorFontSize" type="number" min="12" max="26" step="1"></label><label>Theme <select id="editorTheme"><option value="LIGHT">Light</option><option value="DARK">Dark</option></select></label><button id="resetEditorSettings" type="button">Reset to default</button></div></details>
     </div>

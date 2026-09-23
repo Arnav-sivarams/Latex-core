@@ -8,7 +8,7 @@ handoff message before running an update.
 
 ## Prerequisites and files
 
-Supported host: Ubuntu 24.04 LTS on x86_64, Docker Engine 24 or newer, Docker
+Supported host: Ubuntu 22.04 or 24.04 LTS on x86_64, Docker Engine 24 or newer, Docker
 Compose v2.20 or newer, local rootful Docker at `/var/run/docker.sock`, Python 3,
 `curl`, `ss`, and at least 4 GiB memory. The frozen M7 compiler must remain
 `sha256:8db804f76b8e80e5be9fb28ba14b0938df5989b7a8250ca6b0e9f3c200c4ee38`.

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Writer — LaTeX Core</title>
-  <link rel="stylesheet" href="/static/shells.css?v=ui-consistency-theme-1">
+  <link rel="stylesheet" href="/static/shells.css?v=workspace-release-refresh-1">
   <script src="/static/theme.js?v=ui-consistency-theme-1"></script>
 </head>
 <body class="workspace-shell writer-shell">
@@ -22,14 +22,14 @@
 
   <nav class="action-toolbar" aria-label="Paper actions">
     <div class="toolbar-group" aria-label="File and edit">
-      <button id="saveFile" class="ui-button ui-button-primary workflow-button primary" type="button" disabled aria-label="Save" title="Save (Ctrl/Cmd+S)"><span aria-hidden="true">▣</span><span>Save</span></button>
+      <button id="saveFile" class="ui-button ui-button-secondary workflow-button" type="button" disabled aria-label="Save" title="Save (Ctrl/Cmd+S)"><span aria-hidden="true">▣</span><span>Save</span></button>
       <button id="undoText" class="icon-button" type="button" disabled aria-label="Undo edit" title="Undo edit"><span aria-hidden="true">↶</span></button>
       <button id="redoText" class="icon-button" type="button" disabled aria-label="Redo edit" title="Redo edit"><span aria-hidden="true">↷</span></button>
       <button id="quickOpen" class="icon-button" type="button" aria-label="Quick Open" title="Quick Open (Ctrl/Cmd+P)"><span aria-hidden="true">⌕</span></button>
       <button id="commandPalette" class="icon-button" type="button" aria-label="Command palette" title="Command palette (Ctrl/Cmd+K)"><span aria-hidden="true">⌘</span></button>
     </div>
     <div class="toolbar-group" aria-label="Build and review">
-      <button id="compilePaper" class="ui-button ui-button-secondary workflow-button" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span><span>Compile</span></button>
+      <button id="compilePaper" class="ui-button ui-button-primary workflow-button primary" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span><span>Compile</span></button>
       <span id="buildStatus" class="toolbar-status">No PDF yet</span>
       <button id="sendReview" class="ui-button ui-button-secondary workflow-button" type="button" disabled hidden aria-label="Send for review" title="Send for review (Ctrl/Cmd+Shift+R)"><span aria-hidden="true">⚑</span><span>Send for review</span></button>
       <button id="endReview" class="icon-button" type="button" disabled hidden aria-label="Withdraw review" title="Withdraw review"><span aria-hidden="true">■</span></button>

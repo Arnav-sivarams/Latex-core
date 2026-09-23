@@ -2,7 +2,7 @@
 
 ## One-command installation
 
-The qualified server contract is in [Server installation](INSTALL_SERVER.md). Local development is accepted on Ubuntu 24.04 x86_64, including WSL2 Ubuntu when Docker Desktop exposes the local `/var/run/docker.sock` endpoint. Native macOS and non-amd64 images are not supported by this installer candidate.
+The qualified server contract is in [Server installation](INSTALL_SERVER.md). Local development is accepted on Ubuntu 22.04 or 24.04 LTS x86_64, including WSL2 Ubuntu when Docker Desktop exposes the local `/var/run/docker.sock` endpoint. Native macOS and non-amd64 images are not supported by this installer candidate.
 
 ```sh
 git clone https://github.com/Arnav-sivarams/latex-core.git

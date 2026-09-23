@@ -712,3 +712,226 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .admin-content input, .admin-content select, .admin-content textarea { min-height: 38px; }
 .admin-section { padding: 16px; }
 @media (max-width: 820px) { .writer-shell .action-toolbar { overflow-x: auto; } }
+
+/* Writer and Mentor release refresh: dense, border-led workspace chrome. */
+.workspace-shell {
+  --workspace-chrome: color-mix(in srgb, var(--surface) 94%, var(--accent) 6%);
+  --workspace-header: color-mix(in srgb, var(--surface) 97%, var(--accent) 3%);
+  --workspace-hover: color-mix(in srgb, var(--surface) 88%, var(--accent) 12%);
+  --workspace-selected: color-mix(in srgb, var(--surface) 78%, var(--accent) 22%);
+  --workspace-divider: color-mix(in srgb, var(--border) 74%, var(--text) 26%);
+  --workspace-radius: 5px;
+  --workspace-control-height: 32px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.workspace-shell .shell-topbar {
+  flex-basis: 48px;
+  min-height: 48px;
+  gap: 9px;
+  padding: 6px 14px;
+  border-bottom-color: var(--workspace-divider);
+  background: var(--workspace-header);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--border) 55%, transparent);
+}
+.workspace-shell .shell-brand {
+  gap: 8px;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -.01em;
+}
+.workspace-shell .shell-brand::before {
+  width: 4px;
+  height: 20px;
+  border-radius: 2px;
+  background: var(--accent);
+  content: "";
+}
+.workspace-shell .shell-brand:has(.header-logo:not([hidden]))::before { display: none; }
+.workspace-shell .header-divider { width: 1px; height: 18px; overflow: hidden; color: transparent; background: var(--border); }
+.workspace-shell .header-identity { font-size: 12px; font-weight: 600; }
+.workspace-shell .current-context { color: var(--text); font-size: 12px; font-weight: 600; }
+.workspace-shell .role-badge,
+.workspace-shell .save-status,
+.workspace-shell .subtle-badge,
+.workspace-shell .status-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.workspace-shell .action-toolbar {
+  flex-basis: 46px;
+  min-height: 46px;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom-color: var(--workspace-divider);
+  background: var(--workspace-chrome);
+}
+.workspace-shell .toolbar-group { gap: 5px; padding-right: 9px; border-right-color: var(--workspace-divider); }
+.workspace-shell .ui-button,
+.workspace-shell .workflow-button,
+.workspace-shell .quiet-button,
+.workspace-shell .icon-button,
+.workspace-shell .icon-link,
+.workspace-shell .mini-icon,
+.workspace-shell .toolbar-menu > summary {
+  min-height: var(--workspace-control-height);
+  height: var(--workspace-control-height);
+  border-radius: var(--workspace-radius);
+  font-size: 12px;
+}
+.workspace-shell .ui-button,
+.workspace-shell .workflow-button { padding-inline: 11px; }
+.workspace-shell .icon-button,
+.workspace-shell .icon-link,
+.workspace-shell .mini-icon { width: var(--workspace-control-height); min-width: var(--workspace-control-height); padding: 0; }
+.workspace-shell .icon-button > span { font-size: 15px; }
+.workspace-shell .quiet-button { padding-inline: 9px; }
+.workspace-shell button:hover:not(:disabled),
+.workspace-shell a:hover { border-color: var(--border-strong); background: var(--workspace-hover); }
+.workspace-shell .ui-button-primary,
+.workspace-shell .primary { border-color: var(--accent); background: var(--accent); color: #fff; box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+.workspace-shell .ui-button-primary:hover:not(:disabled),
+.workspace-shell .primary:hover:not(:disabled) { border-color: var(--accent-hover); background: var(--accent-hover); }
+.workspace-shell .toolbar-status { font-size: 11px; }
+.workspace-shell .toolbar-menu > summary { padding: 0 9px; }
+.workspace-shell .header-search > summary { color: var(--muted); font-size: 12px; }
+.workspace-shell .header-search > summary:hover { color: var(--text); }
+
+.workspace-shell .three-pane-workspace {
+  grid-template-columns: minmax(200px, 242px) minmax(340px, 1.06fr) minmax(340px, .94fr);
+  gap: 0;
+  background: var(--workspace-divider);
+}
+.mentor-shell .three-pane-workspace { grid-template-columns: minmax(190px, 230px) minmax(320px, .82fr) minmax(390px, 1.18fr); }
+.workspace-shell .workspace-pane {
+  border: 0;
+  border-right: 1px solid var(--workspace-divider);
+  border-radius: 0;
+  box-shadow: none;
+}
+.workspace-shell .workspace-pane:last-child { border-right: 0; }
+.workspace-shell .files-pane {
+  padding: 13px 10px;
+  background: var(--sidebar-bg);
+  box-shadow: inset -3px 0 0 color-mix(in srgb, var(--border) 45%, transparent);
+}
+.workspace-shell .files-pane section { margin-bottom: 19px; }
+.workspace-shell .paper-nav h2,
+.workspace-shell .review-nav h2,
+.workspace-shell .panel-heading h1,
+.workspace-shell .panel-heading h2 {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.workspace-shell .section-heading { min-height: 28px; border-bottom: 1px solid var(--border); }
+.workspace-shell .section-heading .mini-actions { align-items: center; }
+.workspace-shell .paper-list { gap: 1px; margin-top: 5px; }
+.workspace-shell .paper-list button,
+.workspace-shell .file-tree button {
+  min-height: 28px;
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 12px;
+}
+.workspace-shell .paper-list button:hover:not(:disabled),
+.workspace-shell .file-tree button:hover:not(:disabled) { background: var(--workspace-hover); }
+.workspace-shell .paper-list button[aria-current="page"],
+.workspace-shell .file-tree button[aria-current="page"] {
+  border-left: 3px solid var(--accent);
+  padding-left: 4px;
+  background: var(--workspace-selected);
+  color: var(--text);
+  font-weight: 650;
+}
+.workspace-shell .file-tree { margin-top: 4px; padding-left: 14px; border-left: 1px solid var(--border); }
+.workspace-shell #fileTree > .file-tree { border-left: 0; }
+.workspace-shell .file-tree .directory { padding: 5px 6px 3px; font-size: 11px; }
+.workspace-shell .paper-summary { border: 1px solid var(--border); border-radius: var(--workspace-radius); background: var(--surface); }
+
+.workspace-shell .source-pane > .panel-heading,
+.workspace-shell .pdf-pane > .panel-heading {
+  flex-basis: 40px;
+  min-height: 40px;
+  gap: 8px;
+  padding: 5px 11px;
+  background: var(--workspace-chrome);
+}
+.workspace-shell .source-pane .panel-heading { border-top: 2px solid var(--accent); }
+.workspace-shell .panel-heading span,
+.workspace-shell .pdf-relation { font-size: 11px; }
+.workspace-shell .main-badge { border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border)); border-radius: 4px; }
+.workspace-shell .editor-mount { background: var(--surface); }
+.workspace-shell .editor-mount .cm-editor { font-size: 13px; }
+.workspace-shell .editor-mount .cm-gutters { border-right-color: var(--border); background: var(--surface-subtle); color: var(--muted); }
+.workspace-shell .pdf-location-control { font-size: 10px; }
+.workspace-shell .pdf-location-control input,
+.workspace-shell .pdf-location-control select {
+  min-height: 28px;
+  height: 28px;
+  border-radius: 4px;
+  padding-block: 0;
+  font-size: 11px;
+}
+.workspace-shell .writer-pdf-scroll,
+.workspace-shell .pdf-scroll-region,
+.workspace-shell .pdfjs-viewport { background: var(--pdf-canvas-bg); }
+.workspace-shell .writer-pdf-viewport { padding: 18px 12px; }
+.workspace-shell .writer-pdf-page,
+.workspace-shell .pdfjs-viewport canvas { border: 1px solid color-mix(in srgb, var(--border) 76%, #000 24%); box-shadow: 0 3px 12px rgba(15, 23, 33, .16); }
+.workspace-shell .review-pdf .pdf-relation { background: var(--surface-subtle); }
+.workspace-shell .pdf-controls { flex-wrap: nowrap; }
+.workspace-shell .pdf-controls button { min-height: 28px; height: 28px; }
+
+.writer-shell .build-footer { flex-basis: 40px; grid-template-rows: 39px minmax(0, 1fr); border-top-color: var(--workspace-divider); }
+.writer-shell .build-footer-header { gap: 12px; padding: 4px 10px; background: var(--workspace-chrome); }
+.writer-shell .build-footer-title strong { font-size: 12px; }
+.writer-shell .build-footer-title .status-chip { min-width: 22px; text-align: center; }
+.writer-shell .build-footer-tabs { gap: 0; }
+.writer-shell .build-footer-tabs button {
+  min-height: 34px;
+  padding: 4px 12px;
+  border-bottom-width: 2px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.writer-shell .build-footer-tabs button[aria-selected="true"] { background: transparent; color: var(--text); }
+.writer-shell .build-footer-body { padding: 8px 10px 10px; background: var(--surface); }
+.writer-shell .build-log-text { border-radius: 3px; background: var(--surface-subtle); }
+.writer-shell .build-problem-error { background: color-mix(in srgb, var(--danger) 8%, transparent); }
+.writer-shell .build-problem-warning { background: color-mix(in srgb, var(--warning) 8%, transparent); }
+
+.workspace-shell .workspace-drawer { top: 94px; border-left-color: var(--workspace-divider); box-shadow: -8px 0 24px rgba(15, 23, 33, .12); }
+.workspace-shell .workspace-drawer > header { background: var(--workspace-chrome); }
+.workspace-shell .context-review-popover,
+.workspace-shell .compact-popover,
+.workspace-shell .productivity-dialog { border-radius: 6px; }
+.workspace-shell .thread-filters { border-bottom: 1px solid var(--border); }
+.workspace-shell .thread-filters button[aria-current="page"] { border-bottom: 2px solid var(--accent); border-radius: 0; background: transparent; color: var(--text); }
+
+@media (max-width: 980px) {
+  .workspace-shell .three-pane-workspace { grid-template-columns: minmax(170px, 205px) minmax(300px, 1fr) minmax(290px, .82fr); }
+  .mentor-shell .three-pane-workspace { grid-template-columns: minmax(170px, 205px) minmax(300px, .82fr) minmax(340px, 1.18fr); }
+}
+
+@media (max-width: 820px) {
+  .writer-shell .toolbar-secondary,
+  .writer-shell #undoText,
+  .writer-shell #redoText,
+  .writer-shell #quickOpen,
+  .writer-shell #commandPalette,
+  .writer-shell #problemsToggle,
+  .writer-shell #historyToggle,
+  .writer-shell #documentDetails { display: inline-flex; }
+  .writer-shell .toolbar-secondary { display: flex; }
+  .workspace-shell .action-toolbar { overflow-x: auto; }
+}

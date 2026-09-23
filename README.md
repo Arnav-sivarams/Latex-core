@@ -4,7 +4,7 @@ LaTeX Core is a self-hosted platform for institutional LaTeX papers. It provides
 
 ## Requirements
 
-Ubuntu 24.04 x86_64, Git, Docker Engine 24+, Docker Compose 2.20+, and access to the local Docker daemon as your normal login account. Do not use `sudo` for installation. Docker must be running, and the configured host ports must be free. No host PostgreSQL, Rust, Cargo, Node, or npm is needed. See the [supported host contract](docs/INSTALL_SERVER.md) for the required basic utilities and capacity guidance.
+Ubuntu 22.04 or 24.04 LTS x86_64, Git, Docker Engine 24+, Docker Compose 2.20+, and access to the local Docker daemon as your normal login account. Do not use `sudo` for installation. Docker must be running, and the configured host ports must be free. No host PostgreSQL, Rust, Cargo, Node, or npm is needed. See the [supported host contract](docs/INSTALL_SERVER.md) for the required basic utilities and capacity guidance.
 
 ## Quick Start
 
