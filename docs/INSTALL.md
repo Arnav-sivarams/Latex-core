@@ -2,9 +2,9 @@
 
 ## Requirements
 
-- A Linux host with a current Docker Engine and Docker Compose plugin
+- Ubuntu 22.04 or 24.04 LTS x86_64 with a normal sudo-capable account
 - Enough disk for PostgreSQL, source blobs, build artifacts, and backups
-- The repository checkout and permission to run Docker
+- The repository checkout
 
 The compiler image is digest-pinned. Do not replace it with an unreviewed TeX image.
 
@@ -14,13 +14,12 @@ From the repository root:
 
 ```sh
 ./latex-core install
-./latex-core start
 ./latex-core status
 ./latex-core doctor
 ./latex-core url
 ```
 
-`status` reports service state. `doctor` checks PostgreSQL, blob storage, Docker access from the worker, and the pinned compiler environment.
+`./latex-core install` is the single setup command. It handles missing utilities, Docker/Compose/Buildx provisioning, a stopped daemon, sudo-assisted Docker access, configuration, startup, administrator bootstrap, and verification. It does not require Docker-group membership or a shell restart. `status` reports service state. `doctor` checks PostgreSQL, blob storage, Docker access from the worker, and the pinned compiler environment.
 
 ## Temporary-credential mail
 

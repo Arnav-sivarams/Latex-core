@@ -8,7 +8,7 @@ latex_core_init "$root"
 
 check_port() {
   local label="$1" port="$2" published foreign=false
-  published="$(docker ps --filter "publish=$port" --format '{{.ID}} {{.Label "com.docker.compose.project"}} {{.Names}}')"
+  published="$(latex_core_docker ps --filter "publish=$port" --format '{{.ID}} {{.Label "com.docker.compose.project"}} {{.Names}}')"
   if [[ -n "$published" ]]; then
     while IFS=' ' read -r _id project _name; do
       [[ "$project" == "$LATEX_CORE_PROJECT" ]] || foreign=true

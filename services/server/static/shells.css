@@ -810,6 +810,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .workspace-shell .primary { border-color: var(--accent); background: var(--accent); color: #fff; box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .workspace-shell .ui-button-primary:hover:not(:disabled),
 .workspace-shell .primary:hover:not(:disabled) { border-color: var(--accent-hover); background: var(--accent-hover); }
+.writer-shell #commentsToggle[aria-expanded="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .workspace-shell .toolbar-status { font-size: 11px; }
 .workspace-shell .toolbar-menu > summary { list-style: none; }
 .workspace-shell .toolbar-menu > summary::-webkit-details-marker { display: none; }
@@ -905,6 +906,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .workspace-shell .pdf-controls button { min-height: 28px; height: 28px; }
 
 .writer-shell .build-footer { flex-basis: 40px; grid-template-rows: 39px minmax(0, 1fr); border-top-color: var(--workspace-divider); }
+.writer-shell .build-footer[data-expanded="true"] { flex-basis: min(35vh, 230px); }
 .writer-shell .build-footer-header { gap: 12px; padding: 4px 10px; background: var(--workspace-chrome); }
 .writer-shell .build-footer-title strong { font-size: 12px; }
 .writer-shell .build-footer-title .status-chip { min-width: 22px; text-align: center; }

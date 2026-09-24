@@ -58,8 +58,8 @@ trap on_exit EXIT
 postgres_id="$(recovery_container postgres)"
 api_id="$(recovery_container api)"
 worker_id="$(recovery_container worker)"
-[[ "$(docker inspect "$api_id" --format '{{.State.Status}}')" == running ]] && api_was_running=true
-[[ "$(docker inspect "$worker_id" --format '{{.State.Status}}')" == running ]] && worker_was_running=true
+[[ "$(latex_core_docker inspect "$api_id" --format '{{.State.Status}}')" == running ]] && api_was_running=true
+[[ "$(latex_core_docker inspect "$worker_id" --format '{{.State.Status}}')" == running ]] && worker_was_running=true
 blob_volume="$(recovery_volume_for_mount api /var/lib/latex-core/blobs)"
 postgres_volume="$(recovery_volume_for_mount postgres /var/lib/postgresql)"
 printf 'Verified project %s with PostgreSQL volume %s and BlobStore volume %s.\n' \
@@ -68,19 +68,19 @@ printf 'Verified project %s with PostgreSQL volume %s and BlobStore volume %s.\n
 phase='write-quiescence'
 "${RECOVERY_COMPOSE[@]}" stop -t 30 api worker >/dev/null
 for container_id in "$api_id" "$worker_id"; do
-  [[ "$(docker inspect "$container_id" --format '{{.State.Status}}')" == exited ]] || {
+  [[ "$(latex_core_docker inspect "$container_id" --format '{{.State.Status}}')" == exited ]] || {
     echo 'Application writer did not stop; refusing an inconsistent backup.' >&2
     exit 1
   }
 done
 
 phase='database-durability-check'
-durability="$(docker exec "$postgres_id" psql -X -At -U "$RECOVERY_POSTGRES_USER" -d "$RECOVERY_POSTGRES_DB" -c "SELECT current_setting('fsync')||','||current_setting('synchronous_commit')||','||current_setting('full_page_writes')")"
+durability="$(latex_core_docker exec "$postgres_id" psql -X -At -U "$RECOVERY_POSTGRES_USER" -d "$RECOVERY_POSTGRES_DB" -c "SELECT current_setting('fsync')||','||current_setting('synchronous_commit')||','||current_setting('full_page_writes')")"
 [[ "$durability" == 'on,on,on' ]] || { echo 'PostgreSQL durability settings are not all enabled.' >&2; exit 1; }
-schema_version="$(docker exec "$postgres_id" psql -X -At -U "$RECOVERY_POSTGRES_USER" -d "$RECOVERY_POSTGRES_DB" -c "SELECT max(version) FROM public._sqlx_migrations WHERE success")"
+schema_version="$(latex_core_docker exec "$postgres_id" psql -X -At -U "$RECOVERY_POSTGRES_USER" -d "$RECOVERY_POSTGRES_DB" -c "SELECT max(version) FROM public._sqlx_migrations WHERE success")"
 
 phase='database-dump'
-docker exec "$postgres_id" pg_dump -Fc --no-owner --no-privileges \
+latex_core_docker exec "$postgres_id" pg_dump -Fc --no-owner --no-privileges \
   -U "$RECOVERY_POSTGRES_USER" "$RECOVERY_POSTGRES_DB" >"$partial/database.dump"
 
 phase='blob-verification'
@@ -88,11 +88,11 @@ recovery_validate_blob_volume "$blob_volume"
 recovery_verify_referenced_blobs "$blob_volume"
 
 phase='blob-archive'
-docker run --rm --network none -v "$blob_volume:/source:ro" -v "$partial:/backup" alpine:3.21 \
+latex_core_docker run --rm --network none -v "$blob_volume:/source:ro" -v "$partial:/backup" alpine:3.21 \
   tar czf /backup/blobs.tar.gz -C /source .
 
 phase='artifact-verification'
-docker run --rm --network none -v "$partial:/backup:ro" postgres:18.4 \
+latex_core_docker run --rm --network none -v "$partial:/backup:ro" postgres:18.4 \
   pg_restore --list /backup/database.dump >/dev/null
 gzip -t "$partial/blobs.tar.gz"
 database_size="$(stat -c %s "$partial/database.dump")"

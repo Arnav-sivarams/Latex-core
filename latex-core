@@ -4,6 +4,19 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/install-common.sh
 source "$root/scripts/install-common.sh"
+
+if ((EUID == 0)) && [[ -n "${SUDO_UID:-}" ]]; then
+  invoking_identity="$(latex_core_validate_invoking_identity "$root" "${SUDO_UID:-}" "${SUDO_GID:-}" "${SUDO_USER:-}" || true)"
+  [[ -n "$invoking_identity" ]] || {
+    echo 'The sudo invoking identity is inconsistent; refusing to create root-owned installation state.' >&2
+    exit 1
+  }
+  invoking_user="${invoking_identity%%:*}"
+  invoking_home="${invoking_identity#*:}"
+  exec /usr/bin/sudo -u "$invoking_user" -- /usr/bin/env \
+    HOME="$invoking_home" USER="$invoking_user" LOGNAME="$invoking_user" \
+    LATEX_CORE_SUDO_INVOKER=1 "$root/latex-core" "$@"
+fi
 usage() {
   cat <<'EOF'
 LaTeX Core server administration
@@ -12,8 +25,8 @@ EOF
 }
 require_env() { latex_core_init "$root"; }
 url() { local port; port="$(latex_core_env_value HTTP_PORT "$LATEX_CORE_ENV_FILE")"; printf 'http://localhost:%s\n' "${port:-9000}"; }
-service_state() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf missing; }
-service_health() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || printf none; }
+service_state() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && latex_core_docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf missing; }
+service_health() { local id; id="$(latex_core_container_id "$1")"; [[ -n "$id" ]] && latex_core_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || printf none; }
 case "${1:-}" in
   install) shift; exec "$root/install.sh" "$@" ;;
   admin)
@@ -61,9 +74,9 @@ case "${1:-}" in
       zip="${2:?usage: latex-core template add ZIP --name NAME [--main PATH]}"
       [[ -f "$zip" ]] || { echo 'Template ZIP not found.' >&2; exit 2; }
       api_id="$(latex_core_container_id api)"; [[ -n "$api_id" ]] || { echo 'LaTeX Core API is not running.' >&2; exit 1; }
-      remote="/tmp/latex-core-template-$$.zip"; docker cp "$zip" "$api_id:$remote"
+      remote="/tmp/latex-core-template-$$.zip"; latex_core_docker cp "$zip" "$api_id:$remote"
       "${LATEX_CORE_COMPOSE[@]}" exec -T api /usr/local/bin/latex-core-admin template add "$remote" "${@:3}"
-      docker exec "$api_id" rm -f "$remote" >/dev/null
+      latex_core_docker exec "$api_id" rm -f "$remote" >/dev/null
     else
       "${LATEX_CORE_COMPOSE[@]}" exec -T api /usr/local/bin/latex-core-admin template "$@"
     fi ;;

@@ -11,7 +11,7 @@ git switch --track origin/feature/manual-compile-review-lock-institutional-api
 ./latex-core install
 ```
 
-The installer verifies Docker, anonymously obtains the frozen M7 compiler image when necessary, creates a private `.env`, starts PostgreSQL/API/worker/Caddy, applies migrations, runs the doctor and verifier, and prompts for the first Admin email and permanent password. SMTP is optional. Open the printed URL (normally `http://localhost:9000`).
+The installer provisions missing supported prerequisites when necessary, obtains the frozen M7 compiler image, creates a private `.env`, starts PostgreSQL/API/worker/Caddy, applies migrations, runs the doctor and verifier, and prompts for the first Admin email and permanent password. Sudo authorization is handled inside the command without changing Docker-group membership. SMTP is optional. Open the printed URL (normally `http://localhost:9000`).
 
 Useful commands:
 
@@ -40,16 +40,4 @@ git checkout <new-release-tag>
 ./scripts/update-deployment.sh api worker
 ```
 
-## Manual fallback
-
-Use this only to diagnose the one-command flow:
-
-```sh
-./scripts/generate-local-env.sh
-./latex-core start
-./latex-core doctor
-./latex-core admin create
-./latex-core install --verify-only
-```
-
-The installer never installs operating-system packages with `sudo`, rebuilds M7, resets PostgreSQL, or removes Docker volumes.
+The installer does not rebuild M7, reset PostgreSQL, remove Docker volumes, modify Docker socket permissions, or install passwordless sudo policy.

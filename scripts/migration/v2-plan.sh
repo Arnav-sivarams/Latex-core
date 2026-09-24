@@ -54,6 +54,8 @@ done
 
 script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repository_root=$(cd "$script_directory/../.." && pwd -P)
+# shellcheck source=scripts/install-common.sh
+source "$repository_root/scripts/install-common.sh"
 
 if [[ -e "$output_path" && ! -d "$output_path" ]]; then
   fail 'output path exists and is not a directory'
@@ -68,13 +70,12 @@ existing_output=("$output_directory"/*)
 shopt -u nullglob dotglob
 ((${#existing_output[@]} == 0)) || fail 'output directory must be empty'
 
-command -v docker >/dev/null 2>&1 || fail 'Docker is not available'
-docker info >/dev/null 2>&1 || fail 'Docker daemon is not available'
+latex_core_select_docker "$repository_root" || fail 'Docker daemon is not available'
 
 postgres_image='postgres:18.4'
-if ! docker image inspect "$postgres_image" >/dev/null 2>&1; then
+if ! latex_core_docker image inspect "$postgres_image" >/dev/null 2>&1; then
   printf 'PostgreSQL image %s is not local; pulling it now.\n' "$postgres_image"
-  docker pull "$postgres_image" >/dev/null
+  latex_core_docker pull "$postgres_image" >/dev/null
 fi
 
 dump_checksum_line=$(sha256sum -- "$dump_path")
@@ -84,13 +85,13 @@ container_started=false
 
 cleanup() {
   if [[ "$container_started" == true ]]; then
-    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    latex_core_docker rm -f "$container_name" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT INT TERM
 
 printf 'Starting isolated PostgreSQL restore (%s).\n' "$container_name"
-docker run -d --rm \
+latex_core_docker run -d --rm \
   --name "$container_name" \
   --network none \
   --tmpfs /var/lib/postgresql:rw,nosuid,size=1g \
@@ -108,7 +109,7 @@ container_started=true
 # consecutive successful probes so restore cannot race the final restart.
 consecutive_ready=0
 for attempt in $(seq 1 90); do
-  if docker exec "$container_name" pg_isready -U planner -d legacy >/dev/null 2>&1; then
+  if latex_core_docker exec "$container_name" pg_isready -U planner -d legacy >/dev/null 2>&1; then
     consecutive_ready=$((consecutive_ready + 1))
   else
     consecutive_ready=0
@@ -117,14 +118,14 @@ for attempt in $(seq 1 90); do
     break
   fi
   if ((attempt == 90)); then
-    docker logs "$container_name" >&2
+    latex_core_docker logs "$container_name" >&2
     fail 'isolated PostgreSQL did not become ready'
   fi
   sleep 1
 done
 
-docker exec "$container_name" pg_restore --list /input/database.dump >/dev/null
-docker exec "$container_name" pg_restore \
+latex_core_docker exec "$container_name" pg_restore --list /input/database.dump >/dev/null
+latex_core_docker exec "$container_name" pg_restore \
   --exit-on-error \
   --no-owner \
   --no-privileges \
@@ -132,7 +133,7 @@ docker exec "$container_name" pg_restore \
   -d legacy \
   /input/database.dump
 
-docker exec \
+latex_core_docker exec \
   --user "$(id -u):$(id -g)" \
   "$container_name" \
   psql -X -q -v ON_ERROR_STOP=1 \

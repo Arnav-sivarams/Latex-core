@@ -65,6 +65,7 @@ on_exit() {
 trap on_exit EXIT
 
 phase=host-contract
+"$root/scripts/install-prerequisites.sh"
 "$root/scripts/check-install-host.sh"
 
 for required_file in .env.example deploy/compose/docker-compose.yml deploy/Dockerfile migrations/0001_initial_schema.sql; do
@@ -98,18 +99,18 @@ latex_core_prepare_staging
 echo '[3/8] Preparing directories        OK'
 
 phase=compiler-image-verification
-actual="$(docker image inspect "$local_image" --format '{{.Id}}' 2>/dev/null || true)"
+actual="$(latex_core_docker image inspect "$local_image" --format '{{.Id}}' 2>/dev/null || true)"
 if [[ -z "$actual" ]]; then
   source_image="$(latex_core_env_value LATEX_CORE_M7_IMAGE_SOURCE "$LATEX_CORE_ENV_FILE")"
   source_image="${source_image:-$default_source}"
   echo "Frozen M7 image is missing; pulling published source $source_image ..."
-  docker pull "$source_image"
-  pulled="$(docker image inspect "$source_image" --format '{{.Id}}')"
+  latex_core_docker pull "$source_image"
+  pulled="$(latex_core_docker image inspect "$source_image" --format '{{.Id}}')"
   [[ "$pulled" == "$expected" ]] || { echo "Pulled M7 image identity mismatch: expected $expected, got $pulled" >&2; exit 1; }
-  docker tag "$source_image" "$local_image"
-  actual="$(docker image inspect "$local_image" --format '{{.Id}}')"
+  latex_core_docker tag "$source_image" "$local_image"
+  actual="$(latex_core_docker image inspect "$local_image" --format '{{.Id}}')"
 fi
-platform="$(docker image inspect "$local_image" --format '{{.Os}}/{{.Architecture}}')"
+platform="$(latex_core_docker image inspect "$local_image" --format '{{.Os}}/{{.Architecture}}')"
 [[ "$actual" == "$expected" ]] || { echo "Frozen M7 image identity mismatch: expected $expected, got $actual" >&2; exit 1; }
 [[ "$platform" == linux/amd64 ]] || { echo "Frozen M7 image platform mismatch: expected linux/amd64, got $platform" >&2; exit 1; }
 echo 'Frozen M7 compiler image identity and platform verified.'

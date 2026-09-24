@@ -4,6 +4,7 @@ set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/install-common.sh
 source "$root/scripts/install-common.sh"
+latex_core_select_docker "$root"
 umask 077
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 evidence_root="$root/.install-diagnostics/$stamp-$$"
@@ -12,9 +13,9 @@ chmod 700 "$root/.install-diagnostics" "$evidence_root" 2>/dev/null || true
 
 branch="$(git -C "$root" branch --show-current 2>/dev/null || printf detached)"
 commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || printf unknown)"
-context="$(docker context show 2>/dev/null || printf unavailable)"
-endpoint="$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || printf unavailable)"
-platform="$(docker info --format '{{.OSType}}/{{.Architecture}}' 2>/dev/null || printf unavailable)"
+context="$(latex_core_docker context show 2>/dev/null || printf unavailable)"
+endpoint="$(latex_core_docker context inspect "$context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || printf unavailable)"
+platform="$(latex_core_docker info --format '{{.OSType}}/{{.Architecture}}' 2>/dev/null || printf unavailable)"
 
 if latex_core_init "$root" 2>/dev/null; then
   project="$LATEX_CORE_PROJECT"
@@ -22,7 +23,7 @@ if latex_core_init "$root" 2>/dev/null; then
 else
   project=unavailable
   env_path="$root/.env"
-  LATEX_CORE_COMPOSE=(docker compose --project-name latex-core --env-file "$root/.env" -f "$root/deploy/compose/docker-compose.yml")
+  LATEX_CORE_COMPOSE=("${LATEX_CORE_DOCKER[@]}" compose --project-name latex-core --env-file "$root/.env" -f "$root/deploy/compose/docker-compose.yml")
 fi
 
 {
@@ -39,7 +40,7 @@ fi
       printf '%-10s %s\n' "$service" missing
       continue
     fi
-    docker inspect "$id" --format "${service} {{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.RestartCount}} {{.Image}}"
+    latex_core_docker inspect "$id" --format "${service} {{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.RestartCount}} {{.Image}}"
   done
 } >"$evidence_root/service-status.txt" 2>&1
 
@@ -48,7 +49,7 @@ fi
     id="$(latex_core_container_id "$service" 2>/dev/null)"
     [[ -n "$id" ]] || continue
     printf '%s\n' "[$service]"
-    docker inspect "$id" --format '{{range .Mounts}}{{printf "%s source=%s name=%s -> %s (rw=%t)\n" .Type .Source .Name .Destination .RW}}{{end}}'
+    latex_core_docker inspect "$id" --format '{{range .Mounts}}{{printf "%s source=%s name=%s -> %s (rw=%t)\n" .Type .Source .Name .Destination .RW}}{{end}}'
   done
 } >"$evidence_root/mounts.txt" 2>&1
 

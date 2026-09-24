@@ -11,7 +11,7 @@ cd latex-core
 ./latex-core install
 ```
 
-You may skip SMTP when prompted. Create the first Admin when prompted. The installer generates `.env` once with restrictive permissions and preserves it on later runs.
+This is the only setup command. You may authorize sudo, skip SMTP, and create the first Admin when prompted inside it. The installer generates `.env` once with restrictive permissions and preserves it on later runs. Do not run `apt`, `usermod`, `newgrp`, `systemctl`, Docker diagnostics, or internal scripts as installation steps.
 
 Verify the result:
 
@@ -31,9 +31,13 @@ Open `http://localhost:9000` on the laptop. A normal fresh install requires no m
 
 ## Supported host contract
 
-The supported host is Ubuntu Server 22.04 LTS or Ubuntu Server 24.04 LTS on x86_64 with Docker Engine 24 or newer and Docker Compose 2.20 or newer. Run installation as the normal login account with access to the local, rootful Docker daemon at `unix:///var/run/docker.sock`; do not run it through `sudo`. Rootless Docker, remote Docker contexts, alternate sockets, and CPU emulation do not satisfy the Worker compiler-mount contract.
+The supported host is Ubuntu Server 22.04 LTS or Ubuntu Server 24.04 LTS on x86_64 with a normal sudo-capable account. The supported runtime is a local, rootful daemon at `unix:///var/run/docker.sock`, Docker Engine 24 or newer, Docker Compose 2.20 or newer, and Buildx 0.12 or newer. Rootless Docker, remote contexts, alternate sockets, and CPU emulation do not satisfy the Worker compiler-mount contract.
 
-The host commands checked by the installer are Git, Docker, the Docker Compose plugin, `awk`, `sed`, `grep`, `mktemp`, `chmod`, `mv`, Python 3, `curl`, `ss`, `df`, and `sha384sum`. OpenSSL is optional because Python 3 can generate secrets. The host does not need PostgreSQL Server, `psql`, Rust, Cargo, Node, npm, generated frontend files, or prior LaTeX Core state.
+When prerequisites are missing, the installer lists the changes and requests sudo authorization through the controlling terminal. It installs basic utilities from Ubuntu and installs exact APT candidate versions of `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, and `docker-compose-plugin` from Docker's official HTTPS repository after verifying its signing-key fingerprint. It never runs a downloaded root shell. Package-lock waits are bounded. Existing compatible Docker is reused; a running daemon is not restarted. Conflicting administrator-managed container packages and a masked Docker service produce explicit failures instead of automatic removal or unmasking.
+
+Docker is used directly when the account already has access. Otherwise every Docker and Compose operation goes through the same sudo-assisted executor, including image inspection/pulls, builds, migrations, bootstrap, verification, diagnostics, and later lifecycle commands. Authorization is read from `/dev/tty`, never from administrator-password stdin, and is renewed there if it expires. No group change, logout, new shell, socket chmod, sudoers rule, or stored sudo password is used. `sudo ./latex-core install` is supported by validating `SUDO_UID`, `SUDO_GID`, `SUDO_USER`, the account home, and checkout ownership, then returning configuration and file creation to that account.
+
+The host does not need PostgreSQL Server, `psql`, Rust, Cargo, Node, npm, TeX, generated frontend files, or prior LaTeX Core state.
 
 PostgreSQL comes from the Compose stack. Rust builds run in the Docker build stage. The application image contains the embedded SQLx migrator, and installation runs it against the Compose database. The frozen M7 compiler image is pulled and checked by immutable image ID; the installer does not rebuild it.
 
@@ -41,7 +45,7 @@ The preflight warns below 10 GiB free source or Docker storage and below 4 GiB a
 
 ## Created resources and ports
 
-The installer creates a mode-600 `.env`, a dedicated Worker staging directory, and Compose-managed PostgreSQL and BlobStore volumes. A new checkout gets a stable project name derived from its canonical path, avoiding collisions with other checkouts; existing `.env` project names are preserved. Rerunning preserves resources, credentials, accounts, and data. Invalid existing settings produce a named error; the installer does not silently regenerate `.env` or reset volumes.
+The installer creates a mode-600 `.env`, a private dedicated Worker staging directory, and Compose-managed PostgreSQL and BlobStore volumes. A new checkout gets a stable project name derived from its canonical path, avoiding collisions with other checkouts; existing `.env` project names and valid staging permissions are preserved. Verification checks the staging directory from the deployment account and confirms that the running Worker uses the exact configured host bind. Rerunning preserves resources, credentials, accounts, and data. Invalid existing settings produce a named error; the installer does not silently regenerate `.env`, recursively change ownership, or reset volumes.
 
 Fresh defaults resolve to:
 

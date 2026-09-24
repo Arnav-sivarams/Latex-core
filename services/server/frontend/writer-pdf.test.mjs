@@ -30,3 +30,13 @@ test('Writer DOM and CSS collapse the hidden PDF state', () => {
   assert.match(writer, /model\.pdfLoadingTask\?\.destroy\?\.\(\)/);
   assert.match(writer, /model\.paper\?\.id !== paperId/);
 });
+
+test('automatic forward SyncTeX follows the caret only against the current exact PDF', () => {
+  const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
+  assert.match(writer, /EditorView\.updateListener[\s\S]*update\.selectionSet[\s\S]*scheduleForwardSync/);
+  assert.match(writer, /const head = selection\.head/);
+  assert.match(writer, /model\.pdfDisplayBuildId !== model\.currentBuildId/);
+  assert.match(writer, /model\.view\?\.state\.selection\.main\.head !== head/);
+  assert.match(writer, /if \(update\.docChanged\) markPdfStaleFromEditor\(\)/);
+  assert.match(writer, /Compile current source to synchronize PDF\./);
+});

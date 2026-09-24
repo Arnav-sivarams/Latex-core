@@ -11,7 +11,7 @@ postgres_id="$(latex_core_container_id postgres)"
   echo 'Migration check failed: the selected deployment has no PostgreSQL container.' >&2
   exit 1
 }
-[[ "$(docker inspect -f '{{.State.Status}}' "$postgres_id" 2>/dev/null || true)" == running ]] || {
+[[ "$(latex_core_docker inspect -f '{{.State.Status}}' "$postgres_id" 2>/dev/null || true)" == running ]] || {
   echo 'Migration check failed: the selected deployment PostgreSQL container is not running.' >&2
   exit 1
 }
@@ -29,6 +29,8 @@ expected="${expected%$'\n'}"
 
 # PostgreSQL tooling runs inside the database container; no host psql package
 # is required. SQLx records SHA-384 checksums in _sqlx_migrations.
+# The quoted variables intentionally expand inside the PostgreSQL container.
+# shellcheck disable=SC2016
 installed="$("${LATEX_CORE_COMPOSE[@]}" exec -T postgres sh -ceu '
   PGPASSWORD="$POSTGRES_PASSWORD" psql -X -v ON_ERROR_STOP=1 \
     -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -F "|" \

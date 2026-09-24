@@ -29,6 +29,7 @@
       <button id="commandPalette" class="icon-button" type="button" aria-label="Command palette" title="Command palette (Ctrl/Cmd+K)"><span aria-hidden="true">⌘</span></button>
     </div>
     <div class="toolbar-group" aria-label="Build and review">
+      <button id="commentsToggle" class="ui-button ui-button-secondary workflow-button" type="button" aria-label="Comments" title="Comments" aria-controls="workspaceDrawer" aria-expanded="false"><span aria-hidden="true">◰</span><span>Comments</span><small id="toolbarReviewCount">0</small></button>
       <button id="compilePaper" class="ui-button ui-button-primary workflow-button primary" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span><span>Compile</span></button>
       <span id="buildStatus" class="toolbar-status">No PDF yet</span>
       <button id="sendReview" class="ui-button ui-button-secondary workflow-button" type="button" disabled hidden aria-label="Send for review" title="Send for review (Ctrl/Cmd+Shift+R)"><span aria-hidden="true">⚑</span><span>Send for review</span></button>
@@ -40,7 +41,6 @@
     <div class="toolbar-group toolbar-view" aria-label="View">
       <button id="problemsToggle" class="icon-button badge-button" type="button" aria-label="Problems" title="Problems"><span aria-hidden="true">△</span><small id="problemsCount">0</small></button>
       <button id="historyToggle" class="icon-button" type="button" aria-label="History" title="Version history"><span aria-hidden="true">◷</span></button>
-      <button id="commentsToggle" class="ui-button ui-button-secondary workflow-button" type="button" aria-label="Reviews" title="Reviews"><span aria-hidden="true">◰</span><span>Reviews</span><small id="toolbarReviewCount">0</small></button>
       <button id="documentDetails" class="icon-button" type="button" disabled aria-label="Document details" title="Document details"><span aria-hidden="true">▤</span></button>
       <details id="editorSettings" class="toolbar-menu"><summary>Editor settings</summary><div class="compact-settings"><label>Font size <input id="editorFontSize" type="number" min="12" max="26" step="1"></label><label>Theme <select id="editorTheme"><option value="LIGHT">Light</option><option value="DARK">Dark</option></select></label><button id="resetEditorSettings" type="button">Reset to default</button></div></details>
       <button id="moreActions" class="icon-button" type="button" aria-label="More actions" title="More actions"><span aria-hidden="true">⋯</span></button>

@@ -9,7 +9,7 @@ trap cleanup EXIT
 mkdir -p "$test_root/repo/scripts" "$test_root/repo/deploy/compose" "$test_root/repo/migrations" "$test_root/fake-bin"
 cp "$root/.env.example" "$test_root/repo/.env.example"
 cp "$root/scripts/generate-local-env.sh" "$test_root/repo/scripts/"
-cp "$root/scripts/install-common.sh" "$test_root/repo/scripts/"
+cp "$root/scripts/install-common.sh" "$root/scripts/docker-exec.sh" "$test_root/repo/scripts/"
 cp "$root/scripts/validate-install-config.py" "$test_root/repo/scripts/"
 cp "$root/scripts/check-deployment-migrations.sh" "$test_root/repo/scripts/"
 cp "$root/scripts/check-install-ports.sh" "$test_root/repo/scripts/"
@@ -26,7 +26,13 @@ export FAKE_DOCKER_LOG="$test_root/docker-calls.log"
 cat >"$test_root/fake-bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$FAKE_DOCKER_LOG"
-if [[ "${1:-}" == compose ]]; then
+if [[ "$*" == 'context show' ]]; then
+  echo default
+elif [[ "$*" == 'context inspect default --format {{.Endpoints.docker.Host}}' ]]; then
+  echo unix:///var/run/docker.sock
+elif [[ "$*" == info ]]; then
+  exit 0
+elif [[ "${1:-}" == compose ]]; then
   case " $* " in
     *' config --services '*)
       printf 'postgres\napi\nworker\n'

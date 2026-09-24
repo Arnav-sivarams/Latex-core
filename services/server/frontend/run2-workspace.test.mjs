@@ -69,7 +69,7 @@ test('Run 1 workflow labels, settings, and removed workspace actions are reflect
   }
   assert.match(writerHtml, /<span>Save<\/span>/);
   assert.match(writerHtml, /<span>Compile<\/span>/);
-  assert.match(writerHtml, /<span>Reviews<\/span>/);
+  assert.match(writerHtml, /<span>Comments<\/span>/);
   assert.match(writerHtml, /<span>Send for review<\/span>/);
   assert.match(writerHtml, /TEAM REPORTS/);
   assert.match(mentorHtml, /<span>Push review<\/span>/);

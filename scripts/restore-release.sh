@@ -57,8 +57,8 @@ staging_root="$(awk -F= '$1=="WORKER_STAGING_HOST_ROOT"{print substr($0,index($0
 
 RECOVERY_PROJECT="$target_project"
 recovery_init_compose "$root" "$RECOVERY_PROJECT" "$target_env"
-existing_container="$(docker ps -aq --filter "label=com.docker.compose.project=$RECOVERY_PROJECT" | head -n1)"
-existing_volume="$(docker volume ls -q --filter "label=com.docker.compose.project=$RECOVERY_PROJECT" | head -n1)"
+existing_container="$(latex_core_docker ps -aq --filter "label=com.docker.compose.project=$RECOVERY_PROJECT" | head -n1)"
+existing_volume="$(latex_core_docker volume ls -q --filter "label=com.docker.compose.project=$RECOVERY_PROJECT" | head -n1)"
 [[ -z "$existing_container" && -z "$existing_volume" ]] || {
   echo 'Restore target is not empty. Use a new project name; in-place overwrite is intentionally unsupported.' >&2
   exit 1
@@ -79,17 +79,17 @@ trap on_exit EXIT
 "${RECOVERY_COMPOSE[@]}" up -d postgres >/dev/null
 postgres_id="$(recovery_container postgres)"
 for attempt in $(seq 1 60); do
-  [[ "$(docker inspect "$postgres_id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')" == healthy ]] && break
+  [[ "$(latex_core_docker inspect "$postgres_id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')" == healthy ]] && break
   ((attempt % 10)) || printf 'Waiting for restored PostgreSQL (%ss).\n' "$((attempt * 2))"
   sleep 2
 done
-[[ "$(docker inspect "$postgres_id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')" == healthy ]] || {
+[[ "$(latex_core_docker inspect "$postgres_id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')" == healthy ]] || {
   echo 'Restored PostgreSQL did not become healthy.' >&2
   exit 1
 }
 postgres_volume="$(recovery_volume_for_mount postgres /var/lib/postgresql)"
 blob_volume="${RECOVERY_PROJECT}_latex_core_blob_data"
-docker volume create \
+latex_core_docker volume create \
   --label "com.docker.compose.project=$RECOVERY_PROJECT" \
   --label com.docker.compose.volume=latex_core_blob_data \
   "$blob_volume" >/dev/null
@@ -97,11 +97,11 @@ printf 'Verified empty restore project %s with PostgreSQL volume %s and BlobStor
   "$RECOVERY_PROJECT" "$postgres_volume" "$blob_volume"
 
 phase='database-restore'
-docker exec -i "$postgres_id" pg_restore --exit-on-error --no-owner --no-privileges \
+latex_core_docker exec -i "$postgres_id" pg_restore --exit-on-error --no-owner --no-privileges \
   -U "$RECOVERY_POSTGRES_USER" -d "$RECOVERY_POSTGRES_DB" <"$backup_directory/database.dump"
 
 phase='blob-restore'
-docker run --rm --network none -v "$blob_volume:/target" -v "$backup_directory:/backup:ro" alpine:3.21 \
+latex_core_docker run --rm --network none -v "$blob_volume:/target" -v "$backup_directory:/backup:ro" alpine:3.21 \
   tar xzf /backup/blobs.tar.gz -C /target
 
 phase='cross-store-verification'
@@ -109,7 +109,7 @@ recovery_validate_blob_volume "$blob_volume"
 recovery_verify_referenced_blobs "$blob_volume"
 
 phase='external-side-effect-suppression'
-docker exec -i "$postgres_id" psql -X -v ON_ERROR_STOP=1 \
+latex_core_docker exec -i "$postgres_id" psql -X -v ON_ERROR_STOP=1 \
   -U "$RECOVERY_POSTGRES_USER" -d "$RECOVERY_POSTGRES_DB" <<'SQL' >/dev/null
 TRUNCATE latex_core.sessions;
 UPDATE latex_core.email_outbox
@@ -123,12 +123,12 @@ phase='application-start'
 "${RECOVERY_COMPOSE[@]}" up -d api worker caddy >/dev/null
 for attempt in $(seq 1 60); do
   api_id="$("${RECOVERY_COMPOSE[@]}" ps -q api)"
-  [[ -n "$api_id" && "$(docker inspect "$api_id" --format '{{.State.Status}}')" == running ]] && break
+  [[ -n "$api_id" && "$(latex_core_docker inspect "$api_id" --format '{{.State.Status}}')" == running ]] && break
   ((attempt % 10)) || printf 'Waiting for restored application (%ss).\n' "$((attempt * 2))"
   sleep 2
 done
 api_id="$(recovery_container api)"
-[[ "$(docker inspect "$api_id" --format '{{.State.Status}}')" == running ]] || {
+[[ "$(latex_core_docker inspect "$api_id" --format '{{.State.Status}}')" == running ]] || {
   echo 'Restored API did not start.' >&2
   exit 1
 }

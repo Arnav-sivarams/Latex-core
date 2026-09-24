@@ -82,11 +82,11 @@ done
 
 postgres_id="$(latex_core_container_id postgres)"
 [[ -n "$postgres_id" ]] || { echo 'Existing deployment PostgreSQL container is missing.' >&2; exit 1; }
-[[ "$(docker inspect -f '{{.State.Status}}' "$postgres_id" 2>/dev/null || true)" == running ]] || {
+[[ "$(latex_core_docker inspect -f '{{.State.Status}}' "$postgres_id" 2>/dev/null || true)" == running ]] || {
   echo 'Existing deployment PostgreSQL container is not running.' >&2
   exit 1
 }
-[[ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$postgres_id" 2>/dev/null || true)" == healthy ]] || {
+[[ "$(latex_core_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$postgres_id" 2>/dev/null || true)" == healthy ]] || {
   echo 'Existing deployment PostgreSQL container is not healthy.' >&2
   exit 1
 }
@@ -95,11 +95,11 @@ declare -A previous_blob_volumes=()
 for service in "${services[@]}"; do
   id="$(latex_core_container_id "$service")"
   [[ -n "$id" ]] || { echo "Existing deployment service is missing: $service" >&2; exit 1; }
-  [[ "$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || true)" == running ]] || {
+  [[ "$(latex_core_docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || true)" == running ]] || {
     echo "Existing deployment service is not running: $service" >&2
     exit 1
   }
-  previous_blob_volumes["$service"]="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/latex-core/blobs"}}{{.Name}}{{end}}{{end}}' "$id")"
+  previous_blob_volumes["$service"]="$(latex_core_docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/latex-core/blobs"}}{{.Name}}{{end}}{{end}}' "$id")"
   [[ -n "${previous_blob_volumes[$service]}" ]] || { echo "$service has no persistent blob volume at the expected mount." >&2; exit 1; }
 done
 
@@ -110,7 +110,7 @@ phase=image-build
 echo "Building application image(s): ${services[*]}"
 "${LATEX_CORE_COMPOSE[@]}" build "${services[@]}"
 
-phase=service-replacement
+phase='service-replacement'
 replacement_started=true
 echo "Replacing only application service(s): ${services[*]}"
 "${LATEX_CORE_COMPOSE[@]}" up -d --no-deps "${services[@]}"
@@ -118,7 +118,7 @@ echo "Replacing only application service(s): ${services[*]}"
 container_field() {
   local service="$1" format="$2" id
   id="$(latex_core_container_id "$service")"
-  [[ -n "$id" ]] && docker inspect --format "$format" "$id" 2>/dev/null || true
+  if [[ -n "$id" ]]; then latex_core_docker inspect --format "$format" "$id" 2>/dev/null || true; fi
 }
 
 wait_healthy() {
@@ -175,7 +175,7 @@ phase=preservation-check
 }
 for service in "${services[@]}"; do
   id="$(latex_core_container_id "$service")"
-  current_blob="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/latex-core/blobs"}}{{.Name}}{{end}}{{end}}' "$id")"
+  current_blob="$(latex_core_docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/latex-core/blobs"}}{{.Name}}{{end}}{{end}}' "$id")"
   [[ "$current_blob" == "${previous_blob_volumes[$service]}" ]] || {
     echo "$service blob volume identity changed unexpectedly." >&2
     exit 1

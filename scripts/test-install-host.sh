@@ -13,6 +13,7 @@ case "$*" in
   'info') exit 0 ;;
   'compose version') echo 'Docker Compose version v2.20.0' ;;
   'compose version --short') echo '2.20.0' ;;
+  'buildx version') echo 'github.com/docker/buildx v0.12.0' ;;
   'version --format {{.Server.Version}}') echo '24.0.0' ;;
   'context show') echo 'default' ;;
   'context inspect default --format {{.Endpoints.docker.Host}}') echo 'unix:///var/run/docker.sock' ;;

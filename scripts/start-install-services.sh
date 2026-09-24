@@ -19,7 +19,7 @@ trap failed EXIT
 container_field() {
   local service="$1" format="$2" id
   id="$(latex_core_container_id "$service")"
-  if [[ -n "$id" ]]; then docker inspect --format "$format" "$id" 2>/dev/null || true; fi
+  if [[ -n "$id" ]]; then latex_core_docker inspect --format "$format" "$id" 2>/dev/null || true; fi
 }
 
 wait_healthy() {

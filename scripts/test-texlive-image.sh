@@ -3,12 +3,13 @@ set -euo pipefail
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 cd -- "$repo_root"
-command -v docker >/dev/null || { echo 'Docker is required' >&2; exit 1; }
-docker info >/dev/null
+# shellcheck source=scripts/install-common.sh
+source "$repo_root/scripts/install-common.sh"
+latex_core_select_docker "$repo_root"
 image_ref="${1:-latex-core-texlive:2026-m7}"
-image_id="$(docker image inspect "$image_ref" --format '{{.Id}}')"
+image_id="$(latex_core_docker image inspect "$image_ref" --format '{{.Id}}')"
 [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'immutable local image ID required' >&2; exit 1; }
-run=(docker run --rm --pull=never --network=none --read-only --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777 --user=10001:10001)
+run=("${LATEX_CORE_DOCKER[@]}" run --rm --pull=never --network=none --read-only --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777" --user=10001:10001)
 [[ "$("${run[@]}" --entrypoint=/usr/bin/id "$image_id" -u)" == 10001 ]]
 "${run[@]}" --entrypoint=/opt/texlive/2026/bin/x86_64-linux/tlmgr "$image_id" --version | grep -q 2026
 for tool in latex pdflatex lualatex xelatex latexmk bibtex biber makeglossaries dvips kpsewhich tlmgr; do

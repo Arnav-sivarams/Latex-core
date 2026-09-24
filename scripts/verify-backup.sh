@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/install-common.sh
+source "$root/scripts/install-common.sh"
+latex_core_select_docker "$root"
+
 backup_directory="${1:?usage: verify-backup.sh BACKUP_DIRECTORY}"
 [[ "$backup_directory" == /* ]] || { echo 'Backup directory must be absolute.' >&2; exit 2; }
 for required in manifest.json checksums.sha256 database.dump blobs.tar.gz COMPLETE; do
@@ -24,7 +29,7 @@ grep -q '"verification"[[:space:]]*:[[:space:]]*"passed"' "$backup_directory/man
   [[ "$expected_complete" == "$recorded_complete" ]]
 )
 
-docker run --rm --network none -v "$backup_directory:/backup:ro" postgres:18.4 \
+latex_core_docker run --rm --network none -v "$backup_directory:/backup:ro" postgres:18.4 \
   pg_restore --list /backup/database.dump >/dev/null
 gzip -t "$backup_directory/blobs.tar.gz"
 if tar -tzf "$backup_directory/blobs.tar.gz" | awk '

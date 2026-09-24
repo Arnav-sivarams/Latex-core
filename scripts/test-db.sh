@@ -5,10 +5,13 @@ script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 compose_file="${repository_root}/deploy/compose/docker-compose.yml"
 postgres_port="${LATEX_CORE_POSTGRES_PORT:-54329}"
+# shellcheck source=scripts/install-common.sh
+source "$repository_root/scripts/install-common.sh"
+latex_core_select_docker "$repository_root"
 
 "${repository_root}/scripts/dev-up.sh"
 
-docker compose -p latex-core-dev -f "${compose_file}" exec -T postgres \
+"${LATEX_CORE_DOCKER[@]}" compose -p latex-core-dev -f "${compose_file}" exec -T postgres \
   psql -U latex_core -d postgres -v ON_ERROR_STOP=1 \
   -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'latex_core_test' AND pid <> pg_backend_pid();" \
   -c "DROP DATABASE IF EXISTS latex_core_test;" \

@@ -180,8 +180,12 @@ const model = {
   pdfScrollTimer: null,
   forwardSyncTimer: null,
   forwardSyncRequest: 0,
+  pdfSourceChanged: false,
+  pdfBuildAtSourceChange: null,
+  pdfCompileRequested: false,
   buildLog: '',
   buildLogBuildId: null,
+  buildLogRequest: 0,
   latestBuildId: null,
   lastBuildStatus: null,
   buildFooterTab: 'problems',
@@ -261,23 +265,39 @@ async function navigatePdfLocation(mapping) {
   window.setTimeout(() => highlight.remove(), 1800);
   return true;
 }
-function scheduleForwardSync(delay = 160) {
+function invalidateForwardSync() {
   window.clearTimeout(model.forwardSyncTimer);
-  model.forwardSyncTimer = window.setTimeout(() => { forwardSyncFromEditor(); }, delay);
+  model.forwardSyncRequest += 1;
 }
-async function forwardSyncFromEditor() {
+function scheduleForwardSync(delay = 160) {
+  invalidateForwardSync();
+  const request = model.forwardSyncRequest;
+  model.forwardSyncTimer = window.setTimeout(() => { forwardSyncFromEditor(request); }, delay);
+}
+function markPdfStaleFromEditor() {
+  invalidateForwardSync();
+  model.pdfSourceChanged = true;
+  model.pdfBuildAtSourceChange ||= model.currentBuildId || model.pdfDisplayBuildId;
+  model.pdfCompileRequested = false;
+  model.pdfCurrent = false;
+  ui.locateInPdf.disabled = true;
+  ui.pdfRelation.textContent = 'Compile current source to synchronize PDF.';
+}
+async function forwardSyncFromEditor(request) {
   if (!model.paper || !model.file || !model.view || !model.currentBuildId || !model.pdfCurrent
-      || !/\.tex$/i.test(model.file.path)) return;
+      || model.pdfDisplayBuildId !== model.currentBuildId || !/\.tex$/i.test(model.file.path)) return;
   const selection = model.view.state.selection.main;
-  const line = model.view.state.doc.lineAt(selection.head);
-  const request = ++model.forwardSyncRequest;
+  const head = selection.head;
+  const line = model.view.state.doc.lineAt(head);
   const paperId = model.paper.id;
   const fileId = model.file.file_id;
+  const filePath = model.file.path;
   const buildId = model.currentBuildId;
   try {
-    const mapping = await api.sourcePosition(paperId, buildId, model.file.path, line.number, selection.head - line.from);
+    const mapping = await api.sourcePosition(paperId, buildId, filePath, line.number, head - line.from);
     if (request !== model.forwardSyncRequest || model.paper?.id !== paperId || model.file?.file_id !== fileId
-        || model.currentBuildId !== buildId || !model.pdfCurrent) return;
+        || model.file?.path !== filePath || model.view?.state.selection.main.head !== head
+        || model.currentBuildId !== buildId || model.pdfDisplayBuildId !== buildId || !model.pdfCurrent) return;
     await navigatePdfLocation(mapping);
   } catch (error) {
     if (request !== model.forwardSyncRequest || model.paper?.id !== paperId) return;
@@ -504,23 +524,31 @@ function expandBuildFooter(tab = model.buildFooterTab) {
   ui.buildFooter.dataset.expanded = 'true';
   ui.buildFooterToggle.setAttribute('aria-expanded', 'true');
   ui.buildFooterToggle.setAttribute('aria-label', 'Collapse diagnostics');
+  ui.buildFooterToggle.title = 'Collapse diagnostics';
 }
 
 function collapseBuildFooter() {
   ui.buildFooter.dataset.expanded = 'false';
   ui.buildFooterToggle.setAttribute('aria-expanded', 'false');
   ui.buildFooterToggle.setAttribute('aria-label', 'Expand diagnostics');
+  ui.buildFooterToggle.title = 'Expand diagnostics';
 }
 
 async function loadBuildLog() {
-  if (!model.paper || !model.latestBuildId || model.buildLogBuildId === model.latestBuildId && model.buildLog) return;
+  if (!model.paper || !model.latestBuildId || model.buildLogBuildId === model.latestBuildId) return;
   const buildId = model.latestBuildId;
+  const paperId = model.paper.id;
+  const request = ++model.buildLogRequest;
   model.buildLogBuildId = buildId;
   try {
-    model.buildLog = await api.buildLog(model.paper.id, buildId);
+    const log = await api.buildLog(paperId, buildId);
+    if (request !== model.buildLogRequest || model.paper?.id !== paperId || model.latestBuildId !== buildId) return;
+    model.buildLog = log;
     renderBuildLog(ui.buildLogText, model.buildLog || 'Compiler returned an empty log.');
     renderProblems();
   } catch (error) {
+    if (request !== model.buildLogRequest || model.paper?.id !== paperId || model.latestBuildId !== buildId) return;
+    model.buildLogBuildId = null;
     renderBuildLog(ui.buildLogText, error.message);
   }
 }
@@ -877,7 +905,11 @@ async function openPaper(paper) {
   model.latestBuildId = null;
   model.lastBuildStatus = null;
   model.buildLogBuildId = null;
+  model.buildLogRequest += 1;
   model.buildLog = '';
+  model.pdfSourceChanged = false;
+  model.pdfBuildAtSourceChange = null;
+  model.pdfCompileRequested = false;
   ui.pdfScroll.hidden = true;
   ui.pdfEmpty.hidden = false;
   ui.downloadPdf.disabled = true;
@@ -1032,7 +1064,8 @@ function mountEditor(ytext, editable, latex) {
       StreamLanguage.define(stex),
       autocompletion({ override: [latexCompletionSource] }),
       EditorView.updateListener.of((update) => {
-        if (update.selectionSet && !update.docChanged) scheduleForwardSync();
+        if (update.docChanged) markPdfStaleFromEditor();
+        else if (update.selectionSet) scheduleForwardSync();
       }),
     );
   }
@@ -1046,6 +1079,7 @@ function mountEditor(ytext, editable, latex) {
 }
 
 function destroyEditorView() {
+  invalidateForwardSync();
   if (model.view) model.view.destroy();
   model.view = null;
   model.undoManager = null;
@@ -1113,14 +1147,15 @@ async function reloadPaperAndFile(fileId) {
 async function requestBuild() {
   if (!model.paper) return;
   try {
+    if (model.pdfSourceChanged) model.pdfCompileRequested = true;
     ui.buildStatus.textContent = 'Queued';
     ui.buildFooterState.textContent = 'Queued';
     await api.build(model.paper.id, 'manual');
     await Promise.all([refreshBuildStatus(), refreshHistory()]);
   } catch (error) {
+    model.pdfCompileRequested = false;
     ui.buildStatus.textContent = 'Compilation failed';
     ui.buildFooterState.textContent = 'Compilation failed';
-    expandBuildFooter('problems');
     notice(error.message, true);
   }
 }
@@ -1139,18 +1174,30 @@ async function refreshBuildStatus() {
     const source = build.source_sequence;
     const pdf = build.current_source_sequence;
     const preview = pdfPreviewState(build);
-    model.latestBuildId = build.latest_build_id || build.active_build_id || build.current_build_id || null;
+    const latestBuildId = build.latest_build_id || build.active_build_id || build.current_build_id || null;
+    if (model.latestBuildId !== latestBuildId) {
+      model.latestBuildId = latestBuildId;
+      model.buildLog = '';
+      model.buildLogBuildId = null;
+      model.buildLogRequest += 1;
+      ui.buildLogText.textContent = 'Open Build Log to load the compiler output.';
+    }
     const shortState = shortBuildState(build);
     ui.buildFooterState.textContent = shortState;
-    const stale = buildIsStale(build);
+    const serverStale = buildIsStale(build);
+    const sourceRecompiled = model.pdfBuildAtSourceChange
+      ? build.current_build_id !== model.pdfBuildAtSourceChange
+      : model.pdfCompileRequested && build.current_build_id === latestBuildId && !build.active_build_id;
+    if (model.pdfSourceChanged && build.current_build_id && sourceRecompiled && !serverStale) {
+      model.pdfSourceChanged = false;
+      model.pdfBuildAtSourceChange = null;
+      model.pdfCompileRequested = false;
+    }
+    const stale = serverStale || model.pdfSourceChanged;
     model.pdfCurrent = Boolean(build.current_build_id && !stale);
     model.compileDiagnostic = build.latest_status === 'failed' && build.latest_error?.message
       ? { severity: 'error', code: 'compile', message: build.latest_error.message, path: null, file_id: null }
       : null;
-    if (model.buildLogBuildId !== model.latestBuildId) {
-      model.buildLog = '';
-      ui.buildLogText.textContent = 'Open Build Log to load the compiler output.';
-    }
     if (build.current_build_id && build.current_build_id !== model.currentBuildId) {
       model.currentBuildId = build.current_build_id;
       await loadWriterPdf(build.current_build_id);
@@ -1160,9 +1207,9 @@ async function refreshBuildStatus() {
     ui.pdfEmpty.hidden = !preview.empty;
     ui.locateInPdf.disabled = !model.pdfCurrent || !model.file || !/\.tex$/i.test(model.file.path);
     if (pdf == null) ui.pdfRelation.textContent = 'Compile to generate a PDF.';
+    else if (model.pdfSourceChanged) ui.pdfRelation.textContent = 'Compile current source to synchronize PDF.';
     else if (stale) ui.pdfRelation.textContent = `PDF is out of date — Compile to refresh. Source version ${source} · PDF version ${pdf}`;
     else ui.pdfRelation.textContent = `PDF matches source version ${pdf}`;
-    if (build.latest_status === 'failed' && model.lastBuildStatus !== 'failed') expandBuildFooter('problems');
     if (build.latest_status === 'failed') {
       ui.buildStatus.textContent = 'Compilation failed';
       if (build.current_build_id) ui.pdfRelation.textContent += ` · ${LAST_GOOD_PDF_FAILURE}`;
@@ -1170,6 +1217,8 @@ async function refreshBuildStatus() {
     } else ui.buildStatus.textContent = shortState;
     model.lastBuildStatus = build.latest_status;
     renderProblems();
+    if (model.buildFooterTab === 'log' && !build.active_build_id
+        && ['succeeded', 'failed'].includes(build.latest_status)) await loadBuildLog();
   } catch (error) {
     notice(error.message, true);
   }
@@ -1857,6 +1906,7 @@ function openSymbols() {
 function closeDrawer() {
   ui.workspaceDrawer.hidden = true;
   [ui.problems, ui.reviews, ui.history, ui.documentDetailsPanel].forEach((panel) => { panel.hidden = true; });
+  ui.commentsToggle.setAttribute('aria-expanded', 'false');
 }
 
 function openDrawer(kind) {
@@ -1865,6 +1915,7 @@ function openDrawer(kind) {
   Object.values(panels).forEach((panel) => { panel.hidden = panel !== panels[kind]; });
   ui.drawerTitle.textContent = titles[kind];
   ui.workspaceDrawer.hidden = false;
+  ui.commentsToggle.setAttribute('aria-expanded', String(kind === 'reviews'));
 }
 
 function projectMetadataEditor(detail) {
@@ -2141,7 +2192,10 @@ ui.buildProblemsTab.addEventListener('click', () => expandBuildFooter('problems'
 ui.buildLogTab.addEventListener('click', () => expandBuildFooter('log'));
 ui.buildFooterToggle.addEventListener('click', () => ui.buildFooter.dataset.expanded === 'true' ? collapseBuildFooter() : expandBuildFooter());
 ui.historyToggle.addEventListener('click', () => openDrawer('history'));
-ui.commentsToggle.addEventListener('click', () => openDrawer('reviews'));
+ui.commentsToggle.addEventListener('click', () => {
+  if (!ui.workspaceDrawer.hidden && !ui.reviews.hidden) closeDrawer();
+  else openDrawer('reviews');
+});
 ui.documentDetails.addEventListener('click', openDocumentDetails);
 ui.editorFontSize.addEventListener('change', () => persistPreferences({ font_size_px: Number(ui.editorFontSize.value), theme: ui.editorTheme.value }).catch((error) => notice(error.message, true)));
 ui.editorTheme.addEventListener('change', () => persistPreferences({ font_size_px: Number(ui.editorFontSize.value), theme: ui.editorTheme.value }).catch((error) => notice(error.message, true)));

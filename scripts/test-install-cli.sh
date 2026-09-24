@@ -7,7 +7,7 @@ cleanup() { rm -rf -- "$test_root"; }
 trap cleanup EXIT
 mkdir -p "$test_root/repo/scripts"
 cp "$root/latex-core" "$root/install.sh" "$test_root/repo/"
-cp "$root/scripts/install-common.sh" "$test_root/repo/scripts/"
+cp "$root/scripts/install-common.sh" "$root/scripts/docker-exec.sh" "$test_root/repo/scripts/"
 
 cd "$test_root"
 "$test_root/repo/latex-core" --help | grep -q 'install|start|stop|restart|status'

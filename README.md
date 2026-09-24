@@ -4,7 +4,7 @@ LaTeX Core is a self-hosted platform for institutional LaTeX papers. It provides
 
 ## Requirements
 
-Ubuntu 22.04 or 24.04 LTS x86_64, Git, Docker Engine 24+, Docker Compose 2.20+, and access to the local Docker daemon as your normal login account. Do not use `sudo` for installation. Docker must be running, and the configured host ports must be free. No host PostgreSQL, Rust, Cargo, Node, or npm is needed. See the [supported host contract](docs/INSTALL_SERVER.md) for the required basic utilities and capacity guidance.
+Ubuntu 22.04 or 24.04 LTS x86_64 and a normal sudo-capable account are supported. The installer provisions missing host utilities, Docker Engine 24+, Docker Compose 2.20+, and Buildx 0.12+ from Docker's signed Ubuntu repository, and starts a stopped local Docker service after showing the proposed host changes and requesting authorization. Existing compatible Docker installations are reused. No permanent Docker-group membership and no host PostgreSQL, Rust, Cargo, Node, npm, or TeX installation is required. See the [supported host contract](docs/INSTALL_SERVER.md).
 
 ## Quick Start
 
@@ -16,7 +16,7 @@ cd latex-core
 ./latex-core install
 ```
 
-The installer checks the host, generates a private `.env` and secrets once, creates checkout-owned worker staging, starts PostgreSQL, applies migrations, builds and starts the API/worker/proxy, checks health, and asks to create the first administrator. Existing configuration, accounts, blobs, and database volumes are preserved on subsequent installs.
+The installer handles sudo authorization inside that command, checks the host, generates a private `.env` and secrets once, creates checkout-owned worker staging, starts PostgreSQL, applies migrations, builds and starts the API/worker/proxy, checks health, and asks to create the first administrator. Existing configuration, accounts, blobs, and database volumes are preserved on subsequent installs. `sudo ./latex-core install` is also accepted: the launcher validates the real sudo identity and returns ordinary file work to that account instead of creating root-owned checkout state.
 
 The default URL is `http://localhost:9000`, bound to loopback. For a remote host, run `ssh -L 9000:127.0.0.1:9000 USER@SERVER` on your laptop, then visit that URL locally.
 
