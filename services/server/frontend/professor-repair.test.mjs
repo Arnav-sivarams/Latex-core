@@ -13,8 +13,13 @@ function functionBody(source, name, nextName) {
 }
 
 test('Writer and Mentor keep visible selections and install bounded pane splitters', () => {
-  assert.match(writer, /&:not\(\.cm-focused\) \.cm-selectionBackground/);
-  assert.match(review, /&:not\(\.cm-focused\) \.cm-selectionBackground/);
+  for (const source of [writer, review]) {
+    assert.match(source, /&\.cm-focused > \.cm-scroller > \.cm-selectionLayer \.cm-selectionBackground/);
+    assert.match(source, /&:not\(\.cm-focused\) > \.cm-scroller > \.cm-selectionLayer \.cm-selectionBackground/);
+    assert.match(source, /'\.cm-activeLine': \{ backgroundColor: dark \? 'rgba\(42,49,58,0\.42\)' : 'rgba\(238,244,251,0\.52\)' \}/);
+    assert.match(source, /'#315b7d' : '#82b7ed'/);
+    assert.match(source, /'#38536b' : '#b2cee9'/);
+  }
   assert.equal((writerHtml.match(/class="pane-splitter"/g) || []).length, 2);
   assert.equal((reviewHtml.match(/class="pane-splitter"/g) || []).length, 2);
   assert.match(writer, /installWorkspaceSplitters\([^;]+latex-core-writer-pane-widths/);
@@ -22,10 +27,10 @@ test('Writer and Mentor keep visible selections and install bounded pane splitte
 });
 
 test('Writer presents the conventional images directory without a legacy warning', () => {
-  assert.match(writer, /name === 'images' \? 'Images' : name/);
+  assert.match(writer, /label\.textContent = name === 'assets' \? 'Assets' : name/);
   assert.match(writer, /Project images: images\//);
-  assert.doesNotMatch(writer, /Images? \(legacy\)|Legacy project-local asset path/);
-  assert.doesNotMatch(review, /Images? \(legacy\)|Legacy project-local asset path/);
+  assert.doesNotMatch(writer, /name === 'images' \? 'Images'|Images? \(legacy\)|Legacy project-local asset path/);
+  assert.doesNotMatch(review, /name === 'images' \? 'Images'|Images? \(legacy\)|Legacy project-local asset path/);
 });
 
 test('upload insertion, save sequencing, inverse SyncTeX, and Insert menu contracts remain connected', () => {

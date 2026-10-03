@@ -21,9 +21,10 @@ test('standard editor selection shortcuts are not application-handled', () => {
   assert.match(writer, /EditorView\.editable\.of\(editable\)/);
 });
 
-test('writer selection uses the accent without intercepting native selection', () => {
-  assert.match(writer, /cm-selectionBackground/);
-  assert.match(writer, /color-mix\(in srgb, var\(--accent\)/);
+test('writer selection remains visible over the active line without intercepting native selection', () => {
+  assert.match(writer, /&\.cm-focused > \.cm-scroller > \.cm-selectionLayer \.cm-selectionBackground/);
+  assert.match(writer, /&:not\(\.cm-focused\) > \.cm-scroller > \.cm-selectionLayer \.cm-selectionBackground/);
+  assert.match(writer, /'\.cm-activeLine': \{ backgroundColor: dark \? 'rgba\([^']+,0\.42\)' : 'rgba\([^']+,0\.52\)' \}/);
   assert.match(writer, /\.cm-content ::selection/);
   assert.doesNotMatch(writer, /addEventListener\(['"](?:mousedown|mousemove|mouseup)['"]/);
 });

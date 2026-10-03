@@ -81,8 +81,11 @@ function editorAppearance(preference) {
     '&': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#1f2329' : '#ffffff', color: dark ? '#e6edf3' : '#20242a' },
     '.cm-gutters': { backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
     '.cm-content': { caretColor: dark ? '#f0f6fc' : '#111827' },
-    '.cm-activeLine,.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
-    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground,&:not(.cm-focused) .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#9fc9f5' },
+    '.cm-activeLine': { backgroundColor: dark ? 'rgba(42,49,58,0.42)' : 'rgba(238,244,251,0.52)' },
+    '.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
+    '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#82b7ed' },
+    '&:not(.cm-focused) > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: dark ? '#38536b' : '#b2cee9' },
+    '.cm-content ::selection': { backgroundColor: dark ? '#315b7d' : '#9fc9f5', color: dark ? '#ffffff' : '#111827' },
   }, { dark });
 }
 

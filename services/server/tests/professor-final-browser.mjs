@@ -26,6 +26,7 @@ const disposableEmails = [];
 const suffix = randomBytes(4).toString('hex');
 const accountPassword = `Final-${randomBytes(24).toString('base64url')}`;
 const requestedAreas = new Set((process.env.PROFESSOR_FINAL_AREAS || '').split(',').filter(Boolean));
+const patchedBundles = new Map(await Promise.all(['writer.js', 'review.js'].map(async (name) => [name, await readFile(new URL(`../static/${name}`, import.meta.url))])));
 
 function equal(actual, expected, message) { assertions += 1; assert.equal(actual, expected, message); }
 function ok(value, message) { assertions += 1; assert.ok(value, message); }
@@ -47,7 +48,9 @@ function tracked(page, label) {
 }
 async function newPage(browser, label) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-  const page = await context.newPage(); tracked(page, label); return { context, page };
+  const page = await context.newPage();
+  for (const [name, body] of patchedBundles) await page.route(`**/static/${name}*`, (route) => route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body }));
+  tracked(page, label); return { context, page };
 }
 async function login(page, email, password, destination) {
   await page.goto(base, { waitUntil: 'domcontentloaded' });
@@ -106,6 +109,51 @@ async function selectText(page, text, start = 0, length = text.length) {
   const line = page.locator('#editorMount .cm-line').filter({ hasText: text }).first(); await line.click(); await page.keyboard.press('Home');
   for (let index = 0; index < start; index += 1) await page.keyboard.press('ArrowRight');
   for (let index = 0; index < length; index += 1) await page.keyboard.press('Shift+ArrowRight');
+}
+async function textPoint(page, mount, text, offset) {
+  return page.locator(`${mount} .cm-line`).filter({ hasText: text }).first().evaluate((line, requestedOffset) => {
+    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT); let remaining = requestedOffset; let node;
+    while ((node = walker.nextNode())) {
+      if (remaining <= node.data.length) {
+        const range = document.createRange(); range.setStart(node, remaining); range.collapse(true);
+        const rectangle = range.getBoundingClientRect(); return { x: rectangle.x, y: rectangle.y + rectangle.height / 2 };
+      }
+      remaining -= node.data.length;
+    }
+    throw new Error(`text offset ${requestedOffset} is outside the rendered line`);
+  }, offset);
+}
+async function selectMouseText(page, mount, text, start, length) {
+  const from = await textPoint(page, mount, text, start); const to = await textPoint(page, mount, text, start + length);
+  await page.mouse.move(from.x, from.y); await page.mouse.down(); await page.mouse.move(to.x, to.y, { steps: 8 }); await page.mouse.up();
+}
+async function selectionEvidence(page, mount) {
+  await page.waitForTimeout(50);
+  return page.evaluate((selector) => {
+    const root = document.querySelector(selector); const content = root?.querySelector('.cm-content'); const editor = root?.querySelector('.cm-editor');
+    const main = content?.cmTile?.root?.view?.state?.selection?.main;
+    const styles = (node) => {
+      const style = node ? getComputedStyle(node) : null;
+      return style ? { backgroundColor: style.backgroundColor, color: style.color, opacity: style.opacity, position: style.position, zIndex: style.zIndex } : null;
+    };
+    const rectangles = [...(root?.querySelectorAll('.cm-selectionBackground') || [])].map((node) => {
+      const rectangle = node.getBoundingClientRect(); return { ...styles(node), x: rectangle.x, y: rectangle.y, width: rectangle.width, height: rectangle.height };
+    }).filter((rectangle) => rectangle.width > 0 && rectangle.height > 0);
+    return {
+      state: main ? { from: main.from, to: main.to, empty: main.empty } : null,
+      nativeText: getSelection()?.toString() || '', focused: editor?.classList.contains('cm-focused') || false,
+      selectionLayer: styles(root?.querySelector('.cm-selectionLayer')), rectangles,
+      activeLine: styles(root?.querySelector('.cm-activeLine')), line: styles(root?.querySelector('.cm-line')),
+    };
+  }, mount);
+}
+function colorAlpha(color) {
+  const rgba = color?.match(/^rgba?\([^,]+,[^,]+,[^,]+(?:,\s*([\d.]+))?\)$/); return rgba ? Number(rgba[1] ?? 1) : 0;
+}
+function visibleSelectionEvidence(evidence) {
+  return evidence.state && !evidence.state.empty && evidence.state.to > evidence.state.from
+    && evidence.nativeText.length > 0 && evidence.rectangles.some((rectangle) => rectangle.width > 0 && colorAlpha(rectangle.backgroundColor) > 0)
+    && colorAlpha(evidence.activeLine?.backgroundColor) < 1;
 }
 async function authoritativeSource(page, paperId) {
   const files = await json(page, `/api/v2/papers/${paperId}/files`); const main = files.payload.find((file) => file.path === 'main.tex');
@@ -220,7 +268,8 @@ try {
   await area('R17_R19_R20', async () => {
     equal(await leader.page.locator('#newFile').getAttribute('aria-label'), 'New file'); equal(await leader.page.locator('#uploadImage').getAttribute('aria-label'), 'Upload image');
     equal((await leader.page.locator('#newFile').textContent()) === (await leader.page.locator('#uploadImage').textContent()), false, 'icons are indistinguishable');
-    const labels = await leader.page.locator('#fileTree').allTextContents(); ok(labels.some((text) => text.includes('Images'))); ok(labels.every((text) => !text.includes('legacy')));
+    const imageLabels = await leader.page.locator('#fileTree .directory[title="Project images: images/"]').allTextContents(); equal(imageLabels.length, 1); equal(imageLabels[0], 'images');
+    const treeText = await leader.page.locator('#fileTree').innerText(); ok(!/(?:^|\n)(?:Images|Image \(legacy\)|Images \(legacy\))(?:\n|$)/.test(treeText), treeText);
     await leader.page.locator('#insertMenu').click(); await leader.page.locator('#dialogBody .palette-category').first().waitFor();
     const categories = await leader.page.locator('#dialogBody .palette-category').allTextContents();
     for (const category of ['Structure', 'Media', 'Math', 'References']) ok(categories.includes(category), `missing ${category}: ${JSON.stringify(categories)}`);
@@ -232,19 +281,32 @@ try {
   await closeModal(leader.page);
 
   await area('R11_R13', async () => {
+    const selectionCases = {};
+    for (const theme of ['LIGHT', 'DARK']) {
+      await leader.page.locator('#editorSettings summary').evaluate((summary) => { if (!summary.parentElement.open) summary.click(); });
+      await leader.page.locator('#editorTheme').selectOption(theme); await leader.page.waitForTimeout(200);
+      await selectMouseText(leader.page, '#editorMount', 'DELETEWORD remains.', 0, 'DELETEWORD'.length); selectionCases[`${theme}_mouse`] = await selectionEvidence(leader.page, '#editorMount');
+      await selectText(leader.page, 'DELETEWORD', 0, 5); selectionCases[`${theme}_shift_arrow`] = await selectionEvidence(leader.page, '#editorMount');
+      const line = leader.page.locator('#editorMount .cm-line').filter({ hasText: 'DELETEWORD remains.' }).first(); await line.click(); await leader.page.keyboard.press('End'); await leader.page.keyboard.press('Shift+Home'); selectionCases[`${theme}_shift_home`] = await selectionEvidence(leader.page, '#editorMount');
+      await line.click(); await leader.page.keyboard.press('Home'); await leader.page.keyboard.press('Shift+End'); selectionCases[`${theme}_shift_end`] = await selectionEvidence(leader.page, '#editorMount');
+      await line.click(); await leader.page.keyboard.press('Home'); await leader.page.keyboard.press('ArrowRight'); await leader.page.keyboard.press('Shift+ArrowDown'); selectionCases[`${theme}_multiline`] = await selectionEvidence(leader.page, '#editorMount');
+    }
+    await selectText(leader.page, 'DELETEWORD', 0, 'DELETEWORD'.length); await leader.page.locator('#insertMenu').focus(); await leader.page.waitForFunction(() => !document.querySelector('#editorMount .cm-editor')?.classList.contains('cm-focused')); selectionCases.unfocused = await selectionEvidence(leader.page, '#editorMount');
+    const invisible = Object.entries(selectionCases).filter(([, evidence]) => !visibleSelectionEvidence(evidence));
+    ok(invisible.length === 0, `selection layer obscured by active line: ${JSON.stringify(invisible)}`);
+    ok(selectionCases.LIGHT_mouse.rectangles[0].backgroundColor !== selectionCases.DARK_mouse.rectangles[0].backgroundColor, JSON.stringify(selectionCases));
+
     await selectText(leader.page, 'DELETEWORD', 0, 'DELETEWORD'.length);
-    const visible = await leader.page.locator('.cm-selectionBackground').evaluateAll((nodes) => nodes.map((node) => ({ color: getComputedStyle(node).backgroundColor, width: node.getBoundingClientRect().width })));
-    ok(visible.some((item) => item.width > 0 && item.color !== 'rgba(0, 0, 0, 0)'), JSON.stringify(visible));
-    await leader.page.locator('#insertMenu').focus(); ok((await leader.page.locator('.cm-selectionBackground').count()) > 0, 'unfocused selection disappeared');
-    await leader.page.locator('#editorSettings summary').click(); await leader.page.locator('#editorTheme').selectOption('DARK'); await leader.page.waitForTimeout(200); await selectText(leader.page, 'DELETEWORD');
-    const dark = await leader.page.locator('.cm-selectionBackground').evaluate((node) => getComputedStyle(node).backgroundColor); ok(dark !== 'rgba(0, 0, 0, 0)');
     await leader.page.keyboard.press('Delete'); await writer.page.waitForFunction(() => !document.querySelector('.cm-content')?.innerText.includes('DELETEWORD')); await leader.page.locator('#undoText').click(); await waitText(writer.page, 'DELETEWORD');
-    await selectText(leader.page, 'DELETELINE whole line.'); await leader.page.keyboard.press('Backspace'); await writer.page.waitForFunction(() => !document.querySelector('.cm-content')?.innerText.includes('DELETELINE')); await leader.page.locator('#undoText').click(); await waitText(writer.page, 'DELETELINE');
+    const deleteLine = leader.page.locator('#editorMount .cm-line').filter({ hasText: 'DELETELINE whole line.' }).first(); await deleteLine.click(); await leader.page.keyboard.press('End'); await leader.page.keyboard.press('Shift+Home'); await leader.page.keyboard.press('Backspace'); await writer.page.waitForFunction(() => !document.querySelector('.cm-content')?.innerText.includes('DELETELINE')); await leader.page.locator('#undoText').click(); await waitText(writer.page, 'DELETELINE');
     equal(await mentor.page.locator('#reviewEditor .cm-content').getAttribute('contenteditable'), 'false'); const before = await mentor.page.locator('#reviewEditor .cm-content').innerText();
-    const mentorLine = mentor.page.locator('#reviewEditor .cm-line').filter({ hasText: 'UPLOADSLOT' }); const mentorBox = await mentorLine.boundingBox(); ok(mentorBox, 'Mentor source line was not rendered');
-    await mentor.page.mouse.move(mentorBox.x + 2, mentorBox.y + mentorBox.height / 2); await mentor.page.mouse.down(); await mentor.page.mouse.move(mentorBox.x + mentorBox.width - 2, mentorBox.y + mentorBox.height / 2, { steps: 6 }); await mentor.page.mouse.up();
-    const mentorSelection = await mentor.page.evaluate(() => ({ drawn: document.querySelectorAll('#reviewEditor .cm-selectionBackground').length, native: window.getSelection()?.toString() || '' })); ok(mentorSelection.drawn > 0 || mentorSelection.native.includes('UPLOADSLOT'), `Mentor selection was not visible: ${JSON.stringify(mentorSelection)}`);
+    await selectMouseText(mentor.page, '#reviewEditor', 'UPLOADSLOT', 0, 'UPLOADSLOT'.length); const mentorSingle = await selectionEvidence(mentor.page, '#reviewEditor');
+    const mentorLine = mentor.page.locator('#reviewEditor .cm-line').filter({ hasText: 'UPLOADSLOT' }).first(); const mentorNextLine = mentor.page.locator('#reviewEditor .cm-line').filter({ hasText: 'InlineSlot' }).first(); const mentorFrom = await mentorLine.boundingBox(); const mentorTo = await mentorNextLine.boundingBox(); ok(mentorFrom && mentorTo, 'Mentor source lines were not rendered');
+    await mentor.page.mouse.move(mentorFrom.x + 2, mentorFrom.y + mentorFrom.height / 2); await mentor.page.mouse.down(); await mentor.page.mouse.move(mentorTo.x + mentorTo.width - 2, mentorTo.y + mentorTo.height / 2, { steps: 8 }); await mentor.page.mouse.up(); const mentorMultiline = await selectionEvidence(mentor.page, '#reviewEditor');
+    ok(visibleSelectionEvidence(mentorSingle), JSON.stringify(mentorSingle)); ok(visibleSelectionEvidence(mentorMultiline), JSON.stringify(mentorMultiline));
+    ok(mentorMultiline.rectangles.length >= 2 && mentorMultiline.nativeText.includes('\n'), `Mentor selection did not span lines: ${JSON.stringify(mentorMultiline)}`);
     await mentor.page.locator('#reviewEditor .cm-content').click(); await mentor.page.keyboard.type('MUTATION'); equal(await mentor.page.locator('#reviewEditor .cm-content').innerText(), before);
+    return { selection_cases: selectionCases, mentor_single: mentorSingle, mentor_multiline: mentorMultiline };
   });
   await closeModal(leader.page);
 
