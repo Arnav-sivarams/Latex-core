@@ -7,6 +7,7 @@ import { yCollab } from 'y-codemirror.next';
 import * as Y from 'yjs';
 import * as pdfjsLib from '/static/pdf.min.mjs';
 import { denormalizeRectangle, normalizeRectangle, resolveSuggestionRange } from './review-helpers.mjs';
+import { installWorkspaceSplitters } from './workspace-split.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
 const INITIAL_STATE = 0x10;
@@ -81,7 +82,7 @@ function editorAppearance(preference) {
     '.cm-gutters': { backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
     '.cm-content': { caretColor: dark ? '#f0f6fc' : '#111827' },
     '.cm-activeLine,.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
-    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#bfdcff' },
+    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground,&:not(.cm-focused) .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#9fc9f5' },
   }, { dark });
 }
 
@@ -522,5 +523,6 @@ document.addEventListener('pointerdown', (event) => {
 ui.compileReview.addEventListener('click', async () => { try { ui.buildStatus.textContent = 'Building…'; await api.build(model.paper.id); await refreshBuild(); } catch (failure) { notice(failure.message, true); } });
 ui.previousPage.addEventListener('click', async () => { if (model.page > 1) { model.page -= 1; await renderPage(); } }); ui.nextPage.addEventListener('click', async () => { if (model.page < model.pdf.numPages) { model.page += 1; await renderPage(); } }); ui.zoomOut.addEventListener('click', async () => { model.scale = Math.max(0.5, model.scale - 0.25); await renderPage(); }); ui.zoomIn.addEventListener('click', async () => { model.scale = Math.min(3, model.scale + 0.25); await renderPage(); });
 ui.threadFilters.addEventListener('click', (event) => { const filter = event.target.dataset.filter; if (!filter) return; model.filter = filter; [...ui.threadFilters.children].forEach((node) => node.toggleAttribute('aria-current', node === event.target)); renderThreads(); });
+installWorkspaceSplitters(document.querySelector('.three-pane-workspace'), 'latex-core-mentor-pane-widths');
 window.setInterval(() => { if (model.paper) { refreshBuild().catch(() => {}); refreshPapers().catch(() => {}); } }, 2000);
 Promise.all([api.me(), loadPreferences()]).then(([identity]) => { applyIdentity(identity); return refreshPapers(); }).catch((failure) => notice(failure.message, true));

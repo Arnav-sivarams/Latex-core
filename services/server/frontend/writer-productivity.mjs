@@ -43,7 +43,12 @@ export function fuzzyRankFiles(files, query) {
 const clamp = (value, minimum = 1, maximum = 20) => Math.min(maximum, Math.max(minimum, Number.parseInt(value, 10) || minimum));
 const safeLabel = (value = '') => value.replace(/[^A-Za-z0-9:_.-]/g, '-');
 const safeText = (value = '') => value.replace(/[\\{}%&#]/g, (character) => ({ '\\': '\\textbackslash{}', '{': '\\{', '}': '\\}', '%': '\\%', '&': '\\&', '#': '\\#' })[character]);
-const safePath = (value = '') => value.replace(/[{}\\\r\n%#]/g, '');
+const safePath = (value = '') => {
+  const path = String(value);
+  if (!path || /[\\\r\n]/.test(path)) throw new Error('Asset path must be a portable project-relative path.');
+  if (/[{}%]/.test(path)) throw new Error('Asset path contains a TeX-reserved percent or brace character; choose a portable project filename.');
+  return `\\detokenize{${path}}`;
+};
 
 const DIMENSION = /^(?:0?[.]\d+|[1-9]\d*(?:[.]\d+)?)\s*(?:pt|mm|cm|in|em|ex)$/;
 
@@ -183,6 +188,19 @@ export function buildFigure(options = {}) {
   if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}`);
   if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);
   lines.push('\\end{figure}');
+  return lines.join('\n');
+}
+
+export function buildWrapFigure(options = {}) {
+  const side = ['l', 'r', 'i', 'o'].includes(options.side) ? options.side : 'r';
+  const requestedWidth = String(options.wrapWidth || '0.45\\textwidth').trim();
+  const width = /^(?:0?\.\d+|1(?:\.0+)?)\\(?:textwidth|linewidth)$/.test(requestedWidth)
+    ? requestedWidth : latexDimension(requestedWidth, 'Wrap width');
+  const imageWidth = options.width === 'custom' ? (options.customWidth || '\\linewidth') : (options.width || '\\linewidth');
+  const lines = [`\\begin{wrapfigure}{${side}}{${width}}`, '\\centering', `\\includegraphics[width=${imageWidth}]{${safePath(options.asset || 'path/to/image')}}`];
+  if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}`);
+  if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);
+  lines.push('\\end{wrapfigure}');
   return lines.join('\n');
 }
 

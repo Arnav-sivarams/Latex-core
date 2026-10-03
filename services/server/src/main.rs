@@ -4043,7 +4043,7 @@ async fn single_source_document_details(
             "AUTO"
         };
         let resolved = value.as_str().is_some_and(|value| !value.trim().is_empty());
-        if !resolved {
+        if !resolved && *source != "project.title" {
             missing.insert(key.clone());
         }
         if *command == "projguidename" || *command == "projguidedesignation" {
@@ -4073,7 +4073,7 @@ async fn single_source_document_details(
                 "key":key,
                 "label":label,
                 "type":if *source == "submission_date" { "DATE" } else { "TEXT" },
-                "required":true,
+                "required":*source != "project.title",
                 "source":source,
                 "allow_team_override":*editable && !matches!(*source, "guide.name" | "guide.designation" | "dean.name"),
             }));
@@ -7272,12 +7272,79 @@ fn runtime_log_command(project: &str, args: &[&str]) -> Result<std::process::Out
         .args(args)
         .env("COMPOSE_PROJECT_NAME", project)
         .output()
-        .map_err(|error| format!("runtime log command unavailable: {error}"))?;
+        .map_err(|error| format!("runtime log source unavailable: {error}"))?;
     if output.status.success() {
         Ok(output)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        let detail = String::from_utf8_lossy(&output.stderr);
+        if detail.to_ascii_lowercase().contains("permission denied") {
+            Err("runtime log source permission denied".into())
+        } else {
+            Err(format!(
+                "runtime log request failed: {}",
+                redact_runtime_log(detail.trim())
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            ))
+        }
     }
+}
+
+fn redact_runtime_log(message: &str) -> String {
+    const SENSITIVE: &[&str] = &[
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "authorization",
+        "cookie",
+        "database_url",
+        "api_key",
+        "apikey",
+    ];
+    let mut redact_next = false;
+    message
+        .split_inclusive(char::is_whitespace)
+        .map(|segment| {
+            let token = segment.trim_end_matches(char::is_whitespace);
+            let whitespace = &segment[token.len()..];
+            if redact_next {
+                if token.eq_ignore_ascii_case("bearer") {
+                    return format!("{token}{whitespace}");
+                }
+                redact_next = false;
+                return format!("[REDACTED]{whitespace}");
+            }
+            let lower = token.to_ascii_lowercase();
+            if lower == "bearer" || lower == "authorization" || lower == "authorization:" {
+                redact_next = true;
+                return format!("{token}{whitespace}");
+            }
+            if SENSITIVE.iter().any(|marker| lower.contains(marker))
+                && let Some(index) = token.find(['=', ':'])
+            {
+                return format!("{}[REDACTED]{whitespace}", &token[..=index]);
+            }
+            segment.to_owned()
+        })
+        .collect()
+}
+
+fn runtime_log_output(output: &std::process::Output) -> String {
+    runtime_log_streams(&output.stdout, &output.stderr)
+}
+
+fn runtime_log_streams(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    let stderr = String::from_utf8_lossy(stderr);
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    text
 }
 
 async fn admin_runtime_logs(
@@ -7309,12 +7376,12 @@ async fn admin_runtime_logs(
             if service_filter.as_deref().is_some_and(|wanted| wanted != service) { continue; }
             let logs = runtime_log_command(&project, &["logs", "--timestamps", container])?;
             let mut current: Option<(String, String)> = None;
-            for log_line in String::from_utf8_lossy(&logs.stdout).lines() {
+            for log_line in runtime_log_output(&logs).lines() {
                 let timestamped = log_line.split_once(' ').filter(|(prefix, _)| prefix.contains('T'));
                 if let Some((timestamp, message)) = timestamped {
                     if let Some((old_timestamp, old_message)) = current.take() {
                         if query.as_deref().is_none_or(|needle| old_message.to_lowercase().contains(&needle.to_lowercase())) {
-                            records.push(serde_json::json!({"timestamp": old_timestamp, "service": service, "container": container, "message": old_message}));
+                            records.push(serde_json::json!({"timestamp": old_timestamp, "service": service, "container": container, "message": redact_runtime_log(&old_message).chars().take(16_384).collect::<String>()}));
                         }
                     }
                     current = Some((timestamp.to_owned(), message.to_owned()));
@@ -7325,13 +7392,14 @@ async fn admin_runtime_logs(
             }
             if let Some((timestamp, message)) = current {
                 if query.as_deref().is_none_or(|needle| message.to_lowercase().contains(&needle.to_lowercase())) {
-                    records.push(serde_json::json!({"timestamp": timestamp, "service": service, "container": container, "message": message}));
+                    records.push(serde_json::json!({"timestamp": timestamp, "service": service, "container": container, "message": redact_runtime_log(&message).chars().take(16_384).collect::<String>()}));
                 }
             }
         }
         records.sort_by(|left, right| right["timestamp"].as_str().cmp(&left["timestamp"].as_str()));
         records.truncate(limit);
-        Ok::<_, String>(serde_json::json!({"records": records, "services": services, "next_cursor": null, "retention": "Search available retained container logs"}))
+        let source_status = if records.is_empty() { "empty" } else { "available" };
+        Ok::<_, String>(serde_json::json!({"records": records, "services": services, "source_status":source_status, "next_cursor": null, "retention": "Search available retained container logs"}))
     }).await;
     match result {
         Ok(Ok(value)) => Json(value).into_response(),
@@ -11367,6 +11435,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_logs_merge_both_streams_and_redact_common_secrets() {
+        let merged = runtime_log_streams(
+            b"2026-01-01T00:00:00Z normal\n",
+            b"2026-01-01T00:00:01Z password=hunter2 authorization:Bearer-token\n",
+        );
+        assert!(merged.contains("normal"));
+        assert!(merged.contains("password=hunter2"));
+        let redacted = redact_runtime_log(&merged);
+        assert!(redacted.contains("password=[REDACTED]"));
+        assert!(redacted.contains("authorization:[REDACTED]"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("Bearer-token"));
+        assert_eq!(
+            redact_runtime_log("Authorization: Bearer abc123\nnext line"),
+            "Authorization: Bearer [REDACTED]\nnext line"
+        );
+    }
+
+    #[test]
     fn browser_login_and_account_setup_are_server_rendered_and_minimal() {
         let login = login_html(Some("Invalid email or password."));
         assert!(login.contains("method=\"post\" action=\"/login\""));
@@ -12117,6 +12204,315 @@ mod database_tests {
             let papers = test_json(get(&app, papers_path, Some(&active_cookie)).await).await;
             assert!(papers.to_string().contains(&paper_team_id.to_string()));
         }
+
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn professor_repair_import_apply_maps_real_programmes_and_is_idempotent() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        let admin_id = test_user_id(&pool, &admin.email).await;
+
+        async fn template(state: &AppState, name: &str, marker: &'static [u8]) -> uuid::Uuid {
+            let id = uuid::Uuid::new_v4();
+            let main = state
+                .blobs
+                .put(Bytes::from_static(b"\\documentclass{article}\n\\input{chapters/body.tex}\n\\begin{document}\\end{document}\n"))
+                .await
+                .unwrap();
+            let body = state.blobs.put(Bytes::from_static(marker)).await.unwrap();
+            state
+                .repo
+                .create_template(
+                    id,
+                    name,
+                    None,
+                    Some("main.tex"),
+                    &[
+                        AppTemplateFileRecord {
+                            path: "main.tex".into(),
+                            blob_hash: main.hash(),
+                            size_bytes: main.size_bytes(),
+                        },
+                        AppTemplateFileRecord {
+                            path: "chapters/body.tex".into(),
+                            blob_hash: body.hash(),
+                            size_bytes: body.size_bytes(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            id
+        }
+
+        let btech_template = template(&state, "Mapped template alpha", b"BTECH body").await;
+        let mtech_template = template(&state, "Mapped template beta", b"MTECH body").await;
+        let fallback_template = template(&state, "Global fallback gamma", b"Fallback body").await;
+        sqlx::query(
+            "INSERT INTO vcap.programmes (programme_code) VALUES ('BTECH'),('MTECH'),('UNMAPPED')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        state
+            .institution
+            .set_programme_template_default(admin_id, "BTECH", btech_template)
+            .await
+            .unwrap();
+        state
+            .institution
+            .set_programme_template_default(admin_id, "MTECH", mtech_template)
+            .await
+            .unwrap();
+        state
+            .institution
+            .set_global_fallback(admin_id, fallback_template)
+            .await
+            .unwrap();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let department = uuid::Uuid::new_v4();
+        let faculty_id = format!("FAC-{suffix}");
+        let mentor_email = format!("mentor-{suffix}@example.edu");
+        let btech_first = format!("B1-{suffix}");
+        let btech_leader = format!("B2-{suffix}");
+        let mtech_leader = format!("M1-{suffix}");
+        let fallback_leader = format!("U1-{suffix}");
+        let btech_first_email = format!("btech-first-{suffix}@example.edu");
+        let btech_leader_email = format!("btech-leader-{suffix}@example.edu");
+        let mtech_email = format!("mtech-{suffix}@example.edu");
+        let fallback_email = format!("fallback-{suffix}@example.edu");
+        let btech_key = format!("TEAM-BTECH-{suffix}");
+        let mtech_key = format!("TEAM-MTECH-{suffix}");
+        let fallback_key = format!("TEAM-FALLBACK-{suffix}");
+        let files = vec![
+            (
+                "departments.csv",
+                format!("department_id\n{department}\n").into_bytes(),
+            ),
+            (
+                "faculty.csv",
+                format!("faculty_id,name,email,dept_id,honorific,designation,status\n{faculty_id},Test Mentor,{mentor_email},{department},Dr,Mentor,ACTIVE\n").into_bytes(),
+            ),
+            (
+                "students.csv",
+                format!("reg_no,name,email,programme_code\n{btech_first},BTECH First,{btech_first_email},BTECH\n{btech_leader},BTECH Leader,{btech_leader_email},BTECH\n{mtech_leader},MTECH Leader,{mtech_email},MTECH\n{fallback_leader},Fallback Leader,{fallback_email},UNMAPPED\n").into_bytes(),
+            ),
+            (
+                "paper_teams.csv",
+                format!("external_team_key,team_name,academic_year,semester,status\n{btech_key},BTECH Test Team,2026,1,ACTIVE\n{mtech_key},MTECH Test Team,2026,1,ACTIVE\n{fallback_key},Fallback Test Team,2026,1,ACTIVE\n").into_bytes(),
+            ),
+            (
+                "paper_team_writers.csv",
+                format!("external_team_key,student_reg_no,writer_order,is_leader\n{btech_key},{btech_first},1,false\n{btech_key},{btech_leader},2,true\n{mtech_key},{mtech_leader},1,true\n{fallback_key},{fallback_leader},1,true\n").into_bytes(),
+            ),
+            (
+                "paper_team_mentors.csv",
+                format!("external_team_key,faculty_id\n{btech_key},{faculty_id}\n{mtech_key},{faculty_id}\n{fallback_key},{faculty_id}\n").into_bytes(),
+            ),
+        ];
+
+        let (multipart, content_type) = institution_batch_multipart(&files);
+        let validated = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/institution/import-batches/validate",
+                Some(&admin.cookie),
+                multipart,
+                Some(&content_type),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(validated["batch"]["status"], "VALIDATED");
+        let batch_id = validated["batch"]["id"].as_str().unwrap();
+        let applied = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/institution/import-batches/{batch_id}/apply"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(applied["batch"]["status"], "APPLIED");
+        assert_eq!(applied["account_provisioning"]["created"], 5);
+
+        for (external_key, expected_template, expected_method) in [
+            (btech_key.as_str(), btech_template, "MODE"),
+            (mtech_key.as_str(), mtech_template, "MODE"),
+            (fallback_key.as_str(), fallback_template, "GLOBAL_FALLBACK"),
+        ] {
+            let (paper_id, workspace_id, pinned, resolved, method):
+                (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, String) = sqlx::query_as(
+                "SELECT link.paper_team_id,team.workspace_id,pin.template_id,resolution.selected_template_id,resolution.resolution_method \
+                 FROM latex_core.external_paper_team_links link \
+                 JOIN latex_core.paper_teams team ON team.id=link.paper_team_id \
+                 JOIN latex_core.paper_template_pins pin ON pin.paper_id=team.id \
+                 JOIN latex_core.paper_template_resolutions resolution ON resolution.paper_team_id=team.id \
+                 WHERE link.external_team_key=$1",
+            )
+            .bind(external_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pinned, expected_template);
+            assert_eq!(resolved, expected_template);
+            assert_eq!(method, expected_method);
+            let paths: Vec<String> = sqlx::query_scalar(
+                "SELECT path FROM latex_core.paper_files WHERE workspace_id=$1 AND NOT tombstoned ORDER BY path",
+            )
+            .bind(workspace_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(paths, vec!["chapters/body.tex", "main.tex"]);
+            assert_ne!(paper_id, uuid::Uuid::nil());
+        }
+
+        let btech_members: Vec<(String, String, bool, Option<i32>)> = sqlx::query_as(
+            "SELECT credentials.email,role.role,member.is_leader,member.writer_order \
+             FROM latex_core.external_paper_team_links link \
+             JOIN latex_core.paper_team_members member ON member.paper_team_id=link.paper_team_id \
+             JOIN latex_core.user_credentials credentials ON credentials.user_id=member.user_id \
+             JOIN latex_core.global_user_roles role ON role.user_id=member.user_id \
+             WHERE link.external_team_key=$1 ORDER BY member.writer_order NULLS LAST",
+        )
+        .bind(&btech_key)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            btech_members,
+            vec![
+                (btech_first_email.clone(), "writer".into(), false, Some(1)),
+                (btech_leader_email.clone(), "writer".into(), true, Some(2)),
+                (mentor_email.clone(), "mentor".into(), false, None),
+            ]
+        );
+        let password_before: String = sqlx::query_scalar(
+            "SELECT password_hash FROM latex_core.user_credentials WHERE email=$1",
+        )
+        .bind(&btech_leader_email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let pins_before: Vec<(String, uuid::Uuid)> = sqlx::query_as(
+            "SELECT link.external_team_key,pin.template_id FROM latex_core.external_paper_team_links link JOIN latex_core.paper_template_pins pin ON pin.paper_id=link.paper_team_id ORDER BY link.external_team_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let (multipart, content_type) = institution_batch_multipart(&files);
+        let repeated = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/institution/import-batches/validate",
+                Some(&admin.cookie),
+                multipart,
+                Some(&content_type),
+            )
+            .await,
+        )
+        .await;
+        let repeated_batch = repeated["batch"]["id"].as_str().unwrap();
+        let repeated = test_json(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/admin/v2/institution/import-batches/{repeated_batch}/apply"),
+                Some(&admin.cookie),
+                "{}",
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(repeated["account_provisioning"]["created"], 0);
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM latex_core.paper_teams),(SELECT count(*) FROM latex_core.external_paper_team_links)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (3, 3));
+        let pins_after: Vec<(String, uuid::Uuid)> = sqlx::query_as(
+            "SELECT link.external_team_key,pin.template_id FROM latex_core.external_paper_team_links link JOIN latex_core.paper_template_pins pin ON pin.paper_id=link.paper_team_id ORDER BY link.external_team_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pins_after, pins_before);
+        let password_after: String = sqlx::query_scalar(
+            "SELECT password_hash FROM latex_core.user_credentials WHERE email=$1",
+        )
+        .bind(&btech_leader_email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(password_after, password_before);
+
+        let invalid_key = format!("TEAM-INVALID-{suffix}");
+        let invalid_files = vec![
+            (
+                "paper_teams.csv",
+                format!("external_team_key,team_name\n{invalid_key},Invalid Test Team\n")
+                    .into_bytes(),
+            ),
+            (
+                "paper_team_writers.csv",
+                format!("external_team_key,student_reg_no,writer_order,is_leader\n{invalid_key},MISSING-{suffix},1,true\n").into_bytes(),
+            ),
+        ];
+        let (multipart, content_type) = institution_batch_multipart(&invalid_files);
+        let invalid = test_json(
+            request_bytes(
+                &app,
+                Method::POST,
+                "/api/admin/v2/institution/import-batches/validate",
+                Some(&admin.cookie),
+                multipart,
+                Some(&content_type),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(invalid["batch"]["status"], "FAILED");
+        assert!(invalid["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["code"] == "INVALID_FK"
+                && issue["problem"]
+                    .as_str()
+                    .is_some_and(|problem| problem.contains("references missing students value"))
+        }));
+        let invalid_batch = invalid["batch"]["id"].as_str().unwrap();
+        let rejected = request(
+            &app,
+            Method::POST,
+            &format!("/api/admin/v2/institution/import-batches/{invalid_batch}/apply"),
+            Some(&admin.cookie),
+            "{}",
+            Some("application/json"),
+        )
+        .await;
+        assert!(rejected.status().is_client_error());
+        let invalid_materialized: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM latex_core.external_paper_team_links WHERE external_team_key=$1)",
+        )
+        .bind(&invalid_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!invalid_materialized);
 
         pool.close().await;
         database.close().await;

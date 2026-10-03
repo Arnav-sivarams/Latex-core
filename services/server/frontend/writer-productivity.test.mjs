@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, commentLatexLines, compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
+import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, buildWrapFigure, commentLatexLines, compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
 
 test('outline hierarchy follows section levels', () => {
   const tree = buildOutlineTree([{ level: 'section', title: 'A' }, { level: 'subsection', title: 'B' }, { level: 'section', title: 'C' }]);
@@ -20,7 +20,13 @@ test('table and figure builders generate bounded ordinary LaTeX', () => {
   assert.match(table, /\\toprule/);
   assert.ok(table.indexOf('\\caption{Results}') < table.indexOf('\\begin{tabular}'));
   assert.match(table, /\\rule\{0pt\}\{8mm\}Header 1/);
-  assert.match(buildFigure({ asset: 'images/result.png', width: '0.5\\linewidth', caption: 'Result' }), /\\includegraphics\[width=0.5\\linewidth\]\{images\/result.png\}/);
+  assert.match(buildFigure({ asset: 'images/result.png', width: '0.5\\linewidth', caption: 'Result' }), /\\includegraphics\[width=0.5\\linewidth\]\{\\detokenize\{images\/result.png\}\}/);
+  assert.match(buildFigure({ asset: 'images/result #1.png' }), /\\detokenize\{images\/result #1\.png\}/);
+  assert.throws(() => buildFigure({ asset: 'images/result%7Bfinal%7D.png' }), /TeX-reserved/);
+  const wrapped = buildWrapFigure({ asset: 'images/result.png', side: 'l', wrapWidth: '6cm', caption: 'Wrapped result' });
+  assert.match(wrapped, /^\\begin\{wrapfigure\}\{l\}\{6cm\}/);
+  assert.match(wrapped, /\\includegraphics\[width=\\linewidth\]\{\\detokenize\{images\/result.png\}\}/);
+  assert.match(wrapped, /\\end\{wrapfigure\}$/);
 });
 
 test('table dimensions are explicit and bounded', () => {
@@ -48,6 +54,11 @@ test('source line comments, inline math, and template-aware destinations are det
   assert.equal(suggestedInsertionPath(files, 'Thesis/main.tex', 'asset', 'plot.png').path, 'Thesis/images/plot.png');
   assert.equal(compilationRelativePath('Thesis/images/plot.png', 'Thesis/main.tex'), 'images/plot.png');
   assert.equal(compilationRelativePath('assets/plot.png', 'Thesis/main.tex'), '../assets/plot.png');
+  assert.equal(compilationRelativePath('images/plot.png', 'main.tex'), 'images/plot.png');
+  assert.equal(compilationRelativePath('report/assets/plot.png', 'report/main.tex'), 'assets/plot.png');
+  // An insertion made while editing an included chapter still targets the main document's directory.
+  const editedChapter = 'report/chapters/method.tex';
+  assert.equal(editedChapter.endsWith('.tex') && compilationRelativePath('report/assets/plot.png', 'report/main.tex'), 'assets/plot.png');
 });
 
 test('equation builder covers matrix and cases', () => {

@@ -907,7 +907,7 @@ mod tests {
         let source = b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n\\thesistitle\n\\end{document}\n";
         assert!(single_source_compatible(source));
         let mut values = BTreeMap::new();
-        values.insert("team.name".into(), Value::String("A & B_%".into()));
+        values.insert("project.title".into(), Value::String("A & B_%".into()));
         let bound = bind_single_source_values(source, &values).unwrap();
         let text = std::str::from_utf8(&bound).unwrap();
         assert_eq!(text.matches("LATEX_CORE_SINGLE_SOURCE_BINDINGS").count(), 1);
@@ -921,6 +921,8 @@ mod tests {
         let automatic_bound = bind_single_source_values(automatic, &BTreeMap::new()).unwrap();
         let automatic_text = std::str::from_utf8(&automatic_bound).unwrap();
         assert!(automatic_text.contains("% Known institutional single-source bindings."));
+        assert!(automatic_text.contains(r"\newcommand{\thesistitle}{Placeholder}"));
+        assert!(!automatic_text.contains(r"\renewcommand{\thesistitle}"));
         assert!(
             automatic_text
                 .find("% Known institutional single-source bindings.")

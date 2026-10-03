@@ -159,12 +159,17 @@ async function renderRuntimeLogs() {
       const selected = service.value;
       service.replaceChildren(new Option('All services', '')); services.forEach((name) => service.append(new Option(name, name)));
       service.value = services.includes(selected) ? selected : '';
-      if (!data.records?.length) { host.replaceChildren(element('p', 'empty-copy', 'No retained log records matched.')); return; }
+      if (!data.records?.length) { host.replaceChildren(element('p', 'empty-copy', data.source_status === 'empty' ? 'No retained log records matched.' : 'The runtime log source returned no records.')); return; }
       const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table');
       table.innerHTML = '<thead><tr><th>Timestamp</th><th>Service / container</th><th>Message</th></tr></thead>';
       const body = document.createElement('tbody');
       data.records.forEach((record) => { const row = document.createElement('tr'); const message = element('pre', 'admin-data', record.message || ''); message.className = 'admin-log-message'; const messageCell = element('td'); messageCell.append(message); row.append(element('td', '', record.timestamp), element('td', '', `${record.service} · ${record.container || 'container'}`), messageCell); body.append(row); });
       table.append(body); wrap.append(table); host.replaceChildren(wrap);
+    } catch (error) {
+      const message = /permission denied/i.test(error.message) ? 'Runtime log source permission denied.'
+        : /source unavailable|command unavailable/i.test(error.message) ? 'Runtime log source unavailable.'
+          : `Runtime log request failed: ${error.message}`;
+      host.replaceChildren(element('p', 'danger', message));
     } finally { refresh.disabled = false; }
   };
   service.addEventListener('change', () => load().catch(showError)); search.addEventListener('keydown', (event) => { if (event.key === 'Enter') load().catch(showError); });

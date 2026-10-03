@@ -105,7 +105,7 @@ fn apply_semester_metadata(
 pub const REGISTRY: &[(&str, &str, &str, bool)] = &[
     ("coursecode", "course_code", "Course code", true),
     ("coursename", "course_name", "Course name", true),
-    ("thesistitle", "team.name", "Team title", false),
+    ("thesistitle", "project.title", "Project title", true),
     ("thesismonth", "submission_date", "Submission date", true),
     ("thesisyear", "submission_date", "Submission date", true),
     ("teamsize", "team.size", "Team size", false),
@@ -857,13 +857,29 @@ mod tests {
     #[test]
     fn single_source_bindings_are_allowlisted_and_escaped() {
         let values = BTreeMap::from([
-            ("team.name".into(), Value::String("Safe & exact".into())),
+            ("project.title".into(), Value::String("Safe & exact".into())),
             ("student.a.name".into(), Value::String("Alice Alpha".into())),
         ]);
         let bindings = single_source_bindings(&values).unwrap();
         assert!(bindings.contains("\\renewcommand{\\thesistitle}{Safe \\& exact}"));
         assert!(bindings.contains("\\renewcommand{\\studentAname}{Alice Alpha}"));
         assert!(!bindings.contains("write18"));
+    }
+
+    #[test]
+    fn single_source_title_uses_source_until_project_title_is_explicit() {
+        let source_only = single_source_bindings(&BTreeMap::from([(
+            "team.name".into(),
+            Value::String("Team-2".into()),
+        )]))
+        .unwrap();
+        assert!(!source_only.contains(r"\renewcommand{\thesistitle}"));
+        let explicit = single_source_bindings(&BTreeMap::from([(
+            "project.title".into(),
+            Value::String("Title B".into()),
+        )]))
+        .unwrap();
+        assert!(explicit.contains(r"\renewcommand{\thesistitle}{Title B}"));
     }
 
     #[test]

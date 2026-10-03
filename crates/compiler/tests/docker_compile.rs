@@ -539,6 +539,39 @@ async fn orchestration_packages_local_files_and_paths() {
 }
 
 #[tokio::test]
+async fn kpathsea_records_the_canonical_asset_path_for_case_variant_graphics() {
+    let source = br"\documentclass{article}\usepackage{graphicx}\begin{document}\includegraphics{images/Manual sample.v1.png}\end{document}";
+    let image = include_bytes!(
+        "../../../artifacts/Full_Report_template_v1.1-source/Full_Report_template_v1.0/images/vit_logo.png"
+    );
+    let (execution, _) = compile(
+        &[
+            ("main.tex", source.as_slice()),
+            ("images/manual sample.v1.png", image.as_slice()),
+        ],
+        "main.tex",
+        TexEngine::PdfLatex,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        execution.status(),
+        CompileStatus::Succeeded,
+        "{}",
+        String::from_utf8_lossy(execution.stderr())
+    );
+    pdf(&execution);
+    let recorder = execution
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::Fls)
+        .expect("file recorder artifact");
+    let recorder = String::from_utf8_lossy(recorder.bytes());
+    assert!(recorder.contains("INPUT ./images/manual sample.v1.png"));
+    assert!(!recorder.contains("INPUT ./images/Manual sample.v1.png"));
+}
+
+#[tokio::test]
 async fn bibtex_biber_and_makeindex_complete() {
     let cases: Vec<Vec<(&str, &[u8])>> = vec![
         vec![("main.tex", br"\documentclass{article}\begin{document}\cite{x}\bibliographystyle{plain}\bibliography{refs}\end{document}"), ("refs.bib", br"@book{x,title={X},author={A},year={2026}}")],

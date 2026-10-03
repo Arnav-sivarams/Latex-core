@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { pdfPreviewState } from './writer-pdf.mjs';
+import { pdfPointFromClient, pdfPreviewState } from './writer-pdf.mjs';
 
 test('Writer PDF empty and viewer states are mutually exclusive', () => {
   assert.deepEqual(pdfPreviewState({ current_build_id: null, active_build_id: null, latest_status: null }), {
@@ -16,6 +16,22 @@ test('Writer PDF empty and viewer states are mutually exclusive', () => {
   assert.deepEqual(pdfPreviewState({ current_build_id: 'last-good', active_build_id: null, latest_status: 'failed' }), {
     empty: false, viewer: true, rebuildingWithLastGood: false, failedWithLastGood: true,
   });
+});
+
+test('inverse SyncTeX coordinates account for rendered zoom and page position', () => {
+  assert.deepEqual(pdfPointFromClient(241, 334, { left: 100, top: 200 }, 100), { x: 141, y: 134 });
+  assert.deepEqual(pdfPointFromClient(350, 500, { left: 100, top: 200 }, 125), { x: 200, y: 240 });
+});
+
+test('inverse navigation keeps the displayed build, nested mapping, stale gate, and feedback-loop guard connected', () => {
+  const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
+  assert.match(writer, /!model\.pdfCurrent \|\| model\.pdfDisplayBuildId !== model\.currentBuildId/);
+  assert.match(writer, /const buildId = model\.pdfDisplayBuildId/);
+  assert.match(writer, /mapping\.build_id !== buildId/);
+  assert.match(writer, /mapping\.mapped_file_id[\s\S]*mapping\.mapped_line/);
+  assert.match(writer, /No source position is mapped at that PDF location\./);
+  assert.match(writer, /invalidateForwardSync\(\);\s*model\.inverseNavigating = true;[\s\S]*await openLocation/);
+  assert.match(writer, /else if \(update\.selectionSet && !model\.inverseNavigating\) scheduleForwardSync\(\)/);
 });
 
 test('Writer DOM and CSS collapse the hidden PDF state', () => {

@@ -10,11 +10,12 @@ import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import * as pdfjsLib from '/static/pdf.min.mjs';
 import { resolveSuggestionRange } from './review-helpers.mjs';
-import { pdfPreviewState } from './writer-pdf.mjs';
+import { pdfPointFromClient, pdfPreviewState } from './writer-pdf.mjs';
+import { installWorkspaceSplitters } from './workspace-split.mjs';
 import { buildIsStale, recognizedBuildProblems, renderBuildLog, shortBuildState } from './writer-build.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
 import {
-  buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure,
+  buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildWrapFigure,
   buildLongTable, buildPlot, buildTable, buildTheorem, commentLatexLines,
   buildPublicationBibitems,
   compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
@@ -189,6 +190,9 @@ const model = {
   latestBuildId: null,
   lastBuildStatus: null,
   buildFooterTab: 'problems',
+  saveInFlight: false,
+  inverseSyncRequest: 0,
+  inverseNavigating: false,
 };
 
 function pdfViewKey() { return model.paper ? `latex-core-pdf-view:${model.paper.id}` : null; }
@@ -349,8 +353,8 @@ function editorAppearance(preference) {
     '.cm-gutters': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
     '.cm-content': { fontSize: `${preference.font_size_px}px`, caretColor: dark ? '#f0f6fc' : '#111827' },
     '.cm-activeLine,.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
-    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground': { backgroundColor: 'color-mix(in srgb, var(--accent) 32%, transparent)' },
-    '.cm-content ::selection': { backgroundColor: 'color-mix(in srgb, var(--accent) 32%, transparent)', color: 'var(--text)' },
+    '.cm-selectionBackground,&.cm-focused .cm-selectionBackground,&:not(.cm-focused) .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#9fc9f5' },
+    '.cm-content ::selection': { backgroundColor: dark ? '#315b7d' : '#9fc9f5', color: dark ? '#ffffff' : '#111827' },
     '.review-source-highlight': { color: dark ? '#fff2b2' : '#241a00' },
   }, { dark });
 }
@@ -392,6 +396,16 @@ function saveState(state) {
   };
   ui.saveStatus.textContent = labels[state];
   ui.saveStatus.dataset.state = state;
+  updateSaveControl();
+}
+
+function updateSaveControl() {
+  if (!ui.saveFile) return;
+  const editable = Boolean(model.file && model.collaboration?.access === 'read_write' && !model.conflict);
+  const dirty = Boolean(model.collaboration?.pending?.size);
+  ui.saveFile.disabled = !editable || model.saveInFlight || !dirty;
+  const label = ui.saveFile.querySelector('span:last-child');
+  if (label) label.textContent = model.saveInFlight ? 'Saving…' : 'Save';
 }
 
 function button(text, onClick, active = false) {
@@ -458,8 +472,8 @@ function renderTree(node) {
     const item = document.createElement('li');
     const label = document.createElement('span');
     label.className = 'directory';
-    label.textContent = name === 'assets' ? 'Assets' : name === 'images' ? 'Images (legacy)' : name;
-    if (name === 'images') label.title = 'Legacy project-local asset path: images/';
+    label.textContent = name === 'assets' ? 'Assets' : name === 'images' ? 'Images' : name;
+    if (name === 'images') label.title = 'Project images: images/';
     item.append(label, renderTree(child));
     list.append(item);
   });
@@ -1065,7 +1079,7 @@ function mountEditor(ytext, editable, latex) {
       autocompletion({ override: [latexCompletionSource] }),
       EditorView.updateListener.of((update) => {
         if (update.docChanged) markPdfStaleFromEditor();
-        else if (update.selectionSet) scheduleForwardSync();
+        else if (update.selectionSet && !model.inverseNavigating) scheduleForwardSync();
       }),
     );
   }
@@ -1098,7 +1112,7 @@ function updateFileActions(editable) {
   ui.renameFile.disabled = !selected || !editable;
   ui.deleteFile.disabled = !selected || !editable;
   ui.setMain.disabled = !selected || !editable || ui.mainBadge.hidden === false;
-  ui.saveFile.disabled = !selected || !editable;
+  updateSaveControl();
   ui.insertMenu.disabled = !selected || !editable;
   ui.symbolPalette.disabled = !selected || !editable;
   ui.mathPalette.disabled = !selected || !editable;
@@ -1109,16 +1123,25 @@ function updateFileActions(editable) {
 }
 
 async function syncCurrent(showNotice = true) {
-  if (!model.collaboration || model.conflict) return false;
+  if (!model.collaboration || model.conflict || model.saveInFlight) return false;
+  const session = model.collaboration;
+  const sequence = session.clientSequence;
+  model.saveInFlight = true;
+  saveState('syncing');
   try {
-    await model.collaboration.flush();
+    await session.flush();
     scheduleIntelligence();
-    if (showNotice) notice(`Saved ${model.file.path}`);
+    const current = model.collaboration === session && session.clientSequence === sequence && session.pending.size === 0;
+    if (showNotice) notice(current ? `Saved ${model.file.path}` : 'Earlier edits were saved; newer edits are still saving.');
+    saveState(current ? 'synced' : 'syncing');
     return true;
   } catch (error) {
     saveState('offline');
     notice(error.message, true);
     return false;
+  } finally {
+    model.saveInFlight = false;
+    updateSaveControl();
   }
 }
 
@@ -1304,22 +1327,22 @@ function renderHistory() {
               try { await api.rejectRestoration(request.id, note); await refreshHistory(); notice('Revert request rejected.'); }
               catch (error) { notice(error.message, true); }
             }),
-            button(`Revert for ${request.writer_email}`, async () => {
-              if (!window.confirm('Revert this Team report as a new head? The current state will be retained as PRE_RESTORE_SAFETY.')) return;
+            button(`Revert #${version.version_number} for ${request.writer_email}`, async () => {
+              if (!window.confirm(`Restore version #${version.version_number} as a new Team head? The current state will remain as PRE_RESTORE_SAFETY.`)) return;
               const note = window.prompt('Optional decision note', ''); if (note === null) return;
               try { await api.applyRestoration(request.id, note); await openPaper(model.paper); notice('Team report reverted as a new current version.'); }
               catch (error) { notice(error.message, true); }
             }),
           );
         });
-        label.append(button('Revert', async () => {
-          if (!window.confirm('Revert this Team report directly as a new head? The current state will be retained as PRE_RESTORE_SAFETY.')) return;
+        label.append(button(`Restore #${version.version_number} as new head`, async () => {
+          if (!window.confirm(`Restore version #${version.version_number} as a new Team head? The current state will remain as PRE_RESTORE_SAFETY.`)) return;
           try { await api.revertTeam(model.paper.id, version.id); await openPaper(model.paper); notice('Team report reverted as a new current version.'); }
           catch (error) { notice(error.message, true); }
         }));
       } else {
-        const action = button('Request Revert', async () => {
-          const reason = window.prompt('Optional reason for reverting to this version', '') ?? null;
+        const action = button(`Request restore of #${version.version_number}`, async () => {
+          const reason = window.prompt(`Optional reason for restoring version #${version.version_number}`, '') ?? null;
           if (reason === null) return;
           try {
             await api.requestRestoration(model.paper.id, version.id, reason);
@@ -1330,8 +1353,8 @@ function renderHistory() {
         label.append(action);
       }
     } else {
-      const action = button('Restore this personal version', async () => {
-        if (!window.confirm('Restore this personal paper as a new current head? The current state will be saved permanently as a safety version.')) return;
+      const action = button(`Restore #${version.version_number} as new head`, async () => {
+        if (!window.confirm(`Restore personal version #${version.version_number} as a new current head? The current state will be saved permanently as a safety version.`)) return;
         try {
           await api.restorePersonal(model.paper.id, version.id);
           await openPaper(model.paper);
@@ -1346,12 +1369,15 @@ function renderHistory() {
 
 async function compareSelectedVersions(event) {
   const selected = [...ui.versionHistory.querySelectorAll('input:checked')];
+  ui.versionHistory.querySelectorAll('.version-row').forEach((row) => row.classList.toggle('selected', row.querySelector('input')?.checked));
   if (selected.length > 2) {
     event.target.checked = false;
     return;
   }
   if (selected.length !== 2) {
-    ui.versionDiff.textContent = 'Select two versions to compare.';
+    ui.versionDiff.textContent = selected.length === 1
+      ? `Version #${selected[0].closest('.version-row').querySelector('strong').textContent.split(' ')[0].slice(1)} selected. Select one more version to compare; restore controls create a new head and preserve the current state.`
+      : 'Select two versions to compare. Restore controls create a new head and preserve the current state.';
     return;
   }
   try {
@@ -1633,7 +1659,15 @@ function showPalette(title, items, options = {}) {
     selected = Math.min(selected, Math.max(visible.length - 1, 0));
     const list = document.createElement('div');
     list.className = options.grid ? 'palette-list symbol-grid' : 'palette-list';
+    let lastCategory = null;
     visible.forEach((item, index) => {
+      if (item.category && item.category !== lastCategory) {
+        const heading = document.createElement('h3');
+        heading.className = 'palette-category';
+        heading.textContent = item.category;
+        list.append(heading);
+        lastCategory = item.category;
+      }
       const node = button(item.label, async () => { closeDialog(); await item.run(); }, index === selected);
       node.title = item.tooltip || item.detail || item.label;
       if (item.ariaLabel) node.setAttribute('aria-label', item.ariaLabel);
@@ -1725,6 +1759,7 @@ const builderSchemas = {
   table: [['rows', 'Rows', 'number', 3], ['columns', 'Columns', 'number', 3], ['header', 'Header row', 'checkbox', true], ['alignments', 'Column alignments (shared by each column)', 'text', 'left,center,left'], ['columnWidths', 'Column widths, comma-separated (for example 3cm,,5cm)', 'text', ''], ['minimumRowHeight', 'Minimum height shared by every row (for example 8mm)', 'text', ''], ['selectedCell', 'Selected cell (row,column; for example 2,1)', 'text', ''], ['selectedCellContent', 'Selected cell content (multiple lines supported)', 'textarea', ''], ['selectedColumnWidth', 'Selected cell’s shared column width', 'text', ''], ['selectedRowHeight', 'Selected cell’s shared row minimum height', 'text', ''], ['booktabs', 'Booktabs', 'checkbox', false], ['caption', 'Caption (placed above table)', 'text', ''], ['label', 'Label', 'text', 'tab:'], ['placement', 'Placement', 'text', 'htbp']],
   longtable: [['rows', 'Rows', 'number', 40], ['columns', 'Columns', 'number', 3], ['header', 'Repeat header on later pages', 'checkbox', true], ['alignments', 'Column alignments', 'text', 'left,center,left'], ['caption', 'Caption', 'text', 'Long table'], ['label', 'Label', 'text', 'tab:long']],
   figure: [['asset', 'Asset', 'asset', ''], ['width', 'Width', 'select', ['\\linewidth', '0.75\\linewidth', '0.5\\linewidth', 'custom']], ['customWidth', 'Custom width', 'text', ''], ['placement', 'Placement', 'text', 'htbp'], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:']],
+  wrapfigure: [['asset', 'Asset', 'asset', ''], ['side', 'Side', 'select', ['r', 'l', 'o', 'i']], ['wrapWidth', 'Wrapped figure width', 'text', '0.45\\textwidth'], ['width', 'Image width', 'select', ['\\linewidth', '0.9\\linewidth', 'custom']], ['customWidth', 'Custom image width', 'text', ''], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:']],
   equation: [['type', 'Type', 'select', ['inline', 'display', 'aligned', 'matrix', 'cases']], ['body', 'Expression / body', 'textarea', 'x = y'], ['rows', 'Rows', 'number', 2], ['columns', 'Columns', 'number', 2], ['delimiter', 'Matrix delimiter', 'select', ['()', '[]', '||', 'none']], ['label', 'Label', 'text', 'eq:']],
   plot: [['asset', 'CSV asset', 'csv', ''], ['x', 'X column', 'text', 'x'], ['y', 'Y column', 'text', 'y'], ['type', 'Plot type', 'select', ['line', 'scatter', 'bar']], ['title', 'Title', 'text', ''], ['xLabel', 'X label', 'text', ''], ['yLabel', 'Y label', 'text', ''], ['legend', 'Legend', 'text', ''], ['caption', 'Caption', 'text', ''], ['label', 'Label', 'text', 'fig:plot'], ['width', 'Width', 'text', '\\linewidth']],
   algorithm: [['family', 'Commands', 'select', ['algpseudocode', 'algorithmic']], ['caption', 'Caption', 'text', 'Algorithm'], ['label', 'Label', 'text', 'alg:'], ['body', 'Algorithm lines (\\State for algpseudocode; \\STATE for algorithmic)', 'textarea', '\\State Describe the method']],
@@ -1738,7 +1773,7 @@ function builderRequirement(kind, values) {
     return { available: false, message: `Environment not detected: ${values.environment}` };
   }
   const required = {
-    table: values.booktabs ? ['booktabs'] : [], longtable: ['longtable'], figure: ['graphicx'], plot: ['pgfplots'],
+    table: values.booktabs ? ['booktabs'] : [], longtable: ['longtable'], figure: ['graphicx'], wrapfigure: ['graphicx', 'wrapfig'], plot: ['pgfplots'],
     algorithm: ['algorithm', values.family === 'algorithmic' ? 'algorithmic' : 'algpseudocode'], code: ['listings'],
     equation: ['aligned', 'matrix', 'cases'].includes(values.type) ? ['amsmath'] : [],
   }[kind] || [];
@@ -1753,6 +1788,7 @@ function builderSource(kind, values) {
   if (kind === 'table') return buildTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()), columnWidths: values.columnWidths.split(',').map((value) => value.trim()) });
   if (kind === 'longtable') return buildLongTable({ ...values, alignments: values.alignments.split(',').map((value) => value.trim()) });
   if (kind === 'figure') return buildFigure({ ...values, asset: compilationRelativePath(values.asset, model.paperDetail?.main_file) });
+  if (kind === 'wrapfigure') return buildWrapFigure({ ...values, asset: compilationRelativePath(values.asset, model.paperDetail?.main_file) });
   if (kind === 'equation') return buildEquation(values);
   if (kind === 'plot') return buildPlot(values);
   if (kind === 'algorithm') return buildAlgorithm(values);
@@ -1761,8 +1797,8 @@ function builderSource(kind, values) {
   return buildTheorem(values);
 }
 
-function openBuilder(kind, defaults = {}) {
-  captureInsertionSelection();
+function openBuilder(kind, defaults = {}, options = {}) {
+  if (!options.preserveSelection) captureInsertionSelection();
   const schema = builderSchemas[kind];
   ui.dialogTitle.textContent = `${kind[0].toUpperCase()}${kind.slice(1)} Builder`;
   ui.dialogSearch.hidden = true;
@@ -1839,23 +1875,23 @@ function openBuilder(kind, defaults = {}) {
 
 function openInsertMenu() {
   showPalette('Insert', [
-    { label: 'Table', detail: 'Caption above; column widths and row height', run: () => openBuilder('table') },
-    { label: 'Long table', detail: 'Multi-page table with caption above', run: () => openBuilder('longtable') },
-    { label: 'Figure', detail: 'Image with caption below', run: () => openBuilder('figure') },
-    { label: 'Code block', detail: 'listings; no shell escape', run: () => openBuilder('code') },
-    { label: 'Inline math', detail: 'Wrap the selection or insert an empty expression', run: insertInlineMath },
-    { label: 'Display math', run: () => openBuilder('equation', { type: 'display' }) },
-    { label: 'Symbols', detail: 'Searchable accessible grid', run: openSymbols },
-    { label: 'Plot', run: () => openBuilder('plot') },
-    { label: 'Algorithm', run: () => openBuilder('algorithm') },
-    { label: 'Publications', detail: 'Categorized communicated, accepted and published bibitems', run: openPublications },
-    { label: 'BibTeX entry', detail: 'Insert an entry into an existing .bib file', run: () => openBuilder('bibliography') },
-    { label: 'Theorem', run: () => openBuilder('theorem') },
-    { label: 'Citation', run: openCitationPalette }, { label: 'Reference', run: openReferencePalette },
-    { label: 'Comment selected lines', detail: 'Prefix selected source lines with TeX comments', run: () => toggleSourceComment(false) },
-    { label: 'Uncomment selected lines', detail: 'Remove one TeX comment prefix from selected lines', run: () => toggleSourceComment(true) },
-    { label: 'Itemized list', run: () => insertLatex('\\begin{itemize}\n  \\item Item\n\\end{itemize}\n', 'writer-list') },
-    { label: 'Numbered list', run: () => insertLatex('\\begin{enumerate}\n  \\item Item\n\\end{enumerate}\n', 'writer-list') },
+    { category: 'Structure', label: 'Table', detail: 'Caption above; column widths and row height', run: () => openBuilder('table') },
+    { category: 'Structure', label: 'Long table', detail: 'Multi-page table with caption above', run: () => openBuilder('longtable') },
+    { category: 'Structure', label: 'Code block', detail: 'listings; no shell escape', run: () => openBuilder('code') },
+    { category: 'Structure', label: 'Algorithm', run: () => openBuilder('algorithm') },
+    { category: 'Structure', label: 'Theorem', run: () => openBuilder('theorem') },
+    { category: 'Structure', label: 'Itemized list', run: () => insertLatex('\\begin{itemize}\n  \\item Item\n\\end{itemize}\n', 'writer-list') },
+    { category: 'Structure', label: 'Numbered list', run: () => insertLatex('\\begin{enumerate}\n  \\item Item\n\\end{enumerate}\n', 'writer-list') },
+    { category: 'Media', label: 'Figure', detail: 'Image with caption below', run: () => openBuilder('figure') },
+    { category: 'Media', label: 'Wrap figure', detail: 'Text-wrapped image; requires wrapfig', run: () => openBuilder('wrapfigure') },
+    { category: 'Media', label: 'Plot', run: () => openBuilder('plot') },
+    { category: 'Math', label: 'Inline math', detail: 'Wrap the selection or insert an empty expression', run: insertInlineMath },
+    { category: 'Math', label: 'Display math', run: () => openBuilder('equation', { type: 'display' }) },
+    { category: 'Math', label: 'Symbols', detail: 'Searchable accessible grid', run: openSymbols },
+    { category: 'References', label: 'Publications', detail: 'Categorized communicated, accepted and published bibitems', run: openPublications },
+    { category: 'References', label: 'BibTeX entry', detail: 'Insert an entry into an existing .bib file', run: () => openBuilder('bibliography') },
+    { category: 'References', label: 'Citation', run: openCitationPalette },
+    { category: 'References', label: 'Reference', run: openReferencePalette },
   ]);
 }
 
@@ -2011,7 +2047,7 @@ async function openDocumentDetails(prefetched = null) {
   try {
     const detail = prefetched?.pack_id ? prefetched : await api.documentDetails(model.paper.id);
     ui.documentDetailsBody.replaceChildren();
-    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: detail.single_source ? 'Complete report template · one source controls cover, front matter, and body.' : `Front Matter Pack: ${detail.pack_name || 'None'}` }));
+    ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: detail.single_source ? 'Complete report template · one source controls cover, front matter, and body. The source \\thesistitle is used until a Team Leader or Admin saves an explicit Project title here; that saved title then controls every title-bearing page at the next manual compile.' : `Front Matter Pack: ${detail.pack_name || 'None'}` }));
     ui.documentDetailsBody.append(projectMetadataEditor(detail));
     if (!detail.pack_id && !detail.single_source) {
       ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter pages are assigned. Project metadata remains available for institutional records.' }));
@@ -2212,7 +2248,8 @@ ui.structuralRedo.addEventListener('click', () => runStructural(true));
 ui.uploadImage.addEventListener('click', async () => {
   if (!model.paper) return;
   if (model.collaboration && !await requireDurableFlush()) return;
-  model.assetUploadTarget = { paperId: model.paper.id, reportName: model.paper.name, version: model.version };
+  captureInsertionSelection();
+  model.assetUploadTarget = { paperId: model.paper.id, reportName: model.paper.name, version: model.version, fileId: model.file?.file_id };
   ui.assetInput.click();
 });
 ui.assetInput.addEventListener('change', async () => {
@@ -2248,7 +2285,8 @@ ui.assetInput.addEventListener('change', async () => {
       renderFiles();
       notice(`${replacement ? 'Replaced' : 'Uploaded'} ${result.file.path} in ${target.reportName}.`);
       if (/\.(png|jpe?g)$/i.test(result.file.path) && window.confirm(`Insert a figure reference to ${result.file.path} at the current cursor?`)) {
-        openBuilder('figure', { asset: result.file.path });
+        if (model.file?.file_id !== target.fileId) return notice('Image uploaded. Reopen the intended source file to insert it.', true);
+        openBuilder('figure', { asset: result.file.path }, { preserveSelection: true });
       }
     } else notice(`Uploaded ${result.file.path} to ${target.reportName}; the current report was not changed.`);
   } catch (error) { notice(error.message, true); }
@@ -2315,6 +2353,41 @@ ui.writerReviewFilters.addEventListener('click', (event) => {
   [...ui.writerReviewFilters.children].forEach((node) => node.toggleAttribute('aria-current', node === event.target));
   renderReviews();
 });
+
+ui.pdfViewport.addEventListener('dblclick', async (event) => {
+  const page = event.target.closest?.('.writer-pdf-page');
+  if (!page) return;
+  if (!model.paper || !model.pdfCurrent || model.pdfDisplayBuildId !== model.currentBuildId) {
+    ui.pdfRelation.textContent = 'PDF is stale — compile current source before navigating.';
+    return;
+  }
+  const request = ++model.inverseSyncRequest;
+  const paperId = model.paper.id;
+  const buildId = model.pdfDisplayBuildId;
+  const canvas = page.querySelector('canvas');
+  if (!canvas) return;
+  const point = pdfPointFromClient(event.clientX, event.clientY, canvas.getBoundingClientRect(), model.pdfView.zoom);
+  try {
+    const mapping = await api.map(paperId, { direction: 'INVERSE', page: Number(page.dataset.page), ...point });
+    if (request !== model.inverseSyncRequest || model.paper?.id !== paperId || model.pdfDisplayBuildId !== buildId || mapping.build_id !== buildId) return;
+    if (!mapping.mapped_file_id || !mapping.mapped_line) {
+      ui.pdfRelation.textContent = 'No source position is mapped at that PDF location.';
+      return;
+    }
+    invalidateForwardSync();
+    model.inverseNavigating = true;
+    try {
+      await openLocation({ file_id: mapping.mapped_file_id, line: mapping.mapped_line, column: mapping.mapped_column || 0 });
+    } finally {
+      model.inverseNavigating = false;
+    }
+    ui.pdfRelation.textContent = `${mapping.mapped_path}:${mapping.mapped_line} · ${mapping.mapping_status.toLowerCase()} mapping`;
+  } catch (error) {
+    if (request === model.inverseSyncRequest) ui.pdfRelation.textContent = error.status === 409 ? 'PDF is stale — compile current source before navigating.' : `Source navigation unavailable: ${error.message}`;
+  }
+});
+
+installWorkspaceSplitters(document.querySelector('.three-pane-workspace'), 'latex-core-writer-pane-widths');
 
 window.setInterval(() => {
   if (model.paper) {
