@@ -42,11 +42,12 @@ export function fuzzyRankFiles(files, query) {
 
 const clamp = (value, minimum = 1, maximum = 20) => Math.min(maximum, Math.max(minimum, Number.parseInt(value, 10) || minimum));
 const safeLabel = (value = '') => value.replace(/[^A-Za-z0-9:_.-]/g, '-');
-const safeText = (value = '') => value.replace(/[\\{}%&#]/g, (character) => ({ '\\': '\\textbackslash{}', '{': '\\{', '}': '\\}', '%': '\\%', '&': '\\&', '#': '\\#' })[character]);
+const safeText = (value = '') => value.replace(/[\\{}%&#$_^~]/g, (character) => ({ '\\': '\\textbackslash{}', '{': '\\{', '}': '\\}', '%': '\\%', '&': '\\&', '#': '\\#', '$': '\\$', '_': '\\_', '^': '\\textasciicircum{}', '~': '\\textasciitilde{}' })[character]);
 const safePath = (value = '') => {
   const path = String(value);
-  if (!path || /[\\\r\n]/.test(path)) throw new Error('Asset path must be a portable project-relative path.');
+  if (!path || /[\\\r\n]/.test(path) || path.startsWith('/') || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)) throw new Error('Asset path must be a portable project-relative path.');
   if (/[{}%]/.test(path)) throw new Error('Asset path contains a TeX-reserved percent or brace character; choose a portable project filename.');
+  if (/^[A-Za-z0-9._/-]+$/.test(path)) return path;
   return `\\detokenize{${path}}`;
 };
 
@@ -183,12 +184,21 @@ export function buildLongTable(options = {}) {
 }
 
 export function buildFigure(options = {}) {
-  const width = options.width === 'custom' ? (options.customWidth || '\\linewidth') : (options.width || '\\linewidth');
-  const lines = [`\\begin{figure}[${options.placement || 'htbp'}]`, '\\centering', `\\includegraphics[width=${width}]{${safePath(options.asset || 'path/to/image')}}`];
+  const width = figureWidth(options.width === 'custom' ? options.customWidth : (options.width || '\\linewidth'));
+  const placement = options.placement || 'htbp';
+  if (!/^[htbp!]+$/.test(placement)) throw new Error('Figure placement must use h, t, b, p, or !.');
+  if (!/\.(png|jpe?g|pdf)$/i.test(options.asset || '')) throw new Error('Choose a project PNG, JPEG, or PDF image.');
+  const lines = [`\\begin{figure}[${placement}]`, '\\centering', `\\includegraphics[width=${width}]{${safePath(options.asset)}}`];
   if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}`);
   if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);
   lines.push('\\end{figure}');
   return lines.join('\n');
+}
+
+function figureWidth(value) {
+  const width = String(value || '').trim();
+  if (/^(?:(?:0?\.\d+|1(?:\.0+)?)\s*)?\\(?:linewidth|textwidth|columnwidth)$/.test(width)) return width;
+  return latexDimension(width, 'Image width') || (() => { throw new Error('Enter an image width.'); })();
 }
 
 export function buildWrapFigure(options = {}) {
@@ -196,7 +206,7 @@ export function buildWrapFigure(options = {}) {
   const requestedWidth = String(options.wrapWidth || '0.45\\textwidth').trim();
   const width = /^(?:0?\.\d+|1(?:\.0+)?)\\(?:textwidth|linewidth)$/.test(requestedWidth)
     ? requestedWidth : latexDimension(requestedWidth, 'Wrap width');
-  const imageWidth = options.width === 'custom' ? (options.customWidth || '\\linewidth') : (options.width || '\\linewidth');
+  const imageWidth = figureWidth(options.width === 'custom' ? options.customWidth : (options.width || '\\linewidth'));
   const lines = [`\\begin{wrapfigure}{${side}}{${width}}`, '\\centering', `\\includegraphics[width=${imageWidth}]{${safePath(options.asset || 'path/to/image')}}`];
   if (options.caption) lines.push(`\\caption{${safeText(options.caption)}}`);
   if (options.label) lines.push(`\\label{${safeLabel(options.label)}}`);

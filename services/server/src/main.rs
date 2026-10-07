@@ -5425,6 +5425,10 @@ async fn v2_paper(
         None
     };
     let editable = paper.status == persistence::PaperStatus::Active && review_round_id.is_none();
+    let fixed_main = match complete_report_main(&state, paper_id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match state.workspaces.restore(paper.workspace_id).await {
         Ok(workspace) => {
             let durable_version = match state.v2.durable_workspace_version(paper.workspace_id).await
@@ -5436,6 +5440,8 @@ async fn v2_paper(
             "paper":paper,
             "version":durable_version,
             "main_file":workspace.main_file().map(LogicalPath::as_str),
+            "main_file_fixed":fixed_main.is_some(),
+            "canonical_main_file":fixed_main,
             "editable":editable,
             "review_open":review_round_id.is_some(),
             "review_round_id":review_round_id,
@@ -5450,6 +5456,21 @@ async fn v2_paper(
             .into_response()
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
+    }
+}
+
+async fn complete_report_main(
+    state: &AppState,
+    paper_id: uuid::Uuid,
+) -> Result<Option<String>, Response> {
+    match state
+        .front_matter
+        .paper_template_arrangement(paper_id)
+        .await
+    {
+        Ok((arrangement, main)) => Ok((arrangement == "SINGLE_SOURCE").then_some(main)),
+        Err(FrontMatterRepositoryError::NotFound) => Ok(None),
+        Err(value) => Err(front_matter_repository_error(value)),
     }
 }
 
@@ -5778,10 +5799,27 @@ async fn v2_set_main(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let (paper, _) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await {
+    let (paper, file) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await
+    {
         Ok(value) => value,
         Err(response) => return response,
     };
+    if file.path.extension() != Some("tex") {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Only a TeX source can be a main file.",
+        );
+    }
+    match complete_report_main(&state, paper_id).await {
+        Ok(Some(_)) => {
+            return error(
+                StatusCode::CONFLICT,
+                "Complete Report uses its canonical template main file.",
+            );
+        }
+        Ok(None) => {}
+        Err(response) => return response,
+    }
     let previous_main = match state.workspaces.restore(paper.workspace_id).await {
         Ok(value) => value.main_file().cloned(),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
@@ -6578,23 +6616,58 @@ async fn prepare_single_source_compile_snapshot(
             format!("Complete report template metadata compatibility: {value}"),
         )
     })?;
-    if bound == main {
+    let mut files = workspace.files().clone();
+    let mut changed = bound != main;
+    if changed {
+        let stored = state.blobs.put(bound).await.map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "single-source binding storage failure",
+            )
+        })?;
+        files.insert(
+            main_path.clone(),
+            FileEntryV1 {
+                blob_hash: stored.hash(),
+                size_bytes: stored.size_bytes(),
+            },
+        );
+    }
+    for (path, entry) in workspace.files() {
+        if !matches!(
+            path.as_str().rsplit('/').next(),
+            Some("acknowledgement.tex" | "acknowledgment.tex" | "certificate.tex")
+        ) {
+            continue;
+        }
+        let original = state.blobs.get(entry.blob_hash).await.map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "front matter source unavailable",
+            )
+        })?;
+        let formatted = front_matter::format_student_front_matter(&original)
+            .map_err(|value| error(StatusCode::BAD_REQUEST, value.to_string()))?;
+        if formatted != original {
+            changed = true;
+            let stored = state.blobs.put(formatted).await.map_err(|_| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "front matter formatting storage failed",
+                )
+            })?;
+            files.insert(
+                path.clone(),
+                FileEntryV1 {
+                    blob_hash: stored.hash(),
+                    size_bytes: stored.size_bytes(),
+                },
+            );
+        }
+    }
+    if !changed {
         return Ok(());
     }
-    let stored = state.blobs.put(bound).await.map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "single-source binding storage failure",
-        )
-    })?;
-    let mut files = workspace.files().clone();
-    files.insert(
-        main_path.clone(),
-        FileEntryV1 {
-            blob_hash: stored.hash(),
-            size_bytes: stored.size_bytes(),
-        },
-    );
     let compile_manifest = WorkspaceManifestV1::new(main_path, files).map_err(|_| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,

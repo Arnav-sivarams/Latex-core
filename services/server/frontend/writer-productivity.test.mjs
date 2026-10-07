@@ -20,12 +20,12 @@ test('table and figure builders generate bounded ordinary LaTeX', () => {
   assert.match(table, /\\toprule/);
   assert.ok(table.indexOf('\\caption{Results}') < table.indexOf('\\begin{tabular}'));
   assert.match(table, /\\rule\{0pt\}\{8mm\}Header 1/);
-  assert.match(buildFigure({ asset: 'images/result.png', width: '0.5\\linewidth', caption: 'Result' }), /\\includegraphics\[width=0.5\\linewidth\]\{\\detokenize\{images\/result.png\}\}/);
+  assert.match(buildFigure({ asset: 'images/result.png', width: '0.5\\linewidth', caption: 'Result' }), /\\includegraphics\[width=0.5\\linewidth\]\{images\/result.png\}/);
   assert.match(buildFigure({ asset: 'images/result #1.png' }), /\\detokenize\{images\/result #1\.png\}/);
   assert.throws(() => buildFigure({ asset: 'images/result%7Bfinal%7D.png' }), /TeX-reserved/);
   const wrapped = buildWrapFigure({ asset: 'images/result.png', side: 'l', wrapWidth: '6cm', caption: 'Wrapped result' });
   assert.match(wrapped, /^\\begin\{wrapfigure\}\{l\}\{6cm\}/);
-  assert.match(wrapped, /\\includegraphics\[width=\\linewidth\]\{\\detokenize\{images\/result.png\}\}/);
+  assert.match(wrapped, /\\includegraphics\[width=\\linewidth\]\{images\/result.png\}/);
   assert.match(wrapped, /\\end\{wrapfigure\}$/);
 });
 

@@ -1,3 +1,4 @@
+import { canSetMain, diagnosticIcon } from './writer-policy.mjs';
 import { frontMatterStatus, editableDetail, needsFirstUseDetails } from './document-details.mjs';
 import { basicSetup } from 'codemirror';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
@@ -511,6 +512,9 @@ function renderProblemList(host, diagnostics) {
   diagnostics.forEach((diagnostic) => {
     const row = button(diagnostic.message, () => diagnostic.file_id && openLocation(diagnostic));
     row.className = `problem-row build-problem-${diagnostic.severity || 'info'}`;
+    const indicator = document.createElement('span'); indicator.innerHTML = diagnosticIcon(diagnostic.severity);
+    row.prepend(indicator);
+    row.title = `${diagnostic.severity || 'Information'}: ${diagnostic.message}`;
     const line = diagnostic.range?.start_line;
     row.append(Object.assign(document.createElement('small'), { textContent: `${diagnostic.path || 'Build'}${line ? `:${line}` : ''} · ${diagnostic.code || diagnostic.severity || 'info'}` }));
     host.append(row);
@@ -1113,7 +1117,8 @@ function updateFileActions(editable) {
   const selected = Boolean(model.file);
   ui.renameFile.disabled = !selected || !editable;
   ui.deleteFile.disabled = !selected || !editable;
-  ui.setMain.disabled = !selected || !editable || ui.mainBadge.hidden === false;
+  ui.setMain.hidden = !canSetMain(model.file, model.paperDetail, editable);
+  ui.setMain.disabled = ui.setMain.hidden;
   updateSaveControl();
   ui.insertMenu.disabled = !selected || !editable;
   ui.symbolPalette.disabled = !selected || !editable;
@@ -1707,6 +1712,14 @@ function insertLatex(source, origin = 'writer-builder', cursorOffset = null) {
     return false;
   }
   const selection = resolveInsertionSelection();
+  if (selection && /writer-(?:figure|wrapfigure)-builder/.test(origin) && model.file?.path === model.paperDetail?.main_file) {
+    const text = model.view.state.doc.toString();
+    const begin = text.indexOf('\\begin{document}');
+    const end = text.indexOf('\\end{document}');
+    if (begin < 0 || selection.from < begin + '\\begin{document}'.length || (end >= 0 && selection.to > end)) {
+      return notice('Place the cursor inside the document body before inserting a figure.', true);
+    }
+  }
   model.insertionSelection = null;
   if (!selection) {
     notice('The source or selected range changed while this dialog was open. Reopen the insertion action.', true);
@@ -1879,17 +1892,17 @@ function openInsertMenu() {
   showPalette('Insert', [
     { category: 'Structure', label: 'Table', detail: 'Caption above; column widths and row height', run: () => openBuilder('table') },
     { category: 'Structure', label: 'Long table', detail: 'Multi-page table with caption above', run: () => openBuilder('longtable') },
-    { category: 'Structure', label: 'Code block', detail: 'listings; no shell escape', run: () => openBuilder('code') },
-    { category: 'Structure', label: 'Algorithm', run: () => openBuilder('algorithm') },
-    { category: 'Structure', label: 'Theorem', run: () => openBuilder('theorem') },
     { category: 'Structure', label: 'Itemized list', run: () => insertLatex('\\begin{itemize}\n  \\item Item\n\\end{itemize}\n', 'writer-list') },
     { category: 'Structure', label: 'Numbered list', run: () => insertLatex('\\begin{enumerate}\n  \\item Item\n\\end{enumerate}\n', 'writer-list') },
-    { category: 'Media', label: 'Figure', detail: 'Image with caption below', run: () => openBuilder('figure') },
-    { category: 'Media', label: 'Wrap figure', detail: 'Text-wrapped image; requires wrapfig', run: () => openBuilder('wrapfigure') },
-    { category: 'Media', label: 'Plot', run: () => openBuilder('plot') },
     { category: 'Math', label: 'Inline math', detail: 'Wrap the selection or insert an empty expression', run: insertInlineMath },
     { category: 'Math', label: 'Display math', run: () => openBuilder('equation', { type: 'display' }) },
     { category: 'Math', label: 'Symbols', detail: 'Searchable accessible grid', run: openSymbols },
+    { category: 'Media', label: 'Figure', detail: 'Image with caption below', run: () => openBuilder('figure') },
+    { category: 'Media', label: 'Wrap figure', detail: 'Text-wrapped image; requires wrapfig', run: () => openBuilder('wrapfigure') },
+    { category: 'Data / visualization', label: 'Plot', run: () => openBuilder('plot') },
+    { category: 'Code / formal content', label: 'Code block', detail: 'listings; no shell escape', run: () => openBuilder('code') },
+    { category: 'Code / formal content', label: 'Algorithm', run: () => openBuilder('algorithm') },
+    { category: 'Code / formal content', label: 'Theorem', run: () => openBuilder('theorem') },
     { category: 'References', label: 'Publications', detail: 'Categorized communicated, accepted and published bibitems', run: openPublications },
     { category: 'References', label: 'BibTeX entry', detail: 'Insert an entry into an existing .bib file', run: () => openBuilder('bibliography') },
     { category: 'References', label: 'Citation', run: openCitationPalette },
@@ -2114,7 +2127,7 @@ async function runStructural(redo) {
 
 function commandItems() {
   const items = [
-    ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ['Set Main', () => ui.setMain.click()],
+    ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ...(canSetMain(model.file, model.paperDetail, model.fileEditable) ? [['Set Main', () => ui.setMain.click()]] : []),
     ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
     ['Insert…', openInsertMenu],
     ['Open Problems', () => expandBuildFooter('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
@@ -2176,6 +2189,7 @@ ui.deleteFile.addEventListener('click', async () => {
 });
 
 ui.setMain.addEventListener('click', async () => {
+  if (!canSetMain(model.file, model.paperDetail, model.fileEditable)) return;
   if (!await requireDurableFlush()) return;
   try {
     const result = await api.setMain(model.paper.id, model.file.file_id, { version: model.version });

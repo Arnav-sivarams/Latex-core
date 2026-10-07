@@ -244,6 +244,20 @@ pub fn bind_single_source_values(
     )))
 }
 
+/// TeX discards spaces after control words; make student separators explicit.
+pub fn format_student_front_matter(source: &[u8]) -> Result<Bytes, FrontMatterError> {
+    let source = std::str::from_utf8(source).map_err(|_| FrontMatterError::InvalidManifest)?;
+    let mut output = source.to_owned();
+    for student in ['A', 'B', 'C', 'D'] {
+        let command = format!("\\student{student}name");
+        for spaces in ["  ", " "] {
+            output = output.replace(&format!("{command}{spaces}("), &format!("{command}\\ ("));
+        }
+    }
+    output = output.replace(r"\hspace{1cm}", r"\setlength{\parindent}{1cm}\indent");
+    Ok(Bytes::from(output))
+}
+
 pub fn document_owned_source(source: &str) -> bool {
     matches!(
         source,
@@ -1071,6 +1085,15 @@ mod tests {
         format!(
             r#"{{"schema_version":1,"entry_file":"frontmatter.tex","sections":[{{"key":"cover","label":"Cover","file":"cover.tex","required":true,"default_enabled":true}}],"fields":[{{"key":"title","label":"Title","type":"TEXT","required":true,"source":"{source}","default":null,"allow_team_override":false}}]}}"#
         )
+    }
+
+    #[test]
+    fn complete_report_student_separators_preserve_names_and_registration_numbers() {
+        let source =
+            br"\studentAname  (\studentAregno), \studentBname (\studentBregno) \hspace{1cm}";
+        let result = format_student_front_matter(source).unwrap();
+        assert_eq!(&result[..], br"\studentAname\ (\studentAregno), \studentBname\ (\studentBregno) \setlength{\parindent}{1cm}\indent");
+        assert_eq!(format_student_front_matter(&result).unwrap(), result);
     }
 
     #[test]
