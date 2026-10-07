@@ -197,9 +197,49 @@ pub fn bind_single_source_values(
         target
     };
     let separator = if marker.is_some() { "" } else { "\n" };
+    let mut preamble = source[..start].to_owned();
+    // Update the existing declarations as well as the managed override so the
+    // durable source and the editor show the value the user just saved.
+    for (command, _, _, _) in legacy::REGISTRY {
+        let needle = format!("\\renewcommand{{\\{command}}}");
+        let Some(offset) = binding.find(&needle) else {
+            continue;
+        };
+        let Some(value) = literal_group(&binding[offset + needle.len()..]) else {
+            continue;
+        };
+        let mut replacements = Vec::new();
+        let mut line_offset = 0;
+        for line in preamble.split_inclusive('\n') {
+            let code = tex_code_line(line);
+            for declaration in [
+                "newcommand",
+                "providecommand",
+                "renewcommand",
+                "DeclareRobustCommand",
+            ] {
+                let declaration = format!("\\{declaration}{{\\{command}}}");
+                for (offset, _) in code.match_indices(&declaration) {
+                    let rest = &code[offset + declaration.len()..];
+                    let trimmed = rest.trim_start();
+                    if let Some(old) = literal_group(trimmed) {
+                        let from = line_offset + offset + declaration.len() + rest.len()
+                            - trimmed.len()
+                            + 1;
+                        replacements.push((from, from + old.len()));
+                    }
+                }
+            }
+            line_offset += line.len();
+        }
+        replacements.sort_unstable();
+        for (from, to) in replacements.into_iter().rev() {
+            preamble.replace_range(from..to, value);
+        }
+    }
     Ok(Bytes::from(format!(
         "{}{binding}{separator}{}",
-        &source[..start],
+        preamble,
         &source[end..]
     )))
 }

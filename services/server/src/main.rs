@@ -4274,7 +4274,12 @@ async fn v2_save_document_details(
             }
         }
         submitted.extend(input.values.clone());
-        if let (Some(semester), Some(submission_date)) = (
+        if input.values.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "team_semester" | "submission_date" | "team_academic_year"
+            )
+        }) && let (Some(semester), Some(submission_date)) = (
             submitted
                 .get("team_semester")
                 .and_then(serde_json::Value::as_str),
@@ -13436,9 +13441,11 @@ mod database_tests {
             .unwrap();
         let archive = test_zip(&[
             (
-                "project.tex",
+                "Full_Report_template_v1.0/Full_Report_v1.0.tex",
                 br"\documentclass{report}
 \usepackage{graphicx}
+\newcommand{\coursecode}{BCSXXXX}
+\newcommand{\coursename}{Capstone project - II}
 \newcommand{\thesistitle}{Original Source Title}
 \newcommand{\studentAname}{Original Student}
 % unrelated manual preamble
@@ -13451,20 +13458,23 @@ mod database_tests {
 ",
             ),
             (
-                "chapters/body.tex",
+                "Full_Report_template_v1.0/chapters/body.tex",
                 br"\chapter*{Manual body}
 Unrelated authored LaTeX survives.
 \includegraphics{images/foo.png}
 \includegraphics{foo}
 ",
             ),
-            ("images/foo.png", image.get_ref().as_slice()),
+            (
+                "Full_Report_template_v1.0/images/foo.png",
+                image.get_ref().as_slice(),
+            ),
         ]);
         let template_name = format!("Synthetic complete report {}", uuid::Uuid::new_v4());
         let (body, content_type) = template_multipart(
             &[
                 ("name", template_name.as_str()),
-                ("main", "project.tex"),
+                ("main", "Full_Report_template_v1.0/Full_Report_v1.0.tex"),
                 ("arrangement", "SINGLE_SOURCE"),
             ],
             &archive,
@@ -13505,7 +13515,8 @@ Unrelated authored LaTeX survives.
         let workspace_id = WorkspaceId::from_uuid(
             uuid::Uuid::parse_str(team["team"]["workspace_id"].as_str().unwrap()).unwrap(),
         );
-        let source_path = LogicalPath::parse("project.tex").unwrap();
+        let source_path =
+            LogicalPath::parse("Full_Report_template_v1.0/Full_Report_v1.0.tex").unwrap();
         let source = state
             .workspaces
             .read_file(workspace_id, &source_path)
@@ -13598,7 +13609,7 @@ Unrelated authored LaTeX survives.
                 Method::PUT,
                 &detail_path,
                 Some(&writer.cookie),
-                r#"{"values":{"project_title":"Professor Durable Title One"},"sections":{}}"#,
+                r#"{"values":{"project_title":"Professor Durable Title One","course_code":"BA101"},"sections":{}}"#,
                 Some("application/json"),
             )
             .await,
@@ -13631,6 +13642,8 @@ Unrelated authored LaTeX survives.
             .await
             .unwrap();
         assert_ne!(persisted, source);
+        assert!(String::from_utf8_lossy(&persisted).contains(r"\newcommand{\coursecode}{BA101}"));
+        assert!(!String::from_utf8_lossy(&persisted).contains("BCSXXXX"));
         let access = state
             .v2
             .collaboration_access(writer_id, paper_id, main_file.file_id)
@@ -13757,7 +13770,7 @@ Unrelated authored LaTeX survives.
             let server = tokio::spawn(async move {
                 axum::serve(listener, served).await.unwrap();
             });
-            let config = serde_json::json!({"base":format!("http://{address}"), "cookie":writer.cookie, "paperId":paper_id});
+            let config = serde_json::json!({"base":format!("http://{address}"), "cookie":writer.cookie, "paperId":paper_id, "adminCookie":admin.cookie, "writerId":writer_id, "mentorId":mentor_id});
             let output = tokio::task::spawn_blocking(move || {
                 Command::new("node")
                     .arg("tests/professor-hotfix-smoke.mjs")
@@ -13775,6 +13788,62 @@ Unrelated authored LaTeX survives.
                 String::from_utf8_lossy(&output.stderr)
             );
             println!("{}", String::from_utf8_lossy(&output.stdout));
+            let real_worker = WorkerId::new();
+            let real = state.queue.claim(real_worker).await.unwrap().unwrap();
+            let hash: String = sqlx::query_scalar(
+                "SELECT manifest_blob_hash FROM latex_core.snapshots WHERE snapshot_id=$1",
+            )
+            .bind(real.snapshot_id.to_hex())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let manifest: WorkspaceManifestV1 = serde_json::from_slice(
+                &state
+                    .blobs
+                    .get(core_types::BlobHash::from_str(&hash).unwrap())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let staging = tempfile::tempdir().unwrap();
+            let service = compiler::CompilerService::new(
+                state.blobs.clone(),
+                compiler::DockerCliRuntime::new(
+                    env::var("LATEX_CORE_HOTFIX_TEXLIVE_IMAGE").unwrap(),
+                )
+                .unwrap(),
+                compiler::CompilerConfig::new(compiler::CompileLimits::development_default())
+                    .with_staging_root(staging.path().to_path_buf()),
+            )
+            .unwrap();
+            let execution = service
+                .compile(
+                    real.snapshot_id,
+                    &manifest,
+                    TexEngine::PdfLatex,
+                    ShellPolicy::Safe,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                execution.status(),
+                compiler::CompileStatus::Succeeded,
+                "{}\n{}",
+                String::from_utf8_lossy(execution.stdout()),
+                String::from_utf8_lossy(execution.stderr())
+            );
+            println!("Actual Complete Report sandbox compilation: PASS");
+            state
+                .queue
+                .complete_success(
+                    real.id,
+                    real_worker,
+                    &test_artifacts(&state, "real-complete-report").await,
+                    core_types::BlobHash::digest(b"real-complete-report"),
+                )
+                .await
+                .unwrap();
         } else {
             let saved = request(
                 &app,
@@ -13916,7 +13985,7 @@ Unrelated authored LaTeX survives.
             .as_array()
             .unwrap()
             .iter()
-            .find(|file| file["path"] == "project.tex")
+            .find(|file| file["path"] == "Full_Report_template_v1.0/Full_Report_v1.0.tex")
             .unwrap()["file_id"]
             .as_str()
             .unwrap();

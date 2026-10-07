@@ -2034,6 +2034,16 @@ function projectMetadataEditor(detail) {
     event.preventDefault();
     try {
       if (model.collaboration && !await syncCurrent(false)) return;
+      if (detail.single_source) {
+        const values = {};
+        const previous = Object.fromEntries((detail.values || []).map((item) => [item.field_key, item.value ?? '']));
+        for (const field of detail.manifest.fields || []) {
+          const control = ui.documentDetailsBody.querySelector(`[name="field:${field.key}"]`);
+          if (control && !control.disabled && control.value !== previous[field.key]
+            && !(field.type === 'DATE' && !control.value && previous[field.key])) values[field.key] = control.value;
+        }
+        await api.saveDocumentDetails(model.paper.id, { values, sections: {} });
+      }
       const result = await api.saveProjectMetadata(model.paper.id, payload());
       model.version = result.workspace_version;
       await openPaper(model.paper);
