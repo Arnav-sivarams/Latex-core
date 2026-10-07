@@ -41,7 +41,7 @@ await request(`${root}/files/${nested.file_id}`, 'PUT', {
   content: `${body.content}\n\\includegraphics{images/actually-missing.png}\n`, version: body.version,
 });
 const missing = await request(`${root}/intelligence`);
-assert.ok(missing.diagnostics.some((item) => item.code === 'MissingProjectDependency' && item.message.includes('actually-missing.png')));
+assert.ok(!missing.diagnostics.some((item) => item.code === 'MissingProjectDependency')); // Writer suppresses this diagnostic; parser analysis remains intact.
 const current = await request(`${root}/files/${nested.file_id}`);
 await request(`${root}/files/${nested.file_id}`, 'PUT', { content: body.content, version: current.version });
 assert.ok(!(await request(`${root}/intelligence`)).diagnostics.some((item) => item.code === 'MissingProjectDependency'));

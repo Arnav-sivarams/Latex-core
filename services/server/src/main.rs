@@ -19,6 +19,7 @@ mod integration_api;
 )]
 mod mail;
 mod review_api;
+mod writer_diagnostics;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -6058,19 +6059,7 @@ async fn v2_paper_intelligence(
             })
         })
         .collect::<Vec<_>>();
-    let diagnostics = analysis
-        .diagnostics()
-        .iter()
-        .map(|diagnostic| {
-            serde_json::json!({
-                "severity":diagnostic_severity_name(diagnostic.diagnostic().severity()),
-                "code":format!("{:?}", diagnostic.diagnostic().code()),
-                "message":diagnostic.diagnostic().message(),
-                "file_id":file_ids.get(diagnostic.file()),"path":diagnostic.file(),
-                "range":diagnostic.diagnostic().range().map(source_range_json),
-            })
-        })
-        .collect::<Vec<_>>();
+    let diagnostics = writer_diagnostics::problems_response(analysis.diagnostics(), &file_ids);
     Json(serde_json::json!({
         "schema_version":1,"workspace_version":workspace.version().get(),"outline":outline,
         "labels":labels,"references":references,"citations":citations,
