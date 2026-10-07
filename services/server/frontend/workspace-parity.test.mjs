@@ -15,7 +15,8 @@ test('Writer visual refresh preserves the complete working surface', () => {
     'compilePaper', 'sendReview', 'endReview', 'insertMenu', 'problemsToggle',
     'historyToggle', 'commentsToggle', 'documentDetails', 'editorSettings', 'moreActions',
     'newPaper', 'myPapers', 'teamPapers', 'newFile', 'uploadImage', 'fileActionsToggle',
-    'fileTree', 'editorMount', 'pdfPage', 'pdfZoom', 'locateInPdf', 'downloadPdf',
+    'fileTree', 'editorMount', 'pdfPage', 'pdfZoom', 'locateInPdf', 'downloadMenu',
+    'downloadPdf', 'downloadSource',
     'pdfViewport', 'buildProblemsTab', 'buildLogTab', 'buildLogText', 'workspaceDrawer',
     'renameFile', 'deleteFile', 'setMain', 'structuralUndo', 'structuralRedo',
   ]);

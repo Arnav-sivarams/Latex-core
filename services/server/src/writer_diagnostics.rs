@@ -1,7 +1,7 @@
 //! Diagnostics exposed by Writer's Problems panel, independently of parser analysis.
 
 use core_types::LogicalPath;
-use latex_parser::{DiagnosticCode, ProjectDiagnostic};
+use latex_parser::ProjectDiagnostic;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -12,7 +12,6 @@ pub fn problems_response(
 ) -> Vec<Value> {
     diagnostics
         .iter()
-        .filter(|item| item.diagnostic().code() != DiagnosticCode::MissingProjectDependency)
         .map(|item| {
             serde_json::json!({
                 "severity":super::diagnostic_severity_name(item.diagnostic().severity()),
@@ -28,9 +27,10 @@ pub fn problems_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use latex_parser::DiagnosticCode;
 
     #[test]
-    fn writer_problems_hide_only_missing_project_dependency() {
+    fn writer_problems_preserve_real_errors_and_missing_dependencies() {
         let main = LogicalPath::parse("Full_Report_template_v1.0/Full_Report_v1.0.tex")
             .expect("valid template path");
         let source = latex_parser::ProjectSource::new(
@@ -75,12 +75,12 @@ mod tests {
                 .any(|item| item["code"] == "UnresolvedReference")
         );
         assert!(
-            !result
+            result
                 .iter()
                 .any(|item| item["code"] == "MissingProjectDependency")
         );
         assert!(
-            !serde_json::to_string(&result)
+            serde_json::to_string(&result)
                 .expect("serializable response")
                 .contains("project dependency not found")
         );

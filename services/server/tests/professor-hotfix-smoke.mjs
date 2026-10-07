@@ -41,7 +41,7 @@ await request(`${root}/files/${nested.file_id}`, 'PUT', {
   content: `${body.content}\n\\includegraphics{images/actually-missing.png}\n`, version: body.version,
 });
 const missing = await request(`${root}/intelligence`);
-assert.ok(!missing.diagnostics.some((item) => item.code === 'MissingProjectDependency')); // Writer suppresses this diagnostic; parser analysis remains intact.
+assert.ok(missing.diagnostics.some((item) => item.code === 'MissingProjectDependency'));
 const current = await request(`${root}/files/${nested.file_id}`);
 await request(`${root}/files/${nested.file_id}`, 'PUT', { content: body.content, version: current.version });
 assert.ok(!(await request(`${root}/intelligence`)).diagnostics.some((item) => item.code === 'MissingProjectDependency'));
@@ -74,16 +74,33 @@ try {
   const [name, ...parts] = cookie.split('=');
   await context.addCookies([{ name, value: parts.join('=').split(';')[0], url: base }]);
   const page = await context.newPage();
-  await request(`${realRoot}/document-details`, 'PUT', { values: { course_code: 'BA101' }, sections: {} });
-  await request(`${realRoot}/project-metadata`, 'PUT', { executive_summary: null, project_type: 'capstone', datasets: [], source_code_snippets: [], publications: [], department_display_names: [], school_display_names: [], setup_complete: true });
   await page.goto(`${base}/write?paper=${team.team.id}`);
   await page.locator('.cm-editor').waitFor({ state: 'visible' });
   await page.waitForFunction(() => document.querySelector('#saveStatus')?.dataset.state === 'synced');
+  await page.locator('#documentDetailsPanel').waitFor({ state: 'visible' });
+  await page.locator('[name="field:course_code"]').fill('BA101');
+  await page.locator('[name="field:team_academic_year"]').fill('2026-2027');
+  await page.locator('[name="field:team_semester"]').selectOption('Winter Semester');
+  await page.locator('[name="project_type"]').selectOption('capstone');
+  assert.equal(await page.locator('[name="field:guide_identity"], [name="field:dean_identity"]').count(), 0);
+  await page.getByRole('button', { name: 'Save project metadata', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.cm-content')?.textContent.includes('BA101'));
   const realAfter = await request(`${realRoot}/files/${realMain.file_id}`);
   assert.ok(realAfter.content.includes(String.raw`\newcommand{\coursecode}{BA101}`));
   assert.ok(!realAfter.content.includes('BCSXXXX'));
   assert.ok(realAfter.content.includes(String.raw`\include{coverpage.tex}`));
+  assert.ok(realAfter.content.includes(String.raw`\newcommand{\semester}{Winter Semester 2026-2027}`));
+  assert.ok(realAfter.content.includes(String.raw`\renewcommand{\academicyear}{2026-2027}`));
+  assert.ok(realAfter.file.revision > realBefore.file.revision);
+  assert.ok(realAfter.version > realBefore.version);
+  assert.ok(realAfter.content.includes(String.raw`\newcommand{\programdegree}{Bachelor of Technology}`));
+  assert.ok(realAfter.content.includes(String.raw`\newcommand{\projguidename}{Dr. Rao}`));
+  assert.ok(realAfter.content.includes(String.raw`\newcommand{\deanname}{Dr. Krishnan}`));
+  const exported = await fetch(`${base}${realRoot}/source.zip`, { headers: { Cookie: cookie } });
+  assert.equal(exported.status, 200);
+  // ZIP contents are checked against exact durable bytes in the Rust integration regression.
+  assert.equal(await page.locator('#writerHelp').isEnabled(), true);
+  assert.equal(await page.locator('#writerHelp').getAttribute('title'), 'Contact support: help@institution.example');
   console.log('Real Complete Report: durable coursecode BA101 and open Writer BA101 PASS');
   if (await page.locator('#documentDetailsPanel').isVisible()) await page.locator('#drawerClose').click();
   const policy = await request(realRoot);

@@ -220,3 +220,35 @@ fn graphics_missing_and_traversal_still_warn() {
             .all(|edge| matches!(edge.resolution(), DependencyResolution::Missing(_)))
     );
 }
+
+#[test]
+fn nested_syntax_diagnostic_retains_offending_file_and_line() {
+    let nested = format!("{}\\section{{broken\n", "\n".repeat(36));
+    let source = ProjectSource::new(
+        p("main.tex"),
+        BTreeMap::from([
+            (
+                p("main.tex"),
+                Bytes::from_static(br"\input{chapters/chapter2}"),
+            ),
+            (p("chapters/chapter2.tex"), Bytes::from(nested)),
+        ]),
+    )
+    .unwrap();
+    let analysis = ProjectAnalyzer::with_default_limits()
+        .analyze(&source)
+        .unwrap();
+    assert!(
+        analysis
+            .diagnostics()
+            .iter()
+            .any(|item| item.file() == &p("chapters/chapter2.tex")
+                && item.diagnostic().code() == DiagnosticCode::SyntaxError
+                && item
+                    .diagnostic()
+                    .range()
+                    .is_some_and(|range| range.start().row() + 1 == 37)),
+        "{:?}",
+        analysis.diagnostics()
+    );
+}

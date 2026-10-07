@@ -14,14 +14,14 @@
     <span class="header-divider" aria-hidden="true">|</span><span id="homeRole" class="role-badge">Loading…</span>
     <span class="shell-spacer"></span>
     <a class="quiet-button" href="/home" aria-current="page">Projects</a>
-    <a id="teamChatLink" class="quiet-button" href="/team-chat">Team Chat</a>
+    {{TEAM_CHAT_HEADER_LINK}}
     <form method="post" action="/logout"><button class="quiet-button" type="submit">Log out</button></form>
   </header>
   <div class="projects-layout">
     <nav class="projects-sidebar" aria-label="Workspace navigation">
       <p class="projects-sidebar-label">WORKSPACE</p>
       <a class="projects-nav-item active" href="/home" aria-current="page"><span aria-hidden="true">▦</span>Projects</a>
-      <a class="projects-nav-item" href="/team-chat"><span aria-hidden="true">◌</span>Team Chat</a>
+      {{TEAM_CHAT_NAV_LINK}}
     </nav>
     <main class="projects-main" aria-labelledby="projects-heading">
       <div class="projects-heading">

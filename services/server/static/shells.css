@@ -459,6 +459,9 @@ html:has(body.workspace-shell), body.workspace-shell { overflow: hidden; }
 .toolbar-menu { position: relative; flex: 0 0 auto; }
 .toolbar-menu > summary { min-height: 30px; display: flex; align-items: center; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; background: var(--surface); cursor: pointer; list-style: none; white-space: nowrap; }
 .toolbar-menu > summary::-webkit-details-marker { display: none; }
+.download-menu-popover { position: absolute; z-index: 90; top: calc(100% + 5px); right: 0; width: 170px; display: grid; gap: 2px; padding: 5px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: 0 12px 32px #2025202e; }
+.download-menu-popover button { width: 100%; justify-content: flex-start; border-color: transparent; background: transparent; text-align: left; }
+.download-menu:not([open]) .download-menu-popover { display: none; }
 .compact-settings { position: fixed; z-index: 85; top: 88px; right: 10px; width: 220px; display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 12px 32px #2025202e; }
 .compact-settings label { display: grid; grid-template-columns: 1fr 86px; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .compact-settings input, .compact-settings select { width: 86px; min-width: 0; padding: 4px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
@@ -875,6 +878,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 }
 .workspace-shell .paper-list button:hover:not(:disabled),
 .workspace-shell .file-tree button:hover:not(:disabled) { background: var(--workspace-hover); }
+.workspace-shell .file-tree-row { display: flex; align-items: center; gap: 2px; }
+.workspace-shell .file-tree-row > button:first-child { min-width: 0; flex: 1; }
+.workspace-shell .file-tree .file-row-actions {
+  width: 28px;
+  min-width: 28px;
+  justify-content: center;
+  padding: 4px;
+  color: var(--muted);
+  opacity: .72;
+}
+.workspace-shell .file-tree-row:hover .file-row-actions,
+.workspace-shell .file-tree .file-row-actions:focus-visible { color: var(--text); opacity: 1; }
 .workspace-shell .paper-list button[aria-current="page"],
 .workspace-shell .file-tree button[aria-current="page"] {
   border-left: 3px solid var(--accent);
@@ -966,3 +981,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .writer-shell .toolbar-secondary { display: flex; }
   .workspace-shell .action-toolbar { overflow-x: auto; }
 }
+
+.writer-shell #problemsToggle[data-severity="warning"] { color: var(--warning); }
+.writer-shell #problemsToggle[data-severity="error"] { color: var(--danger); }

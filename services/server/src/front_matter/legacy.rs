@@ -63,6 +63,29 @@ pub fn derive_semester_metadata(
     })
 }
 
+/// Complete Report calendar values are document inputs, never student-derived.
+pub fn document_calendar(semester: &str, academic_year: &str) -> Result<String, FrontMatterError> {
+    let valid_year = academic_year.is_ascii()
+        && academic_year.len() == 9
+        && academic_year.as_bytes()[4] == b'-'
+        && academic_year[..4]
+            .parse::<u32>()
+            .ok()
+            .zip(academic_year[5..].parse::<u32>().ok())
+            .is_some_and(|(start, end)| (1900..=9998).contains(&start) && end == start + 1);
+    if !valid_year {
+        return Err(FrontMatterError::InvalidValue(
+            "Academic year is required (YYYY-YYYY, consecutive years)".into(),
+        ));
+    }
+    if !matches!(semester, "Winter Semester" | "Summer Semester") {
+        return Err(FrontMatterError::InvalidValue(
+            "Select Winter Semester or Summer Semester".into(),
+        ));
+    }
+    Ok(format!("{semester} {academic_year}"))
+}
+
 fn apply_semester_metadata(
     values: &mut BTreeMap<String, ResolvedValue>,
 ) -> Result<(), FrontMatterError> {
@@ -451,26 +474,34 @@ pub fn single_source_bindings(
     values: &BTreeMap<String, Value>,
 ) -> Result<String, FrontMatterError> {
     let mut values = values.clone();
-    if let (Some(semester), Some(submission_date)) = (
-        values
-            .get("team.semester")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty()),
-        values
-            .get("submission_date")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty()),
-    ) {
-        let metadata = derive_semester_metadata(
+    if let Some(semester) = values.get("team.semester").and_then(Value::as_str)
+        && matches!(semester, "Winter Semester" | "Summer Semester")
+    {
+        let display = document_calendar(
             semester,
-            submission_date,
-            values.get("team.academic_year").and_then(Value::as_str),
+            values
+                .get("team.academic_year")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
         )?;
-        values.insert("team.semester".into(), Value::String(metadata.label));
-        values.insert(
-            "team.academic_year".into(),
-            Value::String(metadata.academic_year),
-        );
+        values.insert("team.semester".into(), Value::String(display));
+    } else if let (Some(semester), Some(date)) = (
+        values.get("team.semester").and_then(Value::as_str),
+        values.get("submission_date").and_then(Value::as_str),
+    ) {
+        // Compatibility for older, separately managed institutional packs.
+        if semester.parse::<u8>().is_ok() {
+            let metadata = derive_semester_metadata(
+                semester,
+                date,
+                values.get("team.academic_year").and_then(Value::as_str),
+            )?;
+            values.insert("team.semester".into(), Value::String(metadata.label));
+            values.insert(
+                "team.academic_year".into(),
+                Value::String(metadata.academic_year),
+            );
+        }
     }
     let mut output = String::from("% Known institutional single-source bindings.\n");
     for (word, source, _, _) in REGISTRY {
@@ -499,7 +530,17 @@ pub fn single_source_bindings(
                 - 1]
             .to_owned(),
             "thesisyear" if valid_date(value) => value[..4].to_owned(),
-            "academicyear" if value.len() == 9 && value.as_bytes()[4] == b'-' => {
+            "academicyear"
+                if !values
+                    .get("team.semester")
+                    .and_then(Value::as_str)
+                    .is_some_and(|semester| {
+                        semester.starts_with("Winter Semester ")
+                            || semester.starts_with("Summer Semester ")
+                    })
+                    && value.len() == 9
+                    && value.as_bytes()[4] == b'-' =>
+            {
                 format!("{}--{}", &value[..4], &value[7..9])
             }
             _ => value.to_owned(),
@@ -663,6 +704,36 @@ mod tests {
             detected_main: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn complete_report_calendar_is_required_and_document_owned() {
+        assert_eq!(
+            document_calendar("Winter Semester", "2026-2027").unwrap(),
+            "Winter Semester 2026-2027"
+        );
+        assert_eq!(
+            document_calendar("Summer Semester", "2025-2026").unwrap(),
+            "Summer Semester 2025-2026"
+        );
+        for year in ["", "2026", "2026-2028", "२०२६-२०२७"] {
+            assert!(document_calendar("Winter Semester", year).is_err());
+        }
+        assert!(document_calendar("3", "2026-2027").is_err());
+        let bindings = single_source_bindings(&BTreeMap::from([
+            (
+                "team.semester".into(),
+                Value::String("Summer Semester".into()),
+            ),
+            (
+                "team.academic_year".into(),
+                Value::String("2026-2027".into()),
+            ),
+            ("submission_date".into(), Value::String("2025-01-01".into())),
+        ]))
+        .unwrap();
+        assert!(bindings.contains(r"\renewcommand{\semester}{Summer Semester 2026-2027}"));
+        assert!(bindings.contains(r"\renewcommand{\academicyear}{2026-2027}"));
     }
 
     #[test]

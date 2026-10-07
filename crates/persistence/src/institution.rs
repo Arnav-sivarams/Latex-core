@@ -1705,6 +1705,47 @@ impl InstitutionRepository {
         tx.commit().await.map_err(InstitutionError::Database)
     }
 
+    pub async fn support_email(&self) -> Result<Option<String>, InstitutionError> {
+        sqlx::query_scalar(
+            "SELECT support_email FROM latex_core.institution_template_config WHERE singleton",
+        )
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)
+    }
+
+    pub async fn set_support_email(
+        &self,
+        actor: UserId,
+        email: Option<&str>,
+    ) -> Result<(), InstitutionError> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(InstitutionError::Database)?;
+        let admin: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM latex_core.global_user_roles WHERE user_id=$1 AND role='admin')")
+            .bind(actor.as_uuid()).fetch_one(&mut *tx).await.map_err(InstitutionError::Database)?;
+        if !admin {
+            return Err(InstitutionError::InvalidInput(
+                "Administrator required".into(),
+            ));
+        }
+        sqlx::query("UPDATE latex_core.institution_template_config SET support_email=$1,updated_by_user_id=$2,updated_at=statement_timestamp() WHERE singleton")
+            .bind(email).bind(actor.as_uuid()).execute(&mut *tx).await.map_err(InstitutionError::Database)?;
+        audit_tx(
+            &mut tx,
+            actor,
+            "institution.support_email.changed",
+            "institution_configuration",
+            Uuid::nil(),
+            json!({"configured":email.is_some()}),
+        )
+        .await?;
+        tx.commit().await.map_err(InstitutionError::Database)
+    }
+
     pub async fn global_fallback(&self) -> Result<Option<Uuid>, InstitutionError> {
         sqlx::query_scalar(
             "SELECT global_fallback_template_id FROM latex_core.institution_template_config WHERE singleton",

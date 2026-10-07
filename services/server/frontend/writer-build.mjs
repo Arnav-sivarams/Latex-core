@@ -1,6 +1,6 @@
 const ERROR_PATTERNS = [
   /^!\s+/,
-  /^[^\r\n]*:\d+:\s*(?:LaTeX\s+)?Error:/i,
+  /^[^\r\n]*\.(?:tex|ltx|sty|cls):\d+:\s*(?!.*\bWarning\b).+/i,
   /^Fatal error\b/i,
 ];
 const WARNING_PATTERNS = [
@@ -11,8 +11,10 @@ const WARNING_PATTERNS = [
 ];
 
 export function classifyBuildLine(line) {
-  if (ERROR_PATTERNS.some((pattern) => pattern.test(line))) return 'error';
-  if (WARNING_PATTERNS.some((pattern) => pattern.test(line))) return 'warning';
+  const explicit = line.match(/^.+?\.(?:tex|ltx|sty|cls):\d+:\s*(.+)$/i);
+  const message = explicit?.[1] || line;
+  if (WARNING_PATTERNS.some((pattern) => pattern.test(message))) return 'warning';
+  if (explicit || ERROR_PATTERNS.some((pattern) => pattern.test(message))) return 'error';
   return 'info';
 }
 
@@ -34,10 +36,31 @@ export function renderBuildLog(host, log, documentRef = document) {
   });
 }
 
-export function recognizedBuildProblems(log) {
-  return String(log || '').split(/\r?\n/).filter((line) => classifyBuildLine(line) !== 'info').map((message) => ({
-    severity: classifyBuildLine(message), message,
-  }));
+export function recognizedBuildProblems(log, files = [], mainFile = '') {
+  const mainDirectory = mainFile.includes('/') ? mainFile.slice(0, mainFile.lastIndexOf('/') + 1) : '';
+  return String(log || '').split(/\r?\n/).filter((line) => classifyBuildLine(line) !== 'info').map((message) => {
+    const problem = { severity: classifyBuildLine(message), message };
+    const match = message.match(/^(.+?\.(?:tex|ltx|sty|cls)):(\d+):\s*(.+)$/i);
+    if (!match) return problem;
+    const rawPath = match[1].replace(/^\.\//, '').replace(/^\/work\//, '');
+    if (rawPath.split('/').some((part) => part === '..')) return problem;
+    const file = files.find((item) => item.path === rawPath)
+      || files.find((item) => item.path === mainDirectory + rawPath);
+    return { ...problem, message: match[3], path: file?.path || rawPath,
+      file_id: file?.file_id, range: { start_line: Number(match[2]), start_column: 0 } };
+  });
+}
+
+export function problemsState(diagnostics) {
+  const errors = diagnostics.filter((item) => item.severity === 'error').length;
+  const warnings = diagnostics.filter((item) => item.severity === 'warning').length;
+  return { severity: errors ? 'error' : warnings ? 'warning' : 'neutral',
+    label: `Problems: ${errors} ${errors === 1 ? 'error' : 'errors'}, ${warnings} ${warnings === 1 ? 'warning' : 'warnings'}` };
+}
+
+export function supportLink(email) {
+  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    ? `mailto:${encodeURIComponent(email).replace('%40', '@')}?subject=LaTeX%20Core%20Support` : null;
 }
 
 export function shortBuildState(build) {

@@ -286,6 +286,13 @@ function renderAudit(events) {
 
 function renderSystem(data, overview, branding) {
   content.append(element('p', 'muted-note', 'Read-only operational summary. Administrative actions remain in the operator service.'));
+  const support = element('form', 'branding-form');
+  const supportLabel = document.createElement('label'); supportLabel.textContent = 'Support email';
+  const supportEmail = document.createElement('input'); supportEmail.type = 'email'; supportEmail.name = 'support_email'; supportEmail.maxLength = 254;
+  supportLabel.append(supportEmail); const supportSave = document.createElement('button'); supportSave.type = 'submit'; supportSave.textContent = 'Save support email';
+  support.append(supportLabel, supportSave); content.append(support);
+  api('/api/admin/v2/institution/support').then((config) => { supportEmail.value = config.support_email || ''; }).catch(showError);
+  support.addEventListener('submit', async (event) => { event.preventDefault(); try { await api('/api/admin/v2/institution/support', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ support_email: supportEmail.value || null }) }); announce('Support email saved.'); } catch (error) { showError(error); } });
   const systems = [
     ['API', 'Healthy', data.version],
     ['PostgreSQL', 'Healthy', data.database],

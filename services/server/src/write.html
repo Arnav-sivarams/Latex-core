@@ -36,6 +36,7 @@
       <button id="endReview" class="icon-button" type="button" disabled hidden aria-label="Withdraw review" title="Withdraw review"><span aria-hidden="true">■</span></button>
     </div>
     <div class="toolbar-group toolbar-secondary" aria-label="Insert">
+      <button id="writerHelp" class="quiet-button" type="button" disabled title="Support email is not configured">Help</button>
       <button id="insertMenu" class="icon-button menu-button" type="button" disabled aria-label="Insert" title="Insert"><span aria-hidden="true">＋</span><small>Insert</small></button>
     </div>
     <div class="toolbar-group toolbar-view" aria-label="View">
@@ -78,7 +79,7 @@
     <div class="pane-splitter" role="separator" aria-orientation="vertical" aria-label="Resize source and PDF panes" title="Drag to resize panes"></div>
 
     <section class="pdf-foundation workspace-pane pdf-pane" aria-labelledby="pdf-heading">
-      <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><span id="pdfRelation">No PDF yet</span><span class="shell-spacer"></span><label class="pdf-location-control">Page <input id="pdfPage" type="number" min="1" value="1"></label><label class="pdf-location-control">Zoom <select id="pdfZoom"><option value="75">75%</option><option value="100" selected>100%</option><option value="125">125%</option><option value="150">150%</option></select></label><button id="locateInPdf" class="ui-button ui-button-secondary" type="button" disabled>Locate source</button><button id="downloadPdf" class="ui-button ui-button-secondary" type="button" disabled title="Download the last successful PDF">Download PDF</button></div>
+      <div class="panel-heading"><h2 id="pdf-heading">PDF</h2><span id="pdfRelation">No PDF yet</span><span class="shell-spacer"></span><label class="pdf-location-control">Page <input id="pdfPage" type="number" min="1" value="1"></label><label class="pdf-location-control">Zoom <select id="pdfZoom"><option value="75">75%</option><option value="100" selected>100%</option><option value="125">125%</option><option value="150">150%</option></select></label><button id="locateInPdf" class="ui-button ui-button-secondary" type="button" disabled>Locate source</button><details id="downloadMenu" class="toolbar-menu download-menu"><summary aria-label="Download report"><span id="downloadLabel">Download</span><span aria-hidden="true">▾</span></summary><div class="download-menu-popover" role="menu" aria-label="Download report"><button id="downloadPdf" type="button" role="menuitem" aria-label="Download PDF" title="Download the last successful PDF" disabled>PDF</button><button id="downloadSource" type="button" role="menuitem" aria-label="Download source as ZIP" title="Download the current durable source workspace" disabled>Source (.zip)</button></div></details></div>
       <div id="pdfEmpty" class="foundation-empty"><strong>No PDF yet</strong><p>Compile the current paper to create an exact PDF.</p></div>
       <div id="pdfScroll" class="writer-pdf-scroll" aria-label="Current successful PDF; double-click to locate source" title="Double-click the PDF to locate source" tabindex="0" hidden><div id="pdfViewport" class="writer-pdf-viewport"></div></div>
     </section>
@@ -99,9 +100,9 @@
     </div>
   </section>
 
-  <div id="fileActionsMenu" class="compact-popover file-actions-menu" hidden>
-    <button id="renameFile" type="button" disabled>Rename</button><button id="deleteFile" type="button" disabled>Delete</button><button id="setMain" type="button" disabled>Set Main</button><hr>
-    <button id="structuralUndo" type="button" disabled>Undo file action</button><button id="structuralRedo" type="button" disabled>Redo file action</button>
+  <div id="fileActionsMenu" class="compact-popover file-actions-menu" role="menu" aria-label="File actions" hidden>
+    <button id="renameFile" role="menuitem" type="button" disabled>Rename</button><button id="deleteFile" role="menuitem" type="button" disabled>Delete</button><button id="setMain" role="menuitem" type="button" disabled>Set Main</button><hr>
+    <button id="structuralUndo" role="menuitem" type="button" disabled>Undo file action</button><button id="structuralRedo" role="menuitem" type="button" disabled>Redo file action</button>
   </div>
 
   <aside id="workspaceDrawer" class="workspace-drawer" hidden aria-labelledby="drawerTitle">
@@ -118,7 +119,6 @@
   <button id="tableBuilder" type="button" hidden aria-label="Legacy table builder" title="Table">Table</button>
   <button id="figureBuilder" type="button" hidden aria-label="Legacy figure builder" title="Figure">Figure</button>
   <button id="plotBuilder" type="button" hidden aria-label="Legacy plot builder" title="Plot">Plot</button>
-  <button id="copyRecoveryText" type="button" hidden>Copy recovery text</button>
   <div id="writerNotice" class="status-region" aria-live="polite"></div>
   <script type="module" src="/static/writer.js?v=tomorrow-release-hotfix"></script>
 </body>

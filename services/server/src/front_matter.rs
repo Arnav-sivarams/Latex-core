@@ -134,22 +134,15 @@ pub fn single_source_compatible(main: &[u8]) -> bool {
     single_source_binding_point(main).is_some()
 }
 
-pub fn bind_single_source_values(
-    main: &[u8],
+fn source_binding_inputs(
     values: &BTreeMap<String, Value>,
-) -> Result<Bytes, FrontMatterError> {
-    let source = std::str::from_utf8(main).map_err(|_| FrontMatterError::InvalidManifest)?;
-    let point = single_source_binding_point(main).ok_or_else(|| {
-        FrontMatterError::InvalidValue(
-            "complete report template metadata compatibility: exactly one safe pre-document binding point and a recognized institutional macro declaration are required".into(),
-        )
-    })?;
+) -> Result<BTreeMap<String, Value>, FrontMatterError> {
     let mut canonical = values.clone();
     if let (Some(semester), Some(date)) = (
         values
             .get("team.semester")
             .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty()),
+            .filter(|value| value.parse::<u8>().is_ok()),
         values
             .get("submission_date")
             .and_then(Value::as_str)
@@ -161,9 +154,23 @@ pub fn bind_single_source_values(
             values.get("team.academic_year").and_then(Value::as_str),
         )?;
         canonical
-            .entry("team.academic_year".to_owned())
-            .or_insert(Value::String(derived.academic_year));
+            .entry("team.academic_year".into())
+            .or_insert(derived.academic_year.into());
     }
+    Ok(canonical)
+}
+
+pub fn bind_single_source_values(
+    main: &[u8],
+    values: &BTreeMap<String, Value>,
+) -> Result<Bytes, FrontMatterError> {
+    let source = std::str::from_utf8(main).map_err(|_| FrontMatterError::InvalidManifest)?;
+    let point = single_source_binding_point(main).ok_or_else(|| {
+        FrontMatterError::InvalidValue(
+            "complete report template metadata compatibility: exactly one safe pre-document binding point and a recognized institutional macro declaration are required".into(),
+        )
+    })?;
+    let canonical = source_binding_inputs(values)?;
     let mut binding = legacy::single_source_bindings(&canonical)?;
     // Keep canonical inputs for macros whose display values are derived.
     for (key, command) in CANONICAL_INPUTS {

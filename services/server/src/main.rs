@@ -19,6 +19,7 @@ mod integration_api;
 )]
 mod mail;
 mod review_api;
+mod support;
 mod writer_diagnostics;
 use axum::{
     Json, Router,
@@ -30,8 +31,8 @@ use axum::{
 };
 use blob_store::{BlobStore, FsBlobStore, FsBlobStoreConfig};
 use core_types::{
-    ArtifactId, CompileKeyMaterialV1, CostClass, FileEntryV1, IdempotencyKey, JobId,
-    LatexmkProfileId, LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
+    ArtifactId, CompileKeyMaterialV1, CostClass, IdempotencyKey, JobId, LatexmkProfileId,
+    LogicalPath, ShellPolicy, TexEngine, TexEnvironmentId, UserId, WorkspaceId,
     WorkspaceManifestV1, WorkspaceVersion,
 };
 use image::{GenericImageView, ImageFormat, ImageReader, Limits};
@@ -54,6 +55,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fmt::Write as _,
+    io::Write as _,
     net::SocketAddr,
     process::Command,
     str::FromStr,
@@ -746,6 +748,11 @@ fn router(state: AppState) -> Router {
             "/api/admin/v2/credential-emails/{delivery_id}/retry",
             post(admin_v2_retry_credential_email),
         )
+        .route("/api/v2/support", get(support::read))
+        .route(
+            "/api/admin/v2/institution/support",
+            get(support::read).put(support::save),
+        )
         .route(
             "/api/admin/v2/templates/preview",
             post(admin_v2_template_preview),
@@ -957,6 +964,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v2/papers/{paper_id}/files",
             get(v2_paper_files).post(v2_create_file),
+        )
+        .route(
+            "/api/v2/papers/{paper_id}/source.zip",
+            get(v2_source_archive),
         )
         .route(
             "/api/v2/papers/{paper_id}/files/{file_id}",
@@ -3452,16 +3463,6 @@ fn project_definition_bytes(
         ),
     );
     values.insert(
-        "project.department_names".into(),
-        serde_json::json!(
-            input
-                .department_display_names
-                .iter()
-                .map(|item| &item.display_name)
-                .collect::<Vec<_>>()
-        ),
-    );
-    values.insert(
         "project.school_names".into(),
         serde_json::json!(
             input
@@ -3471,19 +3472,6 @@ fn project_definition_bytes(
                 .collect::<Vec<_>>()
         ),
     );
-    if !input.department_display_names.is_empty() {
-        values.insert(
-            "department_name".into(),
-            serde_json::Value::String(
-                input
-                    .department_display_names
-                    .iter()
-                    .map(|item| item.display_name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" / "),
-            ),
-        );
-    }
     if !input.school_display_names.is_empty() {
         values.insert(
             "school_name".into(),
@@ -3686,13 +3674,22 @@ async fn v2_project_metadata(
     }
 }
 
+#[derive(Deserialize)]
+struct ProjectMetadataSaveInput {
+    #[serde(flatten)]
+    metadata: ProjectMetadataInput,
+    #[serde(default)]
+    document_details: BTreeMap<String, serde_json::Value>,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn v2_save_project_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(paper_id): Path<uuid::Uuid>,
-    Json(input): Json<ProjectMetadataInput>,
+    Json(request): Json<ProjectMetadataSaveInput>,
 ) -> Response {
+    let input = request.metadata;
     if let Err(response) = csrf(&headers) {
         return response;
     }
@@ -3719,12 +3716,71 @@ async fn v2_save_project_metadata(
         }
         Err(error_value) => return front_matter_repository_error(error_value),
     };
-    let arrangement = state
+    let arrangement = match state
         .front_matter
         .paper_template_arrangement(paper_id)
         .await
-        .ok()
-        .map(|value| value.0);
+    {
+        Ok(value) => Some(value.0),
+        Err(FrontMatterRepositoryError::NotFound) => None,
+        Err(value) => return front_matter_repository_error(value),
+    };
+    if arrangement.as_deref() == Some("SINGLE_SOURCE") {
+        if !input.department_display_names.is_empty() || !input.school_display_names.is_empty() {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Institutional display names must be configured by an administrator",
+            );
+        }
+        if request
+            .document_details
+            .values()
+            .any(|value| !value.is_string())
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Document details must be text values",
+            );
+        }
+        let current = match single_source_document_details(&state, paper_id, &detail).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let effective = |key: &str| {
+            request
+                .document_details
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    current["values"]
+                        .as_array()?
+                        .iter()
+                        .find(|item| item["field_key"] == key)?["value"]
+                        .as_str()
+                })
+                .unwrap_or("")
+        };
+        if let Err(value) = front_matter::legacy::document_calendar(
+            effective("team_semester"),
+            effective("team_academic_year"),
+        ) {
+            return error(StatusCode::BAD_REQUEST, value.to_string());
+        }
+        if request.document_details.keys().any(|key| {
+            !current["manifest"]["fields"]
+                .as_array()
+                .is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| field["key"] == *key && field["allow_team_override"] == true)
+                })
+        }) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Institutional values cannot be overridden",
+            );
+        }
+    }
     let automatic_result = if arrangement.as_deref() == Some("SINGLE_SOURCE") {
         state
             .front_matter
@@ -3794,6 +3850,48 @@ async fn v2_save_project_metadata(
                 .record_materialization_warning(paper_id, "FRONT_MATTER_RENDER_FAILED", WARNING)
                 .await;
         }
+    }
+    if arrangement.as_deref() == Some("SINGLE_SOURCE") {
+        let response = v2_save_document_details(
+            State(state.clone()),
+            headers,
+            Path(paper_id),
+            Json(FrontMatterDetailsInput {
+                values: request.document_details,
+                sections: BTreeMap::new(),
+            }),
+        )
+        .await;
+        if !response.status().is_success() {
+            return response;
+        }
+        let bytes = match axum::body::to_bytes(response.into_body(), MAX_FILE_BYTES).await {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metadata response unavailable",
+                );
+            }
+        };
+        let saved: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metadata response invalid",
+                );
+            }
+        };
+        version = match saved["workspace_version"].as_u64() {
+            Some(value) => value,
+            None => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metadata version unavailable",
+                );
+            }
+        };
     }
     Json(serde_json::json!({"paper_team_id":paper_id,"workspace_version":version,"project_metadata":input,"front_matter_warning":warning,"auto_build_required":false})).into_response()
 }
@@ -4021,17 +4119,29 @@ async fn single_source_document_details(
     }
     let automatic = state
         .front_matter
-        .legacy_automatic_values(
-            paper_id,
-            overrides
-                .get("guide_identity")
-                .and_then(serde_json::Value::as_str),
-            overrides
-                .get("dean_identity")
-                .and_then(serde_json::Value::as_str),
-        )
+        .legacy_automatic_values(paper_id, None, None)
         .await
         .map_err(front_matter_repository_error)?;
+    // These two document inputs exist even in older templates without a dedicated macro.
+    commands.extend(["semester".to_owned(), "academicyear".to_owned()]);
+    for key in ["team_semester", "team_academic_year"] {
+        overrides
+            .entry(key.into())
+            .or_insert(serde_json::Value::String(String::new()));
+    }
+    if let Some(value) = overrides
+        .get("team_semester")
+        .and_then(serde_json::Value::as_str)
+    {
+        let selected = ["Winter Semester", "Summer Semester"]
+            .into_iter()
+            .find(|label| value.starts_with(label))
+            .unwrap_or("");
+        overrides.insert(
+            "team_semester".into(),
+            serde_json::Value::String(selected.into()),
+        );
+    }
     let mut fields = BTreeMap::new();
     let mut values = BTreeMap::new();
     let mut missing = BTreeSet::new();
@@ -4044,50 +4154,30 @@ async fn single_source_document_details(
             .get(*source)
             .filter(|_| !front_matter::document_owned_source(source))
             .cloned()
-            .or_else(|| overrides.get(&key).cloned())
-            .or_else(|| automatic.get(*source).cloned())
+            .or_else(|| {
+                front_matter::document_owned_source(source)
+                    .then(|| overrides.get(&key).cloned())
+                    .flatten()
+            })
             .unwrap_or(serde_json::Value::Null);
-        let source_name = if overrides.contains_key(&key)
-            && (front_matter::document_owned_source(source) || !automatic.contains_key(*source))
-        {
-            "TEAM_OVERRIDE"
-        } else {
-            "AUTO"
-        };
+        let source_name =
+            if overrides.contains_key(&key) && front_matter::document_owned_source(source) {
+                "TEAM_OVERRIDE"
+            } else {
+                "AUTO"
+            };
         let resolved = value.as_str().is_some_and(|value| !value.trim().is_empty());
-        if !resolved && *source != "project.title" {
+        if !resolved && !matches!(*source, "project.title" | "specialization") {
             missing.insert(key.clone());
-        }
-        if *command == "projguidename" || *command == "projguidedesignation" {
-            let options = automatic
-                .get("guide.options")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            let selection_required =
-                !resolved && options.as_array().is_some_and(|options| options.len() > 1);
-            fields.entry("guide_identity".to_owned()).or_insert_with(|| serde_json::json!({
-                "key":"guide_identity","label":"Project guide selection","type":"TEXT","required":selection_required,"source":null,"allow_team_override":true,"options":options
-            }));
-            values.entry("guide_identity".to_owned()).or_insert_with(|| serde_json::json!({"field_key":"guide_identity","value":overrides.get("guide_identity").cloned().unwrap_or(serde_json::Value::Null),"value_source":"TEAM_OVERRIDE"}));
-        } else if *command == "deanname" {
-            let options = automatic
-                .get("dean.options")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            let selection_required =
-                !resolved && options.as_array().is_some_and(|options| options.len() > 1);
-            fields.entry("dean_identity".to_owned()).or_insert_with(|| serde_json::json!({
-                "key":"dean_identity","label":"Dean selection","type":"TEXT","required":selection_required,"source":null,"allow_team_override":true,"options":options
-            }));
-            values.entry("dean_identity".to_owned()).or_insert_with(|| serde_json::json!({"field_key":"dean_identity","value":overrides.get("dean_identity").cloned().unwrap_or(serde_json::Value::Null),"value_source":"TEAM_OVERRIDE"}));
         }
         fields.entry(key.clone()).or_insert_with(|| serde_json::json!({
                 "key":key,
                 "label":label,
                 "type":if *source == "submission_date" { "DATE" } else { "TEXT" },
-                "required":*source != "project.title",
+                "required":!matches!(*source, "project.title" | "specialization"),
                 "source":source,
-                "allow_team_override":*editable && (front_matter::document_owned_source(source) || !automatic.contains_key(*source)) && !matches!(*source, "guide.name" | "guide.designation" | "dean.name"),
+                "allow_team_override":*editable && front_matter::document_owned_source(source),
+                "options": if *source == "team.semester" { serde_json::json!([{"value":"Winter Semester","label":"Winter Semester"},{"value":"Summer Semester","label":"Summer Semester"}]) } else { serde_json::Value::Null },
             }));
         values.entry(key.clone()).or_insert_with(
             || serde_json::json!({"field_key":key,"value":value,"value_source":source_name}),
@@ -4275,28 +4365,17 @@ async fn v2_save_document_details(
             }
         }
         submitted.extend(input.values.clone());
-        if input.values.keys().any(|key| {
-            matches!(
-                key.as_str(),
-                "team_semester" | "submission_date" | "team_academic_year"
-            )
-        }) && let (Some(semester), Some(submission_date)) = (
+        if let Err(value) = front_matter::legacy::document_calendar(
             submitted
                 .get("team_semester")
-                .and_then(serde_json::Value::as_str),
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
             submitted
-                .get("submission_date")
-                .and_then(serde_json::Value::as_str),
+                .get("team_academic_year")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
         ) {
-            if let Err(value) = front_matter::legacy::derive_semester_metadata(
-                semester,
-                submission_date,
-                submitted
-                    .get("team_academic_year")
-                    .and_then(serde_json::Value::as_str),
-            ) {
-                return error(StatusCode::BAD_REQUEST, value.to_string());
-            }
+            return error(StatusCode::BAD_REQUEST, value.to_string());
         }
         if input.values.values().any(|value| !value.is_string()) {
             return error(
@@ -4348,28 +4427,29 @@ async fn v2_save_document_details(
         let mut values = front_matter::single_source_managed_values_from_tex(&main);
         let automatic = match state
             .front_matter
-            .legacy_automatic_values(
-                paper_id,
-                submitted
-                    .get("guide_identity")
-                    .and_then(serde_json::Value::as_str),
-                submitted
-                    .get("dean_identity")
-                    .and_then(serde_json::Value::as_str),
-            )
+            .legacy_automatic_values(paper_id, None, None)
             .await
         {
             Ok(value) => value,
             Err(value) => return front_matter_repository_error(value),
         };
-        for (key, value) in automatic {
-            if !front_matter::document_owned_source(&key) {
-                values.insert(key, value);
-            }
-        }
         for (_, source, _, _) in front_matter::legacy::REGISTRY {
-            if let Some(value) = input.values.get(&source.replace('.', "_")) {
-                values.insert((*source).to_owned(), value.clone());
+            if front_matter::document_owned_source(source) {
+                if let Some(value) = input.values.get(&source.replace('.', "_")).or_else(|| {
+                    matches!(*source, "team.semester" | "team.academic_year")
+                        .then(|| submitted.get(&source.replace('.', "_")))
+                        .flatten()
+                }) {
+                    values.insert((*source).to_owned(), value.clone());
+                }
+            } else {
+                values.insert(
+                    (*source).to_owned(),
+                    automatic
+                        .get(*source)
+                        .cloned()
+                        .unwrap_or(serde_json::json!("")),
+                );
             }
         }
         let bound = match front_matter::bind_single_source_values(&main, &values) {
@@ -4390,6 +4470,44 @@ async fn v2_save_document_details(
             blob_hash: stored.hash(),
             size_bytes: stored.size_bytes(),
         };
+        let mut source_files = vec![source_file];
+        for path in workspace.files().keys().filter(|path| {
+            *path != &main_path
+                && matches!(
+                    path.as_str().rsplit('/').next(),
+                    Some("acknowledgement.tex" | "acknowledgment.tex" | "certificate.tex")
+                )
+        }) {
+            let original = match state.workspaces.read_file(workspace_id, path).await {
+                Ok(value) => value,
+                Err(_) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "front matter source unavailable",
+                    );
+                }
+            };
+            let formatted = match front_matter::format_student_front_matter(&original) {
+                Ok(value) => value,
+                Err(value) => return error(StatusCode::BAD_REQUEST, value.to_string()),
+            };
+            if formatted != original {
+                let stored = match state.blobs.put(formatted).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "front matter storage failed",
+                        );
+                    }
+                };
+                source_files.push(ManagedFrontMatterFile {
+                    path: path.to_string(),
+                    blob_hash: stored.hash(),
+                    size_bytes: stored.size_bytes(),
+                });
+            }
+        }
         let (version, document_epoch) = match state
             .front_matter
             .save_single_source_values(
@@ -4397,7 +4515,7 @@ async fn v2_save_document_details(
                 paper_id,
                 &submitted,
                 workspace.version().get(),
-                &source_file,
+                &source_files,
             )
             .await
         {
@@ -5507,6 +5625,167 @@ async fn v2_paper_files(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SourceArchiveError {
+    #[error("source archive exceeds the download size limit")]
+    ArchiveTooLarge,
+    #[error("source archive contains too many files")]
+    TooManyFiles,
+    #[error("source archive contains an oversized file")]
+    FileTooLarge,
+    #[error("source archive exceeds the project size limit")]
+    ProjectTooLarge,
+    #[error("source archive contains a duplicate path")]
+    DuplicatePath,
+    #[error("source archive could not be written")]
+    Write(#[from] std::io::Error),
+    #[error("source archive could not be finalized")]
+    Zip(#[from] zip::result::ZipError),
+}
+
+fn build_source_archive(
+    files: impl IntoIterator<Item = (LogicalPath, Bytes)>,
+) -> Result<Bytes, SourceArchiveError> {
+    let mut output = std::io::Cursor::new(Vec::new());
+    let mut paths = BTreeSet::new();
+    let mut file_count = 0_usize;
+    let mut expanded_size = 0_u64;
+    {
+        let mut writer = zip::ZipWriter::new(&mut output);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (path, bytes) in files {
+            if !paths.insert(path.clone()) {
+                return Err(SourceArchiveError::DuplicatePath);
+            }
+            file_count = file_count
+                .checked_add(1)
+                .ok_or(SourceArchiveError::TooManyFiles)?;
+            if file_count > archive::MAX_FILES {
+                return Err(SourceArchiveError::TooManyFiles);
+            }
+            let size = u64::try_from(bytes.len()).map_err(|_| SourceArchiveError::FileTooLarge)?;
+            if size > archive::MAX_FILE_BYTES {
+                return Err(SourceArchiveError::FileTooLarge);
+            }
+            expanded_size = expanded_size
+                .checked_add(size)
+                .ok_or(SourceArchiveError::ProjectTooLarge)?;
+            if expanded_size > archive::MAX_EXPANDED_BYTES {
+                return Err(SourceArchiveError::ProjectTooLarge);
+            }
+            writer.start_file(path.as_str(), options)?;
+            writer.write_all(&bytes)?;
+        }
+        writer.finish()?;
+    }
+    let output = output.into_inner();
+    if output.len() > archive::MAX_ARCHIVE_BYTES {
+        return Err(SourceArchiveError::ArchiveTooLarge);
+    }
+    Ok(Bytes::from(output))
+}
+
+fn source_archive_filename(name: &str) -> String {
+    let mut stem = String::with_capacity(name.len());
+    let mut separated = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            stem.push(character);
+            separated = false;
+        } else if !separated && !stem.is_empty() {
+            stem.push('-');
+            separated = true;
+        }
+    }
+    let stem = stem.trim_matches(['.', '-', '_']);
+    format!(
+        "{}-source.zip",
+        if stem.is_empty() { "report" } else { stem }
+    )
+}
+
+async fn v2_source_archive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    if state
+        .collaboration
+        .flush_workspace(paper.workspace_id)
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "collaboration flush failed; source was not exported",
+        );
+    }
+    let workspace = match state.workspaces.restore(paper.workspace_id).await {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace restore failed",
+            );
+        }
+    };
+    let visible = match state.v2.visible_paper_files(paper.workspace_id).await {
+        Ok(value) => value,
+        Err(error_value) => return v2_error(error_value),
+    };
+    let mut files = Vec::with_capacity(visible.len());
+    for file in visible {
+        let Some(entry) = workspace.files().get(&file.path) else {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace file metadata is inconsistent",
+            );
+        };
+        let bytes = match state.blobs.get(entry.blob_hash()).await {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "workspace file content is unavailable",
+                );
+            }
+        };
+        files.push((file.path, bytes));
+    }
+    let archive = match build_source_archive(files) {
+        Ok(value) => value,
+        Err(failure) => {
+            tracing::error!(paper_id = %paper_id, error = %failure, "source archive failed");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string());
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/zip".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"{}\"",
+                    source_archive_filename(&paper.name)
+                ),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        archive,
+    )
+        .into_response()
+}
+
 async fn v2_file(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5718,6 +5997,10 @@ async fn v2_rename_file(
         .await
     {
         Ok((file, version)) => {
+            state
+                .collaboration
+                .files_changed(file.workspace_id, file.file_id, file.revision)
+                .await;
             Json(serde_json::json!({"file":file,"version":version})).into_response()
         }
         Err(error_value) => v2_error(error_value),
@@ -5779,6 +6062,10 @@ async fn v2_delete_file(
             state
                 .collaboration
                 .file_deleted(paper.workspace_id, file_id)
+                .await;
+            state
+                .collaboration
+                .files_changed(paper.workspace_id, file_id, file.revision.saturating_add(1))
                 .await;
             Json(serde_json::json!({"version":version})).into_response()
         }
@@ -6536,167 +6823,6 @@ async fn capture_exact_v2_state(
     })
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "compile-only binding keeps snapshot validation, metadata resolution, and immutable blob construction together"
-)]
-async fn prepare_single_source_compile_snapshot(
-    state: &AppState,
-    paper: &persistence::WriterPaper,
-    exact: &mut ExactV2State,
-) -> Result<(), Response> {
-    let arrangement = state
-        .front_matter
-        .paper_template_arrangement(paper.id)
-        .await
-        .map_err(front_matter_repository_error)?
-        .0;
-    if arrangement != "SINGLE_SOURCE" {
-        return Ok(());
-    }
-    let workspace: WorkspaceManifestV1 =
-        serde_json::from_value(exact.manifest.get("workspace").cloned().ok_or_else(|| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "compile snapshot has no workspace manifest",
-            )
-        })?)
-        .map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "compile snapshot has an invalid workspace manifest",
-            )
-        })?;
-    let main_path = workspace.main_file().clone();
-    let source_workspace = serde_json::to_value(&workspace).map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "single-source source manifest serialization failed",
-        )
-    })?;
-    let main_entry = workspace.files().get(&main_path).ok_or_else(|| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "compile snapshot has no main file",
-        )
-    })?;
-    let main = state.blobs.get(main_entry.blob_hash).await.map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "single-source main file is unavailable",
-        )
-    })?;
-    let overrides = state
-        .front_matter
-        .single_source_values(paper.id)
-        .await
-        .map_err(front_matter_repository_error)?;
-    let automatic = state
-        .front_matter
-        .legacy_automatic_values(
-            paper.id,
-            overrides
-                .get("guide_identity")
-                .and_then(serde_json::Value::as_str),
-            overrides
-                .get("dean_identity")
-                .and_then(serde_json::Value::as_str),
-        )
-        .await
-        .map_err(front_matter_repository_error)?;
-    let mut values = front_matter::single_source_managed_values_from_tex(&main);
-    values.extend(automatic.into_iter().filter(|(key, _)| {
-        front_matter::legacy::REGISTRY
-            .iter()
-            .any(|(_, source, _, _)| *source == key && !front_matter::document_owned_source(source))
-    }));
-    let bound = front_matter::bind_single_source_values(&main, &values).map_err(|value| {
-        error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("Complete report template metadata compatibility: {value}"),
-        )
-    })?;
-    let mut files = workspace.files().clone();
-    let mut changed = bound != main;
-    if changed {
-        let stored = state.blobs.put(bound).await.map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "single-source binding storage failure",
-            )
-        })?;
-        files.insert(
-            main_path.clone(),
-            FileEntryV1 {
-                blob_hash: stored.hash(),
-                size_bytes: stored.size_bytes(),
-            },
-        );
-    }
-    for (path, entry) in workspace.files() {
-        if !matches!(
-            path.as_str().rsplit('/').next(),
-            Some("acknowledgement.tex" | "acknowledgment.tex" | "certificate.tex")
-        ) {
-            continue;
-        }
-        let original = state.blobs.get(entry.blob_hash).await.map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "front matter source unavailable",
-            )
-        })?;
-        let formatted = front_matter::format_student_front_matter(&original)
-            .map_err(|value| error(StatusCode::BAD_REQUEST, value.to_string()))?;
-        if formatted != original {
-            changed = true;
-            let stored = state.blobs.put(formatted).await.map_err(|_| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "front matter formatting storage failed",
-                )
-            })?;
-            files.insert(
-                path.clone(),
-                FileEntryV1 {
-                    blob_hash: stored.hash(),
-                    size_bytes: stored.size_bytes(),
-                },
-            );
-        }
-    }
-    if !changed {
-        return Ok(());
-    }
-    let compile_manifest = WorkspaceManifestV1::new(main_path, files).map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "single-source compile manifest is invalid",
-        )
-    })?;
-    let snapshot_id = state
-        .workspaces
-        .store_compile_snapshot(&compile_manifest)
-        .await
-        .map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "single-source compile snapshot storage failure",
-            )
-        })?;
-    exact.manifest["workspace"] = serde_json::to_value(&compile_manifest).map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "single-source compile manifest serialization failed",
-        )
-    })?;
-    exact.manifest["source_workspace"] = source_workspace;
-    exact.snapshot_id = snapshot_id;
-    exact.state_hash = snapshot_id.to_hex();
-    tracing::info!(paper_id=%paper.id, snapshot_id=%snapshot_id, "single-source compile snapshot prepared");
-    Ok(())
-}
-
 async fn v2_create_checkpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7211,14 +7337,10 @@ async fn v2_submit_build(
             return error(StatusCode::FORBIDDEN, "Writer or assigned Mentor required");
         }
     };
-    let mut exact = match capture_exact_v2_state(&state, &paper).await {
+    let exact = match capture_exact_v2_state(&state, &paper).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    if let Err(response) = prepare_single_source_compile_snapshot(&state, &paper, &mut exact).await
-    {
-        return response;
-    }
     let engine = TexEngine::PdfLatex;
     let profile = LatexmkProfileId::parse("safe-v1").expect("static profile is valid");
     let compile_key = match CompileKeyMaterialV1::new(
@@ -7816,10 +7938,13 @@ fn v2_error(error_value: V2Error) -> Response {
         V2Error::RoleMissing { .. } | V2Error::RoleForbidden { .. } => {
             error(StatusCode::FORBIDDEN, error_value.to_string())
         }
+        V2Error::DuplicateFilePath { .. } => error(
+            StatusCode::CONFLICT,
+            "a file already exists at the requested project path",
+        ),
         V2Error::PersonalPaperOwnershipConflict { .. }
         | V2Error::TeamMembershipConflict { .. }
         | V2Error::WorkspaceConflict { .. }
-        | V2Error::DuplicateFilePath { .. }
         | V2Error::Conflict { .. }
         | V2Error::VersionConflict { .. } => error(StatusCode::CONFLICT, error_value.to_string()),
         V2Error::NotFound { .. } => error(StatusCode::NOT_FOUND, error_value.to_string()),
@@ -11313,18 +11438,22 @@ fn writer_html() -> &'static str {
 }
 
 fn home_html(role: GlobalRole) -> String {
-    let (title, intro, cta, cta_href) = match role {
+    let (title, intro, cta, cta_href, team_chat_header, team_chat_nav) = match role {
         GlobalRole::Mentor => (
             "Review Workspace",
             "Open an assigned report to review its source, PDF, and feedback.",
             "Open Review",
             "/review",
+            "<a id=\"teamChatLink\" class=\"quiet-button\" href=\"/team-chat\">Team Chat</a>",
+            "<a class=\"projects-nav-item\" href=\"/team-chat\"><span aria-hidden=\"true\">◌</span>Team Chat</a>",
         ),
         GlobalRole::Writer => (
             "Your Projects",
             "Open a report to continue writing or reviewing.",
             "Open Writer",
             "/write",
+            "",
+            "",
         ),
         GlobalRole::Admin => unreachable!("admin users do not render the shared home"),
     };
@@ -11334,6 +11463,8 @@ fn home_html(role: GlobalRole) -> String {
         .replace("{{HOME_INTRO}}", intro)
         .replace("{{HOME_CTA}}", cta)
         .replace("{{HOME_CTA_HREF}}", cta_href)
+        .replace("{{TEAM_CHAT_HEADER_LINK}}", team_chat_header)
+        .replace("{{TEAM_CHAT_NAV_LINK}}", team_chat_nav)
 }
 
 fn team_chat_html() -> &'static str {
@@ -11615,6 +11746,168 @@ async fn state_js() -> Response {
 #[allow(clippy::expect_used, reason = "unit assertion fixture")]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn actual_complete_report_macros_and_source_zip_share_literal_document_values() {
+        let root = "Full_Report_template_v1.0/Full_Report_v1.0.tex";
+        let archive = include_bytes!("../../../artifacts/Full_Report_template_v1.1.zip");
+        let mut template =
+            zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("actual template archive");
+        let mut main = Vec::new();
+        template
+            .by_name(root)
+            .expect("canonical source")
+            .read_to_end(&mut main)
+            .expect("source bytes");
+        assert!(String::from_utf8_lossy(&main).contains(r"\newcommand{\coursecode}{BCSXXXX}"));
+        let values = BTreeMap::from([
+            ("course_code".into(), serde_json::json!("BA101")),
+            ("team.semester".into(), serde_json::json!("Winter Semester")),
+            ("team.academic_year".into(), serde_json::json!("2026-2027")),
+            ("student.a.name".into(), serde_json::json!("Arnav Sivaram")),
+            ("student.a.reg_no".into(), serde_json::json!("22BCE2308")),
+            ("student.b.name".into(), serde_json::json!("Meera Krishnan")),
+            ("student.b.reg_no".into(), serde_json::json!("22BCE2309")),
+            (
+                "degree_name".into(),
+                serde_json::json!("Master of Technology"),
+            ),
+            (
+                "department_name".into(),
+                serde_json::json!("Computer Science and Engineering"),
+            ),
+            ("guide.name".into(), serde_json::json!("Dr. Rao")),
+            ("dean.name".into(), serde_json::json!("Dr. Krishnan")),
+        ]);
+        let bound =
+            front_matter::bind_single_source_values(&main, &values).expect("safe managed patch");
+        let text = String::from_utf8_lossy(&bound);
+        assert!(text.contains(r"\newcommand{\coursecode}{BA101}"));
+        assert!(text.contains(r"\newcommand{\semester}{Winter Semester 2026-2027}"));
+        assert!(text.contains(r"\renewcommand{\academicyear}{2026-2027}"));
+        assert!(text.contains(r"\newcommand{\programdegree}{Master of Technology}"));
+        assert!(text.contains(r"\include{coverpage.tex}"));
+        assert!(!text.contains("BCSXXXX"));
+        let mut files = vec![(
+            LogicalPath::parse(root).expect("source path"),
+            bound.clone(),
+        )];
+        for name in ["acknowledgement.tex", "certificate.tex"] {
+            let path = format!("Full_Report_template_v1.0/{name}");
+            let mut original = Vec::new();
+            template
+                .by_name(&path)
+                .expect("actual front matter page")
+                .read_to_end(&mut original)
+                .expect("page source");
+            let formatted = front_matter::format_student_front_matter(&original)
+                .expect("student separator patch");
+            assert!(
+                String::from_utf8_lossy(&formatted).contains(r"\studentAname\ (\studentAregno)")
+            );
+            files.push((LogicalPath::parse(&path).expect("page path"), formatted));
+        }
+        let export = build_source_archive(files).expect("portable source archive");
+        let mut exported =
+            zip::ZipArchive::new(std::io::Cursor::new(export)).expect("exported ZIP");
+        let mut source = Vec::new();
+        exported
+            .by_name(root)
+            .expect("canonical exported source")
+            .read_to_end(&mut source)
+            .expect("exported bytes");
+        assert_eq!(source.as_slice(), bound.as_ref());
+    }
+
+    #[test]
+    fn metadata_save_request_accepts_source_backed_document_fields() {
+        let request: ProjectMetadataSaveInput = serde_json::from_value(serde_json::json!({
+            "executive_summary":null,"project_type":"capstone","datasets":[],"source_code_snippets":[],"publications":[],"department_display_names":[],"school_display_names":[],"setup_complete":true,
+            "document_details":{"course_code":"BA101","team_semester":"Winter Semester","team_academic_year":"2026-2027"}
+        })).expect("metadata and source fields share one save request");
+        assert_eq!(
+            request.document_details.get("course_code"),
+            Some(&serde_json::json!("BA101"))
+        );
+        assert_eq!(request.metadata.project_type.as_deref(), Some("capstone"));
+    }
+
+    #[test]
+    fn writer_home_hides_team_chat_without_removing_mentor_navigation_or_comments() {
+        let writer_home = home_html(GlobalRole::Writer);
+        let mentor_home = home_html(GlobalRole::Mentor);
+        assert!(!writer_home.contains("/team-chat"));
+        assert!(!writer_home.contains("Team Chat"));
+        assert!(mentor_home.contains("/team-chat"));
+        assert!(mentor_home.contains("Team Chat"));
+        assert!(writer_html().contains("<span>Comments</span>"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_path_response_does_not_expose_workspace_identity() {
+        let workspace_id = WorkspaceId::new();
+        let response = v2_error(V2Error::DuplicateFilePath {
+            workspace_id,
+            path: "existing.tex".to_owned(),
+        });
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bounded error response");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("JSON error response");
+        assert_eq!(
+            payload["error"],
+            "a file already exists at the requested project path"
+        );
+        assert!(!payload.to_string().contains(&workspace_id.to_string()));
+    }
+
+    #[test]
+    fn source_archive_preserves_canonical_workspace_paths_and_bytes() {
+        let expected = [
+            ("main.tex", b"\\documentclass{article}\n".as_slice()),
+            ("chapters/introduction.tex", b"Introduction\n".as_slice()),
+            ("images/pixel.png", &[0, 1, 2, 0xff]),
+            ("images/reference.pdf", b"%PDF-user-asset".as_slice()),
+            ("references.bib", b"@book{x,title={X}}".as_slice()),
+            ("styles/demo.bst", b"ENTRY{}{}{}".as_slice()),
+            ("styles/demo.cls", b"class bytes".as_slice()),
+            ("styles/demo.sty", b"style bytes".as_slice()),
+            ("config/demo.cfg", b"configuration".as_slice()),
+            ("data/results.csv", b"x,y\n1,2\n".as_slice()),
+            ("notes/readme.txt", b"portable notes".as_slice()),
+        ];
+        let files = expected
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    LogicalPath::parse(path).expect("valid project path"),
+                    Bytes::copy_from_slice(bytes),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let archive = build_source_archive(files).expect("archive should be created");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("valid ZIP");
+        assert_eq!(zip.len(), expected.len());
+        for (path, bytes) in expected {
+            let mut member = zip.by_name(path).expect("expected archive member");
+            let mut actual = Vec::new();
+            member.read_to_end(&mut actual).expect("member should read");
+            assert_eq!(actual, bytes, "{path} bytes must be preserved");
+        }
+    }
+
+    #[test]
+    fn source_archive_download_name_is_sanitized() {
+        assert_eq!(
+            source_archive_filename("Demo Team / Final Report"),
+            "Demo-Team-Final-Report-source.zip"
+        );
+        assert_eq!(source_archive_filename("../"), "report-source.zip");
+    }
 
     #[test]
     fn runtime_logs_merge_both_streams_and_redact_common_secrets() {
@@ -11898,7 +12191,7 @@ mod database_tests {
     };
     use persistence::{DatabaseConfig, GlobalRole};
     use sqlx::PgPool;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -11908,6 +12201,108 @@ mod database_tests {
     struct Fixture {
         email: String,
         cookie: String,
+    }
+
+    #[tokio::test]
+    async fn writer_source_archive_is_authorized_and_exports_only_visible_workspace_files() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, _state) = test_application().await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                r#"{"name":"Portable Demo / Project"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["paper"]["id"].as_str().unwrap();
+        let mut version = created["version"].as_u64().unwrap();
+        let fixtures = [
+            ("chapters/introduction.tex", "Nested source\n"),
+            ("references.bib", "@book{x,title={X}}\n"),
+            ("styles/demo.bst", "ENTRY{}{}{}\n"),
+            ("styles/demo.cls", "class bytes\n"),
+            ("styles/demo.sty", "style bytes\n"),
+            ("data/results.csv", "x,y\n1,2\n"),
+            ("internal.secret", "application state\n"),
+        ];
+        let mut hidden_file_id = None;
+        for (path, content) in fixtures {
+            let body = serde_json::json!({"path":path,"content":content,"version":version});
+            let response = request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+                &body.to_string(),
+                Some("application/json"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let response = test_json(response).await;
+            version = response["version"].as_u64().unwrap();
+            if path == "internal.secret" {
+                hidden_file_id = Some(
+                    uuid::Uuid::parse_str(response["file"]["file_id"].as_str().unwrap()).unwrap(),
+                );
+            }
+        }
+        let workspace_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT workspace_id FROM latex_core.personal_papers WHERE id=$1")
+                .bind(uuid::Uuid::parse_str(paper_id).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        sqlx::query(
+            "INSERT INTO latex_core.paper_file_policies(file_id,workspace_id,policy,updated_by_admin_user_id) VALUES($1,$2,'HIDDEN_SYSTEM',$3)",
+        )
+        .bind(hidden_file_id.unwrap())
+        .bind(workspace_id)
+        .bind(writer_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let path = format!("/api/v2/papers/{paper_id}/source.zip");
+        assert_eq!(
+            get(&app, &path, Some(&outsider.cookie)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(&app, &path, Some(&mentor.cookie)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = get(&app, &path, Some(&writer.cookie)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/zip");
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"Portable-Demo-Project-source.zip\""
+        );
+        let mut zip = zip::ZipArchive::new(Cursor::new(test_bytes(response).await)).unwrap();
+        for (path, content) in fixtures
+            .into_iter()
+            .filter(|(path, _)| *path != "internal.secret")
+        {
+            let mut member = zip.by_name(path).unwrap();
+            let mut actual = String::new();
+            member.read_to_string(&mut actual).unwrap();
+            assert_eq!(actual, content);
+        }
+        assert!(zip.by_name("main.tex").is_ok());
+        assert!(zip.by_name("internal.secret").is_err());
+
+        pool.close().await;
+        database.close().await;
     }
 
     #[tokio::test]
@@ -13480,6 +13875,154 @@ mod database_tests {
     }
 
     #[tokio::test]
+    async fn department_names_follow_programme_keys_and_materialize_both_departments() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let departments = [
+            (
+                uuid::Uuid::from_u128(2001),
+                "DEPT-PROOF-CSE",
+                "Computer Science and Engineering",
+            ),
+            (
+                uuid::Uuid::from_u128(2002),
+                "DEPT-PROOF-ECE",
+                "Electronics and Communication Engineering",
+            ),
+        ];
+        for (id, code, name) in departments {
+            sqlx::query(
+                "INSERT INTO vcap.departments(department_id,department_name) VALUES($1,$2)",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO vcap.faculty(faculty_id,name,dept_id) VALUES($1,'Programme HOD',$2)",
+            )
+            .bind(code)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            // Same programme display name: identity must follow the foreign keys, never text matching.
+            sqlx::query("INSERT INTO vcap.programmes(programme_code,hod_id,programme_name,degree_name) VALUES($1,$1,'Shared programme title','Bachelor of Technology')")
+                .bind(code).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO vcap.students(reg_no,name,programme_code) VALUES('DEPT-PROOF-STUDENT','Institutional Student',$1)")
+            .bind(departments[0].1).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO vcap.student_user_links(reg_no,user_id,status,linked_at) VALUES('DEPT-PROOF-STUDENT',$1,'LINKED',now())")
+            .bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        // The mentor stays in CSE even when the student's programme belongs to ECE.
+        sqlx::query("INSERT INTO vcap.faculty_user_links(faculty_id,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())")
+            .bind(departments[0].1).bind(mentor_id.as_uuid()).execute(&pool).await.unwrap();
+        let main_path = "Full_Report_template_v1.0/Full_Report_v1.0.tex";
+        let source = br"\documentclass{report}
+\newcommand{\thesistitle}{Department proof}
+\newcommand{\coursecode}{BCSXXXX}
+\newcommand{\hoddept}{Placeholder}
+\newcommand{\programdegree}{Placeholder}
+\newcommand{\semester}{Winter Semester 2025-2026}
+\newcommand{\academicyear}{2025-2026}
+\begin{document}\hoddept\end{document}";
+        let archive = test_zip(&[(main_path, source)]);
+        let (body, content_type) = template_multipart(
+            &[
+                ("name", "Department authority regression"),
+                ("main", main_path),
+                ("arrangement", "SINGLE_SOURCE"),
+            ],
+            &archive,
+        );
+        let imported = request_bytes(
+            &app,
+            Method::POST,
+            "/api/admin/v2/templates/import",
+            Some(&admin.cookie),
+            body,
+            Some(&content_type),
+        )
+        .await;
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let template = test_json(imported).await;
+        for (department_id, programme_code, department_name) in departments {
+            sqlx::query(
+                "UPDATE vcap.students SET programme_code=$1 WHERE reg_no='DEPT-PROOF-STUDENT'",
+            )
+            .bind(programme_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let response = request(&app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie),
+                &serde_json::json!({"name":programme_code,"writer_ids":[writer_id],"leader_writer_id":writer_id,"mentor_ids":[mentor_id],"template_id":template["id"]}).to_string(), Some("application/json")).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let team = test_json(response).await;
+            let paper_id = uuid::Uuid::parse_str(team["team"]["id"].as_str().unwrap()).unwrap();
+            let automatic = state
+                .front_matter
+                .legacy_automatic_values(paper_id, None, None)
+                .await
+                .unwrap();
+            assert_eq!(automatic["department.id"], department_id.to_string());
+            assert_eq!(automatic["department_name"], department_name);
+            // A legacy saved label cannot replace the canonical department record.
+            sqlx::query("INSERT INTO latex_core.paper_project_metadata(paper_team_id,department_display_names,updated_by_user_id) VALUES($1,$2,$3)")
+                .bind(paper_id).bind(serde_json::json!([{"id":department_id,"display_name":"Wrong team label"}]))
+                .bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+            let projection = state.front_matter.project_metadata(paper_id).await.unwrap();
+            let department = projection["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["key"] == "departments")
+                .unwrap();
+            assert_eq!(department["value"][0]["id"], department_id.to_string());
+            assert_eq!(department["value"][0]["display_name"], department_name);
+            assert_eq!(department["value"][0]["origin"], "database");
+            let path = format!("/api/v2/papers/{paper_id}/document-details");
+            let details = test_json(get(&app, &path, Some(&writer.cookie)).await).await;
+            assert!(
+                details["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["field_key"] == "department_name"
+                        && item["value"] == department_name
+                        && item["value_source"] == "AUTO")
+            );
+            let saved = request(&app, Method::PUT, &path, Some(&writer.cookie),
+                r#"{"values":{"course_code":"BA101","team_academic_year":"2026-2027","team_semester":"Winter Semester"},"sections":{}}"#, Some("application/json")).await;
+            assert_eq!(saved.status(), StatusCode::OK);
+            let workspace_id = WorkspaceId::from_uuid(
+                uuid::Uuid::parse_str(team["team"]["workspace_id"].as_str().unwrap()).unwrap(),
+            );
+            let materialized = state
+                .workspaces
+                .read_file(workspace_id, &LogicalPath::parse(main_path).unwrap())
+                .await
+                .unwrap();
+            let text = String::from_utf8(materialized.to_vec()).unwrap();
+            assert!(
+                text.contains(&format!(r"\newcommand{{\hoddept}}{{{department_name}}}")),
+                "{text}"
+            );
+            assert!(text.contains(r"\newcommand{\coursecode}{BA101}"));
+            assert!(!text.contains("Wrong team label"));
+            assert_eq!(sqlx::query_scalar::<_, uuid::Uuid>("SELECT f.dept_id FROM vcap.students s JOIN vcap.programmes p ON p.programme_code=s.programme_code JOIN vcap.faculty f ON f.faculty_id=p.hod_id WHERE s.reg_no='DEPT-PROOF-STUDENT'")
+                .fetch_one(&pool).await.unwrap(), department_id);
+        }
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
     async fn single_source_details_persist_source_revision_history_and_compile() {
         use core_types::WorkerId;
 
@@ -13497,6 +14040,66 @@ mod database_tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO vcap.student_user_links(reg_no,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())").bind(&registration).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        let department_id = uuid::Uuid::new_v4();
+        let programme_code = format!("BTECH-{}", uuid::Uuid::new_v4());
+        let mtech_code = format!("MTECH-{}", uuid::Uuid::new_v4());
+        let faculty_id = format!("MENTOR-{}", uuid::Uuid::new_v4());
+        let dean_id = format!("DEAN-{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO vcap.departments(department_id,department_name) VALUES($1,'Computer Science and Engineering')").bind(department_id).execute(&pool).await.unwrap();
+        for (id, name) in [(&faculty_id, "Rao"), (&dean_id, "Krishnan")] {
+            sqlx::query("INSERT INTO vcap.faculty(faculty_id,name,dept_id,honorific,designation,status) VALUES($1,$2,$3,'Dr.','Professor','active')").bind(id).bind(name).bind(department_id).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO vcap.faculty_user_links(faculty_id,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())").bind(&faculty_id).bind(mentor_id.as_uuid()).execute(&pool).await.unwrap();
+        for (code, degree) in [
+            (&programme_code, "Bachelor of Technology"),
+            (&mtech_code, "Master of Technology"),
+        ] {
+            sqlx::query("INSERT INTO vcap.programmes(programme_code,hod_id,programme_name,degree_name) VALUES($1,$2,'Computer Science and Engineering',$3)").bind(code).bind(&faculty_id).bind(degree).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO vcap.faculty_roles(role_id,faculty_id,role_type,department_id,programme_code,status) VALUES($1,$2,'dean',$3,$4,'active')").bind(uuid::Uuid::new_v4()).bind(&dean_id).bind(department_id).bind(code).execute(&pool).await.unwrap();
+        }
+        sqlx::query("UPDATE vcap.students SET programme_code=$2 WHERE reg_no=$1")
+            .bind(&registration)
+            .bind(&programme_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&app, "/api/v2/support", Some(&writer.cookie))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let support_path = "/api/admin/v2/institution/support";
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                support_path,
+                Some(&writer.cookie),
+                r#"{"support_email":"bad@institution.example"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                support_path,
+                Some(&admin.cookie),
+                r#"{"support_email":"help@institution.example"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            test_json(get(&app, "/api/v2/support", Some(&writer.cookie)).await).await["support_email"],
+            "help@institution.example"
+        );
         let mut image = Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(2, 2)
             .write_to(&mut image, ImageFormat::Png)
@@ -13510,6 +14113,14 @@ mod database_tests {
 \newcommand{\coursename}{Capstone project - II}
 \newcommand{\thesistitle}{Original Source Title}
 \newcommand{\studentAname}{Original Student}
+\newcommand{\studentAregno}{22BDS0063}
+\newcommand{\programdegree}{Bachelor of Technology}
+\newcommand{\programname}{Computer Science and Engineering}
+\newcommand{\hoddept}{Placeholder Department}
+\newcommand{\projguidename}{Placeholder Mentor}
+\newcommand{\deanname}{Placeholder Dean}
+\newcommand{\semester}{Winter Semester 2025-2026}
+\newcommand{\academicyear}{2025-2026}
 % unrelated manual preamble
 \graphicspath{{images/}}
 \begin{document}
@@ -13577,6 +14188,48 @@ Unrelated authored LaTeX survives.
         let workspace_id = WorkspaceId::from_uuid(
             uuid::Uuid::parse_str(team["team"]["workspace_id"].as_str().unwrap()).unwrap(),
         );
+        // Verify the same institutional program mapping supports both degree types.
+        let btech = state
+            .front_matter
+            .legacy_automatic_values(paper_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            btech.get("degree_name"),
+            Some(&serde_json::json!("Bachelor of Technology"))
+        );
+        assert_eq!(
+            btech.get("department_name"),
+            Some(&serde_json::json!("Computer Science and Engineering"))
+        );
+        assert_eq!(btech.get("guide.name"), Some(&serde_json::json!("Dr. Rao")));
+        assert_eq!(
+            btech.get("dean.name"),
+            Some(&serde_json::json!("Dr. Krishnan"))
+        );
+        sqlx::query("UPDATE vcap.students SET programme_code=$2 WHERE reg_no=$1")
+            .bind(&registration)
+            .bind(&mtech_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE latex_core.paper_template_resolutions SET dominant_programme_code=$2 WHERE paper_team_id=$1").bind(paper_id).bind(&mtech_code).execute(&pool).await.unwrap();
+        let mtech = state
+            .front_matter
+            .legacy_automatic_values(paper_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mtech.get("degree_name"),
+            Some(&serde_json::json!("Master of Technology"))
+        );
+        sqlx::query("UPDATE vcap.students SET programme_code=$2 WHERE reg_no=$1")
+            .bind(&registration)
+            .bind(&programme_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE latex_core.paper_template_resolutions SET dominant_programme_code=$2 WHERE paper_team_id=$1").bind(paper_id).bind(&programme_code).execute(&pool).await.unwrap();
         let source_path =
             LogicalPath::parse("Full_Report_template_v1.0/Full_Report_v1.0.tex").unwrap();
         let source = state
@@ -13665,13 +14318,26 @@ Unrelated authored LaTeX survives.
             .status(),
             StatusCode::BAD_REQUEST
         );
+        for field in detail["manifest"]["fields"].as_array().unwrap() {
+            if matches!(
+                field["key"].as_str(),
+                Some("guide_name" | "dean_name" | "department_name" | "degree_name")
+            ) {
+                assert_eq!(field["allow_team_override"], false);
+            }
+            assert!(!matches!(
+                field["key"].as_str(),
+                Some("guide_identity" | "dean_identity")
+            ));
+        }
+        assert_eq!(request(&app, Method::PUT, &detail_path, Some(&writer.cookie), r#"{"values":{"team_semester":"Winter Semester","team_academic_year":""},"sections":{}}"#, Some("application/json")).await.status(), StatusCode::BAD_REQUEST);
         let saved = test_json(
             request(
                 &app,
                 Method::PUT,
                 &detail_path,
                 Some(&writer.cookie),
-                r#"{"values":{"project_title":"Professor Durable Title One","course_code":"BA101"},"sections":{}}"#,
+                r#"{"values":{"project_title":"Professor Durable Title One","course_code":"BA101","team_semester":"Winter Semester","team_academic_year":"2026-2027"},"sections":{}}"#,
                 Some("application/json"),
             )
             .await,
@@ -13706,6 +14372,26 @@ Unrelated authored LaTeX survives.
         assert_ne!(persisted, source);
         assert!(String::from_utf8_lossy(&persisted).contains(r"\newcommand{\coursecode}{BA101}"));
         assert!(!String::from_utf8_lossy(&persisted).contains("BCSXXXX"));
+        let persisted_text = String::from_utf8_lossy(&persisted);
+        assert!(persisted_text.contains(r"\newcommand{\semester}{Winter Semester 2026-2027}"));
+        assert!(persisted_text.contains(r"\newcommand{\academicyear}{2026-2027}"));
+        assert!(persisted_text.contains(r"\newcommand{\programdegree}{Bachelor of Technology}"));
+        assert!(persisted_text.contains(r"\newcommand{\projguidename}{Dr. Rao}"));
+        assert!(persisted_text.contains(r"\newcommand{\deanname}{Dr. Krishnan}"));
+        let response = get(
+            &app,
+            &format!("/api/v2/papers/{paper_id}/source.zip"),
+            Some(&writer.cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut zip = zip::ZipArchive::new(Cursor::new(test_bytes(response).await)).unwrap();
+        let mut exported = String::new();
+        zip.by_name(source_path.as_str())
+            .unwrap()
+            .read_to_string(&mut exported)
+            .unwrap();
+        assert!(exported.contains(r"\newcommand{\coursecode}{BA101}"));
         let access = state
             .v2
             .collaboration_access(writer_id, paper_id, main_file.file_id)

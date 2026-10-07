@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 
 const home = readFileSync(new URL('../static/home.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/home.html', import.meta.url), 'utf8');
+const server = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
 
 test('home uses role-scoped APIs and exact Writer/Review routes', () => {
   assert.match(home, /\/api\/v2\/writer\/papers/);
@@ -14,11 +15,20 @@ test('home uses role-scoped APIs and exact Writer/Review routes', () => {
   assert.match(home, /assigned report/);
 });
 
-test('projects home keeps a placeholder when there is no successful PDF and links to Team Chat', () => {
+test('projects home keeps a placeholder when there is no successful PDF', () => {
   assert.match(home, /No successful PDF yet/);
   assert.match(home, /!build.*canvas\.remove/s);
-  assert.match(html, /href="\/team-chat"/);
   assert.doesNotMatch(html, /Coming next/);
+});
+
+test('Writer hides Team Chat presentation while Comments and the chat subsystem remain intact', () => {
+  assert.match(html, /{{TEAM_CHAT_HEADER_LINK}}/);
+  assert.match(html, /{{TEAM_CHAT_NAV_LINK}}/);
+  assert.match(server, /GlobalRole::Writer[\s\S]*?"\/write",\s*"",\s*""/);
+  assert.match(server, /GlobalRole::Mentor[\s\S]*?href=\\"\/team-chat\\"/);
+  assert.match(server, /\.route\("\/team-chat", get\(team_chat_ui\)\)/);
+  assert.match(server, /\.route\("\/api\/v2\/team-chats", get\(v2_team_chats\)\)/);
+  assert.match(server, /\.route\([\s\S]*?\/api\/v2\/team-chats\/\{team_id\}\/messages/);
 });
 
 test('server home shell has distinct Mentor and Writer landing copy', () => {

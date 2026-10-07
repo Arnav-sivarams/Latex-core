@@ -15,7 +15,7 @@ test('Writer diagnostics footer is bottom-mounted, collapsed by default, and tab
   assert.match(css, /\.writer-shell \.build-footer\[data-expanded="true"\][^}]*35vh/);
   assert.match(writer, /expandBuildFooter\('problems'\)/);
   assert.match(writer, /api\.buildLog\(/);
-  assert.match(writer, /model\.buildFooterTab === 'log'[\s\S]*await loadBuildLog\(\)/);
+  assert.match(writer, /\['succeeded', 'failed'\]\.includes\(build\.latest_status\)\) await loadBuildLog\(\)/);
   assert.match(writer, /buildLogRequest/);
 });
 
