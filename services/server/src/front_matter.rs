@@ -144,36 +144,220 @@ pub fn bind_single_source_values(
             "complete report template metadata compatibility: exactly one safe pre-document binding point and a recognized institutional macro declaration are required".into(),
         )
     })?;
-    let binding = format!(
-        "{}\n{}",
-        legacy::single_source_bindings(values)?,
-        SINGLE_SOURCE_MARKER
-    );
-    let lines = source.lines().collect::<Vec<_>>();
-    let document_line = uncommented_document_lines(source)
-        .first()
-        .copied()
-        .unwrap_or_default();
+    let mut canonical = values.clone();
+    if let (Some(semester), Some(date)) = (
+        values
+            .get("team.semester")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty()),
+        values
+            .get("submission_date")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty()),
+    ) {
+        let derived = legacy::derive_semester_metadata(
+            semester,
+            date,
+            values.get("team.academic_year").and_then(Value::as_str),
+        )?;
+        canonical
+            .entry("team.academic_year".to_owned())
+            .or_insert(Value::String(derived.academic_year));
+    }
+    let mut binding = legacy::single_source_bindings(&canonical)?;
+    // Keep canonical inputs for macros whose display values are derived.
+    for (key, command) in CANONICAL_INPUTS {
+        if let Some(value) = canonical.get(*key).and_then(Value::as_str) {
+            writeln!(
+                binding,
+                "\\providecommand{{\\{command}}}{{}}\n\\renewcommand{{\\{command}}}{{{}}}",
+                escape_latex_text(value)
+            )
+            .map_err(|_| FrontMatterError::InvalidManifest)?;
+        }
+    }
+    binding.push_str(SINGLE_SOURCE_MARKER);
+    let marker = source.find(SINGLE_SOURCE_MARKER);
     let target = match point {
-        SingleSourceBindingPoint::ExplicitMarker => lines
-            .iter()
-            .position(|line| line.trim() == SINGLE_SOURCE_MARKER)
-            .ok_or(FrontMatterError::InvalidManifest)?,
-        SingleSourceBindingPoint::AutomaticBeforeDocument => document_line,
+        SingleSourceBindingPoint::ExplicitMarker => {
+            marker.ok_or(FrontMatterError::InvalidManifest)?
+        }
+        SingleSourceBindingPoint::AutomaticBeforeDocument => source
+            .split_inclusive('\n')
+            .take(uncommented_document_lines(source)[0])
+            .map(str::len)
+            .sum(),
     };
-    let mut output = String::new();
-    for (index, line) in lines.iter().enumerate() {
-        if index == target {
-            output.push_str(&binding);
-            output.push('\n');
-            if matches!(point, SingleSourceBindingPoint::ExplicitMarker) {
-                continue;
+    let start = source[..target]
+        .rfind("% Known institutional single-source bindings.\n")
+        .unwrap_or(target);
+    let end = if marker.is_some() {
+        target + SINGLE_SOURCE_MARKER.len()
+    } else {
+        target
+    };
+    let separator = if marker.is_some() { "" } else { "\n" };
+    Ok(Bytes::from(format!(
+        "{}{binding}{separator}{}",
+        &source[..start],
+        &source[end..]
+    )))
+}
+
+pub fn document_owned_source(source: &str) -> bool {
+    matches!(
+        source,
+        "course_code"
+            | "course_name"
+            | "project.title"
+            | "submission_date"
+            | "team.semester"
+            | "team.academic_year"
+    )
+}
+
+/// The generated allowlist does not introduce new required template fields.
+pub fn single_source_commands(source: &str) -> BTreeSet<String> {
+    let Some(start) = source.find("% Known institutional single-source bindings.\n") else {
+        return legacy::commands(source);
+    };
+    let Some(end) = source[start..].find(SINGLE_SOURCE_MARKER) else {
+        return legacy::commands(source);
+    };
+    legacy::commands(&format!(
+        "{}{}",
+        &source[..start],
+        &source[start + end + SINGLE_SOURCE_MARKER.len()..]
+    ))
+}
+
+const CANONICAL_INPUTS: &[(&str, &str)] = &[
+    ("submission_date", "latexcoresubmissiondate"),
+    ("team.semester", "latexcoresemester"),
+    ("team.academic_year", "latexcoreacademicyear"),
+];
+
+/// Preserve unmanaged macro bodies when updating only submitted document fields.
+pub fn single_source_managed_values_from_tex(main: &[u8]) -> BTreeMap<String, Value> {
+    let Ok(source) = std::str::from_utf8(main) else {
+        return BTreeMap::new();
+    };
+    let Some(start) = source.find("% Known institutional single-source bindings.\n") else {
+        return BTreeMap::new();
+    };
+    let Some(end) = source[start..].find(SINGLE_SOURCE_MARKER) else {
+        return BTreeMap::new();
+    };
+    single_source_values_from_tex(&source.as_bytes()[start..start + end])
+}
+
+/// Read literal macro definitions from the durable source without executing TeX.
+/// Later renewcommands take precedence over original template declarations.
+pub fn single_source_values_from_tex(main: &[u8]) -> BTreeMap<String, Value> {
+    let Ok(source) = std::str::from_utf8(main) else {
+        return BTreeMap::new();
+    };
+    let code = source
+        .lines()
+        .map(tex_code_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut values = BTreeMap::new();
+    for (command, key) in legacy::REGISTRY
+        .iter()
+        .map(|(command, key, _, _)| (*command, *key))
+        .chain(
+            CANONICAL_INPUTS
+                .iter()
+                .map(|(key, command)| (*command, *key)),
+        )
+    {
+        let mut definitions = Vec::new();
+        for declaration in [
+            "newcommand",
+            "providecommand",
+            "renewcommand",
+            "DeclareRobustCommand",
+        ] {
+            let needle = format!("\\{declaration}{{\\{command}}}");
+            for (offset, _) in code.match_indices(&needle) {
+                let rest = code[offset + needle.len()..].trim_start();
+                if let Some(value) = literal_group(rest) {
+                    definitions.push((offset, declaration, value));
+                }
             }
         }
-        output.push_str(line);
-        output.push('\n');
+        definitions.sort_by_key(|(offset, _, _)| *offset);
+        let mut current = None;
+        for (_, declaration, value) in definitions {
+            if declaration == "providecommand" && value.is_empty() {
+                continue;
+            }
+            if declaration != "providecommand" || current.is_none() {
+                current = Some(value);
+            }
+        }
+        if let Some(value) = current {
+            values.insert(key.to_owned(), Value::String(unescape_latex_text(value)));
+        }
     }
-    Ok(Bytes::from(output))
+    values
+}
+
+fn literal_group(text: &str) -> Option<&str> {
+    if !text.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0_u32;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[1..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn unescape_latex_text(text: &str) -> String {
+    let escapes = [
+        (r"\textbackslash{}", "\\"),
+        (r"\textasciitilde{}", "~"),
+        (r"\textasciicircum{}", "^"),
+        (r"\&", "&"),
+        (r"\%", "%"),
+        (r"\$", "$"),
+        (r"\#", "#"),
+        (r"\_", "_"),
+        (r"\{", "{"),
+        (r"\}", "}"),
+    ];
+    let mut remaining = text;
+    let mut output = String::new();
+    while !remaining.is_empty() {
+        if let Some((escaped, literal)) = escapes
+            .iter()
+            .find(|(escaped, _)| remaining.starts_with(escaped))
+        {
+            output.push_str(literal);
+            remaining = &remaining[escaped.len()..];
+        } else if let Some(character) = remaining.chars().next() {
+            output.push(character);
+            remaining = &remaining[character.len_utf8()..];
+        }
+    }
+    output
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -900,6 +1084,62 @@ mod tests {
         assert!(!main_template_compatible(
             b"\\input{.latex-core/frontmatter/frontmatter.tex}"
         ));
+    }
+
+    #[test]
+    fn single_source_updates_preserve_manual_macros_and_crlf() {
+        let main = b"\\documentclass{article}\r\n\\newcommand{\\thesistitle}{Manual \\LaTeX{} title}\r\n% manual preamble\r\n\\begin{document}body\\end{document}\r\n";
+        let values = BTreeMap::from([("course_name".into(), Value::String("A new course".into()))]);
+        let saved = bind_single_source_values(main, &values).unwrap();
+        assert!(String::from_utf8_lossy(&saved).starts_with("\\documentclass{article}\r\n\\newcommand{\\thesistitle}{Manual \\LaTeX{} title}\r\n% manual preamble\r\n"));
+        assert!(!String::from_utf8_lossy(&saved).contains(r"\renewcommand{\thesistitle}"));
+        let managed = single_source_managed_values_from_tex(&saved);
+        assert!(!managed.contains_key("project.title"));
+        assert_eq!(managed["course_name"], "A new course");
+        assert_eq!(bind_single_source_values(&saved, &managed).unwrap(), saved);
+        assert_eq!(
+            single_source_commands(&String::from_utf8_lossy(&saved)),
+            legacy::commands(&String::from_utf8_lossy(main))
+        );
+    }
+
+    #[test]
+    fn single_source_persisted_bindings_roundtrip_without_accumulation() {
+        let main = br"\documentclass{article}
+\newcommand{\thesistitle}{Manual original}
+% unrelated manual preamble
+\begin{document}User body\end{document}
+";
+        let values = BTreeMap::from([
+            (
+                "project.title".into(),
+                Value::String("Professor & durable title".into()),
+            ),
+            ("submission_date".into(), Value::String("2026-10-07".into())),
+            ("team.semester".into(), Value::String("3".into())),
+        ]);
+        let saved = bind_single_source_values(main, &values).unwrap();
+        assert!(String::from_utf8_lossy(&saved).contains("Professor \\& durable title"));
+        assert!(String::from_utf8_lossy(&saved).contains("% unrelated manual preamble"));
+        assert!(String::from_utf8_lossy(&saved).contains("User body"));
+        let readback = single_source_values_from_tex(&saved);
+        for (key, value) in &values {
+            assert_eq!(readback.get(key), Some(value));
+        }
+        assert_eq!(bind_single_source_values(&saved, &readback).unwrap(), saved);
+        let mut changed = readback;
+        changed.insert("project.title".into(), Value::String("Second title".into()));
+        let second = bind_single_source_values(&saved, &changed).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&second)
+                .matches("% Known institutional single-source bindings.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            single_source_values_from_tex(&second)["project.title"],
+            "Second title"
+        );
     }
 
     #[test]

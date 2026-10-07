@@ -4004,13 +4004,20 @@ async fn single_source_document_details(
                 "complete report template source is not UTF-8",
             )
         })?;
-        commands.extend(front_matter::legacy::commands(source));
+        commands.extend(front_matter::single_source_commands(source));
     }
-    let overrides = state
+    let mut overrides = state
         .front_matter
         .single_source_values(paper_id)
         .await
         .map_err(front_matter_repository_error)?;
+    let source_values = front_matter::single_source_values_from_tex(&main);
+    overrides.retain(|key, _| matches!(key.as_str(), "guide_identity" | "dean_identity"));
+    for (_, source, _, _) in front_matter::legacy::REGISTRY {
+        if let Some(value) = source_values.get(*source) {
+            overrides.insert(source.replace('.', "_"), value.clone());
+        }
+    }
     let automatic = state
         .front_matter
         .legacy_automatic_values(
@@ -4032,12 +4039,16 @@ async fn single_source_document_details(
             continue;
         }
         let key = source.replace('.', "_");
-        let value = overrides
-            .get(&key)
+        let value = automatic
+            .get(*source)
+            .filter(|_| !front_matter::document_owned_source(source))
             .cloned()
+            .or_else(|| overrides.get(&key).cloned())
             .or_else(|| automatic.get(*source).cloned())
             .unwrap_or(serde_json::Value::Null);
-        let source_name = if overrides.contains_key(&key) {
+        let source_name = if overrides.contains_key(&key)
+            && (front_matter::document_owned_source(source) || !automatic.contains_key(*source))
+        {
             "TEAM_OVERRIDE"
         } else {
             "AUTO"
@@ -4075,7 +4086,7 @@ async fn single_source_document_details(
                 "type":if *source == "submission_date" { "DATE" } else { "TEXT" },
                 "required":*source != "project.title",
                 "source":source,
-                "allow_team_override":*editable && !matches!(*source, "guide.name" | "guide.designation" | "dean.name"),
+                "allow_team_override":*editable && (front_matter::document_owned_source(source) || !automatic.contains_key(*source)) && !matches!(*source, "guide.name" | "guide.designation" | "dean.name"),
             }));
         values.entry(key.clone()).or_insert_with(
             || serde_json::json!({"field_key":key,"value":value,"value_source":source_name}),
@@ -4281,14 +4292,116 @@ async fn v2_save_document_details(
                 return error(StatusCode::BAD_REQUEST, value.to_string());
             }
         }
-        let version = match state
+        if input.values.values().any(|value| !value.is_string()) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Document details must be text values",
+            );
+        }
+        let workspace_id = detail["workspace_id"]
+            .as_str()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(WorkspaceId::from_uuid)
+            .expect("team detail has a workspace");
+        if state
+            .collaboration
+            .flush_workspace(workspace_id)
+            .await
+            .is_err()
+        {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "collaboration flush failed",
+            );
+        }
+        let workspace = match state.workspaces.restore(workspace_id).await {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "workspace restore failed",
+                );
+            }
+        };
+        let (_, main_name) = match state
             .front_matter
-            .save_single_source_values(principal.user_id(), paper_id, &input.values)
+            .paper_template_arrangement(paper_id)
+            .await
+        {
+            Ok(value) => value,
+            Err(value) => return front_matter_repository_error(value),
+        };
+        let main_path = match LogicalPath::parse(&main_name) {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid main path"),
+        };
+        let main = match state.workspaces.read_file(workspace_id, &main_path).await {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "main source unavailable"),
+        };
+        let mut values = front_matter::single_source_managed_values_from_tex(&main);
+        let automatic = match state
+            .front_matter
+            .legacy_automatic_values(
+                paper_id,
+                submitted
+                    .get("guide_identity")
+                    .and_then(serde_json::Value::as_str),
+                submitted
+                    .get("dean_identity")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(value) => return front_matter_repository_error(value),
+        };
+        for (key, value) in automatic {
+            if !front_matter::document_owned_source(&key) {
+                values.insert(key, value);
+            }
+        }
+        for (_, source, _, _) in front_matter::legacy::REGISTRY {
+            if let Some(value) = input.values.get(&source.replace('.', "_")) {
+                values.insert((*source).to_owned(), value.clone());
+            }
+        }
+        let bound = match front_matter::bind_single_source_values(&main, &values) {
+            Ok(value) => value,
+            Err(value) => return error(StatusCode::BAD_REQUEST, value.to_string()),
+        };
+        let stored = match state.blobs.put(bound).await {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "front matter blob storage failed",
+                );
+            }
+        };
+        let source_file = ManagedFrontMatterFile {
+            path: main_name,
+            blob_hash: stored.hash(),
+            size_bytes: stored.size_bytes(),
+        };
+        let (version, document_epoch) = match state
+            .front_matter
+            .save_single_source_values(
+                principal.user_id(),
+                paper_id,
+                &submitted,
+                workspace.version().get(),
+                &source_file,
+            )
             .await
         {
             Ok(value) => value,
             Err(error_value) => return front_matter_repository_error(error_value),
         };
+        state
+            .collaboration
+            .epoch_changed(workspace_id, document_epoch)
+            .await;
         let refreshed = match single_source_document_details(&state, paper_id, &detail).await {
             Ok(value) => value,
             Err(response) => return response,
@@ -6459,19 +6572,21 @@ async fn prepare_single_source_compile_snapshot(
         )
         .await
         .map_err(front_matter_repository_error)?;
-    let mut values = automatic;
-    for (_, source, _, _) in front_matter::legacy::REGISTRY {
-        let key = source.replace('.', "_");
-        if let Some(value) = overrides.get(&key) {
-            values.insert((*source).to_owned(), value.clone());
-        }
-    }
+    let mut values = front_matter::single_source_managed_values_from_tex(&main);
+    values.extend(automatic.into_iter().filter(|(key, _)| {
+        front_matter::legacy::REGISTRY
+            .iter()
+            .any(|(_, source, _, _)| *source == key && !front_matter::document_owned_source(source))
+    }));
     let bound = front_matter::bind_single_source_values(&main, &values).map_err(|value| {
         error(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("Complete report template metadata compatibility: {value}"),
         )
     })?;
+    if bound == main {
+        return Ok(());
+    }
     let stored = state.blobs.put(bound).await.map_err(|_| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -13298,7 +13413,7 @@ mod database_tests {
     }
 
     #[tokio::test]
-    async fn single_source_compile_snapshot_keeps_writer_history_and_review_source_original() {
+    async fn single_source_details_persist_source_revision_history_and_compile() {
         use core_types::WorkerId;
 
         let _guard = SERVER_TEST_LOCK.lock().await;
@@ -13308,31 +13423,47 @@ mod database_tests {
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;
         let mentor_id = test_user_id(&pool, &mentor.email).await;
+        let registration = format!("HOTFIX-{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO vcap.students(reg_no,name) VALUES($1,'Institutional Alice')")
+            .bind(&registration)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vcap.student_user_links(reg_no,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())").bind(&registration).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        let mut image = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut image, ImageFormat::Png)
+            .unwrap();
         let archive = test_zip(&[
             (
                 "project.tex",
-                include_bytes!("../tests/fixtures/vit-complete-report/project.tex"),
+                br"\documentclass{report}
+\usepackage{graphicx}
+\newcommand{\thesistitle}{Original Source Title}
+\newcommand{\studentAname}{Original Student}
+% unrelated manual preamble
+\graphicspath{{images/}}
+\begin{document}
+\thesistitle\par\studentAname
+\includegraphics{images/foo.png}
+\input{chapters/body.tex}
+\end{document}
+",
             ),
             (
                 "chapters/body.tex",
-                include_bytes!("../tests/fixtures/vit-complete-report/chapters/body.tex"),
+                br"\chapter*{Manual body}
+Unrelated authored LaTeX survives.
+\includegraphics{images/foo.png}
+\includegraphics{foo}
+",
             ),
-            (
-                "acronym.tex",
-                include_bytes!("../tests/fixtures/vit-complete-report/acronym.tex"),
-            ),
-            (
-                "vit-report.cls",
-                include_bytes!("../tests/fixtures/vit-complete-report/vit-report.cls"),
-            ),
-            (
-                "images/synthetic-logo.svg",
-                include_bytes!("../tests/fixtures/vit-complete-report/images/synthetic-logo.svg"),
-            ),
+            ("images/foo.png", image.get_ref().as_slice()),
         ]);
+        let template_name = format!("Synthetic complete report {}", uuid::Uuid::new_v4());
         let (body, content_type) = template_multipart(
             &[
-                ("name", "Synthetic complete report"),
+                ("name", template_name.as_str()),
                 ("main", "project.tex"),
                 ("arrangement", "SINGLE_SOURCE"),
             ],
@@ -13396,24 +13527,84 @@ mod database_tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        let main_file = state
+            .v2
+            .visible_paper_files(workspace_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path == source_path)
+            .unwrap();
+        let initial_access = state
+            .v2
+            .collaboration_access(writer_id, paper_id, main_file.file_id)
+            .await
+            .unwrap();
+        let old_doc = yrs::Doc::new();
+        {
+            use yrs::{Text, Transact};
+            old_doc.get_or_insert_text("source").insert(
+                &mut old_doc.transact_mut(),
+                0,
+                &String::from_utf8_lossy(&source),
+            );
+        }
+        let old_state = {
+            use yrs::{ReadTxn, Transact};
+            old_doc
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let compressed = zstd::stream::encode_all(Cursor::new(old_state), 3).unwrap();
+        state
+            .v2
+            .save_collaboration_snapshot(
+                workspace_id,
+                main_file.file_id,
+                initial_access.document_epoch,
+                0,
+                &compressed,
+            )
+            .await
+            .unwrap();
         let detail_path = format!("/api/v2/papers/{paper_id}/document-details");
         let detail = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
         assert_eq!(detail["single_source"], true);
         assert!(detail["pack_id"].is_null());
-        assert_eq!(detail["status"], "NEEDS_INFORMATION");
+        assert!(
+            detail["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["field_key"] == "student_a_name"
+                    && item["value"] == "Institutional Alice")
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                &detail_path,
+                Some(&writer.cookie),
+                r#"{"values":{"student_a_name":"Writer replacement"},"sections":{}}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
         let saved = test_json(
             request(
                 &app,
                 Method::PUT,
                 &detail_path,
                 Some(&writer.cookie),
-                r#"{"values":{"school_name":"School One"},"sections":{}}"#,
+                r#"{"values":{"project_title":"Professor Durable Title One"},"sections":{}}"#,
                 Some("application/json"),
             )
             .await,
         )
         .await;
-        assert_eq!(saved["workspace_version"], source_version);
+        assert_eq!(saved["workspace_version"], source_version + 1);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1",
@@ -13434,14 +13625,52 @@ mod database_tests {
             .unwrap(),
             versions_before
         );
-        assert_eq!(
+        let persisted = state
+            .workspaces
+            .read_file(workspace_id, &source_path)
+            .await
+            .unwrap();
+        assert_ne!(persisted, source);
+        let access = state
+            .v2
+            .collaboration_access(writer_id, paper_id, main_file.file_id)
+            .await
+            .unwrap();
+        assert_eq!(access.document_epoch, initial_access.document_epoch + 1);
+        assert!(
             state
-                .workspaces
-                .read_file(workspace_id, &source_path)
+                .v2
+                .collaboration_recovery(workspace_id, main_file.file_id, access.document_epoch)
                 .await
-                .unwrap(),
-            source
+                .unwrap()
+                .snapshot
+                .is_none()
         );
+        assert!(
+            String::from_utf8_lossy(&persisted)
+                .contains(r"\renewcommand{\studentAname}{Institutional Alice}")
+        );
+        let live_files = state.v2.visible_paper_files(workspace_id).await.unwrap();
+        assert_eq!(
+            live_files
+                .iter()
+                .find(|file| file.path == source_path)
+                .unwrap()
+                .revision,
+            2
+        );
+        assert!(String::from_utf8_lossy(&persisted).contains("Professor Durable Title One"));
+        assert!(String::from_utf8_lossy(&persisted).contains(r"\input{chapters/body.tex}"));
+        let reopened = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        assert!(
+            reopened["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["field_key"] == "project_title"
+                    && item["value"] == "Professor Durable Title One")
+        );
+        let source_checkpoint = state.workspaces.force_snapshot(workspace_id).await.unwrap();
 
         let build_path = format!("/api/v2/papers/{paper_id}/builds");
         let first = test_json(
@@ -13460,7 +13689,7 @@ mod database_tests {
         let worker = WorkerId::new();
         let claimed = state.queue.claim(worker).await.unwrap().unwrap();
         assert_eq!(*claimed.id.as_uuid(), first_build);
-        assert_ne!(claimed.snapshot_id, source_checkpoint.snapshot_id());
+        assert_eq!(claimed.snapshot_id, source_checkpoint.snapshot_id());
         let compile_manifest_hash: String = sqlx::query_scalar(
             "SELECT manifest_blob_hash FROM latex_core.snapshots WHERE snapshot_id=$1",
         )
@@ -13482,7 +13711,9 @@ mod database_tests {
             .await
             .unwrap();
         let compiled_main = String::from_utf8(compiled_main.to_vec()).unwrap();
-        assert!(compiled_main.contains(r"\renewcommand{\schoolname}{School One}"));
+        assert!(
+            compiled_main.contains(r"\renewcommand{\thesistitle}{Professor Durable Title One}")
+        );
         assert!(compiled_main.contains(r"\input{chapters/body.tex}"));
         let version_row: (String, serde_json::Value) = sqlx::query_as(
             "SELECT v.snapshot_id,v.manifest FROM latex_core.v2_paper_builds b JOIN latex_core.paper_versions v ON v.id=b.version_id WHERE b.id=$1",
@@ -13500,7 +13731,7 @@ mod database_tests {
             .get(historical.files()[&source_path].blob_hash)
             .await
             .unwrap();
-        assert_eq!(historical_main, source);
+        assert_eq!(historical_main, persisted);
         state
             .queue
             .complete_success(
@@ -13519,16 +13750,43 @@ mod database_tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let saved = request(
-            &app,
-            Method::PUT,
-            &detail_path,
-            Some(&writer.cookie),
-            r#"{"values":{"school_name":"School Two"},"sections":{}}"#,
-            Some("application/json"),
-        )
-        .await;
-        assert_eq!(saved.status(), StatusCode::OK);
+        if env::var_os("LATEX_CORE_HOTFIX_TEXLIVE_IMAGE").is_some() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let served = app.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, served).await.unwrap();
+            });
+            let config = serde_json::json!({"base":format!("http://{address}"), "cookie":writer.cookie, "paperId":paper_id});
+            let output = tokio::task::spawn_blocking(move || {
+                Command::new("node")
+                    .arg("tests/professor-hotfix-smoke.mjs")
+                    .env("LATEX_CORE_HOTFIX_SMOKE_CONFIG", config.to_string())
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            server.abort();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+        } else {
+            let saved = request(
+                &app,
+                Method::PUT,
+                &detail_path,
+                Some(&writer.cookie),
+                r#"{"values":{"project_title":"Professor Durable Title Two"},"sections":{}}"#,
+                Some("application/json"),
+            )
+            .await;
+            assert_eq!(saved.status(), StatusCode::OK);
+        }
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1",
@@ -13542,14 +13800,13 @@ mod database_tests {
         let stale = test_json(get(&app, &build_path, Some(&writer.cookie)).await).await;
         assert_eq!(stale["build"]["current_build_id"], first_build.to_string());
         assert!(stale["build"]["desired_state_hash"].is_null());
-        assert_eq!(
-            state
-                .workspaces
-                .read_file(workspace_id, &source_path)
-                .await
-                .unwrap(),
-            source
-        );
+        let persisted_two = state
+            .workspaces
+            .read_file(workspace_id, &source_path)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&persisted_two).contains("Professor Durable Title Two"));
+        assert!(!String::from_utf8_lossy(&persisted_two).contains("Professor Durable Title One"));
         let second = test_json(
             request(
                 &app,
@@ -13589,8 +13846,43 @@ mod database_tests {
         assert!(
             String::from_utf8(compiled_main.to_vec())
                 .unwrap()
-                .contains(r"\renewcommand{\schoolname}{School Two}")
+                .contains(r"\renewcommand{\thesistitle}{Professor Durable Title Two}")
         );
+        if let Ok(image) = env::var("LATEX_CORE_HOTFIX_TEXLIVE_IMAGE") {
+            let staging = tempfile::tempdir().unwrap();
+            let runtime = compiler::DockerCliRuntime::new(image).unwrap();
+            let compiler = compiler::CompilerService::new(
+                state.blobs.clone(),
+                runtime,
+                compiler::CompilerConfig::new(compiler::CompileLimits::development_default())
+                    .with_staging_root(staging.path().to_path_buf()),
+            )
+            .unwrap();
+            let execution = compiler
+                .compile(
+                    claimed.snapshot_id,
+                    &compile_manifest,
+                    TexEngine::PdfLatex,
+                    ShellPolicy::Safe,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                execution.status(),
+                compiler::CompileStatus::Succeeded,
+                "{}\n{}",
+                String::from_utf8_lossy(execution.stdout()),
+                String::from_utf8_lossy(execution.stderr())
+            );
+            assert!(
+                execution
+                    .artifacts()
+                    .iter()
+                    .any(|artifact| artifact.kind() == core_types::ArtifactKind::Pdf)
+            );
+            println!("Real sandbox compile of durable source and existing graphics: PASS");
+        }
         state
             .queue
             .complete_success(
@@ -13639,13 +13931,13 @@ mod database_tests {
         .await;
         assert_eq!(
             mentor_source["content"].as_str().unwrap().as_bytes(),
-            source.as_ref()
+            persisted_two.as_ref()
         );
         assert!(
-            !mentor_source["content"]
+            mentor_source["content"]
                 .as_str()
                 .unwrap()
-                .contains(r"\renewcommand{\schoolname}")
+                .contains(r"\renewcommand{\thesistitle}{Professor Durable Title Two}")
         );
 
         pool.close().await;

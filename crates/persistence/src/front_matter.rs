@@ -204,7 +204,9 @@ impl FrontMatterRepository {
         actor: UserId,
         paper_id: Uuid,
         values: &BTreeMap<String, Value>,
-    ) -> Result<u64, FrontMatterRepositoryError> {
+        expected_version: u64,
+        source: &ManagedFrontMatterFile,
+    ) -> Result<(u64, u64), FrontMatterRepositoryError> {
         let mut tx = self
             .database
             .pool()
@@ -220,12 +222,39 @@ impl FrontMatterRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(FrontMatterRepositoryError::Database)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+            .bind(workspace.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(FrontMatterRepositoryError::Database)?;
+        let head: i64 = sqlx::query_scalar("SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1 FOR UPDATE")
+            .bind(workspace).fetch_one(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
+        if u64::try_from(head).ok() != Some(expected_version) {
+            return Err(FrontMatterRepositoryError::VersionConflict);
+        }
+        let next = head.checked_add(1).ok_or_else(|| {
+            FrontMatterRepositoryError::Integrity("workspace version overflow".into())
+        })?;
+        let changed = sqlx::query("UPDATE latex_core.paper_files SET revision=revision+1,updated_at=statement_timestamp() WHERE workspace_id=$1 AND path=$2 AND NOT tombstoned")
+            .bind(workspace).bind(&source.path).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
+        if changed.rows_affected() != 1 {
+            return Err(FrontMatterRepositoryError::NotFound);
+        }
+        sqlx::query("INSERT INTO latex_core.workspace_events (workspace_id,sequence,event_id,base_version,event_type,event_schema_version,payload,created_by_user_id) VALUES ($1,$2,$3,$4,'workspace.mutation',1,$5,$6)")
+            .bind(workspace).bind(next).bind(Uuid::new_v4()).bind(head)
+            .bind(json!({"schema_version":1,"operations":[{"op":"put_file","path":source.path,"blob_hash":source.blob_hash,"size_bytes":source.size_bytes}]}))
+            .bind(actor.as_uuid()).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
+        sqlx::query("UPDATE latex_core.workspace_heads SET durable_version=$2,updated_at=statement_timestamp() WHERE workspace_id=$1")
+            .bind(workspace).bind(next).execute(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
         sqlx::query("DELETE FROM latex_core.paper_front_matter_values WHERE paper_team_id=$1")
             .bind(paper_id)
             .execute(&mut *tx)
             .await
             .map_err(FrontMatterRepositoryError::Database)?;
-        for (key, value) in values {
+        for (key, value) in values
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "guide_identity" | "dean_identity"))
+        {
             sqlx::query("INSERT INTO latex_core.paper_front_matter_values (paper_team_id,field_key,value_json,value_source,updated_by_user_id) VALUES ($1,$2,$3,'TEAM_OVERRIDE',$4)")
                 .bind(paper_id)
                 .bind(key)
@@ -246,6 +275,10 @@ impl FrontMatterRepository {
         .execute(&mut *tx)
         .await
         .map_err(FrontMatterRepositoryError::Database)?;
+        // Canonical source replacement starts a new collaboration generation;
+        // old Yrs snapshots must never restore the previous front matter.
+        let epoch: i64 = sqlx::query_scalar("INSERT INTO latex_core.paper_collaboration_state (workspace_id,document_epoch) VALUES ($1,2) ON CONFLICT(workspace_id) DO UPDATE SET document_epoch=paper_collaboration_state.document_epoch+1,updated_at=statement_timestamp() RETURNING document_epoch")
+            .bind(workspace).fetch_one(&mut *tx).await.map_err(FrontMatterRepositoryError::Database)?;
         audit(
             &mut tx,
             actor,
@@ -258,15 +291,13 @@ impl FrontMatterRepository {
         tx.commit()
             .await
             .map_err(FrontMatterRepositoryError::Database)?;
-        let version: i64 = sqlx::query_scalar(
-            "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
-        )
-        .bind(workspace)
-        .fetch_one(self.database.pool())
-        .await
-        .map_err(FrontMatterRepositoryError::Database)?;
-        u64::try_from(version)
-            .map_err(|_| FrontMatterRepositoryError::Integrity("negative workspace version".into()))
+        let version = u64::try_from(next).map_err(|_| {
+            FrontMatterRepositoryError::Integrity("negative workspace version".into())
+        })?;
+        let epoch = u64::try_from(epoch)
+            .map_err(|_| FrontMatterRepositoryError::Integrity("negative document epoch".into()))?;
+        tracing::info!(paper_id=%paper_id, workspace_id=%workspace, workspace_version=version, document_epoch=epoch, "Front Matter source committed");
+        Ok((version, epoch))
     }
 
     #[allow(

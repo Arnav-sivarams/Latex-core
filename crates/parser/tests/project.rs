@@ -147,3 +147,76 @@ fn multiple_bibliographies_duplicates_and_dynamic_are_conservative() {
             .any(|d| d.diagnostic().code() == DiagnosticCode::UnresolvedCitation)
     );
 }
+
+#[test]
+fn graphics_use_main_context_and_effective_graphicspath() {
+    for (main, nested) in [
+        (r"\includegraphics{images/foo.png}", ""),
+        (r"\graphicspath{{images/}}\includegraphics{foo}", ""),
+        (
+            r"\input{sections/figures}",
+            r"\includegraphics{images/foo.png}",
+        ),
+        (
+            r"\graphicspath{{images/}}\input{sections/figures}",
+            r"\includegraphics{foo}",
+        ),
+        (
+            r"\input{sections/paths}\input{sections/figures}",
+            r"\includegraphics{foo}",
+        ),
+    ] {
+        let source = ProjectSource::new(
+            p("main.tex"),
+            BTreeMap::from([
+                (p("main.tex"), Bytes::copy_from_slice(main.as_bytes())),
+                (
+                    p("sections/figures.tex"),
+                    Bytes::copy_from_slice(nested.as_bytes()),
+                ),
+                (
+                    p("sections/paths.tex"),
+                    Bytes::from_static(br"\graphicspath{{images/}{figures/}}"),
+                ),
+                (p("images/foo.png"), Bytes::from_static(b"image")),
+            ]),
+        )
+        .unwrap();
+        let analysis = ProjectAnalyzer::with_default_limits()
+            .analyze(&source)
+            .unwrap();
+        assert!(
+            !analysis
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.diagnostic().code()
+                    == DiagnosticCode::MissingProjectDependency),
+            "{main} {nested}: {:?}",
+            analysis.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn graphics_missing_and_traversal_still_warn() {
+    let source = project(&[("main.tex", br"\graphicspath{{images/}{../../}}\includegraphics{actually-missing}\includegraphics{../outside.png}"), ("images/foo.png", b"image")]);
+    let analysis = ProjectAnalyzer::with_default_limits()
+        .analyze(&source)
+        .unwrap();
+    assert_eq!(
+        analysis
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.diagnostic().code()
+                == DiagnosticCode::MissingProjectDependency)
+            .count(),
+        2
+    );
+    assert!(
+        analysis
+            .dependency_graph()
+            .edges()
+            .iter()
+            .all(|edge| matches!(edge.resolution(), DependencyResolution::Missing(_)))
+    );
+}

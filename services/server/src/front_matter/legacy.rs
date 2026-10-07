@@ -452,8 +452,14 @@ pub fn single_source_bindings(
 ) -> Result<String, FrontMatterError> {
     let mut values = values.clone();
     if let (Some(semester), Some(submission_date)) = (
-        values.get("team.semester").and_then(Value::as_str),
-        values.get("submission_date").and_then(Value::as_str),
+        values
+            .get("team.semester")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty()),
+        values
+            .get("submission_date")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty()),
     ) {
         let metadata = derive_semester_metadata(
             semester,
@@ -470,11 +476,7 @@ pub fn single_source_bindings(
     for (word, source, _, _) in REGISTRY {
         writeln!(output, "\\providecommand{{\\{word}}}{{}}")
             .map_err(|_| FrontMatterError::InvalidManifest)?;
-        let Some(value) = values
-            .get(*source)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        else {
+        let Some(value) = values.get(*source).and_then(Value::as_str) else {
             continue;
         };
         let value = match *word {
@@ -813,7 +815,7 @@ mod tests {
         let pack = fixture();
         let automatic = BTreeMap::from([
             (
-                "team.name".into(),
+                "project.title".into(),
                 Value::String(r"A & % $ # _ { } \input \write18".into()),
             ),
             ("team.size".into(), Value::String("4".into())),
@@ -849,7 +851,9 @@ mod tests {
         assert!(metadata.contains(r"\renewcommand{\thesisyear}{2026}"));
         assert!(metadata.contains(r"\providecommand{\studentAname}{}"));
         assert!(!metadata.contains(r"\renewcommand{\studentAname}"));
-        assert!(metadata.contains(&escape_latex_text(automatic["team.name"].as_str().unwrap())));
+        assert!(metadata.contains(&escape_latex_text(
+            automatic["project.title"].as_str().unwrap()
+        )));
         assert!(!metadata.contains(r"\write18"));
         assert!(!metadata.contains("gender"));
     }

@@ -219,6 +219,7 @@ impl ProjectAnalyzer {
                 bibliographies.insert(path.clone(), session.analysis().clone());
             }
         }
+        let graphics_contexts = graphics_contexts(source, &files);
         let mut graph = DependencyGraph::default();
         let mut diagnostics = Vec::new();
         for (path, analysis) in &files {
@@ -233,7 +234,18 @@ impl ProjectAnalyzer {
                 let resolution = match request.target() {
                     DependencyTarget::Dynamic(_) => DependencyResolution::Dynamic,
                     DependencyTarget::Static(raw) => {
-                        resolve_dependency(path, request.kind(), raw, &source.files)
+                        if request.kind() == DependencyKind::Graphics {
+                            resolve_graphics(
+                                &source.main_file,
+                                raw,
+                                graphics_contexts
+                                    .get(&(path.clone(), request.range().start_byte()))
+                                    .map_or(&[], Vec::as_slice),
+                                &source.files,
+                            )
+                        } else {
+                            resolve_dependency(path, request.kind(), raw, &source.files)
+                        }
                     }
                 };
                 if let DependencyResolution::Missing(_) = &resolution {
@@ -390,6 +402,124 @@ fn resolve_dependency(
             DependencyResolution::ProjectFile,
         )
 }
+// Follow source commands in execution order, carrying graphicspath through inputs.
+fn graphics_contexts(
+    source: &ProjectSource,
+    files: &BTreeMap<LogicalPath, FileAnalysis>,
+) -> BTreeMap<(LogicalPath, u64), Vec<String>> {
+    let mut contexts = BTreeMap::new();
+    visit_graphics(
+        &source.main_file,
+        source,
+        files,
+        &mut Vec::new(),
+        &mut BTreeSet::new(),
+        &mut contexts,
+    );
+    contexts
+}
+
+fn visit_graphics(
+    path: &LogicalPath,
+    source: &ProjectSource,
+    files: &BTreeMap<LogicalPath, FileAnalysis>,
+    paths: &mut Vec<String>,
+    active: &mut BTreeSet<LogicalPath>,
+    contexts: &mut BTreeMap<(LogicalPath, u64), Vec<String>>,
+) {
+    if !active.insert(path.clone()) {
+        return;
+    }
+    if let Some(analysis) = files.get(path) {
+        let mut events = analysis
+            .commands()
+            .iter()
+            .filter(|command| command.name() == "graphicspath")
+            .map(|command| (command.range().start_byte(), None))
+            .collect::<Vec<_>>();
+        events.extend(
+            analysis
+                .dependencies()
+                .iter()
+                .map(|request| (request.range().start_byte(), Some(request))),
+        );
+        events.sort_by_key(|(offset, _)| *offset);
+        for (offset, request) in events {
+            if let Some(request) = request {
+                if request.kind() == DependencyKind::Graphics {
+                    contexts.insert((path.clone(), offset), paths.clone());
+                } else if matches!(
+                    request.kind(),
+                    DependencyKind::Input | DependencyKind::Include | DependencyKind::Subfile
+                ) {
+                    if let DependencyTarget::Static(raw) = request.target() {
+                        if let DependencyResolution::ProjectFile(target) =
+                            resolve_dependency(path, request.kind(), raw, &source.files)
+                        {
+                            visit_graphics(&target, source, files, paths, active, contexts);
+                        }
+                    }
+                }
+            } else if let Some(bytes) = source.files.get(path) {
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    if let Ok(offset) = usize::try_from(offset) {
+                        if let Some(rest) = text.get(offset..) {
+                            if let Some(declared) = graphicspath_entries(rest) {
+                                *paths = declared;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    active.remove(path);
+}
+
+fn graphicspath_entries(text: &str) -> Option<Vec<String>> {
+    let mut rest = text
+        .strip_prefix(r"\graphicspath")?
+        .trim_start()
+        .strip_prefix('{')?
+        .trim_start();
+    let mut paths = Vec::new();
+    while !rest.starts_with('}') {
+        rest = rest.strip_prefix('{')?;
+        let end = rest.find('}')?;
+        let path = &rest[..end];
+        if path.contains(['{', '\\', '%']) {
+            return None;
+        }
+        paths.push(path.to_owned());
+        rest = rest[end + 1..].trim_start();
+    }
+    Some(paths)
+}
+
+fn resolve_graphics(
+    main: &LogicalPath,
+    raw: &str,
+    paths: &[String],
+    files: &BTreeMap<LogicalPath, Bytes>,
+) -> DependencyResolution {
+    let mut options = candidates(main, DependencyKind::Graphics, raw);
+    for directory in paths {
+        options.extend(candidates(
+            main,
+            DependencyKind::Graphics,
+            &format!("{directory}{raw}"),
+        ));
+    }
+    options
+        .iter()
+        .find(|candidate| files.contains_key(*candidate))
+        .cloned()
+        .map_or_else(
+            || DependencyResolution::Missing(options.clone()),
+            DependencyResolution::ProjectFile,
+        )
+}
+
 fn resolve_tex_request(
     from: &LogicalPath,
     kind: TexRequestKind,
