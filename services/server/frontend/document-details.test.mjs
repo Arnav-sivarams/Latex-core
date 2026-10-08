@@ -26,3 +26,11 @@ test('semester and academic year are explicit team metadata overrides', () => {
   assert.equal(editableDetail({ can_edit: true }, { source: 'team.academic_year', allow_team_override: false }), true);
   assert.equal(editableDetail({ can_edit: false }, { source: 'team.semester', allow_team_override: false }), false);
 });
+
+test('details group document inputs separately from institutional and team fields', async () => {
+  const { detailCategory } = await import('./document-details.mjs');
+  for (const source of ['course_code', 'course_name', 'project.title', 'team.semester', 'team.academic_year']) assert.equal(detailCategory({ source }), 'Document details');
+  assert.equal(detailCategory({ source: 'student.a.name' }), 'Team members');
+  assert.equal(detailCategory({ source: 'department_name' }), 'Institutional details');
+  assert.equal(detailCategory({ source: 'guide.name' }), 'Institutional details');
+});

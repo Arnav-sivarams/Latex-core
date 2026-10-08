@@ -15,10 +15,10 @@ async fn legacy_front_matter_institutional_api_contract() {
     let dean = format!("DEAN-{suffix}");
     let department = uuid::Uuid::new_v4();
     let department_two = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO vcap.departments (department_id) VALUES ($1),($2)").bind(department).bind(department_two).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO vcap.departments (department_id,department_name) VALUES ($1,'Computer Science'),($2,'Data Science')").bind(department).bind(department_two).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO vcap.faculty (faculty_id,name,honorific,dept_id) VALUES ($1,'Helen Head','Dr.',$4),($2,'Dana Dean','Prof.',NULL),($3,'Harriet Head','Dr.',$5)")
         .bind(&hod).bind(&dean).bind(&hod_two).bind(department).bind(department_two).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO vcap.programmes (programme_code,hod_id) VALUES ($1,$2),($3,$4)")
+    sqlx::query("INSERT INTO vcap.programmes (programme_code,hod_id,programme_name,degree_name,specialization) VALUES ($1,$2,'Computer Science and Engineering','Bachelor of Technology','Intelligent Systems'),($3,$4,'Data Science','Bachelor of Technology','Intelligent Systems')")
         .bind(&programme)
         .bind(&hod)
         .bind(&programme_two)
@@ -169,13 +169,7 @@ async fn legacy_front_matter_institutional_api_contract() {
         assert_eq!(value("guide_designation"), "Associate Professor");
         assert_eq!(value("hod_name"), "Dr. Helen Head");
         assert_eq!(value("dean_name"), "Prof. Dana Dean");
-        assert!(
-            detail["missing_required_fields"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item == "Department name")
-        );
+        assert_eq!(value("department_name"), "Computer Science");
         assert_eq!(
             detail["warnings"]
                 .as_array()
@@ -222,7 +216,7 @@ async fn legacy_front_matter_institutional_api_contract() {
     assert_eq!(project_after["values"]["publications"].as_array().unwrap().len(), 3);
     assert_eq!(project_after["values"]["department_display_names"].as_array().unwrap().len(), 2);
     assert_eq!(project_after["values"]["school_display_names"].as_array().unwrap().len(), 2);
-    assert!(project_after["fields"].as_array().unwrap().iter().find(|field| field["key"] == "departments").unwrap()["value"].as_array().unwrap().iter().all(|item| item["display_name"].is_string() && item["origin"] == "team_override"));
+    assert!(project_after["fields"].as_array().unwrap().iter().find(|field| field["key"] == "departments").unwrap()["value"].as_array().unwrap().iter().all(|item| item["display_name"].is_string() && item["origin"] == "database"));
     let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs WHERE workspace_id=$1")
         .bind(uuid::Uuid::parse_str(created["team"]["workspace_id"].as_str().unwrap()).unwrap()).fetch_one(&pool).await.unwrap();
     assert_eq!(jobs_before, jobs_after, "project metadata saves must not compile");
@@ -245,9 +239,9 @@ async fn legacy_front_matter_institutional_api_contract() {
             .await
             .unwrap();
     assert_eq!(before, after, "AUTO reads must not create versions");
-    // Project-scoped labels now resolve these identities authoritatively for this
-    // report. The legacy pack form must not override the same resolved fields.
-    let manual = serde_json::json!({"course_code":"CSE4999","course_name":"Capstone Project","degree_name":"Bachelor of Technology","programme_name":"Computer Science and Engineering","specialization":"Intelligent Systems","submission_date":"2026-09-13"});
+    // Database labels resolve these identities authoritatively for this report.
+    // The legacy pack form must not override the same resolved fields.
+    let manual = serde_json::json!({"course_code":"CSE4999","course_name":"Capstone Project","project_title":"Synthetic Solar Report","team_academic_year":"2026-2027","submission_date":"2026-09-13"});
     let body = serde_json::json!({"values":manual,"sections":{}}).to_string();
     for cookie in [&writers[1].cookie, &mentors[0].cookie] {
         assert_eq!(
@@ -407,12 +401,7 @@ async fn legacy_front_matter_institutional_api_contract() {
         saved_metadata,
         "restore must retain exact generated metadata bytes"
     );
-    sqlx::query("UPDATE latex_core.paper_teams SET name=$2 WHERE id=$1")
-        .bind(paper_id)
-        .bind(r"Title & % $ # _ { } \input \write18")
-        .execute(&pool)
-        .await
-        .unwrap();
+    selected["project_title"] = serde_json::json!(r"Title & % $ # _ { } \input \write18");
     assert_eq!(
         request(
             &app,
@@ -434,11 +423,7 @@ async fn legacy_front_matter_institutional_api_contract() {
     let escaped = String::from_utf8(malicious.to_vec()).unwrap();
     assert!(!escaped.contains(r"\write18"));
     assert!(escaped.contains(r"\textbackslash{}write18"));
-    sqlx::query("UPDATE latex_core.paper_teams SET name='Synthetic Solar Project' WHERE id=$1")
-        .bind(paper_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    selected["project_title"] = serde_json::json!("Synthetic Solar Report");
     // Optional opt-in uses the real frozen compiler and one authenticated browser journey.
     if env::var_os("FRONTMATTER_BROWSER").is_some() {
         legacy_front_matter_browser(

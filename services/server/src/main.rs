@@ -4142,11 +4142,19 @@ async fn single_source_document_details(
             serde_json::Value::String(selected.into()),
         );
     }
+    let team_size = automatic
+        .get("team.size")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut fields = BTreeMap::new();
     let mut values = BTreeMap::new();
     let mut missing = BTreeSet::new();
     for (command, source, label, editable) in front_matter::legacy::REGISTRY {
         if !commands.contains(*command) {
+            continue;
+        }
+        if front_matter::legacy::unused_student_slot(source, team_size) {
             continue;
         }
         let key = source.replace('.', "_");
@@ -4192,6 +4200,7 @@ async fn single_source_document_details(
         "status":if missing.is_empty() { "READY" } else { "NEEDS_INFORMATION" },
         "missing_required_fields":missing,
         "warnings":[],
+        "team_size":team_size,
         "manifest":{"schema_version":2,"sections":[],"fields":fields.into_values().collect::<Vec<_>>()},
         "values":values.into_values().collect::<Vec<_>>(),
         "sections":[],
@@ -11785,7 +11794,7 @@ mod tests {
         let text = String::from_utf8_lossy(&bound);
         assert!(text.contains(r"\newcommand{\coursecode}{BA101}"));
         assert!(text.contains(r"\newcommand{\semester}{Winter Semester 2026-2027}"));
-        assert!(text.contains(r"\renewcommand{\academicyear}{2026-2027}"));
+        assert!(text.contains(r"\newcommand{\academicyear}{2026-2027}"));
         assert!(text.contains(r"\newcommand{\programdegree}{Master of Technology}"));
         assert!(text.contains(r"\include{coverpage.tex}"));
         assert!(!text.contains("BCSXXXX"));
@@ -14409,7 +14418,7 @@ Unrelated authored LaTeX survives.
         );
         assert!(
             String::from_utf8_lossy(&persisted)
-                .contains(r"\renewcommand{\studentAname}{Institutional Alice}")
+                .contains(r"\newcommand{\studentAname}{Institutional Alice}")
         );
         let live_files = state.v2.visible_paper_files(workspace_id).await.unwrap();
         assert_eq!(
@@ -14472,9 +14481,7 @@ Unrelated authored LaTeX survives.
             .await
             .unwrap();
         let compiled_main = String::from_utf8(compiled_main.to_vec()).unwrap();
-        assert!(
-            compiled_main.contains(r"\renewcommand{\thesistitle}{Professor Durable Title One}")
-        );
+        assert!(compiled_main.contains(r"\newcommand{\thesistitle}{Professor Durable Title One}"));
         assert!(compiled_main.contains(r"\input{chapters/body.tex}"));
         let version_row: (String, serde_json::Value) = sqlx::query_as(
             "SELECT v.snapshot_id,v.manifest FROM latex_core.v2_paper_builds b JOIN latex_core.paper_versions v ON v.id=b.version_id WHERE b.id=$1",
@@ -14663,7 +14670,7 @@ Unrelated authored LaTeX survives.
         assert!(
             String::from_utf8(compiled_main.to_vec())
                 .unwrap()
-                .contains(r"\renewcommand{\thesistitle}{Professor Durable Title Two}")
+                .contains(r"\newcommand{\thesistitle}{Professor Durable Title Two}")
         );
         if let Ok(image) = env::var("LATEX_CORE_HOTFIX_TEXLIVE_IMAGE") {
             let staging = tempfile::tempdir().unwrap();
@@ -14754,7 +14761,7 @@ Unrelated authored LaTeX survives.
             mentor_source["content"]
                 .as_str()
                 .unwrap()
-                .contains(r"\renewcommand{\thesistitle}{Professor Durable Title Two}")
+                .contains(r"\newcommand{\thesistitle}{Professor Durable Title Two}")
         );
 
         pool.close().await;

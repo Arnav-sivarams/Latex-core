@@ -45,7 +45,8 @@ test('upload insertion, save sequencing, inverse SyncTeX, and Insert menu contra
   assert.match(insertMenu, /category: 'Structure'/);
   assert.match(insertMenu, /category: 'Media'/);
   assert.match(insertMenu, /label: 'Wrap figure'/);
-  assert.doesNotMatch(insertMenu, /Comment selected lines|Uncomment selected lines/);
+  assert.match(insertMenu, /label: 'Comment selected lines'/);
+  assert.match(insertMenu, /label: 'Uncomment selected lines'/);
   assert.match(writer, /function toggleSourceComment/);
 });
 

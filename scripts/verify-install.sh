@@ -25,15 +25,12 @@ for service in postgres api worker caddy; do
 done
 postgres_id="$(latex_core_container_id postgres)"
 api_id="$(latex_core_container_id api)"
-worker_id="$(latex_core_container_id worker)"
 if [[ -n "$postgres_id" && "$(latex_core_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$postgres_id" 2>/dev/null)" == healthy ]]; then pass 'PostgreSQL healthcheck is healthy'; else fail 'PostgreSQL healthcheck is not healthy'; fi
 if [[ -n "$api_id" && "$(latex_core_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$api_id" 2>/dev/null)" == healthy ]]; then pass 'API database-backed readiness is healthy'; else fail 'API database-backed readiness is not healthy'; fi
-staging="$(latex_core_env_value WORKER_STAGING_HOST_ROOT "$LATEX_CORE_ENV_FILE")"
-if [[ -n "$worker_id" && -d "$staging" && -w "$staging" ]]; then
-  mounted_source="$(latex_core_docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$staging\"}}{{.Source}}{{end}}{{end}}" "$worker_id" 2>/dev/null || true)"
-  if [[ "$mounted_source" == "$staging" ]]; then pass 'worker/compiler staging bind matches the configured writable host path'; else fail 'worker staging bind does not match configured host path'; fi
+if "$root/scripts/verify-worker-staging.sh"; then
+  pass 'worker/compiler staging bind matches the configured writable host path'
 else
-  fail 'deployment account cannot access configured worker staging path'
+  fail 'worker staging bind does not match configured host path'
 fi
 
 expected_versions="$(find migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort | sed -E 's/^0*([0-9]+)_.*/\1/')"

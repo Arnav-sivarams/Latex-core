@@ -170,20 +170,15 @@ pub fn bind_single_source_values(
             "complete report template metadata compatibility: exactly one safe pre-document binding point and a recognized institutional macro declaration are required".into(),
         )
     })?;
-    let canonical = source_binding_inputs(values)?;
-    let mut binding = legacy::single_source_bindings(&canonical)?;
-    // Keep canonical inputs for macros whose display values are derived.
-    for (key, command) in CANONICAL_INPUTS {
-        if let Some(value) = canonical.get(*key).and_then(Value::as_str) {
-            writeln!(
-                binding,
-                "\\providecommand{{\\{command}}}{{}}\n\\renewcommand{{\\{command}}}{{{}}}",
-                escape_latex_text(value)
-            )
-            .map_err(|_| FrontMatterError::InvalidManifest)?;
-        }
-    }
-    binding.push_str(SINGLE_SOURCE_MARKER);
+    let mut inputs = single_source_managed_values_from_tex(main);
+    inputs.extend(values.clone());
+    let canonical = source_binding_inputs(&inputs)?;
+    let rendered = legacy::single_source_bindings(&canonical)?;
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let marker = source.find(SINGLE_SOURCE_MARKER);
     let target = match point {
         SingleSourceBindingPoint::ExplicitMarker => {
@@ -195,60 +190,115 @@ pub fn bind_single_source_values(
             .map(str::len)
             .sum(),
     };
-    let start = source[..target]
-        .rfind("% Known institutional single-source bindings.\n")
-        .unwrap_or(target);
-    let end = if marker.is_some() {
-        target + SINGLE_SOURCE_MARKER.len()
-    } else {
-        target
-    };
-    let separator = if marker.is_some() { "" } else { "\n" };
+    let header = "% Known institutional single-source bindings.";
+    let start = source[..target].rfind(header).unwrap_or(target);
+    let end = marker.map_or(target, |_| target + SINGLE_SOURCE_MARKER.len());
+    let commands = legacy::REGISTRY
+        .iter()
+        .map(|(command, _, _, _)| *command)
+        .chain(CANONICAL_INPUTS.iter().map(|(_, command)| *command))
+        .collect::<BTreeSet<_>>();
+    let preserved = preserve_unmanaged_binding_lines(&source[start..target], header, &commands);
     let mut preamble = source[..start].to_owned();
-    // Update the existing declarations as well as the managed override so the
-    // durable source and the editor show the value the user just saved.
-    for (command, _, _, _) in legacy::REGISTRY {
+    let mut binding = format!("{header}\n");
+    for command in commands {
         let needle = format!("\\renewcommand{{\\{command}}}");
-        let Some(offset) = binding.find(&needle) else {
-            continue;
-        };
-        let Some(value) = literal_group(&binding[offset + needle.len()..]) else {
-            continue;
-        };
-        let mut replacements = Vec::new();
-        let mut line_offset = 0;
-        for line in preamble.split_inclusive('\n') {
-            let code = tex_code_line(line);
-            for declaration in [
-                "newcommand",
-                "providecommand",
-                "renewcommand",
-                "DeclareRobustCommand",
-            ] {
-                let declaration = format!("\\{declaration}{{\\{command}}}");
-                for (offset, _) in code.match_indices(&declaration) {
-                    let rest = &code[offset + declaration.len()..];
-                    let trimmed = rest.trim_start();
-                    if let Some(old) = literal_group(trimmed) {
-                        let from = line_offset + offset + declaration.len() + rest.len()
-                            - trimmed.len()
-                            + 1;
-                        replacements.push((from, from + old.len()));
-                    }
+        let value = rendered
+            .find(&needle)
+            .and_then(|offset| literal_group(&rendered[offset + needle.len()..]))
+            .map(str::to_owned)
+            .or_else(|| {
+                CANONICAL_INPUTS
+                    .iter()
+                    .find(|(_, name)| *name == command)
+                    .and_then(|(key, _)| canonical.get(*key).and_then(Value::as_str))
+                    .map(escape_latex_text)
+            });
+        // Mask comments without changing byte offsets, so multiline literal
+        // definitions can be updated while retaining surrounding formatting.
+        let code = preamble
+            .split_inclusive('\n')
+            .fold(String::new(), |mut masked, line| {
+                let code = tex_code_line(line);
+                masked.push_str(code);
+                masked.extend(std::iter::repeat_n(' ', line.len() - code.len()));
+                masked
+            });
+        let mut declarations = Vec::new();
+        for kind in ["newcommand", "providecommand", "DeclareRobustCommand"] {
+            let needle = format!("\\{kind}{{\\{command}}}");
+            for (offset, _) in code.match_indices(&needle) {
+                let rest = &code[offset + needle.len()..];
+                let trimmed = rest.trim_start();
+                if let Some(body) = literal_group(trimmed) {
+                    let from = offset + needle.len() + rest.len() - trimmed.len() + 1;
+                    declarations.push((from, from + body.len()));
                 }
             }
-            line_offset += line.len();
         }
-        replacements.sort_unstable();
-        for (from, to) in replacements.into_iter().rev() {
-            preamble.replace_range(from..to, value);
+        declarations.sort_unstable();
+        if let Some((from, to)) = declarations.first() {
+            if let Some(value) = value {
+                preamble.replace_range(*from..*to, &value);
+            }
+        } else {
+            writeln!(
+                binding,
+                "\\newcommand{{\\{command}}}{{{}}}",
+                value.unwrap_or_default()
+            )
+            .map_err(|_| FrontMatterError::InvalidManifest)?;
         }
     }
+    binding = binding.replace('\n', newline);
+    binding.push_str(&preserved);
+    binding.push_str(SINGLE_SOURCE_MARKER);
+    let separator = if marker.is_some() { "" } else { newline };
     Ok(Bytes::from(format!(
-        "{}{binding}{separator}{}",
-        preamble,
+        "{preamble}{binding}{separator}{}",
         &source[end..]
     )))
+}
+
+fn preserve_unmanaged_binding_lines(
+    source: &str,
+    header: &str,
+    commands: &BTreeSet<&str>,
+) -> String {
+    // Only remove exact generated zero-argument declarations inside our block.
+    // Preserve unknown commands, comments, and user renewcommands outside it.
+    let mut preserved = String::new();
+    for line in source.split_inclusive('\n') {
+        if line.trim() == header {
+            continue;
+        }
+        let code = tex_code_line(line).trim();
+        let generated = commands.iter().any(|command| {
+            ["providecommand", "renewcommand", "newcommand"]
+                .iter()
+                .any(|kind| {
+                    let needle = format!("\\{kind}{{\\{command}}}");
+                    code.strip_prefix(&needle)
+                        .and_then(|rest| literal_group(rest.trim_start()))
+                        .is_some_and(|body| {
+                            code.strip_prefix(&needle).is_some_and(|rest| {
+                                rest.trim_start()[body.len() + 2..].trim().is_empty()
+                            })
+                        })
+                })
+        });
+        if generated {
+            if let Some(comment) = line
+                .get(tex_code_line(line).len()..)
+                .filter(|comment| comment.starts_with('%'))
+            {
+                preserved.push_str(comment);
+            }
+        } else {
+            preserved.push_str(line);
+        }
+    }
+    preserved
 }
 
 /// TeX discards spaces after control words; make student separators explicit.
@@ -279,7 +329,7 @@ pub fn document_owned_source(source: &str) -> bool {
 
 /// The generated allowlist does not introduce new required template fields.
 pub fn single_source_commands(source: &str) -> BTreeSet<String> {
-    let Some(start) = source.find("% Known institutional single-source bindings.\n") else {
+    let Some(start) = source.find("% Known institutional single-source bindings.") else {
         return legacy::commands(source);
     };
     let Some(end) = source[start..].find(SINGLE_SOURCE_MARKER) else {
@@ -303,7 +353,7 @@ pub fn single_source_managed_values_from_tex(main: &[u8]) -> BTreeMap<String, Va
     let Ok(source) = std::str::from_utf8(main) else {
         return BTreeMap::new();
     };
-    let Some(start) = source.find("% Known institutional single-source bindings.\n") else {
+    let Some(start) = source.find("% Known institutional single-source bindings.") else {
         return BTreeMap::new();
     };
     let Some(end) = source[start..].find(SINGLE_SOURCE_MARKER) else {
@@ -1157,6 +1207,85 @@ mod tests {
     }
 
     #[test]
+    fn old_duplicate_bindings_normalize_without_removing_user_code() {
+        let source = br"\documentclass{article}
+\newcommand{\coursecode}{OLD}
+\newcommand{\coursename}{Captsone project - II} % keep original comment
+\newcommand{\programdegree}{Bachelor of Technology}
+\newcommand{\custom}{original}
+\renewcommand{\custom}{User value}
+% Known institutional single-source bindings.
+\providecommand{\coursecode}{}
+\renewcommand{\coursecode}{BA101}
+\providecommand{\coursename}{}
+\renewcommand{\coursename}{Captsone project - II}
+% keep user comment in managed area
+\newcommand{\anothercustom}{keep me}
+% LATEX_CORE_SINGLE_SOURCE_BINDINGS
+\begin{document}\coursecode\end{document}
+";
+        let intended = BTreeMap::from([("course_code".into(), Value::String("BA102".into()))]);
+        let mut bound = bind_single_source_values(source, &intended).unwrap();
+        for _ in 0..3 {
+            let text = std::str::from_utf8(&bound).unwrap();
+            assert!(text.contains(r"\newcommand{\coursecode}{BA102}"));
+            for command in ["coursecode", "coursename", "programdegree", "academicyear"] {
+                assert_eq!(
+                    text.matches(&format!("\\newcommand{{\\{command}}}"))
+                        .count(),
+                    1
+                );
+                assert!(!text.contains(&format!("\\renewcommand{{\\{command}}}")));
+                assert!(!text.contains(&format!("\\providecommand{{\\{command}}}")));
+            }
+            assert!(text.contains(r"\renewcommand{\custom}{User value}"));
+            assert!(text.contains("% keep original comment"));
+            assert!(text.contains("% keep user comment in managed area"));
+            assert!(text.contains(r"\newcommand{\anothercustom}{keep me}"));
+            let next = bind_single_source_values(&bound, &intended).unwrap();
+            assert_eq!(bound, next);
+            bound = next;
+        }
+        let unchanged = bind_single_source_values(source, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            single_source_values_from_tex(&unchanged)["course_code"],
+            "BA101"
+        );
+    }
+
+    #[test]
+    fn original_multiline_definition_is_updated_in_place() {
+        let source = b"\\documentclass{article}\n\\newcommand{\\coursecode}\n  {Old\nvalue} % retain\n\\begin{document}body\\end{document}\n";
+        let bound = bind_single_source_values(
+            source,
+            &BTreeMap::from([("course_code".into(), Value::String("BA101".into()))]),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bound)
+                .contains("\\newcommand{\\coursecode}\n  {BA101} % retain")
+        );
+        assert!(!String::from_utf8_lossy(&bound).contains(r"\renewcommand{\coursecode}"));
+    }
+
+    #[test]
+    fn student_slots_follow_authoritative_team_size() {
+        for size in [1, 2, 4] {
+            for (index, slot) in ["a", "b", "c", "d"].iter().enumerate() {
+                assert_eq!(
+                    legacy::unused_student_slot(&format!("student.{slot}.name"), size),
+                    index >= size
+                );
+                assert_eq!(
+                    legacy::unused_student_slot(&format!("student.{slot}.reg_no"), size),
+                    index >= size
+                );
+            }
+            assert!(!legacy::unused_student_slot("department_name", size));
+        }
+    }
+
+    #[test]
     fn single_source_updates_preserve_manual_macros_and_crlf() {
         let main = b"\\documentclass{article}\r\n\\newcommand{\\thesistitle}{Manual \\LaTeX{} title}\r\n% manual preamble\r\n\\begin{document}body\\end{document}\r\n";
         let values = BTreeMap::from([("course_name".into(), Value::String("A new course".into()))]);
@@ -1221,7 +1350,7 @@ mod tests {
         let bound = bind_single_source_values(source, &values).unwrap();
         let text = std::str::from_utf8(&bound).unwrap();
         assert_eq!(text.matches("LATEX_CORE_SINGLE_SOURCE_BINDINGS").count(), 1);
-        assert!(text.contains(r"\renewcommand{\thesistitle}{A \& B\_\%}"));
+        assert!(text.contains(r"\newcommand{\thesistitle}{A \& B\_\%}"));
         assert_eq!(source, b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n% LATEX_CORE_SINGLE_SOURCE_BINDINGS\n\\begin{document}\n\\thesistitle\n\\end{document}\n");
         let automatic = b"\\documentclass{article}\n\\newcommand{\\thesistitle}{Placeholder}\n\\newcommand{\\studentAname}{Student}\n\\begin{document}\n\\thesistitle\n\\end{document}\n";
         assert_eq!(

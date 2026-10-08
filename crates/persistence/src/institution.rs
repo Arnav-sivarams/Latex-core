@@ -216,6 +216,8 @@ pub struct InstitutionImportJob {
     pub created_at: String,
     pub validated_at: Option<String>,
     pub applied_at: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1190,8 +1192,9 @@ impl InstitutionRepository {
             }))
         })
         .collect::<Result<Vec<_>, InstitutionError>>()?;
+        let warnings = self.display_name_warnings(None, Some(id)).await?;
         Ok(json!({
-            "batch":batch,"files":files,"summaries":summaries,"issues":issues,"changes":changes,
+            "batch":batch,"files":files,"summaries":summaries,"issues":issues,"changes":changes,"warnings":warnings,
             "issues_limited":true,"changes_limited":true
         }))
     }
@@ -1372,7 +1375,33 @@ impl InstitutionRepository {
         .await
         .map_err(InstitutionError::Database)?
         .ok_or(InstitutionError::NotFound)?;
-        decode_job(row)
+        let mut job = decode_job(row)?;
+        job.warnings = self.display_name_warnings(Some(id), None).await?;
+        Ok(job)
+    }
+
+    async fn display_name_warnings(
+        &self,
+        job_id: Option<Uuid>,
+        batch_id: Option<Uuid>,
+    ) -> Result<Vec<String>, InstitutionError> {
+        let rows = sqlx::query(
+            r"SELECT row.source_table_or_sheet,field.name,count(*) AS missing
+              FROM latex_core.institution_import_rows row
+              JOIN latex_core.institution_import_jobs job ON job.id=row.job_id
+              JOIN (VALUES ('departments','department_name'),('schools','school_name'),
+                           ('programmes','programme_name'),('programmes','degree_name')) field(dataset,name)
+                ON field.dataset=row.source_table_or_sheet
+              WHERE (($1::uuid IS NOT NULL AND job.id=$1) OR ($2::uuid IS NOT NULL AND job.batch_id=$2))
+                AND job.mode <> 'DELETE_ONLY' AND NOT row.payload ? field.name
+              GROUP BY row.source_table_or_sheet,field.name ORDER BY row.source_table_or_sheet,field.name",
+        ).bind(job_id).bind(batch_id).fetch_all(self.database.pool()).await.map_err(InstitutionError::Database)?;
+        rows.into_iter().map(|row| {
+            let dataset: String = row.try_get("source_table_or_sheet").map_err(InstitutionError::Database)?;
+            let name: String = row.try_get("name").map_err(InstitutionError::Database)?;
+            let count: i64 = row.try_get("missing").map_err(InstitutionError::Database)?;
+            Ok(format!("{dataset}: {count} rows omit {name}. Existing names are preserved; new records need a display name before document bindings can resolve."))
+        }).collect()
     }
 
     pub async fn job_rows(
@@ -1916,7 +1945,7 @@ impl InstitutionRepository {
               LEFT JOIN vcap.students s USING(programme_code)
               LEFT JOIN latex_core.programme_template_defaults d USING(programme_code)
               LEFT JOIN latex_core.templates t ON t.id=d.template_id
-              WHERE ($1::text IS NULL OR p.programme_code ILIKE '%' || $1 || '%' OR p.programme_name ILIKE '%' || $1 || '%' OR f.name ILIKE '%' || $1 || '%')
+              WHERE ($1::text IS NULL OR p.programme_code ILIKE '%' || $1 || '%' OR p.programme_name ILIKE '%' || $1 || '%' OR p.degree_name ILIKE '%' || $1 || '%' OR p.specialization ILIKE '%' || $1 || '%' OR f.name ILIKE '%' || $1 || '%')
               GROUP BY p.programme_code,p.programme_name,p.degree_name,p.specialization,p.hod_id,f.name,d.template_id,t.name
               ORDER BY p.programme_code LIMIT $2 OFFSET $3",
         )
@@ -1976,10 +2005,10 @@ impl InstitutionRepository {
         let offset = (page - 1).saturating_mul(limit);
         let query = match dataset {
             "departments" => {
-                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.departments record WHERE ($1::text IS NULL OR record.department_id::text ILIKE '%' || $1 || '%') ORDER BY record.department_id LIMIT $2 OFFSET $3"
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.departments record WHERE ($1::text IS NULL OR record.department_id::text ILIKE '%' || $1 || '%' OR record.department_name ILIKE '%' || $1 || '%') ORDER BY record.department_id LIMIT $2 OFFSET $3"
             }
             "schools" => {
-                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.schools record WHERE ($1::text IS NULL OR record.school_id ILIKE '%' || $1 || '%') ORDER BY record.school_id LIMIT $2 OFFSET $3"
+                "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.schools record WHERE ($1::text IS NULL OR record.school_id ILIKE '%' || $1 || '%' OR record.school_name ILIKE '%' || $1 || '%') ORDER BY record.school_id LIMIT $2 OFFSET $3"
             }
             "student_course_registrations" => {
                 "SELECT to_jsonb(record) AS payload,count(*) OVER() AS total FROM vcap.student_course_registrations record WHERE ($1::text IS NULL OR record.student_reg_no ILIKE '%' || $1 || '%' OR record.course_id ILIKE '%' || $1 || '%' OR record.academic_year ILIKE '%' || $1 || '%' OR record.semester ILIKE '%' || $1 || '%') ORDER BY record.student_reg_no,record.academic_year,record.semester,record.course_id LIMIT $2 OFFSET $3"
@@ -4633,6 +4662,7 @@ async fn audit_tx(
 
 fn decode_job(row: PgRow) -> Result<InstitutionImportJob, InstitutionError> {
     Ok(InstitutionImportJob {
+        warnings: Vec::new(),
         id: row.try_get("id").map_err(InstitutionError::Database)?,
         import_kind: row
             .try_get("import_kind")
@@ -4939,6 +4969,52 @@ mod tests {
     }
 
     #[test]
+    fn department_csv_and_xlsx_accept_canonical_name_and_legacy_id() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let csv = format!("department_id,department_name\n{id},Computer Science and Engineering\n");
+        let sheet = format!(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>department_id</t></is></c><c r="B1" t="inlineStr"><is><t>department_name</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>{id}</t></is></c><c r="B2" t="inlineStr"><is><t>Computer Science and Engineering</t></is></c></row>"#
+        );
+        for mode in [
+            ImportMode::ValidateOnly,
+            ImportMode::Merge,
+            ImportMode::AddOnly,
+            ImportMode::UpdateOnly,
+        ] {
+            let csv_rows = parse_csv(
+                "departments.csv",
+                None,
+                csv.as_bytes(),
+                ImportLimits::default(),
+                mode,
+                0,
+            )
+            .expect("CSV parses");
+            let xlsx_rows = parse_xlsx(
+                &named_workbook_bytes("departments", &sheet),
+                ImportLimits::default(),
+                mode,
+                0,
+            )
+            .expect("XLSX parses");
+            assert!(csv_rows[0].error.is_none());
+            assert!(xlsx_rows[0].error.is_none());
+            assert_eq!(csv_rows[0].payload, xlsx_rows[0].payload);
+            let legacy = parse_csv(
+                "departments.csv",
+                None,
+                format!("department_id\n{id}\n").as_bytes(),
+                ImportLimits::default(),
+                mode,
+                0,
+            )
+            .expect("legacy parses");
+            assert!(legacy[0].error.is_none());
+            assert!(legacy[0].payload.get("department_name").is_none());
+        }
+    }
+
+    #[test]
     fn tie_break_is_defined_by_writer_order_data_structures() {
         let mut counts = BTreeMap::new();
         counts.insert("ECE", 1);
@@ -4974,6 +5050,10 @@ mod tests {
     }
 
     fn workbook_bytes(sheet_rows: &str) -> Vec<u8> {
+        named_workbook_bytes("students", sheet_rows)
+    }
+
+    fn named_workbook_bytes(sheet: &str, sheet_rows: &str) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut output);
@@ -4984,6 +5064,7 @@ mod tests {
                 ("xl/_rels/workbook.xml.rels", r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_owned()),
                 ("xl/worksheets/sheet1.xml", format!(r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{sheet_rows}</sheetData></worksheet>"#)),
             ] {
+                let body = if path == "xl/workbook.xml" { body.replace("name=\"students\"", &format!("name=\"{sheet}\"")) } else { body };
                 writer.start_file(path, SimpleFileOptions::default()).expect("ZIP member starts");
                 writer.write_all(body.as_bytes()).expect("ZIP member writes");
             }

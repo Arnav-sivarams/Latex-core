@@ -110,11 +110,13 @@ export function buildTable(options = {}) {
 }
 
 export function commentLatexLines(source, uncomment = false) {
-  return String(source).split('\n').map((line) => {
-    if (uncomment) return line.replace(/^(\s*)% ?/, '$1');
-    const indentation = line.match(/^\s*/)?.[0] || '';
+  return String(source).split(/(\r?\n)/).map((line, index) => {
+    if (index % 2) return line;
+    if (uncomment) return line.replace(/^([ \t]*)% ?/, '$1');
+    if (/^[ \t]*%/.test(line)) return line;
+    const indentation = line.match(/^[ \t]*/)?.[0] || '';
     return `${indentation}% ${line.slice(indentation.length)}`;
-  }).join('\n');
+  }).join('');
 }
 
 export function isInsideInlineMath(source, position) {
@@ -181,6 +183,11 @@ export function buildLongTable(options = {}) {
   }
   lines.push('\\hline', '\\end{longtable}');
   return lines.join('\n');
+}
+
+export function figureAssetPaths(files, mainFile = '') {
+  const outputPdf = String(mainFile || '').replace(/\.(?:tex|ltx)$/i, '.pdf');
+  return files.filter((file) => /\.(png|jpe?g|pdf)$/i.test(file.path) && file.path !== outputPdf).map((file) => file.path);
 }
 
 export function buildFigure(options = {}) {

@@ -555,6 +555,14 @@ pub fn single_source_bindings(
     Ok(output)
 }
 
+/// Slots beyond authoritative Writer membership are compatibility macros only.
+pub fn unused_student_slot(source: &str, team_size: usize) -> bool {
+    ["a", "b", "c", "d"]
+        .iter()
+        .enumerate()
+        .any(|(index, slot)| index >= team_size && source.starts_with(&format!("student.{slot}.")))
+}
+
 /// Read-only status calculation: resolving data never creates a workspace version.
 pub fn details(
     pack: &ValidatedPack,
@@ -583,6 +591,13 @@ pub fn details(
     }
     let mut fields = Vec::new();
     for field in &pack.manifest.fields {
+        if field
+            .source
+            .as_deref()
+            .is_some_and(|source| unused_student_slot(source, size))
+        {
+            continue;
+        }
         let resolved = rendered.resolved.get(&field.key);
         let value = resolved.map(|value| &value.value);
         let has_value = value.is_some_and(|value| !empty_value(value));

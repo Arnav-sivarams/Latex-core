@@ -1,5 +1,5 @@
 import { canSetMain, diagnosticIcon } from './writer-policy.mjs';
-import { frontMatterStatus, editableDetail, needsFirstUseDetails } from './document-details.mjs';
+import { frontMatterStatus, editableDetail, needsFirstUseDetails, detailCategory } from './document-details.mjs';
 import { basicSetup } from 'codemirror';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
 import { Decoration, EditorView, keymap } from '@codemirror/view';
@@ -20,7 +20,7 @@ import {
 import { MATH_CATALOG } from './math-catalog.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildWrapFigure,
-  buildLongTable, buildPlot, buildTable, buildTheorem, commentLatexLines,
+  buildLongTable, buildPlot, buildTable, buildTheorem, commentLatexLines, figureAssetPaths,
   buildPublicationBibitems,
   compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
   packageRequirement, suggestedInsertionPath,
@@ -1194,6 +1194,7 @@ function mountEditor(ytext, editable, latex) {
   const undoManager = new Y.UndoManager(ytext, { captureTimeout: 500 });
   model.undoManager = undoManager;
   const extensions = [
+    keymap.of([{ key: 'Mod-/', preventDefault: true, run: () => { toggleSourceComment(); return true; } }]),
     basicSetup,
     keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => { syncCurrent(); return true; } }]),
     keymap.of([{ key: 'Mod-Enter', preventDefault: true, run: () => { manualCompile(); return true; } }]),
@@ -1862,13 +1863,16 @@ function insertLatex(source, origin = 'writer-builder', cursorOffset = null) {
   return true;
 }
 
-function toggleSourceComment(uncomment) {
+function toggleSourceComment(uncomment = null) {
   if (!model.view || !model.collaboration || model.collaboration.access !== 'read_write') return notice('Open an editable text file first.', true);
   const selection = model.view.state.selection.main;
   const start = model.view.state.doc.lineAt(selection.from).from;
   const endPosition = selection.to > selection.from && selection.to === model.view.state.doc.lineAt(selection.to).from ? selection.to - 1 : selection.to;
   const end = model.view.state.doc.lineAt(Math.max(start, endPosition)).to;
-  const replacement = commentLatexLines(model.view.state.doc.sliceString(start, end), uncomment);
+  const selectedLines = model.view.state.doc.sliceString(start, end);
+  if (uncomment == null) uncomment = selectedLines.split(/\r?\n/).every((line) => /^[ \t]*%/.test(line));
+  const replacement = commentLatexLines(selectedLines, uncomment);
+  if (replacement === selectedLines) return;
   const current = model.view.state.selection.main;
   model.view.dispatch({ selection: { anchor: start, head: end } });
   captureInsertionSelection();
@@ -1951,7 +1955,7 @@ function openBuilder(kind, defaults = {}, options = {}) {
     let control;
     if (type === 'select' || ['asset', 'csv', 'bib'].includes(type)) {
       control = document.createElement('select');
-      const choices = type === 'select' ? initial : model.files.filter((file) => type === 'asset' ? /\.(png|jpe?g|pdf)$/i.test(file.path) : type === 'csv' ? file.path.endsWith('.csv') : file.path.endsWith('.bib')).map((file) => file.path);
+      const choices = type === 'select' ? initial : type === 'asset' ? figureAssetPaths(model.files, model.paperDetail?.main_file) : model.files.filter((file) => type === 'csv' ? file.path.endsWith('.csv') : file.path.endsWith('.bib')).map((file) => file.path);
       choices.forEach((choice) => control.add(new Option(choice, choice)));
     } else if (type === 'textarea') control = document.createElement('textarea');
     else { control = document.createElement('input'); control.type = type; }
@@ -2027,6 +2031,8 @@ function openInsertMenu() {
     { category: 'Code / formal content', label: 'Code block', detail: 'listings; no shell escape', run: () => openBuilder('code') },
     { category: 'Code / formal content', label: 'Algorithm', run: () => openBuilder('algorithm') },
     { category: 'Code / formal content', label: 'Theorem', run: () => openBuilder('theorem') },
+    { category: 'Code / formal content', label: 'Comment selected lines', run: () => toggleSourceComment(false) },
+    { category: 'Code / formal content', label: 'Uncomment selected lines', run: () => toggleSourceComment(true) },
     { category: 'References', label: 'Publications', detail: 'Categorized communicated, accepted and published bibitems', run: openPublications },
     { category: 'References', label: 'BibTeX entry', detail: 'Insert an entry into an existing .bib file', run: () => openBuilder('bibliography') },
     { category: 'References', label: 'Citation', run: openCitationPalette },
@@ -2097,7 +2103,7 @@ function projectMetadataEditor(detail) {
   const values = project.values || {};
   const section = document.createElement('section');
   section.className = 'project-metadata-editor';
-  section.append(Object.assign(document.createElement('h4'), { textContent: 'Project metadata' }));
+  section.append(Object.assign(document.createElement('h4'), { textContent: 'Project details' }));
   const canonical = document.createElement('details');
   canonical.append(Object.assign(document.createElement('summary'), { textContent: 'Authoritative institutional values' }));
   const canonicalList = document.createElement('dl');
@@ -2122,7 +2128,7 @@ function projectMetadataEditor(detail) {
       input.disabled = key === 'departments' || detail.single_source || !detail.can_edit || (item.origin === 'database' && Boolean(item.display_name)); input.required = key !== 'departments' && !detail.single_source && !item.display_name; input.dataset.identity = item.id;
       label.append(input); host.append(label); controls.push({ item, input });
     }
-    if (controls.length) form.append(host);
+    if (controls.length && !detail.single_source) form.append(host);
     return () => (key === 'departments' || detail.single_source ? [] : controls.filter(({ input }) => input.value.trim())).map(({ item, input }) => ({ id: item.id, display_name: input.value.trim() }));
   };
   const readDepartmentNames = displayNames('departments', 'Department display names', values.department_display_names);
@@ -2198,8 +2204,8 @@ async function openDocumentDetails(prefetched = null) {
     const detail = prefetched?.pack_id ? prefetched : await api.documentDetails(model.paper.id);
     ui.documentDetailsBody.replaceChildren();
     ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: detail.single_source ? 'Complete report template · one source controls cover, front matter, and body. The source \\thesistitle is used until a Team Leader or Admin saves an explicit Project title here; that saved title then controls every title-bearing page at the next manual compile.' : `Front Matter Pack: ${detail.pack_name || 'None'}` }));
-    ui.documentDetailsBody.append(projectMetadataEditor(detail));
     if (!detail.pack_id && !detail.single_source) {
+      ui.documentDetailsBody.append(projectMetadataEditor(detail));
       ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: 'No Front Matter pages are assigned. Project metadata remains available for institutional records.' }));
       openDrawer('documentDetails'); return;
     }
@@ -2211,12 +2217,16 @@ async function openDocumentDetails(prefetched = null) {
     const form = document.createElement('form'); form.className = 'document-details-form';
     const sectionsHeading = document.createElement('h4'); sectionsHeading.textContent = 'Sections'; if ((detail.manifest.sections || []).length) form.append(sectionsHeading);
     (detail.manifest.sections || []).forEach((section) => { const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.name = `section:${section.key}`; checkbox.checked = section.required || (currentSections[section.key] ?? section.default_enabled); checkbox.disabled = section.required || !detail.can_edit; label.append(checkbox, document.createTextNode(` ${section.label}${section.required ? ' · Required' : ' · Optional'}`)); form.append(label); });
-    const fieldsHeading = document.createElement('h4'); fieldsHeading.textContent = 'Metadata'; form.append(fieldsHeading);
+    const groups = new Map(['Document details', 'Institutional details', 'Team members'].map((heading) => {
+      const group = document.createElement('fieldset'); group.append(Object.assign(document.createElement('legend'), { textContent: heading })); return [heading, group];
+    }));
     (detail.manifest.fields || []).forEach((field) => {
+      const group = groups.get(detailCategory(field));
       const value = currentValues[field.key];
       const editable = editableDetail(detail, field);
       if (!editable) {
-        if (!field.key.endsWith('_identity')) form.append(Object.assign(document.createElement('p'), { textContent: `${field.label}: ${value == null || value === '' ? 'Not assigned — contact your administrator.' : Array.isArray(value) ? value.join(', ') : value}` }));
+        if (!field.required && !field.source?.startsWith('student.') && (value == null || value === '')) return;
+        if (!field.key.endsWith('_identity')) group.append(Object.assign(document.createElement('p'), { textContent: `${field.label}: ${value == null || value === '' ? 'Not assigned — contact your administrator.' : Array.isArray(value) ? value.join(', ') : value}` }));
         return;
       }
       const label = document.createElement('label'); label.textContent = field.label;
@@ -2228,11 +2238,12 @@ async function openDocumentDetails(prefetched = null) {
       if (field.type === 'BOOLEAN') { input.type = 'checkbox'; input.checked = Boolean(value); }
       else input.value = Array.isArray(value) ? value.join('\n') : value ?? '';
       input.required = field.required;
-      label.append(input); form.append(label);
+      label.append(input); group.append(label);
     });
+    for (const group of groups.values()) if (group.children.length > 1) form.append(group);
     if (detail.can_edit) { const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Save document details'; form.append(save); }
     form.addEventListener('submit', async (event) => { event.preventDefault(); try { if (model.collaboration && !await syncCurrent(false)) return; model.metadataSaving = true; const values = {}; const sections = {}; (detail.manifest.fields || []).forEach((field) => { const input = form.elements[`field:${field.key}`]; if (!input || input.disabled) return; values[field.key] = field.type === 'BOOLEAN' ? input.checked : input.value; }); (detail.manifest.sections || []).forEach((section) => { const input = form.elements[`section:${section.key}`]; sections[section.key] = section.required || input.checked; }); const result = await api.saveDocumentDetails(model.paper.id, { values, sections }); model.version = result.workspace_version; await openPaper(model.paper); notice(detail.single_source ? 'Complete report metadata saved. Compile to refresh the PDF.' : 'Document details saved. Front Matter was rebuilt. Compile to refresh the PDF.'); } catch (error) { notice(error.message, true); } finally { model.metadataSaving = false; } });
-    ui.documentDetailsBody.append(form); openDrawer('documentDetails');
+    ui.documentDetailsBody.append(form, projectMetadataEditor(detail)); openDrawer('documentDetails');
   } catch (error) { notice(error.message, true); }
 }
 

@@ -642,6 +642,7 @@ async fn manual_build_review_lock_and_integration_reads_share_exact_state() {
     let state_hash = snapshot_text.clone();
     let manifest = serde_json::json!({
         "schema_version":1,
+        "workspace_snapshot_id":snapshot_text,
         "workspace":{"files":{"main.tex":{"blob_hash":source_hash.to_hex(),"size_bytes":source_bytes.len()}}},
         "file_identities":[{"file_id":file.file_id,"path":"main.tex"}],
         "template_policy_provenance":{"file_policies":[{"file_id":file.file_id,"policy":"EDITABLE"}]},
@@ -878,6 +879,222 @@ async fn manual_build_review_lock_and_integration_reads_share_exact_state() {
         integration.authenticate(&token_hash).await,
         Err(IntegrationError::Forbidden)
     ));
+
+    pool.close().await;
+    database.close().await;
+}
+
+#[tokio::test]
+async fn build_reuse_requires_exact_durable_source_identity() {
+    let _guard = V2_TEST_LOCK.lock().await;
+    let (database, pool, repo) = connect().await;
+    let (admin, tenant) = insert_user_with_tenant(&pool).await;
+    let writer = insert_user(&pool).await;
+    for (user, role, label) in [
+        (admin, GlobalRole::Admin, "admin"),
+        (writer, GlobalRole::Writer, "writer-a"),
+    ] {
+        repo.set_global_role(user, role).await.unwrap();
+        sqlx::query(
+            "INSERT INTO latex_core.user_credentials (user_id,email,password_hash) VALUES ($1,$2,'test-only-hash')",
+        )
+        .bind(user.as_uuid())
+        .bind(format!("{label}-{}@example.test", user.as_uuid()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let workspace = insert_workspace(&pool, tenant, admin).await;
+    let team = repo
+        .create_paper_team(admin, workspace, "Build identity regression", writer)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO latex_core.workspace_heads (workspace_id) VALUES ($1)")
+        .bind(workspace.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (file, _) = repo
+        .create_file_with_event(
+            workspace,
+            writer,
+            0,
+            LogicalPath::parse("main.tex").unwrap(),
+            "0".repeat(64).parse().unwrap(),
+            32,
+        )
+        .await
+        .unwrap();
+    let starting_version: i64 = sqlx::query_scalar(
+        "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+    )
+    .bind(workspace.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let source_bytes = b"\\documentclass{article}\n\\begin{document}Qualified\\end{document}\n";
+    let source_hash = BlobHash::digest(source_bytes);
+    let (_, source_version) = repo
+        .save_file_with_event(
+            file.file_id,
+            writer,
+            u64::try_from(starting_version).unwrap(),
+            source_hash,
+            u64::try_from(source_bytes.len()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let jobs_after_save: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.compile_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs_after_save, jobs_before,
+        "ordinary save must enqueue zero builds"
+    );
+
+    let snapshot_text = "2".repeat(64);
+    sqlx::query("INSERT INTO latex_core.snapshots (snapshot_id,manifest_blob_hash) VALUES ($1,$1) ON CONFLICT DO NOTHING")
+        .bind(&snapshot_text)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state_hash = snapshot_text.clone();
+    let manifest = serde_json::json!({
+        "schema_version":1,
+        "workspace_snapshot_id":snapshot_text,
+        "workspace":{"files":{"main.tex":{"blob_hash":source_hash.to_hex(),"size_bytes":source_bytes.len()}}},
+        "file_identities":[{"file_id":file.file_id,"path":"main.tex"}],
+        "template_policy_provenance":{"file_policies":[{"file_id":file.file_id,"policy":"EDITABLE"}]},
+        "front_matter":{"status":"not_configured"},
+        "front_matter_resolved":{"status":"not_configured","fields":[]}
+    });
+    let request = V2BuildRequest {
+        paper_id: team.id,
+        workspace_id: workspace,
+        document_epoch: 1,
+        source_sequence: source_version,
+        snapshot_id: snapshot_text.parse::<SnapshotId>().unwrap(),
+        manifest,
+        state_hash: state_hash.clone(),
+        tenant_id: tenant,
+        user_id: writer,
+        trigger_type: "manual".into(),
+        compile_key: "4".repeat(64).parse::<CompileKey>().unwrap(),
+        engine: TexEngine::PdfLatex,
+        tex_environment_id: TexEnvironmentId::parse("test-frozen-m7").unwrap(),
+        latexmk_profile: LatexmkProfileId::parse("safe-v1").unwrap(),
+        shell_policy: ShellPolicy::Safe,
+        synctex: true,
+    };
+    let submission = repo.submit_v2_build(&request).await.unwrap();
+    let build_id = submission.build_id.unwrap();
+    let (job_id, _version_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT compile_job_id,version_id FROM latex_core.v2_paper_builds WHERE id=$1",
+    )
+    .bind(build_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE latex_core.compile_jobs SET state='succeeded',finished_at=statement_timestamp() WHERE id=$1")
+        .bind(job_id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE latex_core.v2_paper_builds SET status='succeeded' WHERE id=$1")
+        .bind(build_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pdf_bytes = b"%PDF-1.4\n% qualification artifact\n%%EOF\n";
+    for (kind, name, bytes, content_type) in [
+        ("pdf", "main.pdf", pdf_bytes.as_slice(), "application/pdf"),
+        ("log", "main.log", b"ok\n".as_slice(), "text/plain"),
+        (
+            "synctex",
+            "main.synctex.gz",
+            b"gz".as_slice(),
+            "application/gzip",
+        ),
+    ] {
+        let hash = BlobHash::digest(bytes).to_hex();
+        sqlx::query("INSERT INTO latex_core.compilation_artifacts (artifact_id,job_id,compile_key,kind,logical_name,blob_hash,size_bytes,content_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(Uuid::new_v4()).bind(job_id).bind("4".repeat(64)).bind(kind).bind(name).bind(hash).bind(i64::try_from(bytes.len()).unwrap()).bind(content_type)
+            .execute(&pool).await.unwrap();
+    }
+    sqlx::query("UPDATE latex_core.v2_paper_build_state SET active_build_id=NULL,current_build_id=$2 WHERE workspace_id=$1")
+        .bind(workspace.as_uuid()).bind(build_id).execute(&pool).await.unwrap();
+    let cached = repo.submit_v2_build(&request).await.unwrap();
+    assert!(cached.reused, "exact successful identity can be reused");
+    assert_eq!(cached.build_id, Some(build_id));
+
+    // Returning to previously compiled bytes still has a newer durable source
+    // identity. Reusing the old build would leave its PDF permanently stale.
+    repo.save_file_with_event(
+        file.file_id,
+        writer,
+        source_version,
+        "9".repeat(64).parse().unwrap(),
+        3,
+    )
+    .await
+    .unwrap();
+    let head: i64 = sqlx::query_scalar(
+        "SELECT durable_version FROM latex_core.workspace_heads WHERE workspace_id=$1",
+    )
+    .bind(workspace.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (_, restored_sequence) = repo
+        .save_file_with_event(
+            file.file_id,
+            writer,
+            u64::try_from(head).unwrap(),
+            source_hash,
+            u64::try_from(source_bytes.len()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut restored_request = request.clone();
+    restored_request.source_sequence = restored_sequence;
+    let restored = repo.submit_v2_build(&restored_request).await.unwrap();
+    assert!(!restored.reused, "old source identity must not be promoted");
+    assert_ne!(restored.build_id, Some(build_id));
+    let (captured_sequence, captured_epoch): (i64, i64) = sqlx::query_as(
+        "SELECT source_sequence,document_epoch FROM latex_core.v2_paper_builds WHERE id=$1",
+    )
+    .bind(restored.build_id.unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(captured_sequence, i64::try_from(restored_sequence).unwrap());
+    assert_eq!(captured_epoch, 1);
+    let repeated = repo.submit_v2_build(&restored_request).await.unwrap();
+    assert!(repeated.reused, "the exact active request is idempotent");
+    assert_eq!(repeated.build_id, restored.build_id);
+    restored_request.document_epoch = 2;
+    let next_epoch = repo.submit_v2_build(&restored_request).await.unwrap();
+    assert!(
+        !next_epoch.reused,
+        "another epoch must not reuse an active build"
+    );
+    assert_eq!(next_epoch.status, "pending");
+    assert_eq!(next_epoch.active_build_id, restored.build_id);
+
+    // No worker executes this scheduler fixture. Leave no queued job for a
+    // later integration test's real claim operation to pick up.
+    sqlx::query("DELETE FROM latex_core.v2_paper_build_state WHERE workspace_id=$1")
+        .bind(workspace.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE latex_core.compile_jobs SET state='failed',finished_at=now() WHERE id=$1")
+        .bind(restored.build_id.unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
 
     pool.close().await;
     database.close().await;

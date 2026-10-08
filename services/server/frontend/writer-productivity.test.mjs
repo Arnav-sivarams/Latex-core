@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, buildWrapFigure, commentLatexLines, compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
+import { buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildLongTable, buildOutlineTree, buildPlot, buildPublicationBibitems, buildTable, buildTheorem, buildWrapFigure, commentLatexLines, figureAssetPaths, compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath, latexDimension, packageRequirement, suggestedInsertionPath } from './writer-productivity.mjs';
 
 test('outline hierarchy follows section levels', () => {
   const tree = buildOutlineTree([{ level: 'section', title: 'A' }, { level: 'subsection', title: 'B' }, { level: 'section', title: 'C' }]);
@@ -99,4 +99,18 @@ test('categorized publication bibitems preserve all three statuses', () => {
 test('package awareness is explicit', () => {
   assert.equal(packageRequirement(['graphicx'], 'graphicx').available, true);
   assert.equal(packageRequirement([], 'pgfplots').message, 'Requires package: pgfplots');
+});
+
+test('comments are idempotent and preserve tabs, blank lines, and CRLF', () => {
+  for (const original of ['one', '\\section{Intro}\nText.\n\\input{chapter}', '\tone\r\n\r\n  two', '  one\n   \nthree']) {
+    const commented = commentLatexLines(original);
+    assert.equal(commentLatexLines(commented), commented);
+    assert.equal(commentLatexLines(commented, true), original);
+  }
+  assert.equal(commentLatexLines('% existing\n  text'), '% existing\n  % text');
+});
+test('Figure Builder excludes its own report PDF and retains real project images and PDFs', () => {
+  const files = ['Full_Report_template_v1.0/Full_Report_v1.0.pdf', 'Full_Report_template_v1.0/images/logo.png', 'Full_Report_template_v1.0/images/sample-graph.pdf', 'notes.tex'].map((path) => ({ path }));
+  assert.deepEqual(figureAssetPaths(files, 'Full_Report_template_v1.0/Full_Report_v1.0.tex'), ['Full_Report_template_v1.0/images/logo.png', 'Full_Report_template_v1.0/images/sample-graph.pdf']);
+  assert.deepEqual(figureAssetPaths(files, null), files.slice(0, 3).map((file) => file.path), 'ordinary projects can insert images before choosing Main');
 });

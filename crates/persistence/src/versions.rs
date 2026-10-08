@@ -285,7 +285,8 @@ impl V2Repository {
 
         if let Some(row) = sqlx::query(
             "SELECT b.id FROM latex_core.v2_paper_builds b \
-             WHERE b.workspace_id=$1 AND b.state_hash=$2 AND b.status='succeeded' \
+             WHERE b.workspace_id=$1 AND b.state_hash=$2 AND b.source_sequence=$3 \
+               AND b.document_epoch=$4 AND b.status='succeeded' \
                AND EXISTS (SELECT 1 FROM latex_core.compilation_artifacts a WHERE a.job_id=b.compile_job_id AND a.kind='pdf') \
                AND EXISTS (SELECT 1 FROM latex_core.compilation_artifacts a WHERE a.job_id=b.compile_job_id AND a.kind='log') \
                AND EXISTS (SELECT 1 FROM latex_core.compilation_artifacts a WHERE a.job_id=b.compile_job_id AND a.kind='synctex' AND a.size_bytes>0) \
@@ -293,6 +294,8 @@ impl V2Repository {
         )
         .bind(request.workspace_id.as_uuid())
         .bind(&request.state_hash)
+        .bind(to_i64(request.source_sequence, "source sequence")?)
+        .bind(to_i64(request.document_epoch, "document epoch")?)
         .fetch_optional(&mut *tx)
         .await
         .map_err(V2Error::Database)?
@@ -310,7 +313,7 @@ impl V2Repository {
         }
 
         let active = sqlx::query(
-            "SELECT b.id,b.state_hash,j.state FROM latex_core.v2_paper_build_state s \
+            "SELECT b.id,b.state_hash,b.source_sequence,b.document_epoch,j.state FROM latex_core.v2_paper_build_state s \
              JOIN latex_core.v2_paper_builds b ON b.id=s.active_build_id \
              JOIN latex_core.compile_jobs j ON j.id=b.compile_job_id WHERE s.workspace_id=$1",
         )
@@ -322,7 +325,16 @@ impl V2Repository {
             let active_id: Uuid = active.try_get("id").map_err(V2Error::Database)?;
             let active_hash: String = active.try_get("state_hash").map_err(V2Error::Database)?;
             let active_status: String = active.try_get("state").map_err(V2Error::Database)?;
-            if active_hash == request.state_hash {
+            let active_sequence: i64 = active
+                .try_get("source_sequence")
+                .map_err(V2Error::Database)?;
+            let active_epoch: i64 = active
+                .try_get("document_epoch")
+                .map_err(V2Error::Database)?;
+            if active_hash == request.state_hash
+                && u64::try_from(active_sequence).ok() == Some(request.source_sequence)
+                && u64::try_from(active_epoch).ok() == Some(request.document_epoch)
+            {
                 clear_pending(&mut tx, request.workspace_id).await?;
                 tx.commit().await.map_err(V2Error::Database)?;
                 return Ok(V2BuildSubmission {

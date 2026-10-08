@@ -1342,3 +1342,97 @@ async fn insert_template(pool: &PgPool, name: &str) -> Uuid {
         .bind(id).bind("a".repeat(64)).execute(pool).await.unwrap();
     id
 }
+
+#[tokio::test]
+async fn department_display_name_import_modes_search_and_legacy_warning() {
+    let _guard = TEST_LOCK.lock().await;
+    let url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let database =
+        Database::connect(DatabaseConfig::new(&url, 1, 8, Duration::from_secs(10)).unwrap())
+            .await
+            .unwrap();
+    database.migrate().await.unwrap();
+    let test_pool = PgPool::connect(&url).await.unwrap();
+    let pool = &test_pool;
+    let email = format!("names-{}@example.test", Uuid::new_v4());
+    let (actor, _) = insert_user(pool, &email, "admin").await;
+    let repository = InstitutionRepository::new(database.clone());
+    let id = Uuid::new_v4();
+    let field_count: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema='vcap' AND table_name='departments' AND column_name='department_name'").fetch_one(pool).await.unwrap();
+    assert_eq!(field_count, 1);
+    for (mode, csv, expected) in [
+        (
+            ImportMode::Merge,
+            format!("department_id,department_name\n{id},Canonical Engineering\n"),
+            "Canonical Engineering",
+        ),
+        (
+            ImportMode::ValidateOnly,
+            format!("department_id,department_name\n{id},Validation only\n"),
+            "Canonical Engineering",
+        ),
+        (
+            ImportMode::Merge,
+            format!("department_id\n{id}\n"),
+            "Canonical Engineering",
+        ),
+        (
+            ImportMode::AddOnly,
+            format!("department_id,department_name\n{id},Cannot overwrite\n"),
+            "Canonical Engineering",
+        ),
+        (
+            ImportMode::UpdateOnly,
+            format!("department_id,department_name\n{id},Updated Engineering\n"),
+            "Updated Engineering",
+        ),
+    ] {
+        let job = repository
+            .validate_upload(
+                actor,
+                "departments.csv",
+                None,
+                mode,
+                csv.as_bytes(),
+                ImportLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(job.error_rows, 0);
+        if !csv.contains("department_name") {
+            assert!(
+                job.warnings
+                    .iter()
+                    .any(|warning| warning.contains("department_name"))
+            );
+        }
+        if mode != ImportMode::ValidateOnly {
+            repository.apply_import(job.id, actor).await.unwrap();
+        }
+        let name: String = sqlx::query_scalar(
+            "SELECT department_name FROM vcap.departments WHERE department_id=$1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(name, expected);
+    }
+    let page = repository
+        .paginated_dataset(
+            "departments",
+            &InstitutionPageFilter {
+                search: Some("Updated Engineering".into()),
+                ..InstitutionPageFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        page.items
+            .iter()
+            .any(|row| row["department_id"] == id.to_string()
+                && row["department_name"] == "Updated Engineering")
+    );
+    database.close().await;
+}
