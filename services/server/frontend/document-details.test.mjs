@@ -21,10 +21,14 @@ test('AUTO values and nonleaders are read-only; manual fields and modern packs r
   assert.equal(frontMatterStatus({ status: 'READY' }), 'Front Matter ready');
 });
 
-test('semester and academic year are explicit team metadata overrides', () => {
-  assert.equal(editableDetail({ can_edit: true }, { source: 'team.semester', allow_team_override: false }), true);
-  assert.equal(editableDetail({ can_edit: true }, { source: 'team.academic_year', allow_team_override: false }), true);
-  assert.equal(editableDetail({ can_edit: false }, { source: 'team.semester', allow_team_override: false }), false);
+test('Complete Report exposes only three editable fields, never registration overrides', () => {
+  for (const source of ['course_code', 'team.semester', 'team.academic_year', 'department_name', 'guide.name']) {
+    assert.equal(editableDetail({ single_source: true, can_edit: true }, { source, editable: true, allow_team_override: true }), false);
+  }
+  for (const source of ['course_name', 'project.title', 'submission_date']) {
+    assert.equal(editableDetail({ single_source: true, can_edit: true }, { source, allow_team_override: true }), true);
+    assert.equal(editableDetail({ single_source: true, can_edit: false }, { source, allow_team_override: true }), false);
+  }
 });
 
 test('details group document inputs separately from institutional and team fields', async () => {

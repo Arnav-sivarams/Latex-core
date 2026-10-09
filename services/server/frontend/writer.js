@@ -1,4 +1,4 @@
-import { canSetMain, diagnosticIcon } from './writer-policy.mjs';
+import { diagnosticIcon } from './writer-policy.mjs';
 import { frontMatterStatus, editableDetail, needsFirstUseDetails, detailCategory } from './document-details.mjs';
 import { basicSetup } from 'codemirror';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
@@ -68,7 +68,6 @@ class PaperApi {
   createFile(paperId, body) { return this.json(`/api/v2/papers/${paperId}/files`, 'POST', body); }
   renameFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}/path`, 'PATCH', body); }
   deleteFile(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/files/${fileId}`, 'DELETE', body); }
-  setMain(paperId, fileId, body) { return this.json(`/api/v2/papers/${paperId}/main/${fileId}`, 'POST', body); }
   structuralUndo(paperId) { return this.json(`/api/v2/papers/${paperId}/structural-undo`, 'POST', {}); }
   structuralRedo(paperId) { return this.json(`/api/v2/papers/${paperId}/structural-redo`, 'POST', {}); }
   intelligence(paperId) { return this.request(`/api/v2/papers/${paperId}/intelligence`); }
@@ -126,10 +125,10 @@ class PaperApi {
 const api = new PaperApi();
 const ui = Object.fromEntries([
   'myPapers', 'teamPapers', 'fileTree', 'newPaper', 'newFile', 'renameFile', 'deleteFile',
-  'setMain', 'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
+  'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
   'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'pdfRelation', 'pdfEmpty',
   'buildFooter', 'buildFooterBody', 'buildFooterState', 'buildFooterCount', 'buildFooterToggle', 'buildProblemsTab', 'buildLogTab', 'buildProblemsPanel', 'buildProblemsList', 'buildLogPanel', 'buildLogText',
-  'pdfScroll', 'pdfViewport', 'downloadMenu', 'downloadLabel', 'downloadPdf', 'downloadSource', 'createCheckpoint', 'versionHistory', 'versionDiff',
+  'pdfScroll', 'pdfViewport', 'downloadPdf', 'createCheckpoint', 'versionHistory', 'versionDiff',
   'pdfPage', 'pdfZoom', 'locateInPdf',
   'reviewCounts', 'writerReviewFilters', 'writerReviewList',
     'quickOpen', 'commandPalette', 'uploadImage', 'assetInput',
@@ -198,7 +197,6 @@ const model = {
   lastBuildStatus: null,
   buildFooterTab: 'problems',
   saveInFlight: false,
-  sourceDownloadInFlight: false,
   inverseSyncRequest: 0,
   inverseNavigating: false,
 };
@@ -1049,12 +1047,10 @@ async function openPaper(paper) {
   ui.pdfScroll.hidden = true;
   ui.pdfEmpty.hidden = false;
   ui.downloadPdf.disabled = true;
-  ui.downloadSource.disabled = true;
   model.paper = paper;
   model.file = null;
   model.selectedFileId = null;
   model.fileEditable = false;
-  ui.downloadSource.disabled = false;
   loadPdfView();
   model.paperDetail = await api.paper(paper.id);
   model.version = model.paperDetail.version;
@@ -1242,8 +1238,6 @@ function updateFileActions(editable) {
   const selected = Boolean(model.file);
   ui.renameFile.disabled = !selected || !editable || model.fileActionInFlight;
   ui.deleteFile.disabled = !selected || !editable || model.fileActionInFlight;
-  ui.setMain.hidden = !canSetMain(model.file, model.paperDetail, editable);
-  ui.setMain.disabled = ui.setMain.hidden || model.fileActionInFlight;
   updateSaveControl();
   ui.insertMenu.disabled = !selected || !editable;
   ui.symbolPalette.disabled = !selected || !editable;
@@ -2112,6 +2106,13 @@ function projectMetadataEditor(detail) {
     canonicalList.append(Object.assign(document.createElement('dd'), { textContent: field.value == null ? 'Unavailable' : typeof field.value === 'string' ? field.value : JSON.stringify(field.value) }));
   });
   canonical.append(canonicalList); section.append(canonical);
+  if (detail.single_source) {
+    for (const [key, value] of Object.entries(values)) {
+      if (value == null || value === '' || (Array.isArray(value) && !value.length)) continue;
+      section.append(Object.assign(document.createElement('p'), { textContent: `${key.replaceAll('_', ' ')}: ${typeof value === 'string' ? value : JSON.stringify(value)}` }));
+    }
+    return section;
+  }
   const form = document.createElement('form'); form.className = 'document-details-form';
   const typeLabel = document.createElement('label'); typeLabel.textContent = 'Project type';
   const type = document.createElement('select'); type.name = 'project_type'; type.append(new Option('Choose project type', ''), new Option('Capstone', 'capstone'), new Option('Project 1', 'project-1')); type.value = values.project_type || ''; type.required = true; type.disabled = !detail.can_edit; typeLabel.append(type); form.append(typeLabel);
@@ -2249,7 +2250,6 @@ async function openDocumentDetails(prefetched = null) {
 
 function closeTransientMenus() {
   closeFileActionsMenu();
-  ui.downloadMenu.open = false;
 }
 
 async function runStructural(redo) {
@@ -2264,7 +2264,7 @@ async function runStructural(redo) {
 
 function commandItems() {
   const items = [
-    ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()], ...(canSetMain(model.file, model.paperDetail, model.fileEditable) ? [['Set Main', () => ui.setMain.click()]] : []),
+    ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()],
     ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
     ['Insert…', openInsertMenu],
     ['Open Problems', () => expandBuildFooter('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
@@ -2371,16 +2371,6 @@ async function runDeleteFile() {
 ui.renameFile.addEventListener('click', runRenameFile);
 ui.deleteFile.addEventListener('click', runDeleteFile);
 
-ui.setMain.addEventListener('click', async () => {
-  if (!canSetMain(model.file, model.paperDetail, model.fileEditable)) return;
-  if (!await requireDurableFlush()) return;
-  try {
-    const result = await api.setMain(model.paper.id, model.file.file_id, { version: model.version });
-    model.version = result.version;
-    await reloadPaperAndFile(model.file.file_id);
-  } catch (error) { notice(error.message, true); }
-});
-
 ui.saveFile.addEventListener('click', syncCurrent);
 ui.compilePaper.addEventListener('click', manualCompile);
 ui.pdfScroll.addEventListener('scroll', () => { window.clearTimeout(model.pdfScrollTimer); model.pdfScrollTimer = window.setTimeout(capturePdfView, 80); });
@@ -2403,35 +2393,6 @@ ui.downloadPdf.addEventListener('click', () => {
   link.href = downloadPdfUrl(model.currentBuildId);
   link.download = `${(model.paper.name || 'report').replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'report'}.pdf`;
   link.click();
-  ui.downloadMenu.open = false;
-});
-ui.downloadSource.addEventListener('click', async () => {
-  if (!model.paper || model.sourceDownloadInFlight) return;
-  model.sourceDownloadInFlight = true;
-  ui.downloadSource.disabled = true;
-  ui.downloadLabel.textContent = 'Preparing…';
-  try {
-    if (!await requireDurableFlush()) return;
-    const response = await fetch(`/api/v2/papers/${model.paper.id}/source.zip`);
-    if (!response.ok) {
-      const failure = await response.json().catch(() => ({ error: `Request failed (${response.status})` }));
-      throw new Error(failure.error || `Request failed (${response.status})`);
-    }
-    const objectUrl = URL.createObjectURL(await response.blob());
-    const link = document.createElement('a');
-    link.href = objectUrl;
-    link.download = `${(model.paper.name || 'report').replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'report'}-source.zip`;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
-    notice('Source ZIP downloaded.');
-  } catch (error) {
-    notice(error.message || 'Source ZIP could not be prepared.', true);
-  } finally {
-    model.sourceDownloadInFlight = false;
-    ui.downloadSource.disabled = !model.paper;
-    ui.downloadLabel.textContent = 'Download';
-    ui.downloadMenu.open = false;
-  }
 });
 ui.sendReview.addEventListener('click', async () => {
   if (!model.paper?.is_team_leader || !await requireDurableFlush()) return;
@@ -2568,7 +2529,6 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('click', (event) => {
   if (!ui.fileActionsMenu.contains(event.target) && event.target !== ui.fileActionsToggle) closeFileActionsMenu();
-  if (!ui.downloadMenu.contains(event.target)) ui.downloadMenu.open = false;
 });
 ui.createCheckpoint.addEventListener('click', async () => {
   if (!model.paper || !await requireDurableFlush()) return;

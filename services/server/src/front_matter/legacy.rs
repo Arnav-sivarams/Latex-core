@@ -63,7 +63,16 @@ pub fn derive_semester_metadata(
     })
 }
 
-/// Complete Report calendar values are document inputs, never student-derived.
+/// Normalize the institution's Fall/Winter term codes without changing history.
+pub fn institutional_semester(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "FALL" | "FALL SEMESTER" => Some("Fall Semester"),
+        "WINTER" | "WINTER SEMESTER" => Some("Winter Semester"),
+        _ => None,
+    }
+}
+
+/// Validate the effective registration calendar before materializing report source.
 pub fn document_calendar(semester: &str, academic_year: &str) -> Result<String, FrontMatterError> {
     let valid_year = academic_year.is_ascii()
         && academic_year.len() == 9
@@ -78,11 +87,9 @@ pub fn document_calendar(semester: &str, academic_year: &str) -> Result<String, 
             "Academic year is required (YYYY-YYYY, consecutive years)".into(),
         ));
     }
-    if !matches!(semester, "Winter Semester" | "Summer Semester") {
-        return Err(FrontMatterError::InvalidValue(
-            "Select Winter Semester or Summer Semester".into(),
-        ));
-    }
+    let semester = institutional_semester(semester).ok_or_else(|| {
+        FrontMatterError::InvalidValue("Select Fall Semester or Winter Semester".into())
+    })?;
     Ok(format!("{semester} {academic_year}"))
 }
 
@@ -474,8 +481,10 @@ pub fn single_source_bindings(
     values: &BTreeMap<String, Value>,
 ) -> Result<String, FrontMatterError> {
     let mut values = values.clone();
-    if let Some(semester) = values.get("team.semester").and_then(Value::as_str)
-        && matches!(semester, "Winter Semester" | "Summer Semester")
+    if let Some(semester) = values
+        .get("team.semester")
+        .and_then(Value::as_str)
+        .and_then(institutional_semester)
     {
         let display = document_calendar(
             semester,
@@ -536,7 +545,7 @@ pub fn single_source_bindings(
                     .and_then(Value::as_str)
                     .is_some_and(|semester| {
                         semester.starts_with("Winter Semester ")
-                            || semester.starts_with("Summer Semester ")
+                            || semester.starts_with("Fall Semester ")
                     })
                     && value.len() == 9
                     && value.as_bytes()[4] == b'-' =>
@@ -686,6 +695,22 @@ pub fn applicable_overrides(
     reason = "unit test fixtures contain fixed valid paths and values"
 )]
 mod tests {
+    #[test]
+    fn institutional_fall_winter_codes_normalize_without_summer_assumptions() {
+        for value in ["FALL", "Fall", "Fall Semester", " fall "] {
+            assert_eq!(institutional_semester(value), Some("Fall Semester"));
+            assert_eq!(
+                document_calendar(value, "2026-2027").unwrap(),
+                "Fall Semester 2026-2027"
+            );
+        }
+        for value in ["WINTER", "Winter", "Winter Semester", " winter "] {
+            assert_eq!(institutional_semester(value), Some("Winter Semester"));
+        }
+        for value in ["SUMMER", "Summer Semester", "SPRING", ""] {
+            assert_eq!(institutional_semester(value), None);
+        }
+    }
     use super::*;
     use crate::{archive::ImportedArchive, front_matter::validate_archive};
 
@@ -728,8 +753,8 @@ mod tests {
             "Winter Semester 2026-2027"
         );
         assert_eq!(
-            document_calendar("Summer Semester", "2025-2026").unwrap(),
-            "Summer Semester 2025-2026"
+            document_calendar("Fall Semester", "2025-2026").unwrap(),
+            "Fall Semester 2025-2026"
         );
         for year in ["", "2026", "2026-2028", "२०२६-२०२७"] {
             assert!(document_calendar("Winter Semester", year).is_err());
@@ -738,7 +763,7 @@ mod tests {
         let bindings = single_source_bindings(&BTreeMap::from([
             (
                 "team.semester".into(),
-                Value::String("Summer Semester".into()),
+                Value::String("Fall Semester".into()),
             ),
             (
                 "team.academic_year".into(),
@@ -747,7 +772,7 @@ mod tests {
             ("submission_date".into(), Value::String("2025-01-01".into())),
         ]))
         .unwrap();
-        assert!(bindings.contains(r"\renewcommand{\semester}{Summer Semester 2026-2027}"));
+        assert!(bindings.contains(r"\renewcommand{\semester}{Fall Semester 2026-2027}"));
         assert!(bindings.contains(r"\renewcommand{\academicyear}{2026-2027}"));
     }
 

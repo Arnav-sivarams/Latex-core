@@ -15,12 +15,13 @@ test('Writer visual refresh preserves the complete working surface', () => {
     'compilePaper', 'sendReview', 'endReview', 'insertMenu', 'problemsToggle',
     'historyToggle', 'commentsToggle', 'documentDetails', 'editorSettings', 'moreActions',
     'newPaper', 'myPapers', 'teamPapers', 'newFile', 'uploadImage', 'fileActionsToggle',
-    'fileTree', 'editorMount', 'pdfPage', 'pdfZoom', 'locateInPdf', 'downloadMenu',
-    'downloadPdf', 'downloadSource',
+    'fileTree', 'editorMount', 'pdfPage', 'pdfZoom', 'locateInPdf', 'downloadPdf',
     'pdfViewport', 'buildProblemsTab', 'buildLogTab', 'buildLogText', 'workspaceDrawer',
-    'renameFile', 'deleteFile', 'setMain', 'structuralUndo', 'structuralRedo',
+    'renameFile', 'deleteFile', 'structuralUndo', 'structuralRedo',
   ]);
   assert.match(writerHtml, /id="compilePaper" class="[^"]*(?:ui-button-primary|primary)/);
+  assert.doesNotMatch(writerHtml, /id="(?:downloadSource|setMain)"/);
+  assert.match(writerHtml, /id="mainBadge"/);
 });
 
 test('Mentor visual refresh preserves review, locking, source, PDF, and export controls', () => {

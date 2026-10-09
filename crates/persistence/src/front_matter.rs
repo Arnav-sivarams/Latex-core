@@ -199,6 +199,18 @@ impl FrontMatterRepository {
             .collect()
     }
 
+    pub async fn paper_template_main_blob(
+        &self,
+        paper_id: Uuid,
+    ) -> Result<BlobHash, FrontMatterRepositoryError> {
+        let hash: String = sqlx::query_scalar("SELECT file.blob_hash FROM latex_core.paper_template_pins pin JOIN latex_core.templates template ON template.id=pin.template_id JOIN latex_core.template_files file ON file.template_id=template.id AND file.path=template.main_file WHERE pin.paper_id=$1")
+            .bind(paper_id).fetch_optional(self.database.pool()).await.map_err(FrontMatterRepositoryError::Database)?
+            .ok_or(FrontMatterRepositoryError::NotFound)?;
+        BlobHash::from_str(&hash).map_err(|_| {
+            FrontMatterRepositoryError::Integrity("invalid pinned template main hash".into())
+        })
+    }
+
     pub async fn save_single_source_values(
         &self,
         actor: UserId,
@@ -1014,6 +1026,32 @@ impl FrontMatterRepository {
             "selected_dean_identity":stored.get("dean_identity").map(|(value,_)|value),
             "fields":fields
         }))
+    }
+
+    /// All applicable rows for the assigned Leader. Imported Team terms narrow
+    /// the lookup only; course/year/semester always come from one registration.
+    pub async fn applicable_leader_registrations(
+        &self,
+        paper_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>, FrontMatterRepositoryError> {
+        sqlx::query_as(
+            "SELECT registration.course_id,registration.academic_year,registration.semester \
+             FROM latex_core.paper_team_members member \
+             JOIN latex_core.global_user_roles role ON role.user_id=member.user_id AND role.role='writer' \
+             JOIN vcap.student_user_links link ON link.user_id=member.user_id AND link.status='LINKED' \
+             JOIN vcap.students student ON student.reg_no=link.reg_no \
+             JOIN vcap.student_course_registrations registration ON registration.student_reg_no=student.reg_no \
+             LEFT JOIN latex_core.external_paper_team_links team_link ON team_link.paper_team_id=member.paper_team_id \
+             LEFT JOIN vcap.paper_assignment_groups assignment ON assignment.external_team_key=team_link.external_team_key \
+             WHERE member.paper_team_id=$1 AND member.is_leader=TRUE \
+             AND (NULLIF(btrim(assignment.academic_year),'') IS NULL OR registration.academic_year=assignment.academic_year) \
+             AND (NULLIF(btrim(assignment.semester),'') IS NULL OR regexp_replace(upper(btrim(registration.semester)),' SEMESTER$','')=regexp_replace(upper(btrim(assignment.semester)),' SEMESTER$','')) \
+             ORDER BY registration.course_id,registration.academic_year,registration.semester",
+        )
+        .bind(paper_id)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(FrontMatterRepositoryError::Database)
     }
 
     pub async fn automatic_values(

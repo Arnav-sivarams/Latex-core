@@ -80,6 +80,41 @@ pub struct V2FilePolicyRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FilePolicyChange {
+    pub path: LogicalPath,
+    pub policy: V2FilePolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FilePolicySummary {
+    pub path: LogicalPath,
+    /// None means policies vary across the Teams containing this path.
+    pub policy: Option<V2FilePolicy>,
+    pub team_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AllTeamsFilePolicies {
+    pub team_count: u64,
+    pub files: Vec<FilePolicySummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FilePolicyExclusion {
+    pub paper_team_id: Uuid,
+    pub path: LogicalPath,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BulkFilePolicyResult {
+    pub team_count: u64,
+    pub affected_team_count: u64,
+    pub updated_files: Vec<V2FilePolicyRecord>,
+    pub excluded_files: Vec<FilePolicyExclusion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RestorationRequest {
     pub id: Uuid,
     pub paper_id: Uuid,
@@ -474,6 +509,171 @@ impl V2Repository {
         .map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
         decode_policy(row)
+    }
+
+    pub async fn all_teams_file_policies(
+        &self,
+        admin: UserId,
+    ) -> Result<AllTeamsFilePolicies, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(V2Error::Database)?;
+        require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
+        let team_count: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.paper_teams")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(V2Error::Database)?;
+        let rows = sqlx::query(
+            "SELECT f.path,count(*) AS team_count, \
+             CASE WHEN count(DISTINCT COALESCE(p.policy,'EDITABLE'))=1 \
+             THEN min(COALESCE(p.policy,'EDITABLE')) ELSE NULL END AS policy \
+             FROM latex_core.paper_teams t JOIN latex_core.paper_files f ON f.workspace_id=t.workspace_id \
+             LEFT JOIN latex_core.paper_file_policies p ON p.file_id=f.file_id \
+             WHERE NOT f.tombstoned GROUP BY f.path ORDER BY f.path",
+        ).fetch_all(&mut *tx).await.map_err(V2Error::Database)?;
+        let files = rows
+            .into_iter()
+            .map(|row| {
+                let path: String = row.try_get("path").map_err(V2Error::Database)?;
+                let policy: Option<String> = row.try_get("policy").map_err(V2Error::Database)?;
+                Ok(FilePolicySummary {
+                    path: LogicalPath::parse(&path).map_err(|_| V2Error::Integrity {
+                        message: "invalid stored policy path".into(),
+                    })?,
+                    policy: policy.as_deref().map(V2FilePolicy::parse).transpose()?,
+                    team_count: nonnegative_u64(
+                        row.try_get("team_count").map_err(V2Error::Database)?,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, V2Error>>()?;
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(AllTeamsFilePolicies {
+            team_count: nonnegative_u64(team_count)?,
+            files,
+        })
+    }
+
+    /// Apply only explicitly selected paths to the existing Teams containing
+    /// them. Every policy change and audit record commits together or rolls back.
+    pub async fn set_all_teams_file_policies(
+        &self,
+        admin: UserId,
+        expected_team_count: u64,
+        changes: &[FilePolicyChange],
+    ) -> Result<BulkFilePolicyResult, V2Error> {
+        let mut tx = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(V2Error::Database)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(V2Error::Database)?;
+        require_role_tx(&mut tx, admin, GlobalRole::Admin).await?;
+        if changes.is_empty() || changes.len() > 512 {
+            return Err(V2Error::Integrity {
+                message: "select between 1 and 512 file policies".into(),
+            });
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        if changes
+            .iter()
+            .any(|change| !paths.insert(change.path.clone()))
+        {
+            return Err(V2Error::Integrity {
+                message: "duplicate policy path".into(),
+            });
+        }
+        let teams: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM latex_core.paper_teams ORDER BY id")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(V2Error::Database)?;
+        let team_count = u64::try_from(teams.len()).map_err(|_| V2Error::Integrity {
+            message: "Team count overflow".into(),
+        })?;
+        if team_count != expected_team_count {
+            return Err(V2Error::Conflict {
+                entity: "Team collection changed; reload and confirm the current count",
+            });
+        }
+        let mut updated_files = Vec::new();
+        let mut excluded_files = Vec::new();
+        let mut affected = std::collections::BTreeSet::new();
+        for change in changes {
+            let rows = sqlx::query(
+                "SELECT t.id AS paper_id,f.file_id,f.workspace_id,f.path,COALESCE(p.policy,'EDITABLE') AS policy \
+                 FROM latex_core.paper_teams t JOIN latex_core.paper_files f ON f.workspace_id=t.workspace_id \
+                 LEFT JOIN latex_core.paper_file_policies p ON p.file_id=f.file_id \
+                 WHERE t.id=ANY($1) AND f.path=$2 AND NOT f.tombstoned ORDER BY t.id FOR UPDATE OF f",
+            ).bind(&teams).bind(change.path.as_str()).fetch_all(&mut *tx).await.map_err(V2Error::Database)?;
+            if rows.is_empty() && !teams.is_empty() {
+                return Err(V2Error::NotFound {
+                    entity: "selected policy path in existing Teams",
+                });
+            }
+            let matching = rows
+                .iter()
+                .map(|row| row.try_get::<Uuid, _>("paper_id"))
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .map_err(V2Error::Database)?;
+            excluded_files.extend(teams.iter().filter(|team| !matching.contains(team)).map(
+                |team| FilePolicyExclusion {
+                    paper_team_id: *team,
+                    path: change.path.clone(),
+                    reason: "Logical path does not exist in this Team".into(),
+                },
+            ));
+            for row in rows {
+                let file_id: Uuid = row.try_get("file_id").map_err(V2Error::Database)?;
+                let workspace: Uuid = row.try_get("workspace_id").map_err(V2Error::Database)?;
+                let paper_id: Uuid = row.try_get("paper_id").map_err(V2Error::Database)?;
+                let current: String = row.try_get("policy").map_err(V2Error::Database)?;
+                if change.path.as_str().starts_with(".latex-core/frontmatter/")
+                    && (current != "HIDDEN_SYSTEM" || change.policy != V2FilePolicy::HiddenSystem)
+                {
+                    return Err(V2Error::Conflict {
+                        entity: "managed Front Matter file policy",
+                    });
+                }
+                if current == change.policy.as_str() {
+                    continue;
+                }
+                sqlx::query(
+                    "INSERT INTO latex_core.paper_file_policies(file_id,workspace_id,policy,updated_by_admin_user_id) \
+                     VALUES($1,$2,$3,$4) ON CONFLICT(file_id) DO UPDATE SET policy=EXCLUDED.policy, \
+                     updated_by_admin_user_id=EXCLUDED.updated_by_admin_user_id,updated_at=statement_timestamp()",
+                ).bind(file_id).bind(workspace).bind(change.policy.as_str()).bind(admin.as_uuid())
+                    .execute(&mut *tx).await.map_err(V2Error::Database)?;
+                sqlx::query("INSERT INTO latex_core.audit_events(id,actor_user_id,event_type,resource_type,resource_id,metadata) VALUES($1,$2,'paper.file_policy.bulk_updated','paper_file',$3,$4)")
+                    .bind(Uuid::new_v4()).bind(admin.as_uuid()).bind(file_id)
+                    .bind(json!({"paper_team_id":paper_id,"path":change.path,"from":current,"to":change.policy,"team_count":team_count}))
+                    .execute(&mut *tx).await.map_err(V2Error::Database)?;
+                let updated = sqlx::query("SELECT f.file_id,f.workspace_id,f.path,p.policy,p.updated_by_admin_user_id,p.updated_at::text AS updated_at FROM latex_core.paper_files f JOIN latex_core.paper_file_policies p ON p.file_id=f.file_id WHERE f.file_id=$1")
+                    .bind(file_id).fetch_one(&mut *tx).await.map_err(V2Error::Database)?;
+                updated_files.push(decode_policy(updated)?);
+                affected.insert(paper_id);
+            }
+        }
+        tx.commit().await.map_err(V2Error::Database)?;
+        Ok(BulkFilePolicyResult {
+            team_count,
+            affected_team_count: u64::try_from(affected.len()).map_err(|_| V2Error::Integrity {
+                message: "Team count overflow".into(),
+            })?,
+            updated_files,
+            excluded_files,
+        })
     }
 
     pub async fn apply_template_change(
@@ -1579,5 +1779,11 @@ fn validate_note(note: Option<&str>) -> Result<(), V2Error> {
 fn to_i64(value: u64) -> Result<i64, V2Error> {
     i64::try_from(value).map_err(|_| V2Error::Integrity {
         message: "governance number exceeds PostgreSQL BIGINT".to_owned(),
+    })
+}
+
+fn nonnegative_u64(value: i64) -> Result<u64, V2Error> {
+    u64::try_from(value).map_err(|_| V2Error::Integrity {
+        message: "negative policy count".into(),
     })
 }

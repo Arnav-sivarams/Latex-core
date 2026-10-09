@@ -947,7 +947,6 @@ function buttonAction(label, handler, className = '') {
 }
 
 async function renderFilePolicies(teams) {
-  if (!teams.length) return content.append(element('p', 'empty-copy', 'No Paper Teams yet.'));
   const descriptions = {
     EDITABLE: 'Writers can change content and file structure.',
     CONTENT_READ_ONLY: 'Content is visible but cannot be edited.',
@@ -957,10 +956,50 @@ async function renderFilePolicies(teams) {
   };
   const guide = element('div', 'policy-guide'); Object.entries(descriptions).forEach(([policy, description]) => { const item = element('div'); item.append(element('strong', '', humanLabel(policy)), element('small', '', description)); guide.append(item); }); content.append(guide);
   const selector = document.createElement('select'); selector.setAttribute('aria-label', 'Paper Team');
+  selector.append(new Option('All Teams', 'ALL_TEAMS'));
   teams.forEach((team) => selector.append(new Option(team.name, team.id)));
   const tableHost = element('div', 'admin-table-wrap'); content.append(selector, tableHost);
+  let loadRequest = 0;
   const load = async () => {
-    const files = await api(`/api/admin/v2/paper-teams/${selector.value}/file-policies`);
+    const request = ++loadRequest; const selectedTeam = selector.value;
+    tableHost.replaceChildren(element('p', 'muted-note', 'Loading file policies…'));
+    const allTeams = selector.value === 'ALL_TEAMS';
+    if (allTeams) {
+      const overview = await api('/api/admin/v2/file-policies');
+      if (request !== loadRequest) return;
+      const files = overview.files.filter((file) => file.policy !== 'HIDDEN_SYSTEM' && !file.path.startsWith('.latex-core/frontmatter/'));
+      const changed = new Map();
+      const count = element('p', 'muted-note', `${overview.team_count} Teams affected. Only selected existing file paths are changed; other policies stay as they are.`);
+      if (!overview.team_count || !files.length) {
+        tableHost.replaceChildren(count, element('p', 'empty-copy', 'No ordinary Team files are available.')); return;
+      }
+      const table = element('table', 'admin-table');
+      table.innerHTML = '<thead><tr><th>File</th><th>Current policy</th><th>Teams with file</th><th>Change</th></tr></thead>';
+      const body = document.createElement('tbody');
+      const apply = buttonAction('Apply policies to All Teams', async () => {
+        if (!changed.size || !confirm(`Apply these file policies to all ${overview.team_count} Teams? Only Teams containing the selected file paths are affected.`)) return;
+        apply.disabled = true; selector.disabled = true;
+        try {
+          const result = await api('/api/admin/v2/file-policies', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_team_count: overview.team_count, confirmed: true, changes: [...changed].map(([path, policy]) => ({ path, policy })) }) });
+          const exclusions = (result.excluded_files || []).map((item) => `${teams.find((team) => team.id === item.paper_team_id)?.name || item.paper_team_id}: ${item.path} (${item.reason})`);
+          announce(`Updated ${result.updated_files.length} file policies in ${result.affected_team_count} of ${result.team_count} Teams.${exclusions.length ? ` Excluded: ${exclusions.join('; ')}` : ''}`);
+          await load();
+        } finally { selector.disabled = false; apply.disabled = !changed.size; }
+      }, 'primary');
+      apply.disabled = true;
+      files.forEach((file) => {
+        const row = document.createElement('tr'); const select = document.createElement('select');
+        select.append(new Option('Keep unchanged', ''));
+        ['EDITABLE', 'CONTENT_READ_ONLY', 'STRUCTURE_LOCKED', 'TEMPLATE_MANAGED'].forEach((policy) => select.append(new Option(humanLabel(policy), policy)));
+        select.setAttribute('aria-label', `Change policy for ${file.path} across All Teams`);
+        select.addEventListener('change', () => { if (select.value) changed.set(file.path, select.value); else changed.delete(file.path); apply.disabled = !changed.size; });
+        const changeCell = element('td'); changeCell.append(select);
+        row.append(element('td', '', file.path), element('td', '', file.policy === null ? 'Mixed / Varies' : humanLabel(file.policy)), element('td', '', `${file.team_count} of ${overview.team_count}`), changeCell); body.append(row);
+      });
+      table.append(body); tableHost.replaceChildren(count, table, apply); return;
+    }
+    const files = await api(`/api/admin/v2/paper-teams/${selectedTeam}/file-policies`);
+    if (request !== loadRequest) return;
     const visibleFiles = files.filter((file) => file.policy !== 'HIDDEN_SYSTEM');
     if (!visibleFiles.length) { tableHost.replaceChildren(element('p', 'empty-copy', 'No ordinary Team files are available.')); return; }
     const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>File</th><th>Current policy</th><th>Change</th></tr></thead>';
@@ -970,7 +1009,7 @@ async function renderFilePolicies(teams) {
       const select = document.createElement('select');
       ['EDITABLE', 'CONTENT_READ_ONLY', 'STRUCTURE_LOCKED', 'TEMPLATE_MANAGED'].forEach((policy) => { const option = new Option(humanLabel(policy), policy); option.selected = file.policy === policy; select.append(option); });
       select.setAttribute('aria-label', `Change policy for ${file.path}`);
-      select.addEventListener('change', async () => { try { await api(`/api/admin/v2/paper-teams/${selector.value}/file-policies/${file.file_id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: select.value }) }); announce(`Policy updated for ${file.path}. Active rooms were revalidated.`); } catch (error) { showError(error); } });
+      select.addEventListener('change', async () => { try { await api(`/api/admin/v2/paper-teams/${selectedTeam}/file-policies/${file.file_id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: select.value }) }); announce(`Policy updated for ${file.path}. Active rooms were revalidated.`); } catch (error) { showError(error); } });
       const changeCell = document.createElement('td'); changeCell.append(select); row.append(identity, element('td', '', humanLabel(file.policy)), changeCell); body.append(row);
     }); table.append(body); tableHost.replaceChildren(table);
   };
@@ -1019,7 +1058,7 @@ async function showSection(section, options = {}) {
       return;
     }
     if (section === 'File Policies') {
-      const page = await api('/api/admin/v2/paper-teams/query?page=1&limit=25'); content.replaceChildren(element('h1', '', 'File Policies')); await renderFilePolicies(page.items);
+      const teams = await api('/api/admin/v2/paper-teams'); content.replaceChildren(element('h1', '', 'File Policies')); await renderFilePolicies(teams);
       return;
     }
     if (section === 'System') {

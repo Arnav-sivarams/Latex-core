@@ -94,6 +94,7 @@ try {
   await importFile(adminCookie, 'programmes.csv', `programme_code,programme_name,degree_name,hod_id\n${programme},Computer Science and Engineering,Bachelor of Technology,${faculty}\n`);
   await importFile(adminCookie, 'faculty_roles.csv', `role_id,faculty_id,role_type,school_id,department_id,programme_code,status\n${randomUUID()},${dean},dean,${school},${department},${programme},active\n${randomUUID()},${faculty},hod,${school},${department},${programme},active\n`);
   await importFile(adminCookie, 'students.csv', `reg_no,name,email,programme_code\n${people.map((person, index) => `${person.reg},Synthetic Student ${index + 1},${person.email},${programme}`).join('\n')}\n`);
+  await importFile(adminCookie, 'student_course_registrations.csv', `student_reg_no,course_id,academic_year,semester,registration_status\n${people.map(person => `${person.reg},BCSE497J,2026-2027,FALL,REGISTERED`).join('\n')}\n`);
   const form = new FormData(); form.set('name', `Final real Complete Report ${suffix}`); form.set('arrangement', 'SINGLE_SOURCE'); form.set('main', 'Full_Report_template_v1.0/Full_Report_v1.0.tex');
   form.set('archive', new Blob([await readFile(new URL('../../../artifacts/Full_Report_template_v1.1.zip', import.meta.url))]), 'complete-report.zip');
   const template = await request(adminCookie, '/api/admin/v2/templates/import', { method: 'POST', body: form, expected: 201 });
@@ -102,7 +103,7 @@ try {
   const external = `FINAL-TEAM-${suffix}`;
   const teamForm = new FormData(); teamForm.set('operation', 'ADD');
   for (const [name, bytes] of Object.entries({
-    'paper_teams.csv': `external_team_key,team_name,academic_year,semester,status\n${external},Final Imported Report ${suffix},2026-2027,Winter Semester,active\n`,
+    'paper_teams.csv': `external_team_key,team_name,academic_year,semester,status\n${external},Final Imported Report ${suffix},2026-2027,FALL,active\n`,
     'paper_team_writers.csv': `external_team_key,student_reg_no,writer_order,is_leader\n${external},${people[0].reg},1,true\n`,
     'paper_team_mentors.csv': `external_team_key,faculty_id\n${external},${faculty}\n`,
   })) teamForm.append('files[]', new Blob([bytes]), name);
@@ -196,27 +197,23 @@ try {
     assert.ok(!/Student [BCD] (?:name|registration)/.test(panel), panel);
     for (const heading of ['Document details', 'Institutional details', 'Team members', 'Project details']) assert.ok(panel.includes(heading));
     for (const field of ['department_name', 'programme_name', 'degree_name', 'guide_name', 'dean_name', 'hod_name']) assert.equal(await page.locator(`[name="field:${field}"]`).count(), 0, `${field} is read-only`);
-    assert.equal(await page.locator('[name="field:team_academic_year"]').getAttribute('required'), '');
-    assert.equal(await page.locator('[name="field:team_semester"]').evaluate((input) => input.tagName), 'SELECT');
+    for (const key of ['course_code','team_academic_year','team_semester']) assert.equal(await page.locator(`[name="field:${key}"]`).count(), 0);
     check(true, 'Document Details resolves department and omits inactive student slots');
   }
-  async function saveDetails(code, direct = false) {
+  async function saveDetails(name, direct = false) {
     const buildBeforeSave = (await request(writerCookie, `${root}/builds`)).build.latest_build_id;
     if (!await page.locator('#documentDetailsPanel').isVisible()) await page.locator('#documentDetails').click();
-    await page.locator('[name="field:course_code"]').fill(code);
+    await page.locator('[name="field:course_name"]').fill(name);
     await page.locator('[name="field:submission_date"]').fill('2026-10-08');
-    await page.locator('[name="project_type"]').selectOption('capstone');
-    await page.locator('[name="field:team_academic_year"]').fill('2026-2027');
-    await page.locator('[name="field:team_semester"]').selectOption('Winter Semester');
     const invalid = await page.locator('#documentDetailsBody input, #documentDetailsBody select, #documentDetailsBody textarea').evaluateAll((controls) => controls.filter((control) => !control.checkValidity()).map((control) => ({ name: control.name, value: control.value, message: control.validationMessage })));
     assert.deepEqual(invalid, [], 'Document Details invalid controls');
-    const response = page.waitForResponse((response) => response.url().endsWith(direct ? '/document-details' : '/project-metadata') && response.request().method() === 'PUT');
-    await page.getByRole('button', { name: direct ? 'Save document details' : 'Save project metadata', exact: true }).click();
+    const response = page.waitForResponse((response) => response.url().endsWith('/document-details') && response.request().method() === 'PUT');
+    await page.getByRole('button', { name: 'Save document details', exact: true }).click();
     const result = await response.catch(async (error) => { throw new Error(`${error.message}; notice: ${await page.locator('#writerNotice').innerText()}`); }); assert.equal(result.status(), 200, await result.text());
-    await waitSource(page, `\\newcommand{\\coursecode}{${code}}`);
+    await waitSource(page, `\\newcommand{\\coursename}{${name}}`);
     await page.waitForFunction(() => document.querySelector('#saveStatus')?.dataset.state === 'synced');
     assert.equal((await request(writerCookie, `${root}/builds`)).build.latest_build_id, buildBeforeSave, 'metadata save must not compile');
-    const durable = await source(); assert.ok(durable.content.includes(`\\newcommand{\\coursecode}{${code}}`));
+    const durable = await source(); assert.ok(durable.content.includes(`\\newcommand{\\coursename}{${name}}`));
     if (!baseline) {
       for (const macro of ['coursecode', 'coursename', 'programdegree', 'academicyear', 'latexcoresemester', 'latexcoreacademicyear']) {
         assert.equal((durable.content.match(new RegExp(`\\\\(?:newcommand|providecommand|renewcommand)\\{\\\\${macro}\\}`, 'g')) || []).length, 1, macro);
@@ -283,34 +280,42 @@ try {
     for (let n = 1; n <= pdf.numPages; n++) text += (await (await pdf.getPage(n)).getTextContent()).items.map((item) => item.str).join(' ') + '\n';
     await task.destroy(); return text;
   }
-  const first = await saveDetails('BA101');
-  const firstPdf = await compile('course-BA101'); check(firstPdf.includes('BA101'), 'real Complete Report PDF renders BA101');
+  const first = await saveDetails('Course Alpha');
+  const firstPdf = await compile('course-BA101'); check(firstPdf.includes('Course Alpha'), 'real Complete Report PDF renders Course Alpha');
   assert.ok(firstPdf.toLowerCase().includes('synthetic student 1') && firstPdf.includes(people[0].reg) && !firstPdf.includes('Not assigned'));
-  const second = await saveDetails('BA102', true); assert.ok(second.version > first.version);
+  const second = await saveDetails('Course Beta', true); assert.ok(second.version > first.version);
   await page.waitForFunction(() => /out of date|current source|stale/i.test(document.querySelector('#pdfRelation')?.textContent || ''));
-  const secondPdf = await compile('course-BA102'); check(secondPdf.includes('BA102') && !secondPdf.includes('BA101'), 'real Complete Report PDF advances to BA102');
+  const secondPdf = await compile('course-BA102'); check(secondPdf.includes('Course Beta') && !secondPdf.includes('Course Alpha'), 'real Complete Report PDF advances to Course Beta');
   if (baseline) { console.log(JSON.stringify(evidence, null, 2)); process.exitCode = 0; }
   else {
-    const third = await saveDetails('BA102'); assert.equal(third.content, second.content);
-    const zipPath = join(temp, 'source.zip');
+    const third = await saveDetails('Course Beta'); assert.equal(third.content, second.content);
+    check(true, 'three Document Details saves remain idempotent');
+    assert.equal(await page.locator('#downloadSource').count(), 0);
+    assert.equal(await page.locator('#setMain').count(), 0);
+    const deniedExport = await request(writerCookie, `${root}/source.zip`, { expected: 403 });
+    assert.match(deniedExport.error, /disabled/i);
+    await request(writerCookie, `${root}/main/${main.file_id}`, { method: 'POST', json: { version: third.version }, expected: 403 });
+    assert.equal((await request(writerCookie, root)).main_file, main.path);
+    check(true, 'Writer Source ZIP and Set Main are absent and direct APIs are denied');
+    const pdfPath = join(temp, 'report.pdf');
     const download = page.waitForEvent('download');
-    await page.locator('#downloadMenu summary').click(); await page.locator('#downloadSource').click();
-    await (await download).saveAs(zipPath);
-    const extracted = await execute('python3', ['-c', 'import sys,zipfile;sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))', zipPath, main.path], { maxBuffer: 1024 * 1024 });
-    assert.equal(extracted.stdout, third.content); check(true, 'three saves idempotent and Source ZIP matches durable canonical source');
+    assert.equal(await page.locator('#downloadMenu').count(), 0); await page.locator('#downloadPdf').click();
+    await (await download).saveAs(pdfPath);
+    assert.ok((await readFile(pdfPath)).subarray(0, 5).equals(Buffer.from('%PDF-')));
+    check(true, 'Writer PDF download remains available');
     const history = await request(writerCookie, `${root}/versions`); check(history.length > 0 || history.versions?.length > 0, 'History retained');
     const peer = await pageFor(writerCookie, `/write?paper=${team.id}`); await peer.locator('.cm-editor').waitFor();
     if (await peer.locator('#documentDetailsPanel').isVisible()) await peer.locator('#drawerClose').click();
     const text = await editor(page); const start = text.indexOf('\\newcommand{\\coursecode}'); const end = text.indexOf('\n', text.indexOf('\\newcommand{\\programdegree}'));
     await select(page, start + 3, end - 2); await menu(page, 'Comment selected lines');
-    const commented = await editor(page); assert.ok(commented.includes('% \\newcommand{\\coursecode}{BA102}'));
-    await waitSource(peer, '% \\newcommand{\\coursecode}{BA102}');
+    const commented = await editor(page); assert.ok(commented.includes('% \\newcommand{\\coursecode}{BCSE497J}'));
+    await waitSource(peer, '% \\newcommand{\\coursecode}{BCSE497J}');
     const selection = await page.evaluate(() => { const view = document.querySelector('.cm-content').cmTile.root.view; return { from: view.state.selection.main.from, to: view.state.selection.main.to }; });
     assert.ok(selection.to > selection.from); check(true, 'three partial-selected lines commented and synchronized with visible selection');
     await page.locator('#undoText').click(); assert.equal(await editor(page), text);
     await page.locator('#redoText').click(); assert.equal(await editor(page), commented);
     await select(page, start, start + commented.length - text.length + end - start);
-    await menu(page, 'Uncomment selected lines'); assert.equal(await editor(page), text); await waitSource(peer, '\\newcommand{\\coursecode}{BA102}');
+    await menu(page, 'Uncomment selected lines'); assert.equal(await editor(page), text); await waitSource(peer, '\\newcommand{\\coursecode}{BCSE497J}');
     check(true, 'comment undo/redo is one operation and uncomment restores exact source');
     await select(page, start, end); await page.keyboard.press('Control+/'); assert.equal(await editor(page), commented); await page.keyboard.press('Control+/'); assert.equal(await editor(page), text);
     check(true, 'keyboard comment toggle uses same engine');
@@ -364,11 +369,10 @@ try {
       }
       if (await teamPage.locator('#documentDetailsPanel').isVisible()) await teamPage.locator('#drawerClose').click();
       await teamPage.locator('#documentDetails').click();
-      for (const [field, value] of Object.entries({ course_code: `TEAM${size}`, submission_date: '2026-10-08', team_academic_year: '2026-2027' })) await teamPage.locator(`[name="field:${field}"]`).fill(value);
-      await teamPage.locator('[name="field:team_semester"]').selectOption('Winter Semester');
+      for (const [field, value] of Object.entries({ course_name: `Team report ${size}`, submission_date: '2026-10-08' })) await teamPage.locator(`[name="field:${field}"]`).fill(value);
       const saved = teamPage.waitForResponse((response) => response.url().endsWith('/document-details') && response.request().method() === 'PUT');
       await teamPage.getByRole('button', { name: 'Save document details', exact: true }).click(); assert.equal((await saved).status(), 200);
-      await waitSource(teamPage, `\\newcommand{\\coursecode}{TEAM${size}}`);
+      await waitSource(teamPage, `\\newcommand{\\coursename}{Team report ${size}}`);
       await teamPage.waitForFunction(() => document.querySelector('#saveStatus')?.dataset.state === 'synced');
       if (await teamPage.locator('#documentDetailsPanel').isVisible()) await teamPage.locator('#drawerClose').click();
       const teamRoot = `/api/v2/papers/${created.team.id}`;

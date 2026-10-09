@@ -95,8 +95,10 @@ pub use front_matter::{
     ProjectSourceSnippet,
 };
 pub use governance::{
-    ExactRestoreState, RestorationApplied, RestorationRequest, TeamTemplateResolutionInput,
-    TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile, V2FilePolicy, V2FilePolicyRecord,
+    AllTeamsFilePolicies, BulkFilePolicyResult, ExactRestoreState, FilePolicyChange,
+    FilePolicyExclusion, FilePolicySummary, RestorationApplied, RestorationRequest,
+    TeamTemplateResolutionInput, TemplateChangeFile, TemplateChangeRequest, TemplateSeedFile,
+    V2FilePolicy, V2FilePolicyRecord,
 };
 pub use institution::{
     AccountProvisioningResult, AppliedInstitutionImport, GeneratedCredential, ImportFileType,

@@ -6,13 +6,13 @@ import { buildFigure, compilationRelativePath } from './writer-productivity.mjs'
 const writer = readFileSync(new URL('./writer.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/write.html', import.meta.url), 'utf8');
 
-test('Complete Report fixes its canonical main while generic TeX remains selectable', () => {
+test('Writer main is fixed for Complete Report and generic TeX', () => {
   const main = 'Full_Report_template_v1.0/Full_Report_v1.0.tex';
   for (const path of [main, 'chapters/body.tex', 'images/demo.png', 'report.pdf', 'data.csv', 'references.bib']) {
     assert.equal(canSetMain({ file_id: 'id', path }, { main_file: main, main_file_fixed: true }), false);
   }
   assert.equal(canSetMain({ path: 'chapters' }, {}), false);
-  assert.equal(canSetMain({ file_id: 'id', path: 'chapter.tex' }, { main_file: 'main.tex' }), true);
+  assert.equal(canSetMain({ file_id: 'id', path: 'chapter.tex' }, { main_file: 'main.tex' }), false);
   assert.equal(canSetMain({ file_id: 'id', path: 'image.png' }, {}), false);
   assert.equal(canSetMain({ file_id: 'id', path: 'chapter.tex' }, {}, false), false);
   assert.match(writer, /textContent: 'Main'/);

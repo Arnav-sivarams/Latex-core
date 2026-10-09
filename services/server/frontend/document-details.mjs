@@ -7,8 +7,10 @@ export function frontMatterStatus(detail) {
 }
 
 export function editableDetail(detail, field) {
-  const teamMetadata = field.source === 'team.semester' || field.source === 'team.academic_year';
-  return Boolean(detail.can_edit && (field.editable ?? (!field.source || field.allow_team_override || teamMetadata)));
+  if (detail.single_source) {
+    return Boolean(detail.can_edit && ['course_name', 'project.title', 'submission_date'].includes(field.source) && field.allow_team_override);
+  }
+  return Boolean(detail.can_edit && (field.editable ?? (!field.source || field.allow_team_override)));
 }
 
 export function needsFirstUseDetails(detail) {

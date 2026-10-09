@@ -44,6 +44,80 @@ const ALLOWED_SOURCES: &[&str] = &[
 
 pub const SINGLE_SOURCE_MARKER: &str = "% LATEX_CORE_SINGLE_SOURCE_BINDINGS";
 
+/// Institution-approved names; registrations store course IDs, not names.
+pub const COURSE_CATALOG: &[(&str, &str)] = &[
+    ("BCSE497J", "Project-I"),
+    ("BCSE4973", "Project-I"),
+    ("MACSE698", "Internship-I/Dissertation-I"),
+];
+
+pub fn canonical_course_name(code: &str) -> Option<&'static str> {
+    COURSE_CATALOG
+        .iter()
+        .find(|(candidate, _)| code.trim().eq_ignore_ascii_case(candidate))
+        .map(|(_, name)| *name)
+}
+
+/// No template or document override participates in registration resolution.
+pub fn registration_document_values(
+    registrations: &[(String, String, String)],
+) -> (BTreeMap<String, Value>, Vec<String>) {
+    let mut values = BTreeMap::from([
+        ("course_code".into(), Value::Null),
+        ("team.academic_year".into(), Value::Null),
+        ("team.semester".into(), Value::Null),
+    ]);
+    let [(code, year, semester)] = registrations else {
+        return (
+            values,
+            vec![if registrations.is_empty() {
+                "Assigned Team Leader has no applicable institutional course registration. Ask an Admin to link the Leader's student identity and import/correct the registration for this Team.".into()
+            } else {
+                "Assigned Team Leader has multiple applicable institutional course registrations. Ask an Admin to correct the Team/course assignment; no registration was chosen.".into()
+            }],
+        );
+    };
+    let display = legacy::institutional_semester(semester).unwrap_or(semester);
+    // Keep the actual institutional identifier. Normalization is lookup-only.
+    values.insert("course_code".into(), Value::String(code.clone()));
+    values.insert("team.academic_year".into(), Value::String(year.clone()));
+    values.insert("team.semester".into(), Value::String(display.into()));
+    let warnings = if code.trim().is_empty() || legacy::document_calendar(display, year).is_err() {
+        vec!["Assigned Leader registration has an invalid course, academic year or unsupported semester. Ask an Admin to correct the institutional record.".into()]
+    } else {
+        Vec::new()
+    };
+    (values, warnings)
+}
+
+/// An intentional name belongs to its saved course, never a different course.
+pub fn document_course_name(
+    code: &str,
+    source: &BTreeMap<String, Value>,
+    template: &BTreeMap<String, Value>,
+    saved: &BTreeMap<String, Value>,
+) -> Option<String> {
+    let same_course = |values: &BTreeMap<String, Value>| {
+        values
+            .get("course_code")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(code.trim()))
+    };
+    if same_course(source)
+        && (same_course(saved) || source.get("course_name") != template.get("course_name"))
+    {
+        if let Some(name) = source.get("course_name").and_then(Value::as_str) {
+            return Some(name.into());
+        }
+    }
+    if same_course(saved)
+        && let Some(name) = saved.get("course_name").and_then(Value::as_str)
+    {
+        return Some(name.into());
+    }
+    canonical_course_name(code).map(str::to_owned)
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SingleSourceBindingPoint {
     ExplicitMarker,
@@ -316,15 +390,7 @@ pub fn format_student_front_matter(source: &[u8]) -> Result<Bytes, FrontMatterEr
 }
 
 pub fn document_owned_source(source: &str) -> bool {
-    matches!(
-        source,
-        "course_code"
-            | "course_name"
-            | "project.title"
-            | "submission_date"
-            | "team.semester"
-            | "team.academic_year"
-    )
+    matches!(source, "course_name" | "project.title" | "submission_date")
 }
 
 /// The generated allowlist does not introduce new required template fields.
@@ -359,7 +425,19 @@ pub fn single_source_managed_values_from_tex(main: &[u8]) -> BTreeMap<String, Va
     let Some(end) = source[start..].find(SINGLE_SOURCE_MARKER) else {
         return BTreeMap::new();
     };
-    single_source_values_from_tex(&source.as_bytes()[start..start + end])
+    let managed = &source[start..start + end];
+    let mut values = single_source_values_from_tex(managed.as_bytes());
+    // A generated empty helper is not an explicit date edit. Keeping it as an
+    // input would clear the original month/year on the second partial save.
+    // An explicitly submitted empty date still clears them through `values`.
+    let commands = legacy::commands(managed);
+    if values.get("submission_date").and_then(Value::as_str) == Some("")
+        && !commands.contains("thesismonth")
+        && !commands.contains("thesisyear")
+    {
+        values.remove("submission_date");
+    }
+    values
 }
 
 /// Read literal macro definitions from the durable source without executing TeX.
@@ -1121,6 +1199,187 @@ pub fn escape_latex_text(value: &str) -> String {
     reason = "small deterministic in-memory fixtures should fail immediately at their construction site"
 )]
 mod tests {
+    #[test]
+    fn empty_generated_date_helper_preserves_originals_and_explicit_clears() {
+        let source = br"\documentclass{article}
+\newcommand{\coursecode}{BCSE4973}
+\newcommand{\thesismonth}{Month}
+\newcommand{\thesisyear}{Year}
+\begin{document}Report\end{document}";
+        let values = BTreeMap::from([("course_code".into(), Value::String("BCSE4973".into()))]);
+        let saved = bind_single_source_values(source, &values).unwrap();
+        assert_eq!(bind_single_source_values(&saved, &values).unwrap(), saved);
+        let text = String::from_utf8_lossy(&saved);
+        assert!(text.contains(r"\newcommand{\thesismonth}{Month}"));
+        assert!(text.contains(r"\newcommand{\thesisyear}{Year}"));
+        let cleared = bind_single_source_values(
+            &saved,
+            &BTreeMap::from([("submission_date".into(), Value::String(String::new()))]),
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&cleared);
+        assert!(text.contains(r"\newcommand{\thesismonth}{}"));
+        assert!(text.contains(r"\newcommand{\thesisyear}{}"));
+        assert_eq!(
+            bind_single_source_values(&cleared, &values).unwrap(),
+            cleared
+        );
+        let legacy = br"% Known institutional single-source bindings.
+\renewcommand{\thesismonth}{}
+\renewcommand{\thesisyear}{}
+% LATEX_CORE_SINGLE_SOURCE_BINDINGS";
+        assert_eq!(
+            single_source_managed_values_from_tex(legacy)["submission_date"],
+            ""
+        );
+    }
+
+    #[test]
+    fn course_catalog_and_canonical_source_are_exact_and_idempotent() {
+        let source = br"\documentclass{article}
+\newcommand{\coursecode}{OLD}
+\newcommand{\coursename}{Historical name} % preserve comment
+\begin{document}\coursecode\space\coursename\end{document}";
+        for (code, expected) in COURSE_CATALOG {
+            assert_eq!(
+                canonical_course_name(&format!(" {} ", code.to_lowercase())),
+                Some(*expected)
+            );
+            let values = BTreeMap::from([
+                ("course_code".into(), Value::String((*code).into())),
+                ("course_name".into(), Value::String((*expected).into())),
+            ]);
+            let saved = bind_single_source_values(source, &values).unwrap();
+            let text = String::from_utf8_lossy(&saved);
+            assert!(text.contains(&format!("\\newcommand{{\\coursecode}}{{{code}}}")));
+            assert!(text.contains(&format!("\\newcommand{{\\coursename}}{{{expected}}}")));
+            assert!(text.contains("% preserve comment"));
+            assert_eq!(text.matches(r"\newcommand{\coursecode}").count(), 1);
+            assert_eq!(text.matches(r"\newcommand{\coursename}").count(), 1);
+            for _ in 0..3 {
+                assert_eq!(bind_single_source_values(&saved, &values).unwrap(), saved);
+            }
+            let reopened = single_source_values_from_tex(&saved);
+            assert_eq!(reopened["course_code"], *code);
+            assert_eq!(reopened["course_name"], *expected);
+            assert_eq!(
+                document_course_name(code, &reopened, &BTreeMap::new(), &values),
+                Some((*expected).into())
+            );
+        }
+        assert_eq!(canonical_course_name("UNKNOWN"), None);
+        assert_eq!(canonical_course_name("BCSE497"), None);
+    }
+
+    #[test]
+    fn edited_course_name_survives_only_for_the_same_course() {
+        for (code, _) in COURSE_CATALOG {
+            let saved = BTreeMap::from([
+                ("course_code".into(), serde_json::json!(code)),
+                ("course_name".into(), serde_json::json!("Intentional name")),
+            ]);
+            assert_eq!(
+                document_course_name(code, &saved, &BTreeMap::new(), &saved),
+                Some("Intentional name".into())
+            );
+        }
+        let historical = BTreeMap::from([
+            ("course_code".into(), serde_json::json!("BCSE497J")),
+            (
+                "course_name".into(),
+                serde_json::json!("Intentional undergraduate name"),
+            ),
+        ]);
+        assert_eq!(
+            document_course_name("MACSE698", &historical, &historical, &historical),
+            Some("Internship-I/Dissertation-I".into())
+        );
+        assert_eq!(
+            document_course_name("BCSE4973", &historical, &historical, &historical),
+            Some("Project-I".into())
+        );
+        assert_eq!(
+            document_course_name("UNKNOWN", &historical, &historical, &historical),
+            None
+        );
+        let manual = BTreeMap::from([
+            ("course_code".into(), serde_json::json!("UNKNOWN")),
+            (
+                "course_name".into(),
+                serde_json::json!("Manual unknown course"),
+            ),
+        ]);
+        assert_eq!(
+            document_course_name("UNKNOWN", &manual, &BTreeMap::new(), &manual),
+            Some("Manual unknown course".into())
+        );
+    }
+
+    #[test]
+    fn registration_tuple_is_authoritative_and_missing_or_ambiguous_never_defaults() {
+        for (raw, display) in [
+            ("FALL", "Fall Semester"),
+            ("Fall", "Fall Semester"),
+            ("Fall Semester", "Fall Semester"),
+            ("WINTER", "Winter Semester"),
+            ("Winter", "Winter Semester"),
+            ("Winter Semester", "Winter Semester"),
+        ] {
+            let (values, warnings) = registration_document_values(&[(
+                "BCSE497J".into(),
+                "2026-2027".into(),
+                raw.into(),
+            )]);
+            assert!(warnings.is_empty());
+            assert_eq!(values["course_code"], "BCSE497J");
+            assert_eq!(values["team.academic_year"], "2026-2027");
+            assert_eq!(values["team.semester"], display);
+        }
+        let (values, warnings) = registration_document_values(&[(
+            " bcse497j ".into(),
+            "2026-2027".into(),
+            "Fall".into(),
+        )]);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            values["course_code"], " bcse497j ",
+            "lookup normalization must never replace the actual institutional identifier"
+        );
+        let (values, warnings) = registration_document_values(&[]);
+        assert!(values.values().all(Value::is_null));
+        assert!(warnings[0].contains("no applicable"));
+        let (values, warnings) = registration_document_values(&[
+            ("BCSE497J".into(), "2026-2027".into(), "FALL".into()),
+            ("MACSE698".into(), "2026-2027".into(), "FALL".into()),
+        ]);
+        assert!(values.values().all(Value::is_null));
+        assert!(warnings[0].contains("multiple applicable"));
+        let (values, warnings) = registration_document_values(&[(
+            "unknown ".into(),
+            "2026-2027".into(),
+            "SUMMER".into(),
+        )]);
+        assert_eq!(values["course_code"], "unknown ");
+        assert_eq!(values["team.semester"], "SUMMER");
+        assert!(warnings[0].contains("unsupported semester"));
+    }
+
+    #[test]
+    fn complete_report_only_three_fields_are_document_owned() {
+        for source in ["course_name", "project.title", "submission_date"] {
+            assert!(document_owned_source(source));
+        }
+        for source in [
+            "course_code",
+            "team.semester",
+            "team.academic_year",
+            "guide.name",
+            "degree_name",
+        ] {
+            assert!(!document_owned_source(source));
+        }
+    }
+
     use super::*;
 
     fn fixture(manifest: &str, tex: &[(&str, &str)]) -> ImportedArchive {

@@ -382,6 +382,13 @@ struct FilePolicyInput {
     policy: String,
 }
 #[derive(Deserialize)]
+struct BulkFilePolicyInput {
+    expected_team_count: u64,
+    #[serde(default)]
+    confirmed: bool,
+    changes: Vec<persistence::FilePolicyChange>,
+}
+#[derive(Deserialize)]
 struct ImportQuery {
     name: String,
 }
@@ -927,6 +934,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/v2/paper-teams/{id}/file-policies",
             get(admin_v2_file_policies),
+        )
+        .route(
+            "/api/admin/v2/file-policies",
+            get(admin_v2_all_teams_file_policies).patch(admin_v2_set_all_teams_file_policies),
         )
         .route(
             "/api/admin/v2/paper-teams/{id}/file-policies/{file_id}",
@@ -4105,43 +4116,57 @@ async fn single_source_document_details(
         })?;
         commands.extend(front_matter::single_source_commands(source));
     }
-    let mut overrides = state
+    let saved = state
         .front_matter
         .single_source_values(paper_id)
         .await
         .map_err(front_matter_repository_error)?;
     let source_values = front_matter::single_source_values_from_tex(&main);
-    overrides.retain(|key, _| matches!(key.as_str(), "guide_identity" | "dean_identity"));
-    for (_, source, _, _) in front_matter::legacy::REGISTRY {
-        if let Some(value) = source_values.get(*source) {
-            overrides.insert(source.replace('.', "_"), value.clone());
-        }
+    let template_hash = state
+        .front_matter
+        .paper_template_main_blob(paper_id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let template_main = state.blobs.get(template_hash).await.map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pinned template main source unavailable",
+        )
+    })?;
+    let template_values = front_matter::single_source_values_from_tex(&template_main);
+    let mut overrides = source_values
+        .iter()
+        .map(|(key, value)| (key.replace('.', "_"), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(date) = saved.get("submission_date") {
+        overrides.insert("submission_date".into(), date.clone());
     }
-    let automatic = state
+    let mut automatic = state
         .front_matter
         .legacy_automatic_values(paper_id, None, None)
         .await
         .map_err(front_matter_repository_error)?;
-    // These two document inputs exist even in older templates without a dedicated macro.
-    commands.extend(["semester".to_owned(), "academicyear".to_owned()]);
-    for key in ["team_semester", "team_academic_year"] {
-        overrides
-            .entry(key.into())
-            .or_insert(serde_json::Value::String(String::new()));
-    }
-    if let Some(value) = overrides
-        .get("team_semester")
+    let registrations = state
+        .front_matter
+        .applicable_leader_registrations(paper_id)
+        .await
+        .map_err(front_matter_repository_error)?;
+    let (registration_values, warnings) =
+        front_matter::registration_document_values(&registrations);
+    if let Some(code) = registration_values
+        .get("course_code")
         .and_then(serde_json::Value::as_str)
     {
-        let selected = ["Winter Semester", "Summer Semester"]
-            .into_iter()
-            .find(|label| value.starts_with(label))
-            .unwrap_or("");
         overrides.insert(
-            "team_semester".into(),
-            serde_json::Value::String(selected.into()),
+            "course_name".into(),
+            front_matter::document_course_name(code, &source_values, &template_values, &saved)
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
         );
+    } else {
+        overrides.insert("course_name".into(), serde_json::Value::Null);
     }
+    automatic.extend(registration_values);
+    commands.extend(["semester".to_owned(), "academicyear".to_owned()]);
     let team_size = automatic
         .get("team.size")
         .and_then(serde_json::Value::as_str)
@@ -4178,15 +4203,17 @@ async fn single_source_document_details(
         if !resolved && !matches!(*source, "project.title" | "specialization") {
             missing.insert(key.clone());
         }
-        fields.entry(key.clone()).or_insert_with(|| serde_json::json!({
+        fields.entry(key.clone()).or_insert_with(|| {
+            serde_json::json!({
                 "key":key,
                 "label":label,
                 "type":if *source == "submission_date" { "DATE" } else { "TEXT" },
                 "required":!matches!(*source, "project.title" | "specialization"),
                 "source":source,
                 "allow_team_override":*editable && front_matter::document_owned_source(source),
-                "options": if *source == "team.semester" { serde_json::json!([{"value":"Winter Semester","label":"Winter Semester"},{"value":"Summer Semester","label":"Summer Semester"}]) } else { serde_json::Value::Null },
-            }));
+                "options":serde_json::Value::Null,
+            })
+        });
         values.entry(key.clone()).or_insert_with(
             || serde_json::json!({"field_key":key,"value":value,"value_source":source_name}),
         );
@@ -4199,7 +4226,8 @@ async fn single_source_document_details(
         "pack_name":"Complete report template",
         "status":if missing.is_empty() { "READY" } else { "NEEDS_INFORMATION" },
         "missing_required_fields":missing,
-        "warnings":[],
+        "warnings":warnings,
+        "course_catalog":front_matter::COURSE_CATALOG.iter().copied().collect::<BTreeMap<_, _>>(),
         "team_size":team_size,
         "manifest":{"schema_version":2,"sections":[],"fields":fields.into_values().collect::<Vec<_>>()},
         "values":values.into_values().collect::<Vec<_>>(),
@@ -4374,6 +4402,15 @@ async fn v2_save_document_details(
             }
         }
         submitted.extend(input.values.clone());
+        if !source_detail["warnings"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            return error(
+                StatusCode::CONFLICT,
+                "Ask an Admin to resolve the assigned Leader's applicable institutional registration before saving Document Details",
+            );
+        }
         if let Err(value) = front_matter::legacy::document_calendar(
             submitted
                 .get("team_semester")
@@ -4443,23 +4480,23 @@ async fn v2_save_document_details(
             Err(value) => return front_matter_repository_error(value),
         };
         for (_, source, _, _) in front_matter::legacy::REGISTRY {
-            if front_matter::document_owned_source(source) {
-                if let Some(value) = input.values.get(&source.replace('.', "_")).or_else(|| {
-                    matches!(*source, "team.semester" | "team.academic_year")
-                        .then(|| submitted.get(&source.replace('.', "_")))
-                        .flatten()
-                }) {
-                    values.insert((*source).to_owned(), value.clone());
-                }
-            } else {
-                values.insert(
-                    (*source).to_owned(),
-                    automatic
-                        .get(*source)
-                        .cloned()
-                        .unwrap_or(serde_json::json!("")),
-                );
+            let key = source.replace('.', "_");
+            if *source == "submission_date" && !input.values.contains_key(&key) {
+                continue;
             }
+            let value = if front_matter::document_owned_source(source)
+                || matches!(
+                    *source,
+                    "course_code" | "team.semester" | "team.academic_year"
+                ) {
+                submitted.get(&key)
+            } else {
+                automatic.get(*source)
+            };
+            values.insert(
+                (*source).to_owned(),
+                value.cloned().unwrap_or(serde_json::json!("")),
+            );
         }
         let bound = match front_matter::bind_single_source_values(&main, &values) {
             Ok(value) => value,
@@ -5351,6 +5388,61 @@ async fn admin_v2_set_file_policy(
     }
 }
 
+async fn admin_v2_all_teams_file_policies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match state.v2.all_teams_file_policies(principal.user_id()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(value) => v2_error(value),
+    }
+}
+
+async fn admin_v2_set_all_teams_file_policies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BulkFilePolicyInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match admin_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !input.confirmed {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Confirm the All Teams file policy changes before applying.",
+        );
+    }
+    match state
+        .v2
+        .set_all_teams_file_policies(
+            principal.user_id(),
+            input.expected_team_count,
+            &input.changes,
+        )
+        .await
+    {
+        Ok(result) => {
+            for record in &result.updated_files {
+                state
+                    .collaboration
+                    .policy_changed(record.workspace_id, record.file_id)
+                    .await;
+            }
+            tracing::info!(admin = %principal.user_id(), team_count = result.team_count, updated_files = result.updated_files.len(), "All Teams file policies committed");
+            Json(result).into_response()
+        }
+        Err(value) => v2_error(value),
+    }
+}
+
 async fn admin_v2_restoration_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5718,13 +5810,23 @@ fn source_archive_filename(name: &str) -> String {
 async fn v2_source_archive(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(paper_id): Path<uuid::Uuid>,
+    Path(_paper_id): Path<uuid::Uuid>,
 ) -> Response {
-    let principal = match writer_session(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let paper = match state.v2.writer_paper(principal.user_id(), paper_id).await {
+    if let Err(response) = writer_session(&state, &headers).await {
+        return response;
+    }
+    error(
+        StatusCode::FORBIDDEN,
+        "Source ZIP downloads are disabled. You can download the compiled PDF.",
+    )
+}
+
+#[allow(
+    dead_code,
+    reason = "retain internal source export for controlled future re-enablement and regression tests"
+)]
+async fn export_source_archive(state: &AppState, actor: UserId, paper_id: uuid::Uuid) -> Response {
+    let paper = match state.v2.writer_paper(actor, paper_id).await {
         Ok(value) => value,
         Err(error_value) => return v2_error(error_value),
     };
@@ -6085,49 +6187,23 @@ async fn v2_delete_file(
 async fn v2_set_main(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((paper_id, file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
-    Json(input): Json<V2VersionInput>,
+    Path((_paper_id, _file_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(_input): Json<V2VersionInput>,
 ) -> Response {
     if let Err(response) = csrf(&headers) {
         return response;
     }
-    let principal = match writer_session(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let (paper, file) = match authorized_file(&state, principal.user_id(), paper_id, file_id).await
-    {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if file.path.extension() != Some("tex") {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Only a TeX source can be a main file.",
-        );
+    if let Err(response) = writer_session(&state, &headers).await {
+        return response;
     }
-    match complete_report_main(&state, paper_id).await {
-        Ok(Some(_)) => {
-            return error(
-                StatusCode::CONFLICT,
-                "Complete Report uses its canonical template main file.",
-            );
-        }
-        Ok(None) => {}
-        Err(response) => return response,
-    }
-    let previous_main = match state.workspaces.restore(paper.workspace_id).await {
-        Ok(value) => value.main_file().cloned(),
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "workspace failure"),
-    };
-    match state
-        .v2
-        .set_main_with_event(file_id, principal.user_id(), input.version, previous_main)
-        .await
-    {
-        Ok(version) => Json(serde_json::json!({"version":version})).into_response(),
-        Err(error_value) => v2_error(error_value),
-    }
+    main_change_denied()
+}
+
+fn main_change_denied() -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        "Changing the main file is disabled. Compilation uses the existing template main file.",
+    )
 }
 
 async fn v2_structural_undo(
@@ -11791,6 +11867,34 @@ mod tests {
         ]);
         let bound =
             front_matter::bind_single_source_values(&main, &values).expect("safe managed patch");
+        for (code, name) in front_matter::COURSE_CATALOG {
+            let mut course_values = values.clone();
+            course_values.insert("course_code".into(), serde_json::json!(code));
+            course_values.insert("course_name".into(), serde_json::json!(name));
+            let canonical = front_matter::bind_single_source_values(&main, &course_values)
+                .expect("canonical course binding in the actual template");
+            let text = String::from_utf8_lossy(&canonical);
+            assert!(text.contains(&format!("\\newcommand{{\\coursecode}}{{{code}}}")));
+            assert!(text.contains(&format!("\\newcommand{{\\coursename}}{{{name}}}")));
+            assert_eq!(text.matches(r"\newcommand{\coursename}").count(), 1);
+            let repeated = front_matter::bind_single_source_values(&canonical, &course_values)
+                .expect("idempotent canonical course binding");
+            let offset = canonical
+                .iter()
+                .zip(&repeated)
+                .position(|(a, b)| a != b)
+                .unwrap_or(canonical.len().min(repeated.len()));
+            assert!(
+                repeated == canonical,
+                "course {code} normalization differs at byte {offset}: {:?} / {:?}",
+                String::from_utf8_lossy(
+                    &canonical[offset.saturating_sub(50)..(offset + 100).min(canonical.len())]
+                ),
+                String::from_utf8_lossy(
+                    &repeated[offset.saturating_sub(50)..(offset + 100).min(repeated.len())]
+                )
+            );
+        }
         let text = String::from_utf8_lossy(&bound);
         assert!(text.contains(r"\newcommand{\coursecode}{BA101}"));
         assert!(text.contains(r"\newcommand{\semester}{Winter Semester 2026-2027}"));
@@ -12193,6 +12297,7 @@ mod tests {
 )]
 mod database_tests {
     include!("front_matter_db_tests.rs");
+    include!("course_autofill_db_tests.rs");
     use super::*;
     use axum::{
         body::Body,
@@ -12213,9 +12318,532 @@ mod database_tests {
     }
 
     #[tokio::test]
-    async fn writer_source_archive_is_authorized_and_exports_only_visible_workspace_files() {
+    async fn all_teams_file_policies_are_confirmed_authorized_atomic_and_persistent() {
         let _guard = SERVER_TEST_LOCK.lock().await;
-        let (database, pool, app, _storage, _state) = test_application().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.paper_teams")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            existing, 0,
+            "Run this regression first in a fresh disposable test database."
+        );
+        let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
+        let writer_id = test_user_id(&pool, &writer.email).await;
+        let path = "/api/admin/v2/file-policies";
+        let empty = test_json(get(&app, path, Some(&admin.cookie)).await).await;
+        assert_eq!(empty["team_count"], 0);
+        assert_eq!(empty["files"], serde_json::json!([]));
+        let empty_save = request(&app, Method::PATCH, path, Some(&admin.cookie), r#"{"expected_team_count":0,"confirmed":true,"changes":[{"path":"main.tex","policy":"CONTENT_READ_ONLY"}]}"#, Some("application/json")).await;
+        assert_eq!(empty_save.status(), StatusCode::OK);
+        assert_eq!(
+            test_json(empty_save).await["updated_files"],
+            serde_json::json!([])
+        );
+        // A fresh database has no fallback template. Provision the Teams through
+        // the real template-import contract without changing global defaults.
+        let archive = test_zip(&[(
+            "main.tex",
+            br"\documentclass{article}
+\begin{document}File policy fixture\end{document}",
+        )]);
+        let (body, content_type) = template_multipart(
+            &[("name", "Disposable policy template"), ("main", "main.tex")],
+            &archive,
+        );
+        let imported = request_bytes(
+            &app,
+            Method::POST,
+            "/api/admin/v2/templates/import",
+            Some(&admin.cookie),
+            body,
+            Some(&content_type),
+        )
+        .await;
+        let status = imported.status();
+        let template = test_json(imported).await;
+        assert_eq!(status, StatusCode::CREATED, "template import: {template}");
+        let template_id = uuid::Uuid::parse_str(template["id"].as_str().unwrap()).unwrap();
+        let mut teams = Vec::new();
+        for name in [
+            "Disposable Policy A",
+            "Disposable Policy B",
+            "Disposable Policy C",
+        ] {
+            let response = request(&app, Method::POST, "/api/admin/v2/paper-teams", Some(&admin.cookie), &serde_json::json!({"name":name,"writer_ids":[writer_id],"leader_writer_id":writer_id,"mentor_ids":[],"template_id":template_id,"use_front_matter_default":false}).to_string(), Some("application/json")).await;
+            let status = response.status();
+            let created = test_json(response).await;
+            assert_eq!(status, StatusCode::CREATED, "Team creation: {created}");
+            teams.push(uuid::Uuid::parse_str(created["team"]["id"].as_str().unwrap()).unwrap());
+        }
+        let mut files = Vec::new();
+        for team in &teams {
+            let mut version = 1;
+            for file_path in ["shared-policy.tex", "untouched-policy.tex"] {
+                let created = test_json(request(&app, Method::POST, &format!("/api/v2/papers/{team}/files"), Some(&writer.cookie), &serde_json::json!({"path":file_path,"content":"Policy fixture","version":version}).to_string(), Some("application/json")).await).await;
+                version = created["version"].as_u64().unwrap();
+            }
+            let records = test_json(
+                get(
+                    &app,
+                    &format!("/api/admin/v2/paper-teams/{team}/file-policies"),
+                    Some(&admin.cookie),
+                )
+                .await,
+            )
+            .await;
+            files.push(
+                records
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|file| file["path"] == "shared-policy.tex")
+                    .unwrap()["file_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        let individual = format!(
+            "/api/admin/v2/paper-teams/{}/file-policies/{}",
+            teams[0], files[0]
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &individual,
+                Some(&admin.cookie),
+                r#"{"policy":"STRUCTURE_LOCKED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let third_policy = format!(
+            "/api/admin/v2/paper-teams/{}/file-policies/{}",
+            teams[2], files[2]
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                &third_policy,
+                Some(&admin.cookie),
+                r#"{"policy":"CONTENT_READ_ONLY"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let mixed = test_json(get(&app, path, Some(&admin.cookie)).await).await;
+        assert_eq!(mixed["team_count"], 3);
+        assert!(
+            mixed["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"] == "shared-policy.tex" && file["policy"].is_null())
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, served).await.unwrap();
+        });
+        let config = serde_json::json!({"base":format!("http://{address}"),"cookie":admin.cookie,"count":teams.len(),"teams":teams});
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new("node")
+                .arg("tests/all-teams-browser.mjs")
+                .env("LATEX_CORE_ALL_TEAMS_CONFIG", config.to_string())
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        server.abort();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        let browser_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.audit_events WHERE event_type='paper.file_policy.bulk_updated'").fetch_one(&pool).await.unwrap();
+        let template_pins_before: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+            "SELECT paper_id,template_id FROM latex_core.paper_template_pins ORDER BY paper_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let structure_before: Vec<(uuid::Uuid,uuid::Uuid,String,i64)> = sqlx::query_as("SELECT t.id,m.user_id,f.path,f.revision FROM latex_core.paper_teams t JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id JOIN latex_core.paper_files f ON f.workspace_id=t.workspace_id ORDER BY t.id,m.user_id,f.path")
+            .fetch_all(&pool).await.unwrap();
+        let payload = r#"{"expected_team_count":3,"confirmed":true,"changes":[{"path":"shared-policy.tex","policy":"CONTENT_READ_ONLY"}]}"#;
+        for cookie in [&writer.cookie, &mentor.cookie] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::PATCH,
+                    path,
+                    Some(cookie),
+                    payload,
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(
+            state
+                .v2
+                .set_all_teams_file_policies(
+                    writer_id,
+                    3,
+                    &[persistence::FilePolicyChange {
+                        path: LogicalPath::parse("shared-policy.tex").unwrap(),
+                        policy: V2FilePolicy::ContentReadOnly
+                    }]
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                path,
+                Some(&admin.cookie),
+                &payload.replace("\"confirmed\":true", "\"confirmed\":false"),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                path,
+                Some(&admin.cookie),
+                &payload.replace("\"expected_team_count\":3", "\"expected_team_count\":1"),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let unchanged_before: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT file_id,policy FROM latex_core.paper_file_policies ORDER BY file_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let failing = r#"{"expected_team_count":3,"confirmed":true,"changes":[{"path":"shared-policy.tex","policy":"CONTENT_READ_ONLY"},{"path":"no-such-file.tex","policy":"STRUCTURE_LOCKED"}]}"#;
+        assert_eq!(
+            request(
+                &app,
+                Method::PATCH,
+                path,
+                Some(&admin.cookie),
+                failing,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let unchanged_after: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT file_id,policy FROM latex_core.paper_file_policies ORDER BY file_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged_before, unchanged_after,
+            "a failed bulk request must roll back every policy"
+        );
+        let applied = request(
+            &app,
+            Method::PATCH,
+            path,
+            Some(&admin.cookie),
+            payload,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(applied.status(), StatusCode::OK);
+        let applied = test_json(applied).await;
+        assert_eq!(applied["affected_team_count"], 3);
+        assert_eq!(applied["updated_files"].as_array().unwrap().len(), 3);
+        for team in &teams {
+            let records = test_json(
+                get(
+                    &app,
+                    &format!("/api/admin/v2/paper-teams/{team}/file-policies"),
+                    Some(&admin.cookie),
+                )
+                .await,
+            )
+            .await;
+            assert!(
+                records
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["path"] == "shared-policy.tex"
+                        && file["policy"] == "CONTENT_READ_ONLY")
+            );
+            assert!(
+                records
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["path"] == "untouched-policy.tex"
+                        && file["policy"] == "EDITABLE")
+            );
+        }
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM latex_core.audit_events WHERE event_type='paper.file_policy.bulk_updated'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            audits,
+            browser_audits + 3,
+            "only committed changes should have audit records"
+        );
+        let template_pins_after: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+            "SELECT paper_id,template_id FROM latex_core.paper_template_pins ORDER BY paper_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(template_pins_before, template_pins_after);
+        let structure_after: Vec<(uuid::Uuid,uuid::Uuid,String,i64)> = sqlx::query_as("SELECT t.id,m.user_id,f.path,f.revision FROM latex_core.paper_teams t JOIN latex_core.paper_team_members m ON m.paper_team_id=t.id JOIN latex_core.paper_files f ON f.workspace_id=t.workspace_id ORDER BY t.id,m.user_id,f.path")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            structure_before, structure_after,
+            "policies must preserve memberships, files and revisions"
+        );
+        let team = state.v2.writer_paper(writer_id, teams[0]).await.unwrap();
+        let version = state
+            .workspaces
+            .restore(team.workspace_id)
+            .await
+            .unwrap()
+            .version()
+            .get();
+        let response = request(&app, Method::POST, &format!("/api/v2/papers/{}/files",teams[0]), Some(&writer.cookie),
+            &serde_json::json!({"path":"nested/shared-policy.tex","content":"Explicit logical-path fixture","version":version}).to_string(), Some("application/json")).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = request(&app, Method::PATCH, path, Some(&admin.cookie),
+            r#"{"expected_team_count":3,"confirmed":true,"changes":[{"path":"nested/shared-policy.tex","policy":"STRUCTURE_LOCKED"}]}"#, Some("application/json")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let applied = test_json(response).await;
+        assert_eq!(applied["affected_team_count"], 1);
+        assert_eq!(applied["excluded_files"].as_array().unwrap().len(), 2);
+        for excluded in applied["excluded_files"].as_array().unwrap() {
+            assert_eq!(excluded["path"], "nested/shared-policy.tex");
+            assert!(
+                teams[1..]
+                    .iter()
+                    .any(|team| excluded["paper_team_id"] == team.to_string())
+            );
+        }
+        let overview = test_json(get(&app, path, Some(&admin.cookie)).await).await;
+        assert!(
+            overview["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"] == "shared-policy.tex"
+                    && file["policy"] == "CONTENT_READ_ONLY"),
+            "basename matches must not be changed"
+        );
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn writer_export_and_main_endpoints_are_denied_without_mutating_source() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
+        let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let created = test_json(
+            request(
+                &app,
+                Method::POST,
+                "/api/v2/writer/personal-papers",
+                Some(&writer.cookie),
+                r#"{"name":"Disposable Writer restrictions"}"#,
+                Some("application/json"),
+            )
+            .await,
+        )
+        .await;
+        let paper_id = created["paper"]["id"].as_str().unwrap();
+        let workspace =
+            uuid::Uuid::parse_str(created["paper"]["workspace_id"].as_str().unwrap()).unwrap();
+        let main = state
+            .workspaces
+            .restore(WorkspaceId::from_uuid(workspace))
+            .await
+            .unwrap();
+        let before_main = main.main_file().cloned();
+        let files = test_json(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+            )
+            .await,
+        )
+        .await;
+        let root_id = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "main.tex")
+            .unwrap()["file_id"]
+            .as_str()
+            .unwrap();
+        let mut version = created["version"].as_u64().unwrap();
+        let mut targets = vec![root_id.to_owned()];
+        for path in ["nested/report.tex", "other.tex", "image.txt"] {
+            let created = request(
+                &app,
+                Method::POST,
+                &format!("/api/v2/papers/{paper_id}/files"),
+                Some(&writer.cookie),
+                &serde_json::json!({"path":path,"content":"Still editable","version":version})
+                    .to_string(),
+                Some("application/json"),
+            )
+            .await;
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let created = test_json(created).await;
+            version = created["version"].as_u64().unwrap();
+            targets.push(created["file"]["file_id"].as_str().unwrap().to_owned());
+        }
+        for id in &targets {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::POST,
+                    &format!("/api/v2/papers/{paper_id}/main/{id}"),
+                    Some(&writer.cookie),
+                    &serde_json::json!({"version":version}).to_string(),
+                    Some("application/json")
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("/api/projects/{workspace}/main"),
+                Some(&writer.cookie),
+                &serde_json::json!({"path":"nested/report.tex","version":version}).to_string(),
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/source.zip"),
+                Some(&writer.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let unchanged = state
+            .workspaces
+            .restore(WorkspaceId::from_uuid(workspace))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.version().get(), version);
+        assert_eq!(unchanged.main_file().cloned(), before_main);
+        let saved = request(&app, Method::PUT, &format!("/api/v2/papers/{paper_id}/files/{root_id}"), Some(&writer.cookie), &serde_json::json!({"content":"\\documentclass{article}\n\\begin{document}Editing still works\\end{document}\n","version":version}).to_string(), Some("application/json")).await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        let build = request(
+            &app,
+            Method::POST,
+            &format!("/api/v2/papers/{paper_id}/builds"),
+            Some(&writer.cookie),
+            r#"{"trigger_type":"manual"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(build.status(), StatusCode::ACCEPTED);
+        let build = test_json(build).await;
+        let worker = core_types::WorkerId::new();
+        let claimed = state.queue.claim(worker).await.unwrap().unwrap();
+        assert_eq!(claimed.id.to_string(), build["build_id"].as_str().unwrap());
+        let manifest_hash: String = sqlx::query_scalar(
+            "SELECT manifest_blob_hash FROM latex_core.snapshots WHERE snapshot_id=$1",
+        )
+        .bind(claimed.snapshot_id.to_hex())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let manifest: WorkspaceManifestV1 = serde_json::from_slice(
+            &state
+                .blobs
+                .get(core_types::BlobHash::from_str(&manifest_hash).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.main_file().as_str(), "main.tex");
+        state
+            .queue
+            .complete_success(
+                claimed.id,
+                worker,
+                &test_artifacts(&state, "writer-restrictions").await,
+                core_types::BlobHash::digest(b"writer-restrictions-manifest"),
+            )
+            .await
+            .unwrap();
+        let _ = get(
+            &app,
+            &format!("/api/v2/papers/{paper_id}/builds"),
+            Some(&writer.cookie),
+        )
+        .await;
+        let pdf = get(
+            &app,
+            &format!(
+                "/api/v2/papers/{paper_id}/artifacts/pdf?build={}&download=true",
+                claimed.id
+            ),
+            Some(&writer.cookie),
+        )
+        .await;
+        assert_eq!(pdf.status(), StatusCode::OK);
+        assert_eq!(
+            pdf.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"paper.pdf\""
+        );
+        assert_eq!(test_bytes(pdf).await, b"pdf-writer-restrictions");
+        pool.close().await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn writer_source_export_is_denied_and_internal_export_preserves_visible_files() {
+        let _guard = SERVER_TEST_LOCK.lock().await;
+        let (database, pool, app, _storage, state) = test_application().await;
         let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let outsider = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
@@ -12284,13 +12912,19 @@ mod database_tests {
         let path = format!("/api/v2/papers/{paper_id}/source.zip");
         assert_eq!(
             get(&app, &path, Some(&outsider.cookie)).await.status(),
-            StatusCode::NOT_FOUND
+            StatusCode::FORBIDDEN
         );
         assert_eq!(
             get(&app, &path, Some(&mentor.cookie)).await.status(),
             StatusCode::FORBIDDEN
         );
-        let response = get(&app, &path, Some(&writer.cookie)).await;
+        assert_eq!(
+            get(&app, &path, Some(&writer.cookie)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let response =
+            export_source_archive(&state, writer_id, uuid::Uuid::parse_str(paper_id).unwrap())
+                .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/zip");
         assert_eq!(
@@ -13201,9 +13835,10 @@ mod database_tests {
     #[tokio::test]
     async fn s2_admin_team_writer_and_file_vertical_slice() {
         let _guard = SERVER_TEST_LOCK.lock().await;
-        let (database, pool, app, _storage, _state) = test_application().await;
+        let (database, pool, app, _storage, state) = test_application().await;
         let legacy_admin = fixture(&app, &database, "admin", None).await;
         let admin = fixture(&app, &database, "student", Some(GlobalRole::Admin)).await;
+        fixture_default_template(&state, &pool, &admin).await;
         let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let other_writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let mentor = fixture(&app, &database, "student", Some(GlobalRole::Mentor)).await;
@@ -13485,7 +14120,12 @@ mod database_tests {
             )
             .await
             .status(),
-            StatusCode::OK
+            StatusCode::FORBIDDEN
+        );
+        let fixture_actor = test_user_id(&pool, &writer.email).await;
+        assert_eq!(
+            fixture_assign_main(&state, fixture_actor, &paper_id, &second_id, 4).await,
+            5
         );
         assert_eq!(
             request(
@@ -13929,6 +14569,7 @@ mod database_tests {
             .bind(departments[0].1).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO vcap.student_user_links(reg_no,user_id,status,linked_at) VALUES('DEPT-PROOF-STUDENT',$1,'LINKED',now())")
             .bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO vcap.student_course_registrations(student_reg_no,course_id,academic_year,semester) VALUES('DEPT-PROOF-STUDENT','BA101','2026-2027','WINTER')").execute(&pool).await.unwrap();
         // The mentor stays in CSE even when the student's programme belongs to ECE.
         sqlx::query("INSERT INTO vcap.faculty_user_links(faculty_id,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())")
             .bind(departments[0].1).bind(mentor_id.as_uuid()).execute(&pool).await.unwrap();
@@ -14006,8 +14647,15 @@ mod database_tests {
                         && item["value"] == department_name
                         && item["value_source"] == "AUTO")
             );
-            let saved = request(&app, Method::PUT, &path, Some(&writer.cookie),
-                r#"{"values":{"course_code":"BA101","team_academic_year":"2026-2027","team_semester":"Winter Semester"},"sections":{}}"#, Some("application/json")).await;
+            let saved = request(
+                &app,
+                Method::PUT,
+                &path,
+                Some(&writer.cookie),
+                r#"{"values":{},"sections":{}}"#,
+                Some("application/json"),
+            )
+            .await;
             assert_eq!(saved.status(), StatusCode::OK);
             let workspace_id = WorkspaceId::from_uuid(
                 uuid::Uuid::parse_str(team["team"]["workspace_id"].as_str().unwrap()).unwrap(),
@@ -14303,6 +14951,136 @@ Unrelated authored LaTeX survives.
             .await
             .unwrap();
         let detail_path = format!("/api/v2/papers/{paper_id}/document-details");
+        let missing_term = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        assert!(
+            missing_term["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("no applicable"))
+        );
+        for key in ["team_academic_year", "team_semester"] {
+            assert!(
+                missing_term["manifest"]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field["key"] == key && field["allow_team_override"] == false)
+            );
+        }
+        // Defaults come from the assigned leader, never another Writer.
+        let second_writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
+        let second_id = test_user_id(&pool, &second_writer.email).await;
+        let second_registration = format!("TERM-{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO vcap.students(reg_no,name) VALUES($1,'Other Writer')")
+            .bind(&second_registration)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vcap.student_user_links(reg_no,user_id,status,linked_at) VALUES($1,$2,'LINKED',now())")
+            .bind(&second_registration).bind(second_id.as_uuid()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO latex_core.paper_team_members(paper_team_id,user_id,assigned_by_user_id,writer_order,is_leader) VALUES($1,$2,$3,2,FALSE)")
+            .bind(paper_id).bind(second_id.as_uuid()).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        for (reg, year, semester) in [
+            (&registration, "2026-2027", "FALL"),
+            (&second_registration, "2029-2030", "WINTER"),
+        ] {
+            sqlx::query("INSERT INTO vcap.student_course_registrations(student_reg_no,course_id,academic_year,semester) VALUES($1,'BCSXXXX',$2,$3)")
+                .bind(reg).bind(year).bind(semester).execute(&pool).await.unwrap();
+        }
+        let autofilled = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        for (key, expected) in [
+            ("team_academic_year", "2026-2027"),
+            ("team_semester", "Fall Semester"),
+        ] {
+            assert!(
+                autofilled["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["field_key"] == key && item["value"] == expected)
+            );
+        }
+        assert_eq!(
+            state
+                .front_matter
+                .applicable_leader_registrations(paper_id)
+                .await
+                .unwrap(),
+            vec![("BCSXXXX".into(), "2026-2027".into(), "FALL".into())]
+        );
+        // A new document follows a changed assigned Leader, even with two Writers.
+        sqlx::query("UPDATE latex_core.paper_team_members SET is_leader=FALSE WHERE paper_team_id=$1 AND user_id=$2")
+            .bind(paper_id).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE latex_core.paper_team_members SET is_leader=TRUE WHERE paper_team_id=$1 AND user_id=$2")
+            .bind(paper_id).bind(second_id.as_uuid()).execute(&pool).await.unwrap();
+        let changed_leader = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        for (key, expected) in [
+            ("team_academic_year", "2029-2030"),
+            ("team_semester", "Winter Semester"),
+        ] {
+            assert!(
+                changed_leader["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["field_key"] == key && item["value"] == expected)
+            );
+        }
+        sqlx::query("UPDATE latex_core.paper_team_members SET is_leader=FALSE WHERE paper_team_id=$1 AND user_id=$2")
+            .bind(paper_id).bind(second_id.as_uuid()).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE latex_core.paper_team_members SET is_leader=TRUE WHERE paper_team_id=$1 AND user_id=$2")
+            .bind(paper_id).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO vcap.student_course_registrations(student_reg_no,course_id,academic_year,semester) VALUES($1,'BCSXXXX','2028-2029','WINTER')")
+            .bind(&registration).execute(&pool).await.unwrap();
+        let ambiguous = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        assert!(
+            ambiguous["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("multiple applicable"))
+        );
+        assert!(
+            ambiguous["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["field_key"] == "team_academic_year" && item["value"].is_null())
+        );
+        sqlx::query("DELETE FROM vcap.student_course_registrations WHERE student_reg_no=$1 AND course_id='BCSXXXX' AND academic_year='2028-2029'")
+            .bind(&registration).execute(&pool).await.unwrap();
+        // Institutional WINTER is a supported code and does not change the academic year.
+        sqlx::query("UPDATE vcap.student_course_registrations SET semester='WINTER' WHERE student_reg_no=$1 AND course_id='BCSXXXX'")
+            .bind(&registration).execute(&pool).await.unwrap();
+        let winter = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        assert!(
+            winter["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["field_key"] == "team_academic_year"
+                    && item["value"] == "2026-2027")
+        );
+        assert!(
+            winter["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["field_key"] == "team_semester"
+                    && item["value"] == "Winter Semester")
+        );
+        assert!(winter["warnings"].as_array().unwrap().is_empty());
+        sqlx::query("UPDATE vcap.student_course_registrations SET semester='FALL' WHERE student_reg_no=$1 AND course_id='BCSXXXX'")
+            .bind(&registration).execute(&pool).await.unwrap();
+        sqlx::query(
+            "DELETE FROM latex_core.paper_team_members WHERE paper_team_id=$1 AND user_id=$2",
+        )
+        .bind(paper_id)
+        .bind(second_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
         let detail = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
         assert_eq!(detail["single_source"], true);
         assert!(detail["pack_id"].is_null());
@@ -14346,7 +15124,7 @@ Unrelated authored LaTeX survives.
                 Method::PUT,
                 &detail_path,
                 Some(&writer.cookie),
-                r#"{"values":{"project_title":"Professor Durable Title One","course_code":"BA101","team_semester":"Winter Semester","team_academic_year":"2026-2027"},"sections":{}}"#,
+                r#"{"values":{"project_title":"Professor Durable Title One"},"sections":{}}"#,
                 Some("application/json"),
             )
             .await,
@@ -14379,20 +15157,25 @@ Unrelated authored LaTeX survives.
             .await
             .unwrap();
         assert_ne!(persisted, source);
-        assert!(String::from_utf8_lossy(&persisted).contains(r"\newcommand{\coursecode}{BA101}"));
-        assert!(!String::from_utf8_lossy(&persisted).contains("BCSXXXX"));
+        assert!(String::from_utf8_lossy(&persisted).contains(r"\newcommand{\coursecode}{BCSXXXX}"));
+        assert!(!String::from_utf8_lossy(&persisted).contains("Placeholder Department"));
         let persisted_text = String::from_utf8_lossy(&persisted);
-        assert!(persisted_text.contains(r"\newcommand{\semester}{Winter Semester 2026-2027}"));
+        assert!(persisted_text.contains(r"\newcommand{\semester}{Fall Semester 2026-2027}"));
         assert!(persisted_text.contains(r"\newcommand{\academicyear}{2026-2027}"));
         assert!(persisted_text.contains(r"\newcommand{\programdegree}{Bachelor of Technology}"));
         assert!(persisted_text.contains(r"\newcommand{\projguidename}{Dr. Rao}"));
         assert!(persisted_text.contains(r"\newcommand{\deanname}{Dr. Krishnan}"));
-        let response = get(
-            &app,
-            &format!("/api/v2/papers/{paper_id}/source.zip"),
-            Some(&writer.cookie),
-        )
-        .await;
+        assert_eq!(
+            get(
+                &app,
+                &format!("/api/v2/papers/{paper_id}/source.zip"),
+                Some(&writer.cookie)
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = export_source_archive(&state, writer_id, paper_id).await;
         assert_eq!(response.status(), StatusCode::OK);
         let mut zip = zip::ZipArchive::new(Cursor::new(test_bytes(response).await)).unwrap();
         let mut exported = String::new();
@@ -14400,7 +15183,9 @@ Unrelated authored LaTeX survives.
             .unwrap()
             .read_to_string(&mut exported)
             .unwrap();
-        assert!(exported.contains(r"\newcommand{\coursecode}{BA101}"));
+        assert!(exported.contains(r"\newcommand{\coursecode}{BCSXXXX}"));
+        assert!(exported.contains(r"\newcommand{\semester}{Fall Semester 2026-2027}"));
+        assert!(exported.contains(r"\newcommand{\academicyear}{2026-2027}"));
         let access = state
             .v2
             .collaboration_access(writer_id, paper_id, main_file.file_id)
@@ -14431,7 +15216,21 @@ Unrelated authored LaTeX survives.
         );
         assert!(String::from_utf8_lossy(&persisted).contains("Professor Durable Title One"));
         assert!(String::from_utf8_lossy(&persisted).contains(r"\input{chapters/body.tex}"));
+        sqlx::query("UPDATE vcap.student_course_registrations SET academic_year='2029-2030',semester='WINTER' WHERE student_reg_no=$1")
+            .bind(&registration).execute(&pool).await.unwrap();
         let reopened = test_json(get(&app, &detail_path, Some(&writer.cookie)).await).await;
+        for (key, expected) in [
+            ("team_academic_year", "2029-2030"),
+            ("team_semester", "Winter Semester"),
+        ] {
+            assert!(
+                reopened["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["field_key"] == key && item["value"] == expected)
+            );
+        }
         assert!(
             reopened["values"]
                 .as_array()
@@ -14811,6 +15610,37 @@ Unrelated authored LaTeX survives.
             .await
             .unwrap()
             .to_vec()
+    }
+
+    async fn fixture_assign_main(
+        state: &AppState,
+        actor: UserId,
+        paper_id: &str,
+        file_id: &str,
+        version: u64,
+    ) -> u64 {
+        let paper = state
+            .v2
+            .writer_paper(actor, uuid::Uuid::parse_str(paper_id).unwrap())
+            .await
+            .unwrap();
+        let previous_main = state
+            .workspaces
+            .restore(paper.workspace_id)
+            .await
+            .unwrap()
+            .main_file()
+            .cloned();
+        state
+            .v2
+            .set_main_with_event(
+                uuid::Uuid::parse_str(file_id).unwrap(),
+                actor,
+                version,
+                previous_main,
+            )
+            .await
+            .unwrap()
     }
 
     async fn test_user_id(pool: &PgPool, email: &str) -> UserId {
@@ -17008,8 +17838,9 @@ Unrelated authored LaTeX survives.
     #[tokio::test]
     async fn s6_structural_history_intelligence_and_conflict_safety() {
         let _guard = SERVER_TEST_LOCK.lock().await;
-        let (database, pool, app, _storage, _state) = test_application().await;
+        let (database, pool, app, _storage, state) = test_application().await;
         let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        fixture_default_template(&state, &pool, &admin).await;
         let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let other = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;
@@ -17146,19 +17977,23 @@ Unrelated authored LaTeX survives.
             .await["version"],
             8
         );
-        let set_main = test_json(
+        assert_eq!(
             request(
                 &app,
                 Method::POST,
                 &format!("{root}/main/{file_id}"),
                 Some(&writer.cookie),
                 r#"{"version":8}"#,
-                Some("application/json"),
+                Some("application/json")
             )
-            .await,
-        )
-        .await;
-        assert_eq!(set_main["version"], 9);
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fixture_assign_main(&state, writer_id, paper_id, file_id, 8).await,
+            9
+        );
         assert_eq!(
             test_json(
                 request(
@@ -17208,18 +18043,20 @@ Unrelated authored LaTeX survives.
         let analysis_id = analysis_file["file"]["file_id"].as_str().unwrap();
         assert_eq!(test_json(request(&app, Method::POST, &format!("{root}/files"), Some(&writer.cookie), &serde_json::json!({"path":"refs.bib","content":"@article{doe2026,title={A Paper},author={Doe},year={2026}}","version":11}).to_string(), Some("application/json")).await).await["version"], 12);
         assert_eq!(
-            test_json(
-                request(
-                    &app,
-                    Method::POST,
-                    &format!("{root}/main/{analysis_id}"),
-                    Some(&writer.cookie),
-                    r#"{"version":12}"#,
-                    Some("application/json")
-                )
-                .await
+            request(
+                &app,
+                Method::POST,
+                &format!("{root}/main/{analysis_id}"),
+                Some(&writer.cookie),
+                r#"{"version":12}"#,
+                Some("application/json")
             )
-            .await["version"],
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fixture_assign_main(&state, writer_id, paper_id, analysis_id, 12).await,
             13
         );
         let intelligence =
@@ -17728,6 +18565,7 @@ Unrelated authored LaTeX survives.
         let _guard = SERVER_TEST_LOCK.lock().await;
         let (database, pool, app, _storage, state) = test_application().await;
         let admin = fixture(&app, &database, "admin", Some(GlobalRole::Admin)).await;
+        fixture_default_template(&state, &pool, &admin).await;
         let writer = fixture(&app, &database, "student", Some(GlobalRole::Writer)).await;
         let mentor = fixture(&app, &database, "professor", Some(GlobalRole::Mentor)).await;
         let writer_id = test_user_id(&pool, &writer.email).await;

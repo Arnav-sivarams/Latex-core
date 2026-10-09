@@ -1,7 +1,5 @@
-export function canSetMain(file, detail, editable = true) {
-  return Boolean(editable && file?.file_id && /\.tex$/i.test(file.path)
-    && !detail?.main_file_fixed && file.path !== detail?.main_file);
-}
+// Writer main-file selection is fixed for every project.
+export function canSetMain() { return false; }
 
 export function diagnosticIcon(severity = 'information') {
   const shape = severity === 'error'
