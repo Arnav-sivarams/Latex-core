@@ -31,7 +31,7 @@
     <div class="toolbar-group" aria-label="Build and review">
       <button id="commentsToggle" class="ui-button ui-button-secondary workflow-button" type="button" aria-label="Comments" title="Comments" aria-controls="workspaceDrawer" aria-expanded="false"><span aria-hidden="true">◰</span><span>Comments</span><small id="toolbarReviewCount">0</small></button>
       <button id="compilePaper" class="ui-button ui-button-primary workflow-button primary" type="button" disabled aria-label="Compile" title="Compile (Ctrl/Cmd+Enter)"><span aria-hidden="true">▶</span><span>Compile</span></button>
-      <span id="buildStatus" class="toolbar-status">No PDF yet</span>
+      <span id="compileSpinner" class="compile-spinner" aria-hidden="true" hidden></span><span id="buildStatus" class="toolbar-status" role="status" aria-live="polite">No PDF yet</span>
       <button id="sendReview" class="ui-button ui-button-secondary workflow-button" type="button" disabled hidden aria-label="Send for review" title="Send for review (Ctrl/Cmd+Shift+R)"><span aria-hidden="true">⚑</span><span>Send for review</span></button>
       <button id="endReview" class="icon-button" type="button" disabled hidden aria-label="Withdraw review" title="Withdraw review"><span aria-hidden="true">■</span></button>
     </div>

@@ -984,3 +984,26 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .writer-shell #problemsToggle[data-severity="warning"] { color: var(--warning); }
 .writer-shell #problemsToggle[data-severity="error"] { color: var(--danger); }
+/* Team editors need room for both identity text and independent actions. */
+.manual-team-form { grid-template-columns: minmax(0, 1fr); align-items: start; }
+.manual-team-form > label, .manual-team-form > section { min-width: 0; }
+.people-builder { display: grid; gap: 8px; min-width: 0; }
+.people-builder h2 { margin: 0; }
+.people-search-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.people-search-controls > input { grid-column: 1 / -1; }
+.people-search-controls > select { min-width: 0; max-width: 100%; }
+.ordered-person { grid-template-columns: auto minmax(0, 1fr); }
+.ordered-person > span { min-width: 0; overflow-wrap: anywhere; }
+.ordered-person-actions { grid-column: 2; display: flex; flex-wrap: wrap; gap: 6px; }
+.manual-team-form > button { justify-self: start; }
+.compile-spinner { display: inline-block; width: 15px; height: 15px; box-sizing: border-box; margin-right: 6px; vertical-align: -2px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: compile-spin 0.8s linear infinite; pointer-events: none; }
+.compile-spinner[hidden] { display: none; }
+@keyframes compile-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .compile-spinner { animation: none; } }
+@media (min-width: 700px) {
+  .manual-team-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .manual-team-form > label, .manual-team-form > button { grid-column: 1 / -1; }
+  .manual-team-form > .people-builder { grid-column: 1 / -1; }
+  .ordered-person { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .ordered-person-actions { grid-column: 3; }
+}

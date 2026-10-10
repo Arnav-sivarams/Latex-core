@@ -1,9 +1,10 @@
 import { diagnosticIcon } from './writer-policy.mjs';
 import { frontMatterStatus, editableDetail, needsFirstUseDetails, detailCategory } from './document-details.mjs';
-import { basicSetup } from 'codemirror';
+import { writerEditorSetup } from './writer-editor.mjs';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
 import { Decoration, EditorView, keymap } from '@codemirror/view';
-import { StreamLanguage } from '@codemirror/language';
+import { StreamLanguage, HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { tags } from '@lezer/highlight';
 import { autocompletion, snippetCompletion } from '@codemirror/autocomplete';
 import { stex } from '@codemirror/legacy-modes/mode/stex';
 import * as Y from 'yjs';
@@ -13,17 +14,18 @@ import * as pdfjsLib from '/static/pdf.min.mjs';
 import { resolveSuggestionRange } from './review-helpers.mjs';
 import { pdfPointFromClient, pdfPreviewState } from './writer-pdf.mjs';
 import { installWorkspaceSplitters } from './workspace-split.mjs';
-import { buildIsStale, problemsState, supportLink, recognizedBuildProblems, renderBuildLog, shortBuildState } from './writer-build.mjs';
+import { buildIsStale, compileIsActive, problemsState, supportLink, recognizedBuildProblems, renderBuildLog, shortBuildState } from './writer-build.mjs';
 import {
   boundedMenuPosition, fileActionError, renamePathError, resolveFileActionTarget,
 } from './writer-file-actions.mjs';
 import { MATH_CATALOG } from './math-catalog.mjs';
+import { insertionCapability, symbolCapability, mathInsertionSource } from './writer-capabilities.mjs';
 import {
   buildAlgorithm, buildBibtexEntry, buildCodeListing, buildEquation, buildFigure, buildWrapFigure,
   buildLongTable, buildPlot, buildTable, buildTheorem, commentLatexLines, figureAssetPaths,
   buildPublicationBibitems,
   compilationRelativePath, fuzzyRankFiles, inlineMathInsertion, insertionDirectories, isInsideInlineMath,
-  packageRequirement, suggestedInsertionPath,
+  suggestedInsertionPath,
 } from './writer-productivity.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/pdf.worker.min.mjs';
@@ -126,7 +128,7 @@ const api = new PaperApi();
 const ui = Object.fromEntries([
   'myPapers', 'teamPapers', 'fileTree', 'newPaper', 'newFile', 'renameFile', 'deleteFile',
   'saveFile', 'currentPaper', 'currentFile', 'mainBadge', 'saveStatus',
-  'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'pdfRelation', 'pdfEmpty',
+  'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'compileSpinner', 'pdfRelation', 'pdfEmpty',
   'buildFooter', 'buildFooterBody', 'buildFooterState', 'buildFooterCount', 'buildFooterToggle', 'buildProblemsTab', 'buildLogTab', 'buildProblemsPanel', 'buildProblemsList', 'buildLogPanel', 'buildLogText',
   'pdfScroll', 'pdfViewport', 'downloadPdf', 'createCheckpoint', 'versionHistory', 'versionDiff',
   'pdfPage', 'pdfZoom', 'locateInPdf',
@@ -157,6 +159,7 @@ const model = {
   version: 0,
   view: null,
   collaboration: null,
+  fileSessions: new Map(),
   conflict: false,
   currentBuildId: null,
   versions: [],
@@ -354,17 +357,30 @@ function notice(message, failed = false) {
 
 function editorAppearance(preference) {
   const dark = preference.theme === 'DARK';
-  return EditorView.theme({
+  return [EditorView.theme({
     '&': { backgroundColor: dark ? '#1f2329' : '#ffffff', color: dark ? '#e6edf3' : '#20242a' },
     '.cm-gutters': { fontSize: `${preference.font_size_px}px`, backgroundColor: dark ? '#181b20' : '#f5f6f7', color: dark ? '#9da7b3' : '#626b75', borderColor: dark ? '#39414b' : '#d9dde2' },
     '.cm-content': { fontSize: `${preference.font_size_px}px`, caretColor: dark ? '#f0f6fc' : '#111827' },
     '.cm-activeLine': { backgroundColor: dark ? 'rgba(42,49,58,0.42)' : 'rgba(238,244,251,0.52)' },
     '.cm-activeLineGutter': { backgroundColor: dark ? '#2a313a' : '#eef4fb' },
-    '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: dark ? '#315b7d' : '#82b7ed' },
-    '&:not(.cm-focused) > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: dark ? '#38536b' : '#b2cee9' },
-    '.cm-content ::selection': { backgroundColor: dark ? '#315b7d' : '#9fc9f5', color: dark ? '#ffffff' : '#111827' },
+    '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: dark ? '#213b53' : '#82b7ed' },
+    '&:not(.cm-focused) > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: dark ? '#21384e' : '#b2cee9' },
+    '.cm-content ::selection': { backgroundColor: dark ? '#213b53' : '#9fc9f5', color: dark ? '#ffffff' : '#111827' },
     '.review-source-highlight': { color: dark ? '#fff2b2' : '#241a00' },
-  }, { dark });
+    '.cm-tooltip': { backgroundColor: dark ? '#161b22' : '#ffffff', color: dark ? '#e6edf3' : '#20242a', borderColor: dark ? '#8b949e' : '#d9dde2' },
+    '.cm-tooltip-autocomplete ul li[aria-selected]': { backgroundColor: dark ? '#26476b' : '#dbeafe', color: dark ? '#ffffff' : '#20242a' },
+    '.cm-searchMatch': { backgroundColor: dark ? '#362b14' : '#ffec99', outline: dark ? '1px solid #d29922' : '1px solid #b8860b' },
+    '.cm-searchMatch-selected': { backgroundColor: dark ? '#40351c' : '#ffd866' },
+    '.cm-diagnostic-error': { borderLeftColor: dark ? '#ff7b72' : '#b42318' },
+  }, { dark }), ...(dark ? [syntaxHighlighting(HighlightStyle.define([
+    { tag: [tags.keyword, tags.operator, tags.macroName, tags.tagName], color: '#ff7b72' },
+    { tag: [tags.atom, tags.number, tags.bool, tags.constant(tags.name)], color: '#79c0ff' },
+    { tag: [tags.string, tags.attributeValue], color: '#a5d6ff' },
+    { tag: [tags.variableName, tags.attributeName, tags.definition(tags.name)], color: '#d2a8ff' },
+    { tag: [tags.bracket, tags.punctuation], color: '#e6edf3' },
+    { tag: tags.comment, color: '#a6b0bb' },
+    { tag: tags.invalid, color: '#ffa198', textDecoration: 'underline' },
+  ]))] : [])];
 }
 
 function applyIdentity(identity) {
@@ -659,6 +675,7 @@ async function refreshIntelligence() {
   if (!model.paper) return;
   try {
     model.intelligence = await api.intelligence(model.paper.id);
+    updateFileActions(model.fileEditable);
     renderProblems();
   } catch (error) { notice(error.message, true); }
 }
@@ -678,6 +695,7 @@ class CollaborationSession {
     this.doc = null;
     this.text = null;
     this.persistence = null;
+    this.undoManager = null;
     this.destroyed = false;
     this.connected = false;
     this.access = 'read_only';
@@ -711,11 +729,12 @@ class CollaborationSession {
     this.metadata = null;
     this.initialState = null;
     socket.addEventListener('open', () => {
+      if (socket !== this.socket) { socket.close(); return; }
       this.connected = true;
       this.backoff = 250;
       saveState('syncing');
     });
-    socket.addEventListener('message', (event) => this.receive(event));
+    socket.addEventListener('message', (event) => { if (socket === this.socket) this.receive(event); });
     socket.addEventListener('close', () => {
       if (socket !== this.socket) return;
       this.connected = false;
@@ -898,12 +917,16 @@ class CollaborationSession {
         this.doc.on('update', (update, origin) => {
           if (origin === REMOTE_ORIGIN) return;
           if (this.connected && this.access === 'read_write') this.sendUpdate(update);
-          else saveState(this.localPersistenceAvailable ? 'offline' : 'storage_error');
+          else if (model.collaboration === this) saveState(this.localPersistenceAvailable ? 'offline' : 'storage_error');
         });
-        mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
+        if (model.collaboration === this && !this.destroyed) mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
         this.resolveReady();
       } else {
         Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
+        if (model.collaboration === this && !model.view) {
+          mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
+          this.resolveReady();
+        }
       }
       if (this.access === 'read_write') this.sendUpdate(Y.encodeStateAsUpdate(this.doc));
       else saveState('synced');
@@ -953,11 +976,28 @@ class CollaborationSession {
     this.flushWaiters.splice(0).forEach(({ reject }) => reject(error));
   }
 
-  destroy() {
-    this.destroyed = true;
+  suspend() {
     window.clearTimeout(this.reconnectTimer);
     this.rejectFlushes(new Error('collaboration session closed'));
-    if (this.socket) this.socket.close();
+    const socket = this.socket;
+    this.socket = null;
+    this.connected = false;
+    this.pending.clear();
+    socket?.close();
+    this.undoManager?.stopCapturing();
+  }
+
+  resume(file, editable) {
+    this.file = file;
+    this.requestedEditable = editable;
+    this.ready = new Promise((resolve) => { this.resolveReady = resolve; });
+    this.start();
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.suspend();
+    this.undoManager?.destroy();
     if (this.persistence) this.persistence.destroy();
     if (this.doc) this.doc.destroy();
     this.socket = null;
@@ -988,6 +1028,11 @@ async function refreshReportFiles(changedFileId, revision) {
 }
 
 async function reloadAfterDelete(deletedFileId, remote = false) {
+  for (const [key, session] of model.fileSessions) {
+    if (session.file.file_id === deletedFileId && session.paper.id === model.paper?.id) {
+      session.destroy(); model.fileSessions.delete(key);
+    }
+  }
   const paper = model.paper;
   if (!paper) return;
   const deletingCurrent = model.file?.file_id === deletedFileId;
@@ -1032,6 +1077,7 @@ async function refreshPapers() {
 const promptedDocumentDetails = new Set();
 
 async function openPaper(paper) {
+  ui.compileSpinner.hidden = true;
   closeEditor();
   closeFileActionsMenu();
   disposeWriterPdf();
@@ -1092,7 +1138,8 @@ async function openPaper(paper) {
 }
 
 async function openFile(file, force = false) {
-  if (!force) closeEditor();
+  if (!force && model.collaboration && !await syncCurrent(false)) return;
+  closeEditor();
   try {
     const payload = await api.file(model.paper.id, file.file_id);
     model.file = payload.file;
@@ -1103,13 +1150,16 @@ async function openFile(file, force = false) {
     ui.currentFile.textContent = payload.file.path;
     ui.mainBadge.hidden = !payload.main;
     ui.editorMount.innerHTML = '<div class="foundation-empty"><strong>Local</strong><p>Opening collaborative document…</p></div>';
-    model.collaboration = new CollaborationSession(
+    const key = `${model.identity.user_id}:${model.paperDetail.paper.workspace_id}:${payload.file.file_id}`;
+    const retained = model.fileSessions.get(key);
+    model.collaboration = retained && !retained.destroyed ? retained : new CollaborationSession(
       model.paperDetail.paper,
       payload.file,
       payload.editable,
       payload.file.path.endsWith('.tex'),
     );
-    model.collaboration.start();
+    model.fileSessions.set(key, model.collaboration);
+    model.collaboration.resume(payload.file, payload.editable);
     updateFileActions(payload.editable);
     renderFiles();
   } catch (error) {
@@ -1187,11 +1237,11 @@ function latexCompletionSource(context) {
 function mountEditor(ytext, editable, latex) {
   destroyEditorView();
   ui.editorMount.replaceChildren();
-  const undoManager = new Y.UndoManager(ytext, { captureTimeout: 500 });
+  const undoManager = model.collaboration.undoManager ||= new Y.UndoManager(ytext, { captureTimeout: 500 });
   model.undoManager = undoManager;
   const extensions = [
     keymap.of([{ key: 'Mod-/', preventDefault: true, run: () => { toggleSourceComment(); return true; } }]),
-    basicSetup,
+    writerEditorSetup,
     keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => { syncCurrent(); return true; } }]),
     keymap.of([{ key: 'Mod-Enter', preventDefault: true, run: () => { manualCompile(); return true; } }]),
     EditorState.readOnly.of(!editable),
@@ -1230,7 +1280,7 @@ function destroyEditorView() {
 
 function closeEditor() {
   destroyEditorView();
-  if (model.collaboration) model.collaboration.destroy();
+  if (model.collaboration) model.collaboration.suspend();
   model.collaboration = null;
 }
 
@@ -1244,7 +1294,8 @@ function updateFileActions(editable) {
   ui.mathPalette.disabled = !selected || !editable;
   ui.tableBuilder.disabled = !selected || !editable;
   ui.figureBuilder.disabled = !selected || !editable;
-  ui.plotBuilder.disabled = !selected || !editable;
+  ui.plotBuilder.disabled = !selected || !editable || !builderRequirement('plot', {}).available;
+  ui.plotBuilder.title = builderRequirement('plot', {}).message;
   ui.fileActionsToggle.disabled = !selected;
 }
 
@@ -1298,12 +1349,14 @@ async function requestBuild() {
   try {
     if (model.pdfSourceChanged) model.pdfCompileRequested = true;
     ui.buildStatus.textContent = 'Queued';
+    ui.compileSpinner.hidden = false;
     ui.buildFooterState.textContent = 'Queued';
     await api.build(model.paper.id, 'manual');
     await Promise.all([refreshBuildStatus(), refreshHistory()]);
   } catch (error) {
     model.pdfCompileRequested = false;
     ui.buildStatus.textContent = 'Compilation failed';
+    ui.compileSpinner.hidden = true;
     ui.buildFooterState.textContent = 'Compilation failed';
     notice(error.message, true);
   }
@@ -1317,8 +1370,10 @@ async function manualCompile() {
 
 async function refreshBuildStatus() {
   if (!model.paper) return;
+  const paperId = model.paper.id;
   try {
-    const payload = await api.buildStatus(model.paper.id);
+    const payload = await api.buildStatus(paperId);
+    if (model.paper?.id !== paperId) return;
     const build = payload.build;
     const source = build.source_sequence;
     const pdf = build.current_source_sequence;
@@ -1332,6 +1387,7 @@ async function refreshBuildStatus() {
       ui.buildLogText.textContent = 'Open Build Log to load the compiler output.';
     }
     const shortState = shortBuildState(build);
+    ui.compileSpinner.hidden = !compileIsActive(build);
     ui.buildFooterState.textContent = shortState;
     const serverStale = buildIsStale(build);
     const sourceRecompiled = model.pdfBuildAtSourceChange
@@ -1794,7 +1850,9 @@ function showPalette(title, items, options = {}) {
         list.append(heading);
         lastCategory = item.category;
       }
-      const node = button(item.label, async () => { closeDialog(); await item.run(); }, index === selected);
+      const node = button(item.label, async () => { if (!item.disabled) { closeDialog(); await item.run(); } }, index === selected);
+      node.disabled = Boolean(item.disabled);
+      if (item.disabled) node.append(Object.assign(document.createElement('small'), { textContent: item.detail }));
       node.title = item.tooltip || item.detail || item.label;
       if (item.ariaLabel) node.setAttribute('aria-label', item.ariaLabel);
       list.append(node);
@@ -1906,19 +1964,11 @@ const builderSchemas = {
 };
 
 function builderRequirement(kind, values) {
-  if (kind === 'theorem' && values.environment !== 'proof' && !(model.intelligence.environments || []).includes(values.environment)) {
-    return { available: false, message: `Environment not detected: ${values.environment}` };
-  }
-  const required = {
-    table: values.booktabs ? ['booktabs'] : [], longtable: ['longtable'], figure: ['graphicx'], wrapfigure: ['graphicx', 'wrapfig'], plot: ['pgfplots'],
-    algorithm: ['algorithm', values.family === 'algorithmic' ? 'algorithmic' : 'algpseudocode'], code: ['listings'],
-    equation: ['aligned', 'matrix', 'cases'].includes(values.type) ? ['amsmath'] : [],
-  }[kind] || [];
   if (kind === 'longtable' && /\\documentclass\s*\[[^\]]*\btwocolumn\b[^\]]*\]|\\twocolumn\b/.test(model.collaboration?.text?.toString() || '')) {
     return { available: false, message: 'Long tables cannot break across pages in a two-column layout. Use a normal table or make an explicit one-column region.' };
   }
-  const missing = required.filter((name) => !packageRequirement(model.intelligence.packages || [], name).available);
-  return missing.length ? { available: false, message: `Requires package${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}` } : { available: true, message: 'Available' };
+  if (kind === 'bibliography' && !values.target) return { available: false, message: 'Choose an existing .bib file before inserting a BibTeX entry.' };
+  return insertionCapability(kind, values, model.intelligence.packages || [], model.intelligence.environments || []);
 }
 
 function builderSource(kind, values) {
@@ -1927,7 +1977,7 @@ function builderSource(kind, values) {
   if (kind === 'figure') return buildFigure({ ...values, asset: compilationRelativePath(values.asset, model.paperDetail?.main_file) });
   if (kind === 'wrapfigure') return buildWrapFigure({ ...values, asset: compilationRelativePath(values.asset, model.paperDetail?.main_file) });
   if (kind === 'equation') return buildEquation(values);
-  if (kind === 'plot') return buildPlot(values);
+  if (kind === 'plot') return buildPlot({ ...values, asset: compilationRelativePath(values.asset, model.paperDetail?.main_file) });
   if (kind === 'algorithm') return buildAlgorithm(values);
   if (kind === 'code') return buildCodeListing(values);
   if (kind === 'bibliography') return buildBibtexEntry(values);
@@ -1994,9 +2044,13 @@ function openBuilder(kind, defaults = {}, options = {}) {
     }
   };
   ui.dialogBody.append(note);
+  if (kind === 'algorithm') controls.family.addEventListener('input', () => {
+    if (controls.body.value === '\\State Describe the method' || controls.body.value === '\\STATE Describe the method') controls.body.value = controls.family.value === 'algorithmic' ? '\\STATE Describe the method' : '\\State Describe the method';
+  });
   Object.values(controls).forEach((control) => control.addEventListener('input', refresh));
   const insert = button('Insert', async () => {
     const current = values();
+    if (!builderRequirement(kind, current).available) return;
     if (kind === 'bibliography' && current.target) {
       const target = model.files.find((file) => file.path === current.target);
       if (target && model.file?.file_id !== target.file_id) await openFile(target);
@@ -2011,7 +2065,7 @@ function openBuilder(kind, defaults = {}, options = {}) {
 }
 
 function openInsertMenu() {
-  showPalette('Insert', [
+  const items = [
     { category: 'Structure', label: 'Table', detail: 'Caption above; column widths and row height', run: () => openBuilder('table') },
     { category: 'Structure', label: 'Long table', detail: 'Multi-page table with caption above', run: () => openBuilder('longtable') },
     { category: 'Structure', label: 'Itemized list', run: () => insertLatex('\\begin{itemize}\n  \\item Item\n\\end{itemize}\n', 'writer-list') },
@@ -2031,7 +2085,16 @@ function openInsertMenu() {
     { category: 'References', label: 'BibTeX entry', detail: 'Insert an entry into an existing .bib file', run: () => openBuilder('bibliography') },
     { category: 'References', label: 'Citation', run: openCitationPalette },
     { category: 'References', label: 'Reference', run: openReferencePalette },
-  ]);
+  ];
+  const builders = { Table: 'table', 'Long table': 'longtable', Figure: 'figure', 'Wrap figure': 'wrapfigure', Plot: 'plot', 'Code block': 'code', Algorithm: 'algorithm', Theorem: 'theorem', 'BibTeX entry': 'bibliography' };
+  items.forEach(item => {
+    const kind = builders[item.label];
+    if (!kind) return;
+    const requirement = builderRequirement(kind, { target: model.files.find(file => file.path.endsWith('.bib'))?.path });
+    item.disabled = !requirement.available;
+    if (item.disabled) item.detail = requirement.message;
+  });
+  showPalette('Insert', items);
 }
 async function openPublications() {
   captureInsertionSelection();
@@ -2045,9 +2108,10 @@ async function openPublications() {
 function openMathPalette() {
   showPalette('Math', MATH_CATALOG.map((entry) => ({
     label: `${entry.symbol}  ${entry.latex}`,
-    detail: `${entry.category} · ${entry.description}`,
+    detail: `${symbolCapability(entry.latex, model.intelligence.packages || []).message} · ${entry.category} · ${entry.description}`,
     search: `${entry.category} ${entry.description} ${entry.keywords}`,
-    run: () => insertLatex(entry.latex, 'writer-math-palette'),
+    disabled: !symbolCapability(entry.latex, model.intelligence.packages || []).available,
+    run: () => insertMathSymbol(entry.latex),
   })));
 }
 
@@ -2062,19 +2126,30 @@ function openReferencePalette() {
 function openSymbols() {
   const items = MATH_CATALOG.map((entry) => ({
     label: entry.symbol,
-    detail: `${entry.category} · ${entry.description} · ${entry.latex}`,
+    detail: `${symbolCapability(entry.latex, model.intelligence.packages || []).message} · ${entry.category} · ${entry.description} · ${entry.latex}`,
     search: `${entry.category} ${entry.description} ${entry.keywords}`,
     ariaLabel: `${entry.description}, ${entry.latex}`,
     tooltip: `${entry.description} — ${entry.latex}`,
+    disabled: !symbolCapability(entry.latex, model.intelligence.packages || []).available,
     run: () => {
       const selection = resolveInsertionSelection();
       if (!selection || !model.view) return insertLatex(entry.latex, 'writer-symbol');
-      const source = isInsideInlineMath(model.view.state.doc.toString(), selection.from)
-        ? entry.latex : `\\(${entry.latex}\\)`;
+      let source;
+      try { source = mathInsertionSource(entry.latex, isInsideInlineMath(model.view.state.doc.toString(), selection.from)); }
+      catch (error) { return notice(error.message, true); }
       return insertLatex(source, 'writer-symbol');
     },
   }));
   showPalette('Symbols', items, { grid: true });
+}
+
+function insertMathSymbol(latex) {
+  const selection = resolveInsertionSelection();
+  if (!selection || !model.view) return;
+  let source;
+  try { source = mathInsertionSource(latex, isInsideInlineMath(model.view.state.doc.toString(), selection.from)); }
+  catch (error) { return notice(error.message, true); }
+  return insertLatex(source, 'writer-math-palette');
 }
 
 function closeDrawer() {
@@ -2391,16 +2466,25 @@ ui.downloadPdf.addEventListener('click', () => {
   if (!model.paper || !model.currentBuildId) return;
   const link = document.createElement('a');
   link.href = downloadPdfUrl(model.currentBuildId);
-  link.download = `${(model.paper.name || 'report').replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'report'}.pdf`;
+  // The authorized endpoint supplies the current Team name, including UTF-8.
+  link.download = '';
   link.click();
 });
 ui.sendReview.addEventListener('click', async () => {
-  if (!model.paper?.is_team_leader || !await requireDurableFlush()) return;
+  if (!model.paper?.is_team_leader) return;
+  if (model.saveInFlight) return notice('A save is still in progress. Wait for Saved, then send for review again.', true);
+  if (!await requireDurableFlush()) return notice('Review was not opened because the pending source could not be saved. Reconnect and retry.', true);
+  const paperId = model.paper.id;
+  ui.sendReview.disabled = true;
   try {
-    await api.sendForReview(model.paper.id);
+    await api.sendForReview(paperId);
+    const authoritative = await api.reviewRounds(paperId);
+    if (!authoritative.review_open) throw new Error('The server did not open the review. Refresh and retry.');
+    if (model.paper?.id !== paperId) return;
     await openPaper(model.paper);
     notice('Current report sent for Mentor review.');
-  } catch (error) { notice(error.message, true); }
+  } catch (error) { notice(`Review was not opened: ${error.message}`, true); }
+  finally { if (model.paper?.id === paperId) ui.sendReview.disabled = model.reviewOpen || !model.paperDetail?.editable; }
 });
 ui.endReview.addEventListener('click', async () => {
   const open = model.currentReviewRound;

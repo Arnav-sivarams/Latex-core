@@ -29,6 +29,7 @@ services:
     environment:
       BLOB_STORAGE_ROOT: /var/lib/latex-core/blobs
       BIND_ADDR: 0.0.0.0:8080
+      LATEX_CORE_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-latex-core}
     volumes:
       - latex_core_blob_data:/var/lib/latex-core/blobs
       # The API uses a narrow, server-owned log inspection command; the socket is never sent to browsers.

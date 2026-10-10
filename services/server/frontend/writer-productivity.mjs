@@ -120,12 +120,15 @@ export function commentLatexLines(source, uncomment = false) {
 }
 
 export function isInsideInlineMath(source, position) {
-  const before = String(source).slice(0, position);
+  const before = String(source).slice(0, position).replace(/(?<!\\)%[^\n]*/g, '');
   const parenOpen = before.lastIndexOf('\\(');
   const parenClose = before.lastIndexOf('\\)');
   if (parenOpen > parenClose) return true;
-  const dollars = [...before].filter((character, index) => character === '$' && before[index - 1] !== '\\').length;
-  return dollars % 2 === 1;
+  if (before.lastIndexOf('\\[') > before.lastIndexOf('\\]')) return true;
+  const environments = [...before.matchAll(/\\(begin|end)\{(equation\*?|align\*?|gather\*?|multline\*?|math|displaymath)\}/g)];
+  if (environments.reduce((depth, match) => depth + (match[1] === 'begin' ? 1 : -1), 0) > 0) return true;
+  const delimiters = before.match(/(?<!\\)\$\$?/g) || [];
+  return delimiters.filter(value => value === '$').length % 2 === 1 || delimiters.filter(value => value === '$$').length % 2 === 1;
 }
 
 export function inlineMathInsertion(selection = '') {
@@ -229,12 +232,12 @@ export function buildEquation(options = {}) {
     const columns = clamp(options.columns, 1, 10);
     const delimiter = { '()': 'pmatrix', '[]': 'bmatrix', '||': 'vmatrix', none: 'matrix' }[options.delimiter] || 'pmatrix';
     const matrix = Array.from({ length: rows }, (_, row) => Array.from({ length: columns }, (_, column) => `a_{${row + 1}${column + 1}}`).join(' & ')).join(' \\\\\n');
-    return `\\begin{${delimiter}}\n${matrix}\n\\end{${delimiter}}`;
+    return `\\[\n\\begin{${delimiter}}\n${matrix}\n\\end{${delimiter}}\n\\]`;
   }
   if (options.type === 'cases') {
     const rows = clamp(options.rows, 1, 10);
     const cases = Array.from({ length: rows }, (_, row) => `${row ? '0' : 'f(x)'} & \\text{if } ${row ? 'x < 0' : 'x \\geq 0'}`).join(' \\\\\n');
-    return `\\begin{cases}\n${cases}\n\\end{cases}`;
+    return `\\[\n\\begin{cases}\n${cases}\n\\end{cases}\n\\]`;
   }
   if (options.type === 'aligned') return `\\begin{align}\n${body}\n\\end{align}`;
   return `\\begin{equation}\n${body}${options.label ? `\n\\label{${safeLabel(options.label)}}` : ''}\n\\end{equation}`;

@@ -169,7 +169,7 @@ async function renderRuntimeLogs() {
       const message = /permission denied/i.test(error.message) ? 'Runtime log source permission denied.'
         : /source unavailable|command unavailable/i.test(error.message) ? 'Runtime log source unavailable.'
           : `Runtime log request failed: ${error.message}`;
-      host.replaceChildren(element('p', 'danger', message));
+      const alert = element('p', 'danger', message); alert.setAttribute('role', 'alert'); host.replaceChildren(alert);
     } finally { refresh.disabled = false; }
   };
   service.addEventListener('change', () => load().catch(showError)); search.addEventListener('keydown', (event) => { if (event.key === 'Enter') load().catch(showError); });
@@ -634,7 +634,7 @@ async function searchPeople(role, q) {
 }
 
 function peopleBuilder(role, ordered, changed) {
-  const section = element('section', 'admin-section'); section.append(element('h2', '', ordered ? 'Ordered Writers' : 'Mentors'));
+  const section = element('section', 'admin-section people-builder'); section.append(element('h2', '', ordered ? 'Ordered Writers' : 'Mentors'));
   const search = element('input'); search.type = 'search'; search.placeholder = `Search V2 ${role} email`; search.setAttribute('aria-label', `Search V2 ${role}s`);
   const results = document.createElement('select'); results.setAttribute('aria-label', `${role} search results`); results.append(new Option('Search to find accounts…', ''));
   let timer;
@@ -646,11 +646,14 @@ function peopleBuilder(role, ordered, changed) {
       const up = buttonAction('Up', () => { if (index) [selected[index - 1], selected[index]] = [selected[index], selected[index - 1]]; draw(); changed(selected); }); up.disabled = !ordered || index === 0; up.title = 'Move up'; up.setAttribute('aria-label', `Move ${person.email} up`);
       const down = buttonAction('Down', () => { if (index < selected.length - 1) [selected[index], selected[index + 1]] = [selected[index + 1], selected[index]]; draw(); changed(selected); }); down.disabled = !ordered || index === selected.length - 1; down.title = 'Move down'; down.setAttribute('aria-label', `Move ${person.email} down`);
       const remove = buttonAction('Remove', () => { selected.splice(index, 1); draw(); changed(selected); }, 'danger'); remove.title = 'Remove account'; remove.setAttribute('aria-label', `Remove ${person.email}`);
-      row.append(up, down, remove); host.append(row);
+      const actions = element('div', 'ordered-person-actions');
+      if (ordered) actions.append(up, down);
+      actions.append(remove); row.append(actions); host.append(row);
     });
   };
   const add = buttonAction('Add', () => { const option = results.selectedOptions[0]; if (!option?.value || selected.some((person) => person.user_id === option.value)) return; selected.push({ user_id: option.value, email: option.textContent }); draw(); changed(selected); });
-  section.append(search, results, add, host);
+  const controls = element('div', 'people-search-controls'); controls.append(search, results, add);
+  section.append(controls, host);
   return { section, selected, draw };
 }
 

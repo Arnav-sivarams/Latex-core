@@ -22,3 +22,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .login-card h1 { font-size: 24px; font-weight: 750; line-height: 1.2; }
 .login-card input { min-height: 38px; }
 .login-card .wide { width: 100%; margin-top: 12px; }
+/* Authentication errors remain visible in both application themes. */
+.login-card #loginError { color: #b42318; }
+html[data-theme="dark"] .login-card #loginError { color: #ff7b72; }

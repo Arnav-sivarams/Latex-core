@@ -65,11 +65,16 @@ export function supportLink(email) {
 
 export function shortBuildState(build) {
   if (!build) return 'Ready';
-  if (build.active_build_id && build.active_status === 'queued') return 'Queued';
-  if (build.active_build_id) return 'Compiling…';
+  if (compileIsActive(build) && build.active_status === 'queued') return 'Queued';
+  if (compileIsActive(build)) return 'Compiling…';
+  if (build.active_status === 'cancelled' || build.latest_status === 'cancelled') return 'Compilation cancelled';
   if (build.latest_status === 'failed') return 'Compilation failed';
   if (build.current_build_id) return 'Compiled';
   return 'Ready';
+}
+
+export function compileIsActive(build) {
+  return Boolean(build?.active_build_id) && !['cancelled', 'failed', 'succeeded'].includes(build.active_status);
 }
 
 export function buildIsStale(build) {

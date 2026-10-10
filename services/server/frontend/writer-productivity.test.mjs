@@ -48,6 +48,8 @@ test('source line comments, inline math, and template-aware destinations are det
   assert.deepEqual(inlineMathInsertion('x+y'), { source: '\\(x+y\\)', cursorOffset: null });
   assert.equal(isInsideInlineMath('before \\(x+y', 12), true);
   assert.equal(isInsideInlineMath('before $x', 9), true);
+  for (const source of ['\\[x', '$$x', '\\begin{equation}x', '\\begin{align*}x']) assert.equal(isInsideInlineMath(source, source.length), true);
+  for (const source of ['\\[x\\] text', '$$x$$ text', '% $ comment\ntext', '\\begin{equation}x\\end{equation}']) assert.equal(isInsideInlineMath(source, source.length), false);
   const files = [{ path: 'Thesis/main.tex' }, { path: 'Thesis/chapters/chapter1.tex' }, { path: 'Thesis/images/logo.png' }];
   assert.deepEqual(insertionDirectories(files, 'Thesis/main.tex', 'chapter'), ['Thesis/chapters']);
   assert.equal(suggestedInsertionPath(files, 'Thesis/main.tex', 'chapter', 'chapter9.tex').path, 'Thesis/chapters/chapter9.tex');

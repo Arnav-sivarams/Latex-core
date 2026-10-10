@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildIsStale, buildLogLines, classifyBuildLine, recognizedBuildProblems, shortBuildState } from './writer-build.mjs';
+import { buildIsStale, compileIsActive, buildLogLines, classifyBuildLine, recognizedBuildProblems, shortBuildState } from './writer-build.mjs';
 
 test('build lines use conservative error and warning classification', () => {
   assert.equal(classifyBuildLine('! Undefined control sequence.'), 'error');
@@ -71,4 +71,11 @@ test('metadata-only changes make the last successful PDF stale', () => {
   assert.equal(buildIsStale({ ...current, desired_state_hash: null }), true);
   assert.equal(buildIsStale({ ...current, desired_state_hash: 'compiled-with-metadata-2' }), true);
   assert.equal(buildIsStale({ ...current, source_sequence: 8 }), true);
+});
+
+test('terminal jobs stop compiling even while their active build reference remains', () => {
+  for (const status of ['queued','claimed','running']) assert.equal(compileIsActive({active_build_id:'job',active_status:status}),true);
+  for (const status of ['cancelled','failed','succeeded']) assert.equal(compileIsActive({active_build_id:'job',active_status:status}),false);
+  assert.equal(compileIsActive({active_build_id:null}),false);
+  assert.equal(shortBuildState({active_build_id:'job',active_status:'cancelled',current_build_id:'last-good'}),'Compilation cancelled');
 });

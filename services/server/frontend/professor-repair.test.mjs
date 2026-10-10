@@ -17,8 +17,8 @@ test('Writer and Mentor keep visible selections and install bounded pane splitte
     assert.match(source, /&\.cm-focused > \.cm-scroller > \.cm-selectionLayer \.cm-selectionBackground/);
     assert.match(source, /&:not\(\.cm-focused\) > \.cm-scroller > \.cm-selectionLayer \.cm-selectionBackground/);
     assert.match(source, /'\.cm-activeLine': \{ backgroundColor: dark \? 'rgba\(42,49,58,0\.42\)' : 'rgba\(238,244,251,0\.52\)' \}/);
-    assert.match(source, /'#315b7d' : '#82b7ed'/);
-    assert.match(source, /'#38536b' : '#b2cee9'/);
+    assert.match(source, source === writer ? /'#213b53' : '#82b7ed'/ : /'#315b7d' : '#82b7ed'/);
+    assert.match(source, source === writer ? /'#21384e' : '#b2cee9'/ : /'#38536b' : '#b2cee9'/);
   }
   assert.equal((writerHtml.match(/class="pane-splitter"/g) || []).length, 2);
   assert.equal((reviewHtml.match(/class="pane-splitter"/g) || []).length, 2);

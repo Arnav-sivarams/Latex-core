@@ -1236,7 +1236,10 @@ async fn browser_login(
     }) else {
         return (
             StatusCode::UNAUTHORIZED,
-            Html(login_html(Some("Invalid email or password."))),
+            Html(login_html_with_email(
+                Some("Invalid email or password."),
+                &input.email,
+            )),
         )
             .into_response();
     };
@@ -7509,6 +7512,19 @@ async fn v2_current_artifact(
                 .await
         }
     };
+    let disposition = if kind == "pdf" && query.download && artifact.is_ok() {
+        let name = match state.v2.paper_team(paper_id).await {
+            Ok(team) => team.name,
+            Err(V2Error::NotFound { .. }) => match state.v2.personal_paper(paper_id).await {
+                Ok(paper) => paper.name,
+                Err(error_value) => return v2_error(error_value),
+            },
+            Err(error_value) => return v2_error(error_value),
+        };
+        Some(pdf_download_disposition(&name))
+    } else {
+        None
+    };
     match artifact {
         Ok(artifact) => match state.blobs.get(artifact.blob_hash).await {
             Ok(bytes) => (
@@ -7516,19 +7532,21 @@ async fn v2_current_artifact(
                     (header::CONTENT_TYPE, artifact.content_type),
                     (
                         header::CONTENT_DISPOSITION,
-                        format!(
-                            "{}; filename=\"{}\"",
-                            if kind == "pdf" && !query.download {
-                                "inline"
-                            } else {
-                                "attachment"
-                            },
-                            artifact
-                                .logical_name
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or("artifact")
-                        ),
+                        disposition.unwrap_or_else(|| {
+                            format!(
+                                "{}; filename=\"{}\"",
+                                if kind == "pdf" && !query.download {
+                                    "inline"
+                                } else {
+                                    "attachment"
+                                },
+                                artifact
+                                    .logical_name
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or("artifact")
+                            )
+                        }),
                     ),
                 ],
                 bytes,
@@ -7693,16 +7711,24 @@ fn redact_runtime_log(message: &str) -> String {
         "apikey",
     ];
     let mut redact_next = false;
+    let mut redact_quoted_line = false;
     message
         .split_inclusive(char::is_whitespace)
         .map(|segment| {
             let token = segment.trim_end_matches(char::is_whitespace);
             let whitespace = &segment[token.len()..];
+            if redact_quoted_line {
+                if whitespace.contains('\n') {
+                    redact_quoted_line = false;
+                }
+                return format!("[REDACTED]{whitespace}");
+            }
             if redact_next {
                 if token.eq_ignore_ascii_case("bearer") {
                     return format!("{token}{whitespace}");
                 }
                 redact_next = false;
+                redact_quoted_line = token.starts_with(['"', '\'']) && !whitespace.contains('\n');
                 return format!("[REDACTED]{whitespace}");
             }
             let lower = token.to_ascii_lowercase();
@@ -7713,6 +7739,11 @@ fn redact_runtime_log(message: &str) -> String {
             if SENSITIVE.iter().any(|marker| lower.contains(marker))
                 && let Some(index) = token.find(['=', ':'])
             {
+                redact_quoted_line =
+                    token[index + 1..].starts_with(['"', '\'']) && !whitespace.contains('\n');
+                if token[index + 1..].trim_matches(['"', '\'']).is_empty() {
+                    redact_next = true;
+                }
                 return format!("{}[REDACTED]{whitespace}", &token[..=index]);
             }
             segment.to_owned()
@@ -7745,7 +7776,13 @@ async fn admin_runtime_logs(
         return response;
     }
     let limit = input.limit.unwrap_or(100).clamp(1, 100);
-    let project = env::var("LATEX_CORE_COMPOSE_PROJECT").unwrap_or_else(|_| "latex-core".into());
+    let project = match runtime_log_project(
+        env::var("LATEX_CORE_COMPOSE_PROJECT").ok().as_deref(),
+        env::var("COMPOSE_PROJECT_NAME").ok().as_deref(),
+    ) {
+        Ok(project) => project,
+        Err(message) => return error(StatusCode::SERVICE_UNAVAILABLE, message),
+    };
     let service_filter = input.service.filter(|value| !value.trim().is_empty());
     let query = input.query.filter(|value| !value.trim().is_empty());
     let result = tokio::task::spawn_blocking(move || {
@@ -7759,6 +7796,9 @@ async fn admin_runtime_logs(
         )?;
         let mut records = Vec::new();
         let mut services = BTreeSet::new();
+        if listing.stdout.is_empty() {
+            return Err("No runtime containers matched the configured Compose project. Check LATEX_CORE_COMPOSE_PROJECT.".to_owned());
+        }
         for line in String::from_utf8_lossy(&listing.stdout).lines() {
             let Some((container, service)) = line.split_once('\t') else { continue };
             services.insert(service.to_owned());
@@ -11513,9 +11553,75 @@ fn queue_limits() -> Result<QueueLimits, Box<dyn std::error::Error>> {
 }
 
 fn login_html(error_message: Option<&str>) -> String {
+    login_html_with_email(error_message, "")
+}
+
+fn runtime_log_project(
+    explicit: Option<&str>,
+    compose: Option<&str>,
+) -> Result<String, &'static str> {
+    let project = explicit.or(compose).unwrap_or("latex-core");
+    if !(2..=63).contains(&project.len())
+        || !project.starts_with(|character: char| {
+            character.is_ascii_lowercase() || character.is_ascii_digit()
+        })
+        || !project.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-')
+        })
+    {
+        return Err("Invalid runtime log Compose project configuration.");
+    }
+    Ok(project.to_owned())
+}
+
+fn pdf_download_disposition(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .filter(|character| !character.is_control())
+        .map(|character| {
+            if matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            ) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(150)
+        .collect();
+    let stem = stem.trim().trim_matches('.').trim();
+    let filename = format!("{}.pdf", if stem.is_empty() { "report" } else { stem });
+    let ascii: String = filename
+        .chars()
+        .map(|character| if character.is_ascii() { character } else { '_' })
+        .collect();
+    let encoded: String = filename
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+}
+
+fn login_html_with_email(error_message: Option<&str>, email: &str) -> String {
+    let email = email
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
     include_str!("ui.html")
         .replacen("<body>", "<body data-server-authenticated=\"false\">", 1)
         .replace("{{LOGIN_ERROR}}", error_message.unwrap_or(""))
+        .replace("{{LOGIN_EMAIL}}", &email)
 }
 
 fn writer_html() -> &'static str {
@@ -12039,6 +12145,16 @@ mod tests {
             redact_runtime_log("Authorization: Bearer abc123\nnext line"),
             "Authorization: Bearer [REDACTED]\nnext line"
         );
+        for secret in [
+            "password: \"two words\"\nnormal",
+            "{\"token\":\"two words\"}\nnormal",
+            "password= \"two words\"\nnormal",
+        ] {
+            let redacted = redact_runtime_log(secret);
+            assert!(!redacted.contains("two"));
+            assert!(!redacted.contains("words"));
+            assert!(redacted.ends_with("normal"));
+        }
     }
 
     #[test]
@@ -12055,6 +12171,61 @@ mod tests {
         assert!(setup.contains("method=\"post\" action=\"/logout\""));
         for forbidden in ["/workspace", "/write", "/review", "/admin", "app.js"] {
             assert!(!setup.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn failed_login_preserves_exact_email_without_html_injection_or_password() {
+        let html = login_html_with_email(
+            Some("Invalid email or password."),
+            " Writer+Tag@Example.invalid ",
+        );
+        assert!(html.contains("value=\" Writer+Tag@Example.invalid \""));
+        assert!(html.contains("role=\"alert\""));
+        let escaped = login_html_with_email(None, "\"><script>&'");
+        assert!(escaped.contains("value=\"&quot;&gt;&lt;script&gt;&amp;&#39;\""));
+        assert!(!escaped.contains("value=\"\"><script>"));
+        assert!(html.contains(
+            "name=\"password\" type=\"password\" autocomplete=\"current-password\" required"
+        ));
+        assert!(!login_html(None).contains("Invalid email or password."));
+    }
+
+    #[test]
+    fn pdf_names_preserve_spaces_unicode_and_sanitize_header_and_path_characters() {
+        assert_eq!(
+            pdf_download_disposition("team_6"),
+            "attachment; filename=\"team_6.pdf\"; filename*=UTF-8''team_6.pdf"
+        );
+        assert!(
+            pdf_download_disposition("Smart Energy Monitoring")
+                .contains("filename*=UTF-8''Smart%20Energy%20Monitoring.pdf")
+        );
+        assert!(
+            pdf_download_disposition("研究 Team")
+                .contains("filename*=UTF-8''%E7%A0%94%E7%A9%B6%20Team.pdf")
+        );
+        for name in ["../../report\r\n", "\\a\"b:<c>?*|", "", "...", "\r\n"] {
+            let header = pdf_download_disposition(name);
+            assert!(HeaderValue::from_str(&header).is_ok());
+            assert!(!header.contains(['\r', '\n', '/', '\\']));
+        }
+        assert!(pdf_download_disposition("...").contains("report.pdf"));
+    }
+
+    #[test]
+    fn runtime_logs_use_explicit_then_compose_project_and_reject_invalid_configuration() {
+        assert_eq!(
+            runtime_log_project(Some("institution-stage"), Some("other")),
+            Ok("institution-stage".to_owned())
+        );
+        assert_eq!(
+            runtime_log_project(None, Some("latex-core-stage-123")),
+            Ok("latex-core-stage-123".to_owned())
+        );
+        assert_eq!(runtime_log_project(None, None), Ok("latex-core".to_owned()));
+        for invalid in ["", "a", "--all", "STAGING", "stage\n"] {
+            assert!(runtime_log_project(Some(invalid), None).is_err());
         }
     }
 
@@ -12298,6 +12469,7 @@ mod tests {
 mod database_tests {
     include!("front_matter_db_tests.rs");
     include!("course_autofill_db_tests.rs");
+    include!("nine_corrections_db_tests.rs");
     use super::*;
     use axum::{
         body::Body,
@@ -12833,7 +13005,7 @@ mod database_tests {
         assert_eq!(pdf.status(), StatusCode::OK);
         assert_eq!(
             pdf.headers()[header::CONTENT_DISPOSITION],
-            "attachment; filename=\"paper.pdf\""
+            "attachment; filename=\"Disposable Writer restrictions.pdf\"; filename*=UTF-8''Disposable%20Writer%20restrictions.pdf"
         );
         assert_eq!(test_bytes(pdf).await, b"pdf-writer-restrictions");
         pool.close().await;
@@ -17574,7 +17746,9 @@ Unrelated authored LaTeX survives.
                 .headers()
                 .get(header::CONTENT_DISPOSITION)
                 .and_then(|value| value.to_str().ok()),
-            Some("attachment; filename=\"paper.pdf\"")
+            Some(
+                "attachment; filename=\"S4 exact paper.pdf\"; filename*=UTF-8''S4%20exact%20paper.pdf"
+            )
         );
         assert_eq!(test_bytes(downloaded).await, b"pdf-h4");
 
