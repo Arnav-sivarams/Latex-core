@@ -4141,8 +4141,10 @@ async fn single_source_document_details(
         .iter()
         .map(|(key, value)| (key.replace('.', "_"), value.clone()))
         .collect::<BTreeMap<_, _>>();
-    if let Some(date) = saved.get("submission_date") {
-        overrides.insert("submission_date".into(), date.clone());
+    if let Some(date) = front_matter::single_source_submission_date_from_tex(&main)
+        .or_else(|| saved.get("submission_date").cloned())
+    {
+        overrides.insert("submission_date".into(), date);
     }
     let mut automatic = state
         .front_matter
@@ -4519,44 +4521,7 @@ async fn v2_save_document_details(
             blob_hash: stored.hash(),
             size_bytes: stored.size_bytes(),
         };
-        let mut source_files = vec![source_file];
-        for path in workspace.files().keys().filter(|path| {
-            *path != &main_path
-                && matches!(
-                    path.as_str().rsplit('/').next(),
-                    Some("acknowledgement.tex" | "acknowledgment.tex" | "certificate.tex")
-                )
-        }) {
-            let original = match state.workspaces.read_file(workspace_id, path).await {
-                Ok(value) => value,
-                Err(_) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "front matter source unavailable",
-                    );
-                }
-            };
-            let formatted = match front_matter::format_student_front_matter(&original) {
-                Ok(value) => value,
-                Err(value) => return error(StatusCode::BAD_REQUEST, value.to_string()),
-            };
-            if formatted != original {
-                let stored = match state.blobs.put(formatted).await {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "front matter storage failed",
-                        );
-                    }
-                };
-                source_files.push(ManagedFrontMatterFile {
-                    path: path.to_string(),
-                    blob_hash: stored.hash(),
-                    size_bytes: stored.size_bytes(),
-                });
-            }
-        }
+        let source_files = vec![source_file];
         let (version, document_epoch) = match state
             .front_matter
             .save_single_source_values(
@@ -11934,6 +11899,9 @@ async fn state_js() -> Response {
 }
 
 #[cfg(test)]
+mod preservation_compile_tests;
+
+#[cfg(test)]
 #[allow(clippy::expect_used, reason = "unit assertion fixture")]
 mod tests {
     use super::*;
@@ -12020,12 +11988,10 @@ mod tests {
                 .expect("actual front matter page")
                 .read_to_end(&mut original)
                 .expect("page source");
-            let formatted = front_matter::format_student_front_matter(&original)
-                .expect("student separator patch");
-            assert!(
-                String::from_utf8_lossy(&formatted).contains(r"\studentAname\ (\studentAregno)")
-            );
-            files.push((LogicalPath::parse(&path).expect("page path"), formatted));
+            files.push((
+                LogicalPath::parse(&path).expect("page path"),
+                Bytes::from(original),
+            ));
         }
         let export = build_source_archive(files).expect("portable source archive");
         let mut exported =
@@ -12469,6 +12435,7 @@ mod tests {
 mod database_tests {
     include!("front_matter_db_tests.rs");
     include!("course_autofill_db_tests.rs");
+    include!("source_preservation_db_tests.rs");
     include!("nine_corrections_db_tests.rs");
     use super::*;
     use axum::{

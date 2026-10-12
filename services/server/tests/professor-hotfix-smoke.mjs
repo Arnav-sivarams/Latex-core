@@ -80,6 +80,9 @@ try {
   await page.locator('#documentDetailsPanel').waitFor({ state: 'visible' });
   for (const key of ['course_code','team_academic_year','team_semester']) assert.equal(await page.locator(`[name="field:${key}"]`).count(), 0);
   await page.locator('[name="field:course_name"]').fill('Hotfix intentional course name');
+  // The untouched template has Month/Year placeholders, so provide the required
+  // date explicitly before submitting this disposable Document Details fixture.
+  await page.locator('[name="field:submission_date"]').fill('2026-10-07');
   assert.equal(await page.locator('[name="field:guide_identity"], [name="field:dean_identity"]').count(), 0);
   await page.getByRole('button', { name: 'Save document details', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.cm-content')?.textContent.includes('Hotfix intentional course name'));
