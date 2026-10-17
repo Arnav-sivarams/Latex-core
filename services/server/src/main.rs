@@ -2167,7 +2167,16 @@ async fn admin_v2_institution_batch_apply(
         Ok(value) => value,
         Err(error_value) => return institution_error(error_value),
     };
-    let account_provisioning = detail["account_provisioning"].clone();
+    let mut account_provisioning: persistence::AccountProvisioningResult =
+        match serde_json::from_value(detail["account_provisioning"].clone()) {
+            Ok(value) => value,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid provisioning response",
+                );
+            }
+        };
     if detail["batch"]["operation"] != "DELETE" {
         let job_id = match state.institution.batch_primary_job(batch_id).await {
             Ok(value) => value,
@@ -2178,11 +2187,26 @@ async fn admin_v2_institution_batch_apply(
         if materialization.status().is_server_error() {
             return materialization;
         }
+        if let Err(value) = state
+            .institution
+            .group_generated_credentials(job_id, &mut account_provisioning)
+            .await
+        {
+            return institution_error(value);
+        }
     }
     match state.institution.batch_detail(batch_id, 100).await {
         Ok(mut current) => {
-            current["account_provisioning"] = account_provisioning;
-            Json(current).into_response()
+            current["account_provisioning"] = match serde_json::to_value(account_provisioning) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "invalid provisioning response",
+                    );
+                }
+            };
+            ([(header::CACHE_CONTROL, "no-store")], Json(current)).into_response()
         }
         Err(error_value) => institution_error(error_value),
     }
@@ -2240,7 +2264,7 @@ async fn admin_v2_institution_apply(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let applied_job = match state
+    let mut applied_job = match state
         .institution
         .apply_import(job_id, principal.user_id())
         .await
@@ -2412,15 +2436,25 @@ async fn admin_v2_institution_apply(
             tokio::spawn(async move { drain_front_matter_rerenders(maintenance, 20).await });
         }
     }
+    if let Err(value) = state
+        .institution
+        .group_generated_credentials(job_id, &mut applied_job.account_provisioning)
+        .await
+    {
+        return institution_error(value);
+    }
     match state.institution.job(job_id).await {
-        Ok(job) => Json(serde_json::json!({
-            "job": job,
-            "account_provisioning": applied_job.account_provisioning,
-            "materialized_teams": materialized,
-            "merged_teams": merged,
-            "unresolved_teams": unresolved,
-        }))
-        .into_response(),
+        Ok(job) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({
+                "job": job,
+                "account_provisioning": applied_job.account_provisioning,
+                "materialized_teams": materialized,
+                "merged_teams": merged,
+                "unresolved_teams": unresolved,
+            })),
+        )
+            .into_response(),
         Err(error_value) => institution_error(error_value),
     }
 }
@@ -4039,6 +4073,29 @@ async fn resolve_legacy_details(
         .map_err(|value| error(StatusCode::BAD_REQUEST, value.to_string()))
 }
 
+// Read every metadata source from the same captured workspace generation.
+async fn captured_report_source(
+    state: &AppState,
+    workspace: WorkspaceId,
+    path: &LogicalPath,
+    file: &workspace_model::WorkspaceFile,
+) -> Result<Bytes, Response> {
+    let bytes = state.blobs.get(file.blob_hash()).await.map_err(|failure| {
+        tracing::error!(target: "review_metadata_failure", workspace_id=%workspace, %path, error=%failure, "captured report source read failed");
+        error(StatusCode::INTERNAL_SERVER_ERROR, "complete report source storage is unavailable")
+    })?;
+    if u64::try_from(bytes.len()).ok() != Some(file.size_bytes())
+        || core_types::BlobHash::digest(&bytes) != file.blob_hash()
+    {
+        tracing::error!(target: "review_metadata_failure", workspace_id=%workspace, %path, "captured report source failed integrity verification");
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "complete report source failed integrity verification",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the complete-report metadata projection keeps registry resolution and serializable UI fields together"
@@ -4069,48 +4126,32 @@ async fn single_source_document_details(
             "complete report template has an invalid main path",
         )
     })?;
-    let main = state
-        .workspaces
-        .read_file(workspace, &path)
-        .await
-        .map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "complete report main source is unavailable",
-            )
-        })?;
+    let workspace_state = state.workspaces.restore(workspace).await.map_err(|failure| {
+        tracing::error!(target: "review_metadata_failure", %paper_id, workspace_id=%workspace, error=%failure, "report metadata workspace capture failed");
+        error(StatusCode::INTERNAL_SERVER_ERROR, "complete report workspace is unavailable")
+    })?;
+    let main_file = workspace_state.file(&path).ok_or_else(|| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "complete report main source is unavailable",
+        )
+    })?;
+    let main = captured_report_source(state, workspace, &path, main_file).await?;
     if !front_matter::single_source_compatible(&main) {
         return Err(error(
             StatusCode::CONFLICT,
             "Complete report template metadata compatibility: no safe binding point is available before \\begin{document}.",
         ));
     }
-    // Complete-report fields are often consumed by included front-matter files
-    // (for example, certificate.tex), rather than the root source itself.
-    // Project the union of the declared macros without mutating the immutable
-    // template workspace.
-    let workspace_state = state.workspaces.restore(workspace).await.map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "complete report template workspace is unavailable",
-        )
-    })?;
+    // Included front matter can consume definitions absent from the root source.
+    // Keep their immutable blob identities from this one captured generation.
     let mut commands = BTreeSet::new();
-    for source_path in workspace_state
+    for (source_path, file) in workspace_state
         .files()
-        .keys()
-        .filter(|source_path| source_path.extension() == Some("tex"))
+        .iter()
+        .filter(|(source_path, _)| source_path.extension() == Some("tex"))
     {
-        let source = state
-            .workspaces
-            .read_file(workspace, source_path)
-            .await
-            .map_err(|_| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "complete report template source is unavailable",
-                )
-            })?;
+        let source = captured_report_source(state, workspace, source_path, file).await?;
         let source = std::str::from_utf8(&source).map_err(|_| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -12437,6 +12478,7 @@ mod database_tests {
     include!("course_autofill_db_tests.rs");
     include!("source_preservation_db_tests.rs");
     include!("nine_corrections_db_tests.rs");
+    include!("review_regressions_db_tests.rs");
     use super::*;
     use axum::{
         body::Body,
@@ -13548,12 +13590,8 @@ mod database_tests {
                 Some("application/x-www-form-urlencoded"),
             )
             .await;
-            let expected_path = if credential["credential_role"] == "student" {
-                "/write"
-            } else {
-                "/review"
-            };
-            assert_eq!(changed.headers()[header::LOCATION], expected_path);
+            // Both V2 roles now enter their role-scoped workspace through Home.
+            assert_eq!(changed.headers()[header::LOCATION], "/home");
             let active_cookie = response_cookie(&changed);
             let papers_path = if credential["credential_role"] == "student" {
                 "/api/v2/writer/papers"

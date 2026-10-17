@@ -119,7 +119,9 @@ test('institution data manager uses server pagination and authoritative manual o
   assert.match(js, /leader_user_id/);
   assert.match(js, /review_state/);
   assert.match(js, /unresolved/);
-  assert.doesNotMatch(js, /api\('\/api\/admin\/v2\/paper-teams'\)/);
+  const teamList = js.slice(js.indexOf('async function renderPaperTeamGrid('), js.indexOf('async function renderImport', js.indexOf('async function renderPaperTeamGrid(')));
+  assert.match(teamList, /paper-teams\/query/);
+  assert.doesNotMatch(teamList, /api\('\/api\/admin\/v2\/paper-teams'\)/);
   assert.doesNotMatch(js, /team-card/);
 });
 

@@ -472,7 +472,7 @@ async fn room_actor(
                             }
                             Err(error) => {
                                 tracing::warn!(workspace_id=%key.workspace_id, file_id=%key.file_id, %error, "collaboration update rejected before room application");
-                                let _ = acknowledgements.send(error_json("authority_revoked", "Under review — source updates are read-only until the review ends.")).await;
+                                let _ = acknowledgements.send(source_update_rejection(&error)).await;
                             }
                         }
                     }
@@ -869,9 +869,70 @@ pub fn websocket_principal_is_supported(principal: &crate::AuthenticatedPrincipa
     )
 }
 
+fn source_update_rejection(error: &persistence::V2Error) -> String {
+    use persistence::V2Error;
+    match error {
+        V2Error::Conflict {
+            entity: "file content policy",
+        } => error_json(
+            "authority_revoked",
+            "File policy is read-only. Unsaved edits remain local; refresh file access before retrying.",
+        ),
+        V2Error::Conflict {
+            entity: "paper under review",
+        } => error_json(
+            "authority_revoked",
+            "Under review — source updates are read-only until the review ends.",
+        ),
+        V2Error::Conflict {
+            entity: "collaboration document epoch",
+        } => error_json(
+            "reload_required",
+            "Paper version changed. Preserve offline text and reload before saving.",
+        ),
+        V2Error::RoleMissing { .. } | V2Error::RoleForbidden { .. } | V2Error::NotFound { .. } => {
+            error_json(
+                "authority_revoked",
+                "Source access changed. Unsaved edits remain local; refresh file access.",
+            )
+        }
+        _ => error_json(
+            "durability",
+            "Source was not durably saved. Edits remain local; reconnect and retry Save.",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_and_persistence_denials_do_not_masquerade_as_review_locks() {
+        let policy: serde_json::Value =
+            serde_json::from_str(&source_update_rejection(&persistence::V2Error::Conflict {
+                entity: "file content policy",
+            }))
+            .expect("valid control JSON");
+        assert_eq!(policy["code"], "authority_revoked");
+        assert!(
+            policy["message"]
+                .as_str()
+                .expect("message")
+                .contains("File policy")
+        );
+        assert!(
+            !policy["message"]
+                .as_str()
+                .expect("message")
+                .contains("Under review")
+        );
+        let storage: serde_json::Value = serde_json::from_str(&source_update_rejection(
+            &persistence::V2Error::Database(sqlx::Error::PoolTimedOut),
+        ))
+        .expect("valid control JSON");
+        assert_eq!(storage["code"], "durability");
+    }
 
     #[test]
     fn duplicate_state_update_does_not_change_the_room_document() {

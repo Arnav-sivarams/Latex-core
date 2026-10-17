@@ -101,11 +101,11 @@ pub use governance::{
     V2FilePolicy, V2FilePolicyRecord,
 };
 pub use institution::{
-    AccountProvisioningResult, AppliedInstitutionImport, GeneratedCredential, ImportFileType,
-    ImportJobPageFilter, ImportLimits, ImportMode, ImportedTeamPlan, InstitutionBatchUpload,
-    InstitutionError, InstitutionImportBatch, InstitutionImportJob, InstitutionImportRow,
-    InstitutionOperation, InstitutionPageFilter, InstitutionRepository, PaperTeamPage,
-    PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
+    AccountProvisioningResult, AppliedInstitutionImport, CredentialTeam, GeneratedCredential,
+    ImportFileType, ImportJobPageFilter, ImportLimits, ImportMode, ImportedTeamPlan,
+    InstitutionBatchUpload, InstitutionError, InstitutionImportBatch, InstitutionImportJob,
+    InstitutionImportRow, InstitutionOperation, InstitutionPageFilter, InstitutionRepository,
+    PaperTeamPage, PaperTeamPageFilter, ProgrammeTemplateDefault, TemplateResolution,
 };
 pub use integration::{
     INTEGRATION_SCOPES, IntegrationClient, IntegrationError, IntegrationPrincipal,

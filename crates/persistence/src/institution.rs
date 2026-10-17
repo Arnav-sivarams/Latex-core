@@ -243,6 +243,19 @@ pub struct GeneratedCredential {
     pub email: String,
     pub temporary_password: String,
     pub credential_role: String,
+    #[serde(default)]
+    pub teams: Vec<CredentialTeam>,
+}
+
+/// Presentation metadata only; credentials remain a one-time response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CredentialTeam {
+    pub team_id: Uuid,
+    pub team_name: String,
+    pub team_key: String,
+    pub team_role: String,
+    pub writer_order: Option<i32>,
+    pub is_leader: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2519,6 +2532,64 @@ impl InstitutionRepository {
         tx.commit().await.map_err(InstitutionError::Database)
     }
 
+    /// Called after materialization, with only credentials from this apply response.
+    /// Team scope comes from the import, never from a shared Mentor's other Teams.
+    pub async fn group_generated_credentials(
+        &self,
+        job_id: Uuid,
+        provisioning: &mut AccountProvisioningResult,
+    ) -> Result<(), InstitutionError> {
+        let team_ids = self
+            .pending_team_plans(job_id)
+            .await?
+            .into_iter()
+            .filter_map(|plan| plan.existing_paper_team_id)
+            .collect::<Vec<_>>();
+        let emails = provisioning
+            .credentials
+            .iter()
+            .map(|item| item.email.clone())
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(
+            "SELECT c.email,t.id,t.name,x.external_team_key,r.role,m.writer_order,m.is_leader \
+             FROM latex_core.paper_team_members m \
+             JOIN latex_core.paper_teams t ON t.id=m.paper_team_id \
+             JOIN latex_core.external_paper_team_links x ON x.paper_team_id=t.id \
+             JOIN latex_core.user_credentials c ON c.user_id=m.user_id \
+             JOIN latex_core.global_user_roles r ON r.user_id=m.user_id \
+             WHERE t.id=ANY($1) AND c.email=ANY($2) ORDER BY t.name,t.id,m.writer_order,c.email",
+        )
+        .bind(&team_ids)
+        .bind(&emails)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(InstitutionError::Database)?;
+        let mut memberships = BTreeMap::<String, Vec<CredentialTeam>>::new();
+        for row in rows {
+            memberships
+                .entry(row.try_get("email").map_err(InstitutionError::Database)?)
+                .or_default()
+                .push(CredentialTeam {
+                    team_id: row.try_get("id").map_err(InstitutionError::Database)?,
+                    team_name: row.try_get("name").map_err(InstitutionError::Database)?,
+                    team_key: row
+                        .try_get("external_team_key")
+                        .map_err(InstitutionError::Database)?,
+                    team_role: row.try_get("role").map_err(InstitutionError::Database)?,
+                    writer_order: row
+                        .try_get("writer_order")
+                        .map_err(InstitutionError::Database)?,
+                    is_leader: row
+                        .try_get("is_leader")
+                        .map_err(InstitutionError::Database)?,
+                });
+        }
+        for credential in &mut provisioning.credentials {
+            credential.teams = memberships.remove(&credential.email).unwrap_or_default();
+        }
+        Ok(())
+    }
+
     pub async fn pending_team_plans(
         &self,
         job_id: Uuid,
@@ -4560,6 +4631,7 @@ async fn provision_people_rows(
                     email,
                     temporary_password,
                     credential_role: credential_role.to_owned(),
+                    teams: Vec::new(),
                 });
             }
             [account] => {

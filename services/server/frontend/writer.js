@@ -762,7 +762,7 @@ class CollaborationSession {
         this.documentEpoch = control.document_epoch;
         this.metadata = control;
         this.access = control.access;
-        this.initializeOrMerge();
+        this.initializeOrMerge().catch((failure) => { if (model.collaboration === this) notice(failure.message, true); });
       } else if (control.type === 'DURABLE_ACK') {
         this.pending.delete(control.client_seq);
         if (this.pending.size === 0) {
@@ -795,10 +795,10 @@ class CollaborationSession {
       } else if (control.type === 'PAPER_EPOCH_CHANGED') {
         this.preserveOldEpoch(control.document_epoch);
       } else if (control.type === 'POLICY_CHANGED') {
-        model.conflict = true;
-        saveState('conflict');
-        notice(control.message || 'File policy changed; reload the paper.', true);
-        this.destroy();
+        this.revalidatePolicy().catch((error) => {
+          model.conflict = true; saveState('conflict');
+          notice(`File policy changed. Access could not be refreshed: ${error.message}. Reload before continuing; offline text remains in recovery storage.`, true);
+        });
       } else if (control.type === 'CAPABILITIES_CHANGED') {
         model.conflict = true;
         saveState('conflict');
@@ -806,11 +806,15 @@ class CollaborationSession {
           ? (model.paper?.is_team_leader ? 'Under review — use End review to resume editing.' : 'Under review — your Team Leader can end the review.')
           : 'Review ended — normal editing permissions are being restored.');
         this.destroy();
-        if (model.paper) window.setTimeout(() => openPaper(model.paper), 0);
+        this.reloadPaperAfterControl();
       } else if (control.type === 'ERROR') {
-        model.conflict = true;
-        saveState('conflict');
-        notice(control.message || 'Collaboration failed.', true);
+        if (control.code === 'authority_revoked') {
+          this.revalidatePolicy().catch((failure) => notice(`Source access could not be refreshed: ${failure.message}. Offline edits remain in recovery storage.`, true));
+        } else {
+          model.conflict = true;
+          saveState('conflict');
+          notice(control.message || 'Collaboration failed.', true);
+        }
       }
       return;
     }
@@ -818,7 +822,7 @@ class CollaborationSession {
     if (!bytes.length) return;
     if (bytes[0] === INITIAL_STATE) {
       this.initialState = bytes.slice(1);
-      this.initializeOrMerge();
+      this.initializeOrMerge().catch((failure) => { if (model.collaboration === this) notice(failure.message, true); });
     } else if (bytes[0] === REMOTE_SOURCE_UPDATE) {
       saveState('syncing');
       if (this.doc) Y.applyUpdate(this.doc, bytes.slice(1), REMOTE_ORIGIN);
@@ -833,11 +837,46 @@ class CollaborationSession {
     saveState('conflict');
     notice('Offline changes from the previous paper version were preserved locally and were not merged after restoration.', true);
     this.destroy();
-    if (!model.metadataSaving && model.paper && Number.isInteger(newEpoch)) window.setTimeout(() => openPaper(model.paper), 0);
+    if (!model.metadataSaving && Number.isInteger(newEpoch)) this.reloadPaperAfterControl();
+  }
+
+  reloadPaperAfterControl() {
+    const paperId = this.paper.id;
+    window.setTimeout(() => {
+      if (model.paper?.id !== paperId) return;
+      openPaper(model.paper).catch((failure) => {
+        if (model.paper?.id === paperId) notice(`Could not refresh source access: ${failure.message}. Reload before continuing.`, true);
+      });
+    }, 0);
   }
 
   recoveryScope() {
     return `latex-core:${model.identity.user_id}:${this.paper.workspace_id}:${this.file.file_id}`;
+  }
+
+  async revalidatePolicy() {
+    const active = model.collaboration === this;
+    const paperId = this.paper.id;
+    const fileId = this.file.file_id;
+    const unsaved = this.pending.size > 0;
+    if (unsaved && this.text) model.recoveryText = this.text.toString();
+    if (active) {
+      model.conflict = true; model.fileEditable = false;
+      destroyEditorView(); updateFileActions(false); saveState('syncing');
+    }
+    this.destroy();
+    if (!active) return;
+    const [detail, files] = await Promise.all([api.paper(paperId), api.files(paperId)]);
+    if (model.paper?.id !== paperId || model.collaboration !== this) return;
+    model.paperDetail = detail; model.version = detail.version; model.files = files;
+    ui.compilePaper.disabled = !detail.editable;
+    const file = files.find((item) => item.file_id === fileId)
+      || files.find((item) => item.path === detail.main_file) || files[0];
+    if (!file) throw new Error('No accessible source file remains');
+    await openFile(file, true);
+    notice(unsaved
+      ? 'File policy updated. Unacknowledged text was preserved for recovery; the server source follows the new access policy.'
+      : 'File policy updated. Source access was refreshed; Compile still uses the complete report.');
   }
 
   async cachedText(key) {
@@ -879,13 +918,16 @@ class CollaborationSession {
 
   async initializeOrMerge() {
     if (!this.metadata || !this.initialState || this.initializing) return;
+    const initialState = this.initialState;
+    const metadata = this.metadata;
     this.initializing = true;
     try {
       if (!this.doc) {
-        await this.recoverIncompatibleCache(this.metadata.document_epoch);
+        await this.recoverIncompatibleCache(metadata.document_epoch);
+        if (this.destroyed) return;
         this.doc = new Y.Doc();
         this.text = this.doc.getText('source');
-        const key = `latex-core:${model.identity.user_id}:${this.paper.workspace_id}:${this.file.file_id}:${this.metadata.document_epoch}`;
+        const key = `latex-core:${model.identity.user_id}:${this.paper.workspace_id}:${this.file.file_id}:${metadata.document_epoch}`;
         if (this.access === 'read_write') {
           try {
             this.persistence = new IndexeddbPersistence(key, this.doc);
@@ -902,8 +944,9 @@ class CollaborationSession {
         } else {
           try {
             const cached = await this.cachedText(key);
+            if (this.destroyed) return;
             const serverDoc = new Y.Doc();
-            Y.applyUpdate(serverDoc, this.initialState, REMOTE_ORIGIN);
+            Y.applyUpdate(serverDoc, initialState, REMOTE_ORIGIN);
             if (cached && cached !== serverDoc.getText('source').toString()) {
               model.recoveryText = cached;
               notice('File access is now read-only. Offline text was preserved for recovery and was not submitted.', true);
@@ -911,7 +954,8 @@ class CollaborationSession {
             serverDoc.destroy();
           } catch (_) { this.localPersistenceAvailable = false; }
         }
-        Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
+        if (this.destroyed) return;
+        Y.applyUpdate(this.doc, initialState, REMOTE_ORIGIN);
         this.bufferedRemote.forEach((update) => Y.applyUpdate(this.doc, update, REMOTE_ORIGIN));
         this.bufferedRemote = [];
         this.doc.on('update', (update, origin) => {
@@ -922,16 +966,23 @@ class CollaborationSession {
         if (model.collaboration === this && !this.destroyed) mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
         this.resolveReady();
       } else {
-        Y.applyUpdate(this.doc, this.initialState, REMOTE_ORIGIN);
+        Y.applyUpdate(this.doc, initialState, REMOTE_ORIGIN);
         if (model.collaboration === this && !model.view) {
           mountEditor(this.text, this.requestedEditable && this.access === 'read_write', this.latex);
           this.resolveReady();
         }
       }
-      if (this.access === 'read_write') this.sendUpdate(Y.encodeStateAsUpdate(this.doc));
-      else saveState('synced');
+      if (model.collaboration === this && this.initialState === initialState && this.metadata === metadata) {
+        if (this.access === 'read_write') this.sendUpdate(Y.encodeStateAsUpdate(this.doc));
+        else saveState('synced');
+      }
     } finally {
       this.initializing = false;
+      // A retained session can reconnect while recovery storage is loading.
+      // Finish one coherent frame, then merge the newer handshake.
+      if (!this.destroyed && this.initialState && this.metadata && this.initialState !== initialState) {
+        this.initializeOrMerge().catch((failure) => { if (model.collaboration === this) notice(failure.message, true); });
+      }
     }
   }
 
@@ -1075,8 +1126,10 @@ async function refreshPapers() {
 }
 
 const promptedDocumentDetails = new Set();
+let documentDetailsRequest = 0;
 
 async function openPaper(paper) {
+  const detailsRequestAtOpen = documentDetailsRequest;
   ui.compileSpinner.hidden = true;
   closeEditor();
   closeFileActionsMenu();
@@ -1129,7 +1182,7 @@ async function openPaper(paper) {
     if (model.paper.id !== paper.id) return;
     ui.documentDetails.title = detail.single_source ? 'Complete report metadata' : detail.pack_id ? frontMatterStatus(detail) : 'Document details';
     const key = `${paper.id}:${detail.pack_id || detail.template_arrangement || 'none'}`;
-    if (needsFirstUseDetails(detail) && !promptedDocumentDetails.has(key)) {
+    if (needsFirstUseDetails(detail) && !promptedDocumentDetails.has(key) && documentDetailsRequest === detailsRequestAtOpen) {
       promptedDocumentDetails.add(key);
       await openDocumentDetails(detail);
       ui.drawerTitle.textContent = 'Complete document details';
@@ -1364,7 +1417,7 @@ async function requestBuild() {
 
 async function manualCompile() {
   if (!model.paper || !model.paperDetail?.editable) return;
-  if (!await requireDurableFlush()) return;
+  if (!await requireDurableFlush()) return notice('Compilation was not requested because source could not be durably saved. Wait for Saved or reconnect, then Compile.', true);
   await requestBuild();
 }
 
@@ -2153,12 +2206,14 @@ function insertMathSymbol(latex) {
 }
 
 function closeDrawer() {
+  documentDetailsRequest += 1;
   ui.workspaceDrawer.hidden = true;
   [ui.problems, ui.reviews, ui.history, ui.documentDetailsPanel].forEach((panel) => { panel.hidden = true; });
   ui.commentsToggle.setAttribute('aria-expanded', 'false');
 }
 
 function openDrawer(kind) {
+  if (kind !== 'documentDetails') documentDetailsRequest += 1;
   const panels = { problems: ui.problems, reviews: ui.reviews, history: ui.history, documentDetails: ui.documentDetailsPanel };
   const titles = { problems: 'Problems', reviews: 'Comments', history: 'History', documentDetails: 'Document details' };
   Object.values(panels).forEach((panel) => { panel.hidden = panel !== panels[kind]; });
@@ -2276,8 +2331,14 @@ function projectMetadataEditor(detail) {
 
 async function openDocumentDetails(prefetched = null) {
   if (!model.paper || model.paper.kind !== 'team') return;
+  const paperId = model.paper.id;
+  const request = ++documentDetailsRequest;
+  ui.documentDetailsBody.replaceChildren(Object.assign(document.createElement('p'), { textContent: 'Loading document details…' }));
+  openDrawer('documentDetails');
   try {
-    const detail = prefetched?.pack_id ? prefetched : await api.documentDetails(model.paper.id);
+    const detail = prefetched?.manifest ? prefetched : await api.documentDetails(paperId);
+    if (model.paper?.id !== paperId || request !== documentDetailsRequest) return;
+    promptedDocumentDetails.add(`${paperId}:${detail.pack_id || detail.template_arrangement || 'none'}`);
     ui.documentDetailsBody.replaceChildren();
     ui.documentDetailsBody.append(Object.assign(document.createElement('p'), { textContent: detail.single_source ? 'Complete report template · one source controls cover, front matter, and body. The source \\thesistitle is used until a Team Leader or Admin saves an explicit Project title here; that saved title then controls every title-bearing page at the next manual compile.' : `Front Matter Pack: ${detail.pack_name || 'None'}` }));
     if (!detail.pack_id && !detail.single_source) {

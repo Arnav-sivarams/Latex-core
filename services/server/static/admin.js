@@ -92,13 +92,29 @@ function rowMenu(label, actions) {
   return menu;
 }
 
+// Keep the legacy first three columns and append Team presentation metadata.
 function csvCell(value) {
   const text = String(value ?? '');
-  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  // Prefix untrusted spreadsheet formulas; ordinary credentials are unchanged.
+  const safe = /^[=+@\-\t\r\n]/.test(text.trimStart()) ? `'${text}` : text;
+  return /[",\n\r]/.test(safe) ? `"${safe.replaceAll('"', '""')}"` : safe;
 }
 
 function credentialsCsv(credentials) {
-  return ['email,password,role', ...credentials.map((item) => [item.email, item.temporary_password, item.credential_role].map(csvCell).join(','))].join('\r\n') + '\r\n';
+  if (credentials.some(item => !Array.isArray(item.teams))) {
+    // Manual account handoffs do not carry an import's membership scope.
+    return ['email,password,role', ...credentials.map(item => [item.email, item.temporary_password, item.credential_role].map(csvCell).join(','))].join('\r\n') + '\r\n';
+  }
+  const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  const rows = credentials.filter(item => typeof item.temporary_password === 'string' && item.temporary_password.length).flatMap(item =>
+    (item.teams?.length ? item.teams : [{ team_name: 'Unassigned', team_id: '', team_key: '', team_role: '', writer_order: null, is_leader: false }])
+      .map(team => ({ item, team })));
+  const rank = team => team.is_leader ? 0 : team.team_role === 'writer' ? 1 : team.team_role === 'mentor' ? 2 : 3;
+  rows.sort((a, b) => compare(a.team.team_name, b.team.team_name) || compare(a.team.team_id, b.team.team_id)
+    || rank(a.team) - rank(b.team) || (a.team.writer_order ?? Number.MAX_SAFE_INTEGER) - (b.team.writer_order ?? Number.MAX_SAFE_INTEGER)
+    || compare(a.item.email, b.item.email));
+  return ['email,password,role,team_name,team_id,team_key,team_role,writer_order,is_team_leader', ...rows.map(({item, team}) =>
+    [item.email, item.temporary_password, item.credential_role, team.team_name, team.team_id, team.team_key, team.team_role, team.writer_order, team.is_leader].map(csvCell).join(','))].join('\r\n') + '\r\n';
 }
 
 function downloadCredentials(credentials, batchId) {
@@ -112,6 +128,7 @@ function showCredentialHandoff(provisioning, batchId) {
   if (!provisioning) return;
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody');
   const credentials = provisioning.credentials || [];
+  const grouped = credentials.every(item => Array.isArray(item.teams));
   host.replaceChildren(
     element('h2', '', 'Account setup'),
     element('p', '', `${provisioning.created || 0} accounts created`),
@@ -119,9 +136,10 @@ function showCredentialHandoff(provisioning, batchId) {
     element('p', '', `${provisioning.reused || 0} existing accounts reused`),
     element('p', '', `${provisioning.needs_attention || 0} need attention`),
     element('p', 'muted-note', 'Email is the primary credential delivery method. The CSV is an administrator fallback.'),
-    element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again.'),
+    element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again. Administrator-only: do not distribute the all-Teams CSV to students.'),
+    element('p', 'muted-note', grouped ? 'Grouped by materialized Teams in this import. Accounts without a current in-scope assignment appear as Unassigned; later assignments cannot update this one-time export.' : 'Team assignments are unavailable for this account handoff. This download retains the original account-only CSV format.'),
   );
-  const download = buttonAction('Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
+  const download = buttonAction(grouped ? 'Download Team-grouped credentials' : 'Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
   download.disabled = credentials.length === 0; host.append(download); openAdminDialog('Account setup');
   if (credentials.length) downloadCredentials(credentials, batchId);
 }

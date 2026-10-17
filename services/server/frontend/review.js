@@ -1,3 +1,6 @@
+import { nativeSourceRange } from './review-source-selection.mjs';
+import { digest } from 'lib0/hash/sha256';
+import { uuidv4 } from 'lib0/random';
 import { basicSetup } from 'codemirror';
 import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
@@ -65,7 +68,7 @@ const model = {
   reviewOpen: false, currentReviewRound: null,
   filter: 'active', collaboration: null, view: null, pendingAnchor: null, pendingAnchorSummary: null,
   pdf: null, pdfBuildId: null, page: 1, scale: 1, viewport: null, renderTask: null, dragStart: null,
-  suppressSelection: false,
+  suppressSelection: false, contextSourceRange: null,
   identity: null, preferences: { font_size_px: 14, theme: 'LIGHT' },
   editorAppearance: new Compartment(), pendingDraftSave: null, draftSaveFailed: null,
   failedDraftEdit: null, failedDraftDeleteId: null,
@@ -130,6 +133,7 @@ class ReadOnlySession {
     socket.addEventListener('error', () => { ui.liveStatus.textContent = 'Read-only connection failed'; ui.liveStatus.dataset.state = 'error'; });
   }
   receive(event) {
+    if (this.destroyed) return;
     if (typeof event.data === 'string') {
       const value = JSON.parse(event.data);
       if (value.type === 'JOIN_ACCEPTED') { this.metadata = value; this.initialize(); }
@@ -137,8 +141,8 @@ class ReadOnlySession {
       else if (value.type === 'REVIEW_PUBLISHED') { refreshThreads(); refreshRounds(); }
       else if (value.type === 'FILES_CHANGED') { refreshReportFiles(value.file_id, value.revision); }
       else if (value.type === 'RELOAD_REQUIRED') notice('The selected file was removed.', true);
-      else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('The Team Leader changed the paper version; reloading.', true); openPaper(model.paper); }
-      else if (value.type === 'POLICY_CHANGED') { notice(value.message || 'File policy changed; reload.', true); openPaper(model.paper); }
+      else if (value.type === 'PAPER_EPOCH_CHANGED') { notice('The Team Leader changed the paper version; reloading.', true); openPaper(model.paper).catch((failure) => notice(failure.message, true)); }
+      else if (value.type === 'POLICY_CHANGED') { notice(value.message || 'File policy changed; reload.', true); openPaper(model.paper).catch((failure) => notice(failure.message, true)); }
       else if (value.type === 'ERROR') notice(value.message || 'Read-only collaboration failed.', true);
       return;
     }
@@ -173,7 +177,7 @@ async function refreshReportFiles(changedFileId, revision) {
 function mountReadOnlyEditor(session) {
   if (model.view) model.view.destroy(); ui.reviewEditor.replaceChildren();
   const extensions = [basicSetup, EditorState.readOnly.of(true), EditorView.editable.of(false), yCollab(session.text),
-    EditorView.updateListener.of((update) => { if (update.selectionSet && !model.suppressSelection) sourceSelected(update.state); }),
+    EditorView.updateListener.of((update) => { if (update.selectionSet && !model.suppressSelection) sourceSelected(update.state, nativeSourceRange(model.view) || update.state.selection.main).catch((failure) => notice(failure.message, true)); }),
     EditorView.theme({ '&': { height: '100%' }, '.cm-scroller': { overflow: 'auto' }, '.cm-content': { caretColor: 'transparent' } }),
     model.editorAppearance.of(editorAppearance(model.preferences)),
   ];
@@ -181,8 +185,8 @@ function mountReadOnlyEditor(session) {
   model.view = new EditorView({ state: EditorState.create({ doc: session.text.toString(), extensions }), parent: ui.reviewEditor });
 }
 
-async function sourceSelected(state) {
-  const range = state.selection.main;
+async function sourceSelected(state, range = state.selection.main) {
+  if (!ui.reviewPopover.hidden) return;
   if (range.empty || !model.collaboration?.text) { ui.sourceSelection.textContent = 'Select text, then right-click to review'; ui.reviewSelection.disabled = true; return; }
   if (!canDraft()) { ui.sourceSelection.textContent = 'Waiting for your active review assignment'; ui.reviewSelection.disabled = true; return; }
   const quoted = state.sliceDoc(range.from, range.to);
@@ -191,7 +195,7 @@ async function sourceSelected(state) {
   const context = state.sliceDoc(Math.max(0, range.from - 80), Math.min(state.doc.length, range.to + 80));
   const sourceAnchor = {
     file_id: model.file.file_id, encoded_relative_start: [...relativeStart], encoded_relative_end: [...relativeEnd],
-    quoted_text: quoted, context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq,
+    quoted_text: quoted, context_hash: sha256(context), source_sequence: model.collaboration.metadata.durable_seq,
     source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch,
     start_line: state.doc.lineAt(range.from).number,
     end_line: state.doc.lineAt(Math.max(range.from, range.to - 1)).number,
@@ -209,16 +213,36 @@ async function sourceSelected(state) {
   } catch { /* Source annotation remains valid without a projection. */ }
 }
 
-ui.reviewEditor.addEventListener('contextmenu', (event) => {
-  if (!canDraft() || !model.pendingAnchor?.source_anchor || !model.view) return;
-  const selection = model.view.state.selection.main;
+document.addEventListener('selectionchange', () => {
+  if (!model.view || !ui.reviewPopover.hidden) return;
+  const range = nativeSourceRange(model.view);
+  if (range) sourceSelected(model.view.state, range).catch((failure) => notice(failure.message, true));
+});
+
+ui.reviewEditor.addEventListener('mousedown', (event) => {
+  model.contextSourceRange = null;
+  if (event.button !== 2 || !canDraft() || !model.view) return;
+  const range = nativeSourceRange(model.view) || model.view.state.selection.main;
   const position = model.view.posAtCoords({ x: event.clientX, y: event.clientY });
-  if (selection.empty || position == null || position < selection.from || position > selection.to) return;
+  if (range.empty || position == null || position < range.from || position > range.to) return;
+  model.contextSourceRange = { view: model.view, from: range.from, to: range.to, empty: range.empty };
   event.preventDefault();
+}, { capture: true });
+
+ui.reviewEditor.addEventListener('contextmenu', (event) => {
+  if (!canDraft() || !model.view) return;
+  const saved = model.contextSourceRange?.view === model.view ? model.contextSourceRange : null;
+  const range = saved || nativeSourceRange(model.view) || model.view.state.selection.main;
+  const position = model.view.posAtCoords({ x: event.clientX, y: event.clientY });
+  if (range.empty || position == null || position < range.from || position > range.to) return;
+  event.preventDefault();
+  // Anchor construction runs synchronously before its optional PDF projection.
+  sourceSelected(model.view.state, range).catch((failure) => notice(failure.message, true));
   showReviewPopover(event.clientX, event.clientY, model.pendingAnchorSummary);
 });
 
-async function sha256(value) { const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)); return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join(''); }
+// lib0 uses SHA-256 and crypto.getRandomValues, which also work without secure-context-only APIs.
+function sha256(value) { return [...digest(new TextEncoder().encode(value))].map((byte) => byte.toString(16).padStart(2, '0')).join(''); }
 
 async function refreshPapers() {
   const payload = await api.papers(); model.papers = payload.papers; if (model.paper) model.paper = model.papers.find((paper) => paper.id === model.paper.id) || model.paper; ui.assignedPapers.replaceChildren();
@@ -265,7 +289,7 @@ async function openFile(file) {
     }
   }
 }
-function disposeSource() { if (model.view) model.view.destroy(); if (model.collaboration) model.collaboration.destroy(); model.view = null; model.collaboration = null; }
+function disposeSource() { hideComposer(); model.contextSourceRange = null; if (model.view) model.view.destroy(); if (model.collaboration) model.collaboration.destroy(); model.view = null; model.collaboration = null; }
 
 async function refreshBuild() {
   if (!model.paper) return; const payload = await api.buildStatus(model.paper.id); const build = payload.build;
@@ -327,7 +351,7 @@ async function anchorMappedLine(mapping) {
   const target = model.files.find((file) => file.file_id === mapping.mapped_file_id); if (!target) return null; if (model.file?.file_id !== target.file_id) await openFile(target);
   const lineNumber = Math.min(Math.max(mapping.mapped_line, 1), model.view.state.doc.lines); const line = model.view.state.doc.line(lineNumber); const from = Math.min(line.to, line.from + (mapping.mapped_column || 0)); const to = line.to;
   const context = model.view.state.sliceDoc(Math.max(0, from - 80), Math.min(model.view.state.doc.length, to + 80));
-  return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: await sha256(context), source_sequence: model.collaboration.metadata.durable_seq, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch, start_line: lineNumber, end_line: lineNumber };
+  return { file_id: target.file_id, encoded_relative_start: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, from))], encoded_relative_end: [...Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(model.collaboration.text, to))], quoted_text: model.view.state.sliceDoc(from, to), context_hash: sha256(context), source_sequence: model.collaboration.metadata.durable_seq, source_version_id: model.paper.current_version_id, document_epoch: model.collaboration.metadata.document_epoch, start_line: lineNumber, end_line: lineNumber };
 }
 
 function reviewOpen() { return model.reviewOpen; }
@@ -485,7 +509,7 @@ async function pushReview() {
   const count = Number(participation.draft_count || 0);
   const question = count === 0 ? 'Submit review with no new comments?' : `Push review with ${count} draft comment${count === 1 ? '' : 's'}/suggestion${count === 1 ? '' : 's'}?`;
   if (!window.confirm(question)) return;
-  const submissionId = model.pendingSubmissionId || crypto.randomUUID();
+  const submissionId = model.pendingSubmissionId || uuidv4();
   model.pendingSubmissionId = submissionId;
   ui.pushReview.disabled = true; ui.draftStatus.textContent = 'Submitting review…';
   try {
@@ -511,7 +535,7 @@ ui.createSuggestion.addEventListener('click', () => createAnnotation('SUGGESTION
 ui.createAnnotation.addEventListener('click', () => createAnnotation(ui.threadType.value).catch((failure) => notice(failure.message, true)));
 ui.mentorCommentsToggle.addEventListener('click', () => { ui.mentorReviewDrawer.hidden = false; });
 ui.mentorDrawerClose.addEventListener('click', () => { ui.mentorReviewDrawer.hidden = true; });
-ui.pushReview.addEventListener('click', pushReview);
+ui.pushReview.addEventListener('click', () => pushReview().catch((failure) => notice(`Review was not submitted: ${failure.message}`, true)));
 ui.editorFontSize.addEventListener('change', () => persistPreferences({ font_size_px: Number(ui.editorFontSize.value), theme: ui.editorTheme.value }).catch((failure) => notice(failure.message, true)));
 ui.editorTheme.addEventListener('change', () => persistPreferences({ font_size_px: Number(ui.editorFontSize.value), theme: ui.editorTheme.value }).catch((failure) => notice(failure.message, true)));
 ui.resetEditorSettings.addEventListener('click', () => { ui.editorFontSize.value = 14; ui.editorTheme.value = 'LIGHT'; persistPreferences({ font_size_px: 14, theme: 'LIGHT' }).catch((failure) => notice(failure.message, true)); });
