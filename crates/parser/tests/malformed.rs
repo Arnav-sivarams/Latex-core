@@ -15,7 +15,7 @@ fn incomplete_documents_return_partial_analysis() {
         b"\\documentclass{article}\\begin{document}".as_slice(),
     ] {
         let session = parse(Bytes::copy_from_slice(source));
-        assert!(!session.analysis().diagnostics().is_empty());
+        assert_ne!(session.analysis().diagnostics(), []);
     }
 }
 #[test]

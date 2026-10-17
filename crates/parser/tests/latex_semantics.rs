@@ -154,8 +154,8 @@ fn templates_comments_and_verbatim_preserve_expected_structure() {
         assert_eq!(session.analysis().document_classes()[0].name(), class);
     }
     let commented = parse(b"% \\input{evil.tex}\n% \\label{fake}\n% \\section{Fake}\n\\begin{verbatim}\n\\input{not-real.tex}\n\\label{not-real}\n\\end{verbatim}");
-    assert!(commented.analysis().dependencies().is_empty());
-    assert!(commented.analysis().labels().is_empty());
-    assert!(commented.analysis().sections().is_empty());
+    assert_eq!(commented.analysis().dependencies(), []);
+    assert_eq!(commented.analysis().labels(), []);
+    assert_eq!(commented.analysis().sections(), []);
     assert!(commented.analysis().comments().len() >= 3);
 }

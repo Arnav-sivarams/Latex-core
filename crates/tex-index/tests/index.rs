@@ -56,7 +56,7 @@ impl CommandRunner for Fake {
         } else if name == "tlmgr" {
             "tlmgr revision 1 (TeX Live 2026)".into()
         } else if name == "makeindex" {
-            assert!(args.is_empty());
+            assert_eq!(args, &[] as &[&OsStr]);
             String::new()
         } else {
             format!("{name} version 1")

@@ -1244,7 +1244,7 @@ mod tests {
                 "2026-2027".into(),
                 raw.into(),
             )]);
-            assert!(warnings.is_empty());
+            assert_eq!(warnings, Vec::<String>::new());
             assert_eq!(values["course_code"], "BCSE497J");
             assert_eq!(values["team.academic_year"], "2026-2027");
             assert_eq!(values["team.semester"], display);
@@ -1254,7 +1254,7 @@ mod tests {
             "2026-2027".into(),
             "Fall".into(),
         )]);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(
             values["course_code"], " bcse497j ",
             "lookup normalization must never replace the actual institutional identifier"
