@@ -126,6 +126,9 @@ async fn review_regressions_browser_acceptance() {
             sqlx::query("INSERT INTO latex_core.paper_front_matter_values(paper_team_id,field_key,value_json,value_source,updated_by_user_id) VALUES($1,$2,$3,'TEAM_OVERRIDE',$4)").bind(id).bind(key).bind(serde_json::json!(value)).bind(writer_id.as_uuid()).execute(&pool).await.unwrap();
         }
     }
+    if env::var_os("LATEX_CORE_FIDELITY_OUTPUT").is_some() {
+        verify_actual_template_fidelity(&app, &state, &pool, &writer, &teams[1], main_name).await;
+    }
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {

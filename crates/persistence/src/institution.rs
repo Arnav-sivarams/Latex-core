@@ -337,6 +337,8 @@ pub struct PaperTeamPageFilter {
     pub programme_code: Option<String>,
     pub mentor_user_id: Option<Uuid>,
     pub leader_user_id: Option<Uuid>,
+    pub mentor_email: Option<String>,
+    pub leader_email: Option<String>,
     pub template_id: Option<Uuid>,
     pub review_state: Option<String>,
     pub source: Option<String>,
@@ -3073,7 +3075,12 @@ impl InstitutionRepository {
               LEFT JOIN latex_core.external_paper_team_links link ON link.paper_team_id=t.id
               LEFT JOIN latex_core.institution_import_jobs job ON job.id=link.source_import_job_id
               LEFT JOIN LATERAL (SELECT r.status FROM latex_core.review_rounds r WHERE r.paper_id=t.id ORDER BY r.opened_at DESC,r.id DESC LIMIT 1) review ON TRUE
-              WHERE ($1::text IS NULL OR t.name ILIKE '%' || $1 || '%' OR link.external_team_key ILIKE '%' || $1 || '%')
+              WHERE ($1::text IS NULL OR strpos(lower(t.name),lower($1))>0 OR strpos(lower(link.external_team_key),lower($1))>0
+                OR EXISTS (SELECT 1 FROM latex_core.paper_team_members m
+                           JOIN latex_core.global_user_roles r ON r.user_id=m.user_id
+                           JOIN latex_core.user_credentials c ON c.user_id=m.user_id
+                           WHERE m.paper_team_id=t.id AND (r.role='mentor' OR (r.role='writer' AND m.is_leader))
+                             AND strpos(lower(c.email),lower($1))>0))
                 AND ($2::text IS NULL OR t.status=$2)
                 AND ($3::text IS NULL OR resolution.dominant_programme_code=$3)
                 AND ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='mentor' WHERE m.paper_team_id=t.id AND m.user_id=$4))
@@ -3082,6 +3089,8 @@ impl InstitutionRepository {
                 AND ($7::text IS NULL OR COALESCE(review.status,'NONE')=$7)
                 AND ($8::text IS NULL OR ($8='manual' AND link.external_team_key IS NULL) OR ($8='imported' AND link.external_team_key IS NOT NULL))
                 AND ($9::boolean IS NULL OR $9=FALSE)
+                AND ($12::text IS NULL OR EXISTS (SELECT 1 FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='mentor' JOIN latex_core.user_credentials c ON c.user_id=m.user_id WHERE m.paper_team_id=t.id AND strpos(lower(c.email),lower($12))>0))
+                AND ($13::text IS NULL OR EXISTS (SELECT 1 FROM latex_core.paper_team_members m JOIN latex_core.global_user_roles r ON r.user_id=m.user_id AND r.role='writer' JOIN latex_core.user_credentials c ON c.user_id=m.user_id WHERE m.paper_team_id=t.id AND m.is_leader AND strpos(lower(c.email),lower($13))>0))
               ORDER BY t.updated_at DESC,t.id DESC LIMIT $10 OFFSET $11",
         )
         .bind(
@@ -3101,6 +3110,8 @@ impl InstitutionRepository {
         .bind(filter.unresolved)
         .bind(limit)
         .bind(offset)
+        .bind(filter.mentor_email.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(filter.leader_email.as_deref().map(str::trim).filter(|s| !s.is_empty()))
         .fetch_all(self.database.pool())
         .await
         .map_err(InstitutionError::Database)?;
@@ -3176,11 +3187,15 @@ impl InstitutionRepository {
                   LEFT JOIN vcap.paper_assignment_students writer ON writer.external_team_key=g.external_team_key
                   LEFT JOIN latex_core.external_paper_team_links link ON link.external_team_key=g.external_team_key
                   WHERE link.external_team_key IS NULL
-                    AND ($1::text IS NULL OR g.team_name ILIKE '%' || $1 || '%' OR g.external_team_key ILIKE '%' || $1 || '%')
+                    AND ($1::text IS NULL OR strpos(lower(g.team_name),lower($1))>0 OR strpos(lower(g.external_team_key),lower($1))>0
+                      OR EXISTS (SELECT 1 FROM vcap.paper_assignment_mentors assigned JOIN vcap.faculty_user_links identity ON identity.faculty_id=assigned.faculty_id AND identity.status='LINKED' JOIN latex_core.user_credentials c ON c.user_id=identity.user_id JOIN latex_core.global_user_roles r ON r.user_id=c.user_id AND r.role='mentor' WHERE assigned.external_team_key=g.external_team_key AND strpos(lower(c.email),lower($1))>0)
+                      OR EXISTS (SELECT 1 FROM vcap.paper_assignment_students assigned JOIN vcap.student_user_links identity ON identity.reg_no=assigned.student_reg_no AND identity.status='LINKED' JOIN latex_core.user_credentials c ON c.user_id=identity.user_id JOIN latex_core.global_user_roles r ON r.user_id=c.user_id AND r.role='writer' WHERE assigned.external_team_key=g.external_team_key AND assigned.is_leader AND strpos(lower(c.email),lower($1))>0))
                     AND ($2::text IS NULL OR COALESCE(g.status,'unresolved')=$2)
                     AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_students assigned JOIN vcap.students student ON student.reg_no=assigned.student_reg_no WHERE assigned.external_team_key=g.external_team_key AND student.programme_code=$3))
                     AND ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_mentors assigned JOIN vcap.faculty_user_links identity ON identity.faculty_id=assigned.faculty_id AND identity.status='LINKED' WHERE assigned.external_team_key=g.external_team_key AND identity.user_id=$4))
                     AND ($5::uuid IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_students assigned JOIN vcap.student_user_links identity ON identity.reg_no=assigned.student_reg_no AND identity.status='LINKED' WHERE assigned.external_team_key=g.external_team_key AND assigned.is_leader AND identity.user_id=$5))
+                    AND ($8::text IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_mentors assigned JOIN vcap.faculty_user_links identity ON identity.faculty_id=assigned.faculty_id AND identity.status='LINKED' JOIN latex_core.user_credentials c ON c.user_id=identity.user_id JOIN latex_core.global_user_roles r ON r.user_id=c.user_id AND r.role='mentor' WHERE assigned.external_team_key=g.external_team_key AND strpos(lower(c.email),lower($8))>0))
+                    AND ($9::text IS NULL OR EXISTS (SELECT 1 FROM vcap.paper_assignment_students assigned JOIN vcap.student_user_links identity ON identity.reg_no=assigned.student_reg_no AND identity.status='LINKED' JOIN latex_core.user_credentials c ON c.user_id=identity.user_id JOIN latex_core.global_user_roles r ON r.user_id=c.user_id AND r.role='writer' WHERE assigned.external_team_key=g.external_team_key AND assigned.is_leader AND strpos(lower(c.email),lower($9))>0))
                   GROUP BY g.external_team_key,g.team_name,g.status,g.academic_year,g.semester
               ) SELECT * FROM unresolved ORDER BY updated_at DESC,external_team_key LIMIT $6 OFFSET $7",
         )
@@ -3197,6 +3212,8 @@ impl InstitutionRepository {
         .bind(filter.leader_user_id)
         .bind(limit)
         .bind(offset)
+        .bind(filter.mentor_email.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(filter.leader_email.as_deref().map(str::trim).filter(|s| !s.is_empty()))
         .fetch_all(self.database.pool())
         .await
         .map_err(InstitutionError::Database)?;

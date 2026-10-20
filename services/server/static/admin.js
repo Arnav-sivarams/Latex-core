@@ -733,10 +733,10 @@ async function openTeamDetail(team, templates, frontMatterPacks) {
 
 async function renderPaperTeamGrid() {
   const [templates, frontMatterPacks] = await Promise.all([api('/api/admin/templates'), api('/api/admin/v2/front-matter-packs')]); await renderManualTeamForm(templates, frontMatterPacks);
-  const state = { page: 1, limit: 25, search: '', status: '', programme_code: '', mentor_user_id: '', leader_user_id: '', template_id: '', review_state: '', source: '', unresolved: '' };
+  const state = { page: 1, limit: 25, search: '', status: '', programme_code: '', mentor_email: '', leader_email: '', template_id: '', review_state: '', source: '', unresolved: '' };
   const filters = filterForm([
-    { name: 'search', label: 'Search Teams', type: 'search', placeholder: 'Search Teams…' }, { name: 'status', label: 'Status', type: 'select', options: [['Active', 'active'], ['Frozen', 'frozen'], ['Submitted', 'submitted'], ['Archived', 'archived']] },
-    { name: 'programme_code', label: 'Programme' }, { name: 'mentor_user_id', label: 'Mentor user ID' }, { name: 'leader_user_id', label: 'Leader user ID' },
+    { name: 'search', label: 'Search Teams', type: 'search', placeholder: 'Team name or Leader/Mentor email…' }, { name: 'status', label: 'Status', type: 'select', options: [['Active', 'active'], ['Frozen', 'frozen'], ['Submitted', 'submitted'], ['Archived', 'archived']] },
+    { name: 'programme_code', label: 'Programme' }, { name: 'mentor_email', label: 'Mentor email', type: 'search' }, { name: 'leader_email', label: 'Leader email', type: 'search' },
     { name: 'template_id', label: 'Template', type: 'select', options: templates.map((item) => [item.name, item.id]) }, { name: 'review_state', label: 'Review state' }, { name: 'source', label: 'Source', type: 'select', options: [['Manual', 'manual'], ['Imported', 'imported']] }, { name: 'unresolved', label: 'Unresolved', type: 'select', options: [['Only unresolved', 'true'], ['Resolved only', 'false']] },
   ], (values) => { Object.assign(state, values, { page: 1 }); load(); });
   const pageSize = document.createElement('select'); [25, 50, 100].forEach((size) => pageSize.append(new Option(`${size} per page`, size))); pageSize.addEventListener('change', () => { state.limit = Number(pageSize.value); state.page = 1; load(); }); filters.append(pageSize); content.append(filters);

@@ -115,8 +115,8 @@ test('institution data manager uses server pagination and authoritative manual o
   assert.match(js, /paper-teams\/query\?\$\{queryString\(state\)\}/);
   assert.match(js, /\[25, 50, 100\]/);
   assert.match(js, /programme_code/);
-  assert.match(js, /mentor_user_id/);
-  assert.match(js, /leader_user_id/);
+  assert.match(js, /mentor_email/);
+  assert.match(js, /leader_email/);
   assert.match(js, /review_state/);
   assert.match(js, /unresolved/);
   const teamList = js.slice(js.indexOf('async function renderPaperTeamGrid('), js.indexOf('async function renderImport', js.indexOf('async function renderPaperTeamGrid(')));

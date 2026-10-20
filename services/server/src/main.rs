@@ -284,6 +284,8 @@ struct PaperTeamPageQuery {
     programme_code: Option<String>,
     mentor_user_id: Option<uuid::Uuid>,
     leader_user_id: Option<uuid::Uuid>,
+    mentor_email: Option<String>,
+    leader_email: Option<String>,
     template_id: Option<uuid::Uuid>,
     review_state: Option<String>,
     source: Option<String>,
@@ -1867,6 +1869,8 @@ async fn admin_v2_paper_teams_query(
         programme_code: query.programme_code,
         mentor_user_id: query.mentor_user_id,
         leader_user_id: query.leader_user_id,
+        mentor_email: query.mentor_email,
+        leader_email: query.leader_email,
         template_id: query.template_id,
         review_state: query.review_state,
         source: query.source,
@@ -12479,6 +12483,8 @@ mod database_tests {
     include!("source_preservation_db_tests.rs");
     include!("nine_corrections_db_tests.rs");
     include!("review_regressions_db_tests.rs");
+    include!("team_email_search_db_tests.rs");
+    include!("template_fidelity_db_tests.rs");
     use super::*;
     use axum::{
         body::Body,

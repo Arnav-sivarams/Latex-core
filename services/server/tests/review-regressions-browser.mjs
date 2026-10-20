@@ -80,6 +80,8 @@ try {
   const gutter=await m.page.locator('.cm-gutters').boundingBox();const sourceLeft=Math.max(box.x+4,gutter.x+gutter.width+4);
   await m.page.mouse.move(sourceLeft,box.y+box.height/2); await m.page.mouse.down();
   await m.page.mouse.move(Math.max(end.x+Math.min(end.width-4,150),sourceLeft+30),end.y+end.height/2,{steps:12}); await m.page.mouse.up();
+  const selectedQuote=await m.page.evaluate(()=>window.getSelection().toString());
+  assert.ok(selectedQuote.length>0);
   console.log('SELECTION:',await m.page.locator('#sourceSelection').textContent(),await m.page.locator('.cm-content').evaluate(el=>({nativeLength:window.getSelection()?.toString().length,nativeInEditor:el.contains(window.getSelection()?.anchorNode)&&el.contains(window.getSelection()?.focusNode),editor:el.cmTile?.root?.view?.state.selection.main.toJSON()})),{box,end});
   await m.page.mouse.click(sourceLeft+12,box.y+box.height/2,{button:'right'});
   await m.page.locator('#reviewPopover').waitFor({state:'visible',timeout:5000});
@@ -87,7 +89,9 @@ try {
   await m.page.locator('#threadMessage').fill('Synthetic source feedback'); await m.page.locator('#createComment').click(); console.log('DRAFT_CLICKED');
   await m.page.waitForFunction(()=>document.querySelector('#draftStatus').textContent.includes('Draft saved'));
   await m.page.reload(); await m.page.locator('.cm-content').waitFor();
-  assert.equal((await json(m.ctx,review+'/threads')).threads.length,1);
+  const privateSource=(await json(m.ctx,review+'/threads')).threads;
+  assert.equal(privateSource.length,1);
+  assert.equal(privateSource[0].source_anchor.quoted_text,selectedQuote,'Mouse selection must be stored at the exact source range');
   assert.equal((await json(w.ctx,review+'/threads')).threads.length,0);
   const overlay=m.page.locator('#pdfOverlay'); await overlay.waitFor();
   const pdf=await overlay.boundingBox();
@@ -96,6 +100,7 @@ try {
   await m.page.locator('#reviewPopover').waitFor({state:'visible'});
   await m.page.locator('#threadMessage').fill('Synthetic PDF feedback'); await m.page.locator('#createComment').click(); console.log('DRAFT_CLICKED');
   await m.page.waitForFunction(()=>document.querySelector('#draftStatus').textContent.includes('Draft saved'));
+  assert.equal((await json(w.ctx,review+'/threads')).threads.length,0,'Both source and PDF drafts remain private until Push Review');
   await m.page.bringToFront();m.page.on('dialog',d=>{console.log('MENTOR_DIALOG:',d.type());return d.accept();}); const publication=m.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/submit')).catch(async error=>{console.log('PUSH_UI:',await m.page.locator('#reviewNotice').textContent(),await m.page.locator('#draftStatus').textContent());throw error;});await m.page.locator('#pushReview').click();const sent=await publication;assert.equal(sent.status(),200);const retry=await m.ctx.request.post(sent.url(),{data:sent.request().postDataJSON(),headers:{Origin:base}});assert.equal(retry.status(),200);
   await m.page.waitForFunction(()=>document.querySelector('#reviewNotice').textContent.includes('Review submitted. Writers can now see your feedback.'));
   assert.equal((await json(w.ctx,review+'/threads')).threads.length,2);
@@ -106,6 +111,7 @@ try {
   await sourceCard.locator('.thread-title').click();
   await w.page.waitForFunction(()=>document.querySelector('#currentFile').textContent==='Full_Report_template_v1.0/chapters/chapter1.tex');
   await w.page.locator('.cm-content').waitFor();await w.page.waitForFunction(()=>document.querySelector('#saveStatus').dataset.state==='synced');
+  await w.page.waitForFunction(quote=>{const view=document.querySelector('.cm-content')?.cmTile?.root?.view;return view&&view.state.sliceDoc(view.state.selection.main.from,view.state.selection.main.to)===quote;},selectedQuote);
   const [reply]=await Promise.all([w.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/messages'),{timeout:15000}),sourceCard.getByRole('button',{name:'Reply',exact:true}).click({timeout:10000})]).catch(async error=>{console.log('WRITER_FEEDBACK_UI:',await w.page.locator('#writerNotice').textContent());await w.page.screenshot({path:'/tmp/latex-review-feedback.png',mask:[w.page.locator('.discussion')]});throw error;});assert.ok(reply.ok());await sourceCard.locator('.discussion').getByText('Synthetic Writer reply',{exact:false}).waitFor();
   const [done]=await Promise.all([w.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/state'),{timeout:15000}),sourceCard.getByRole('button',{name:'Done',exact:true}).click({timeout:10000})]);assert.ok(done.ok());
   assert.ok((await json(w.ctx,review+'/threads')).threads.some(t=>t.state==='RESOLVED'));
@@ -115,6 +121,18 @@ try {
   if (process.env.REVIEW_SKIP_POLICY) process.exitCode=0;
   else {
     const admin=await client(config.adminCookie);await login(admin,config.adminEmail); await admin.page.goto(base+'/admin');
+    await admin.page.getByRole('button',{name:'Paper Teams',exact:true}).click();
+    const filters=admin.page.locator('form.admin-filters');
+    for(const [field,value] of [['search',config.mentorEmail],['search',config.writerEmail.toUpperCase()],['mentor_email',`  ${config.mentorEmail.split('@')[0]}  `],['leader_email',config.writerEmail]]) {
+      for(const name of ['search','mentor_email','leader_email'])await filters.locator(`[name="${name}"]`).fill(name===field?value:'');
+      const response=admin.page.waitForResponse(r=>r.url().includes('/paper-teams/query?'));
+      await filters.getByRole('button',{name:'Apply filters',exact:true}).click();
+      const result=await (await response).json();assert.equal(result.total,3);assert.equal(result.items.length,3);
+      await admin.page.getByRole('cell',{name:'Review regression fixture',exact:true}).waitFor();
+    }
+    assert.equal(await filters.getByText('Mentor user ID',{exact:true}).count(),0);
+    assert.equal(await filters.getByText('Leader user ID',{exact:true}).count(),0);
+    console.log('TEAM_EMAIL_SEARCH_BROWSER_PASS: generic and role-specific email filters, case and whitespace');
     await admin.page.getByRole('button',{name:'File Policies',exact:true}).click();
     const chapter='Full_Report_template_v1.0/chapters/chapter1.tex';
     const policyTeam=admin.page.getByRole('combobox',{name:'Paper Team',exact:true});

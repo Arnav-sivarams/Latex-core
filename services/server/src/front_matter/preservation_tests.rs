@@ -14,6 +14,8 @@ pub(crate) fn sensitive_source(newline: &str) -> String {
         r"\newcommand{\thesisyear}[0]{2026}",
         r"\newcommand{\latexcoresubmissiondate}{2026-10-07}",
         r"\newcommand{\customspacing}{\linespread{1.3}\setstretch{1.5}}",
+        r"\newcommand{\linespace}[1]{\vspace{#1}} % custom authored macro",
+        r"\newcommand{\customlines}{\linespace{4mm}}",
         r"\renewcommand{\baselinestretch}{1.2}",
         r"\providecommand{\customfont}{\sffamily\large}",
         r"\def\customskip{\vspace*{3mm}}",
