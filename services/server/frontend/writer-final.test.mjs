@@ -44,7 +44,9 @@ test('Writer omits the recovery-copy control while retaining diagnostic navigati
   assert.doesNotMatch(writer, /copyRecoveryText/);
   assert.match(html, /id="buildProblemsList"/);
   assert.match(html, /id="buildLogTab"/);
-  assert.match(writer, /openLocation\(diagnostic\)/);
+  assert.match(writer, /renderProblemList\(ui\.buildProblemsList, diagnostics, openLocation\)/);
+  const problems = readFileSync(new URL('./writer-problems.mjs', import.meta.url), 'utf8');
+  assert.match(problems, /openLocation\(diagnostic\)/);
   assert.match(writer, /model\.recoveryText = recovered/);
   assert.match(writer, /IndexeddbPersistence/);
 });

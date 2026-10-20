@@ -12344,6 +12344,44 @@ mod tests {
     }
 
     #[test]
+    fn csrf_supports_network_origins_without_trusting_forwarded_hosts() {
+        for host in [
+            "localhost:8080",
+            "192.168.1.42:8080",
+            "[fd00::42]:8080",
+            "latex.example",
+        ] {
+            for scheme in ["http", "https"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::HOST, host.parse().expect("valid test host"));
+                headers.insert(
+                    header::ORIGIN,
+                    format!("{scheme}://{host}")
+                        .parse()
+                        .expect("valid test origin"),
+                );
+                assert!(csrf(&headers).is_ok(), "{scheme}://{host}");
+                headers.insert(
+                    "x-forwarded-host",
+                    HeaderValue::from_static("attacker.example"),
+                );
+                headers.insert(
+                    header::ORIGIN,
+                    HeaderValue::from_static("https://attacker.example"),
+                );
+                assert!(csrf(&headers).is_err());
+                headers.insert(
+                    header::ORIGIN,
+                    format!("{scheme}://{host}.attacker.example")
+                        .parse()
+                        .expect("valid foreign test origin"),
+                );
+                assert!(csrf(&headers).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn logical_paths_and_stale_versions_are_strict() {
         assert!(LogicalPath::parse("../escape.tex").is_err());
         let mut headers = HeaderMap::new();

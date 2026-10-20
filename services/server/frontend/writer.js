@@ -1,4 +1,4 @@
-import { diagnosticIcon } from './writer-policy.mjs';
+import { renderProblemList } from './writer-problems.mjs';
 import { frontMatterStatus, editableDetail, needsFirstUseDetails, detailCategory } from './document-details.mjs';
 import { writerEditorSetup } from './writer-editor.mjs';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
@@ -583,24 +583,6 @@ function buildDiagnostics() {
   return diagnostics;
 }
 
-function renderProblemList(host, diagnostics) {
-  host.replaceChildren();
-  if (!diagnostics.length) {
-    host.innerHTML = '<p class="empty-copy">No current problems.</p>';
-    return;
-  }
-  diagnostics.forEach((diagnostic) => {
-    const row = button(diagnostic.message, () => diagnostic.file_id && openLocation(diagnostic));
-    row.className = `problem-row build-problem-${diagnostic.severity || 'info'}`;
-    const indicator = document.createElement('span'); indicator.innerHTML = diagnosticIcon(diagnostic.severity);
-    row.prepend(indicator);
-    row.title = `${diagnostic.severity || 'Information'}: ${diagnostic.message}`;
-    const line = diagnostic.range?.start_line;
-    row.append(Object.assign(document.createElement('small'), { textContent: `${diagnostic.path || 'Build'}${line ? `:${line}` : ''} · ${diagnostic.code || diagnostic.severity || 'info'}` }));
-    host.append(row);
-  });
-}
-
 function renderProblems() {
   const diagnostics = buildDiagnostics();
   const state = problemsState(diagnostics);
@@ -609,8 +591,8 @@ function renderProblems() {
   ui.problemsToggle.title = state.label;
   ui.problemsCount.textContent = diagnostics.length;
   ui.buildFooterCount.textContent = diagnostics.length;
-  renderProblemList(ui.buildProblemsList, diagnostics);
-  if (ui.problemsList) renderProblemList(ui.problemsList, diagnostics);
+  renderProblemList(ui.buildProblemsList, diagnostics, openLocation);
+  if (ui.problemsList) renderProblemList(ui.problemsList, diagnostics, openLocation);
 }
 
 function selectBuildFooterTab(tab) {
@@ -756,7 +738,7 @@ class CollaborationSession {
       const control = JSON.parse(event.data);
       if (control.type === 'JOIN_ACCEPTED') {
         if (this.documentEpoch !== null && this.documentEpoch !== control.document_epoch) {
-          this.preserveOldEpoch(control.document_epoch);
+          this.preserveOldEpoch(control.document_epoch, true);
           return;
         }
         this.documentEpoch = control.document_epoch;
@@ -830,14 +812,17 @@ class CollaborationSession {
     }
   }
 
-  preserveOldEpoch(newEpoch) {
+  preserveOldEpoch(newEpoch, rejoining = false) {
     if (model.collaboration !== this) return;
     model.recoveryText = this.text?.toString() || '';
     model.conflict = true;
     saveState('conflict');
     notice('Offline changes from the previous paper version were preserved locally and were not merged after restoration.', true);
     this.destroy();
-    if (!model.metadataSaving && Number.isInteger(newEpoch)) this.reloadPaperAfterControl();
+    // A metadata save already reloads the paper after its epoch notification.
+    // If that reload rejoins a retained file from the old epoch, it must replace
+    // that session even while the metadata handler is still finishing.
+    if ((!model.metadataSaving || rejoining) && Number.isInteger(newEpoch)) this.reloadPaperAfterControl();
   }
 
   reloadPaperAfterControl() {

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { networkInterfaces } from 'node:os';
 import { credentialHandoff } from './credential-handoff-browser.mjs';
+import { verifyServedAssets, verifyProblems, verifyCollaboration } from './origin-workflows-browser.mjs';
 import { chromium, firefox } from 'playwright';
 const config = JSON.parse(process.env.LATEX_CORE_REVIEW_CONFIG);
 const engine = process.env.REVIEW_BROWSER === 'firefox' ? firefox : chromium;
@@ -10,10 +11,16 @@ const base = `http://${host}:${config.port}`;
 const contexts = [];
 const browserFailures = [];
 const serverFailures = [];
+const blockedRequests = [];
 async function client(cookie) {
   const ctx = await browser.newContext({viewport:{width:1440,height:1000},acceptDownloads:true}); contexts.push(ctx);
+  ctx.setDefaultTimeout(30000);
   const [name,...value]=cookie.split('='); await ctx.addCookies([{name,value:value.join('='),url:base}]);
   const sockets=[]; const page=await ctx.newPage(); page.on('websocket',socket=>sockets.push(socket)); page.on('pageerror',e=>{browserFailures.push(e.message);console.log('BROWSER_EXCEPTION:',e.stack);});page.on('response',r=>{if(r.status()>=500)serverFailures.push(`${r.status()} ${new URL(r.url()).pathname}`);});
+  page.on('requestfailed', request => {
+    // Navigations intentionally cancel superseded reads; security/network failures do not.
+    if (!['net::ERR_ABORTED', 'NS_BINDING_ABORTED'].includes(request.failure()?.errorText)) blockedRequests.push(`${request.failure()?.errorText} ${request.url()}`);
+  });
   return {ctx,page,sockets};
 }
 async function json(ctx,path,method='GET',data) {
@@ -33,6 +40,11 @@ try {
   await login(w,config.writerEmail);await login(m,config.mentorEmail);
   await w.page.bringToFront();await w.page.goto(`${base}/write?paper=${config.paperId}`); await w.page.locator('.cm-content').waitFor();
   console.log('ORIGIN:',base,await w.page.evaluate(()=>({secure:isSecureContext,subtle:!!crypto.subtle,randomUUID:typeof crypto.randomUUID})));
+  assert.equal(await w.page.evaluate(() => isSecureContext), host === 'localhost' || host === '127.0.0.1', 'LAN HTTP must run without a browser security bypass');
+  await verifyServedAssets(w.ctx, base);
+  await verifyProblems(w.page, base, config.paperId, await json(w.ctx, paper+'/files'));
+  const other=await client(config.otherCookie);await login(other,config.otherEmail);
+  await verifyCollaboration(w, other, base, config.paperId, await json(w.ctx,paper+'/files'), json);
   await w.page.locator('#documentDetails').click();
   const panel=w.page.locator('#documentDetailsBody');
   await panel.getByText('Course code: BCSE4973',{exact:true}).waitFor();assert.equal(await panel.locator('[name="field:course_code"]').count(),0);assert.equal(await panel.locator('[name="field:course_name"]').inputValue(),'Project-I');
@@ -42,13 +54,14 @@ try {
   console.log('DETAILS_READY:',await panel.locator('input:invalid').evaluateAll(nodes=>nodes.map(n=>n.name)),await w.page.locator('#saveStatus').textContent());
   await panel.getByRole('button',{name:'Save document details',exact:true}).click(); assert.equal((await saved).status(),200);
   await w.page.waitForFunction(()=>document.querySelector('#writerNotice').textContent.includes('metadata saved'));
+  await w.page.waitForFunction(()=>document.querySelector('#saveStatus').dataset.state==='synced');
   await w.page.locator('#drawerClose').click();
   await w.page.locator('#compilePaper').click();
   await w.page.waitForFunction(()=>document.querySelector('#buildStatus').textContent==='Compiled',null,{timeout:120000});
   await w.page.waitForFunction(()=>!document.querySelector('#downloadPdf').disabled);
   console.log('DOWNLOAD_READY:',await w.page.locator('#workspaceDrawer').isVisible(),await w.page.locator('#buildStatus').textContent());
   const [pdfDownload]=await Promise.all([w.page.waitForEvent('download'),w.page.locator('#downloadPdf').click({timeout:10000})]);assert.equal(pdfDownload.suggestedFilename(),'Review regression fixture.pdf');console.log('TEAM_PDF_DOWNLOAD_PASS');
-  const other=await client(config.otherCookie);await login(other,config.otherEmail);await other.page.goto(`${base}/write?paper=${config.paperId}`);await other.page.locator('.cm-content').waitFor();assert.equal(await other.page.locator('#sendReview').isVisible(),false);
+  assert.equal(await other.page.locator('#sendReview').isVisible(),false);
   await w.page.bringToFront();await w.page.locator('#sendReview').click();
   await w.page.waitForFunction(()=>document.querySelector('#reviewStateBadge').textContent==='In Review');
   const round=(await json(w.ctx,review+'/rounds')).current_review_round;
@@ -85,6 +98,8 @@ try {
   console.log('SELECTION:',await m.page.locator('#sourceSelection').textContent(),await m.page.locator('.cm-content').evaluate(el=>({nativeLength:window.getSelection()?.toString().length,nativeInEditor:el.contains(window.getSelection()?.anchorNode)&&el.contains(window.getSelection()?.focusNode),editor:el.cmTile?.root?.view?.state.selection.main.toJSON()})),{box,end});
   await m.page.mouse.click(sourceLeft+12,box.y+box.height/2,{button:'right'});
   await m.page.locator('#reviewPopover').waitFor({state:'visible',timeout:5000});
+  const popup=await m.page.locator('#reviewPopover').boundingBox();
+  assert.ok(Math.abs(popup.x-(sourceLeft+12))<40 && Math.abs(popup.y-(box.y+box.height/2))<40, 'Source popup opens at the actual selection');
   console.log('SOURCE_POPUP_PASS');
   await m.page.locator('#threadMessage').fill('Synthetic source feedback'); await m.page.locator('#createComment').click(); console.log('DRAFT_CLICKED');
   await m.page.waitForFunction(()=>document.querySelector('#draftStatus').textContent.includes('Draft saved'));
@@ -112,6 +127,7 @@ try {
   await w.page.waitForFunction(()=>document.querySelector('#currentFile').textContent==='Full_Report_template_v1.0/chapters/chapter1.tex');
   await w.page.locator('.cm-content').waitFor();await w.page.waitForFunction(()=>document.querySelector('#saveStatus').dataset.state==='synced');
   await w.page.waitForFunction(quote=>{const view=document.querySelector('.cm-content')?.cmTile?.root?.view;return view&&view.state.sliceDoc(view.state.selection.main.from,view.state.selection.main.to)===quote;},selectedQuote);
+  await w.page.locator('.review-source-highlight').first().waitFor();
   const [reply]=await Promise.all([w.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/messages'),{timeout:15000}),sourceCard.getByRole('button',{name:'Reply',exact:true}).click({timeout:10000})]).catch(async error=>{console.log('WRITER_FEEDBACK_UI:',await w.page.locator('#writerNotice').textContent());await w.page.screenshot({path:'/tmp/latex-review-feedback.png',mask:[w.page.locator('.discussion')]});throw error;});assert.ok(reply.ok());await sourceCard.locator('.discussion').getByText('Synthetic Writer reply',{exact:false}).waitFor();
   const [done]=await Promise.all([w.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/state'),{timeout:15000}),sourceCard.getByRole('button',{name:'Done',exact:true}).click({timeout:10000})]);assert.ok(done.ok());
   assert.ok((await json(w.ctx,review+'/threads')).threads.some(t=>t.state==='RESOLVED'));
@@ -203,4 +219,10 @@ try {
   }
   assert.deepEqual(browserFailures,[],'No browser runtime exceptions are permitted in the accepted flow');
   assert.deepEqual(serverFailures,[],'No server errors are permitted in the accepted flow');
+  assert.deepEqual(blockedRequests,[],'No blocked network requests are permitted in the accepted flow');
+} catch (error) {
+  for (const ctx of contexts) for (const page of ctx.pages()) {
+    console.error('ACCEPTANCE_FAILURE_STATE:', page.url(), await page.locator('#writerNotice, #reviewNotice, #saveStatus, #buildStatus, #draftStatus').allTextContents());
+  }
+  throw error;
 } finally { for(const ctx of contexts) await ctx.close(); await browser.close(); }
