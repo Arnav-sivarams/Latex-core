@@ -105,6 +105,10 @@ pub fn router() -> Router<AppState> {
         .route("/static/pdf.min.mjs", get(pdf_js))
         .route("/static/pdf.worker.min.mjs", get(pdf_worker))
         .route("/api/v2/mentor/papers", get(mentor_papers))
+        .route(
+            "/api/v2/reviews/papers/{paper_id}/client-errors",
+            post(crate::review_diagnostics::client_error),
+        )
         .route("/api/v2/reviews/papers/{paper_id}", get(review_paper))
         .route("/api/v2/reviews/papers/{paper_id}/files", get(review_files))
         .route(
@@ -206,7 +210,7 @@ fn static_asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::CACHE_CONTROL, "no-cache"),
         ],
         Bytes::from_static(bytes),
     )
@@ -591,20 +595,40 @@ async fn publish_review(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((paper_id, round_id)): Path<(Uuid, Uuid)>,
-    Json(input): Json<PublishReviewInput>,
+    input: Result<Json<PublishReviewInput>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = csrf(&headers) {
-        return response;
+        return publication_response(paper_id, round_id, None, None, response);
     }
     let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return publication_response(paper_id, round_id, None, None, response),
+    };
+    let input = match input {
+        Ok(Json(input)) => input,
+        Err(rejection) => {
+            return publication_response(
+                paper_id,
+                round_id,
+                None,
+                Some(mentor),
+                rejection.into_response(),
+            );
+        }
     };
     let (paper, _) = match state.v2.review_paper(mentor, paper_id).await {
         Ok(value) => value,
-        Err(value) => return v2_error(value),
+        Err(value) => {
+            return publication_response(
+                paper_id,
+                round_id,
+                Some(input.submission_id),
+                Some(mentor),
+                v2_error(value),
+            );
+        }
     };
-    match state
+    let response = match state
         .v2
         .publish_review_drafts(
             mentor,
@@ -647,7 +671,41 @@ async fn publish_review(
             "This review was already submitted with a different request. Reload its status.",
         ),
         Err(value) => v2_error(value),
+    };
+    publication_response(
+        paper_id,
+        round_id,
+        Some(input.submission_id),
+        Some(mentor),
+        response,
+    )
+}
+
+// Runtime evidence records only requests received here; private review contents never enter logs.
+fn publication_response(
+    paper_id: Uuid,
+    round_id: Uuid,
+    submission_id: Option<Uuid>,
+    actor: Option<UserId>,
+    response: Response,
+) -> Response {
+    let request_id = Uuid::new_v4();
+    let status = response.status();
+    let code = match status.as_u16() {
+        200..=299 => "PUBLICATION_CONFIRMED",
+        401 => "AUTHENTICATION_REQUIRED",
+        403 => "AUTHORIZATION_OR_ORIGIN_REJECTED",
+        404 => "REVIEW_NOT_AVAILABLE",
+        409 => "REVIEW_STATE_CONFLICT",
+        400 | 415 | 422 => "INVALID_PUBLICATION_REQUEST",
+        _ => "PUBLICATION_FAILED",
+    };
+    if status.is_success() {
+        tracing::info!(event = "REVIEW_PUBLICATION_RESPONSE", %request_id, %paper_id, %round_id, ?submission_id, ?actor, http_status = status.as_u16(), outcome = "confirmed", error_code = code);
+    } else {
+        tracing::warn!(event = "REVIEW_PUBLICATION_RESPONSE", %request_id, %paper_id, %round_id, ?submission_id, ?actor, http_status = status.as_u16(), outcome = "rejected", error_code = code);
     }
+    response
 }
 
 async fn add_message(
@@ -1072,7 +1130,7 @@ async fn participant_session(state: &AppState, headers: &HeaderMap) -> Result<Us
     Ok(principal.user_id())
 }
 
-async fn role_session(
+pub(crate) async fn role_session(
     state: &AppState,
     headers: &HeaderMap,
     required: GlobalRole,
@@ -1205,6 +1263,15 @@ fn context_hash(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mutable_review_asset_url_must_revalidate_and_bypass_legacy_immutable_cache() {
+        let response = review_js().await;
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let html = include_str!("review.html");
+        assert!(!html.contains("review.js?v=v2-run2"));
+        assert!(html.contains("review.js?v=review-ip-20261022"));
+    }
 
     #[test]
     fn simple_comment_defaults_hidden_legacy_metadata() {

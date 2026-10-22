@@ -12,7 +12,7 @@ test('review anchors and publication retain the LAN-compatible cryptographic hel
  assert.match(review,/import \{ digest \} from 'lib0\/hash\/sha256'/);
  assert.match(review,/import \{ uuidv4 \} from 'lib0\/random'/);
  assert.match(review,/digest\(new TextEncoder\(\)\.encode\(value\)\)/);
- assert.match(review,/model\.pendingSubmissionId \|\| uuidv4\(\)/);
+ assert.match(review,/submission_id: uuidv4\(\)/);
  assert.doesNotMatch(review,/crypto\.(?:subtle\.|randomUUID\()|Math\.random\(/);
 });
 test('review operation IDs use secure version 4 UUIDs',()=>{

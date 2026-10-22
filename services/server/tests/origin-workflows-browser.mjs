@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import { readFile, mkdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 
 export async function verifyServedAssets(context, base) {
   for (const name of ['writer.js', 'review.js', 'shells.css', 'admin.js', 'pdf.min.mjs', 'pdf.worker.min.mjs']) {
     const response = await context.request.get(`${base}/static/${name}`);
     assert.equal(response.status(), 200);
+    if (['review.js','writer.js'].includes(name)) {
+      assert.equal(response.headers()['cache-control'], 'no-cache');
+      console.log('SERVED_ASSET_SHA256:',name,createHash('sha256').update(await response.body()).digest('hex'));
+    }
     assert.deepEqual(await response.body(), await readFile(new URL(`../static/${name}`, import.meta.url)), `Served ${name} must match the tested source`);
   }
   console.log('SERVED_ASSETS_PASS: exact source bytes');

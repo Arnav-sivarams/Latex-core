@@ -19,6 +19,7 @@ mod integration_api;
 )]
 mod mail;
 mod review_api;
+mod review_diagnostics;
 mod support;
 mod writer_diagnostics;
 use axum::{
@@ -11881,7 +11882,10 @@ async fn admin_js() -> Response {
 
 async fn writer_js() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("../static/writer.js"),
     )
         .into_response()

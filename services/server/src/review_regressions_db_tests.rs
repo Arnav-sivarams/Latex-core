@@ -3,7 +3,7 @@
 async fn review_regressions_browser_acceptance() {
     let _guard = SERVER_TEST_LOCK.lock().await;
     tracing_subscriber::fmt()
-        .with_env_filter("off,review_metadata_failure=error")
+        .with_env_filter("off,review_metadata_failure=error,latex_core_api::review_api=info,latex_core_api::review_diagnostics=warn")
         .with_test_writer()
         .try_init()
         .expect("acceptance tracing initializes once");
@@ -129,7 +129,9 @@ async fn review_regressions_browser_acceptance() {
     if env::var_os("LATEX_CORE_FIDELITY_OUTPUT").is_some() {
         verify_actual_template_fidelity(&app, &state, &pool, &writer, &teams[1], main_name).await;
     }
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = env::var("REVIEW_PORT").unwrap_or_else(|_| "0".to_owned());
+    let bind = env::var("REVIEW_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_owned());
+    let listener = tokio::net::TcpListener::bind(format!("{bind}:{port}")).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

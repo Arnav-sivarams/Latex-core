@@ -8,3 +8,9 @@ export function nativeSourceRange(view, selection = view?.dom.ownerDocument.getS
   const from = Math.min(anchor, head), to = Math.max(anchor, head);
   return from === to ? null : { from, to, empty: false };
 }
+
+// The browser decides whether to show its menu before asynchronous work finishes.
+export function openSourceContextMenu(event, resolve, open, fail) {
+  event.preventDefault();
+  return Promise.resolve().then(resolve).then(open).catch(fail);
+}

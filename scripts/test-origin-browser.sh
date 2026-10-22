@@ -21,7 +21,7 @@ latex_core_docker run -d --name "$container" \
 created=true
 ready=false
 for attempt in {1..30}; do
-  if latex_core_docker exec "$container" pg_isready -U origin_audit >/dev/null 2>&1; then
+  if latex_core_docker exec "$container" pg_isready -h 127.0.0.1 -U origin_audit >/dev/null 2>&1; then
     ready=true
     break
   fi
@@ -30,10 +30,14 @@ done
 [[ "$ready" == true ]] || { echo 'Disposable PostgreSQL did not become ready.' >&2; exit 1; }
 port="$(latex_core_docker port "$container" 5432)"
 port="${port##*:}"
-for origin in localhost network; do
-  latex_core_docker exec "$container" createdb -U origin_audit "origin_$origin"
-  export TEST_DATABASE_URL="postgresql://origin_audit:synthetic-test-only@127.0.0.1:$port/origin_$origin"
-  echo "Browser acceptance: $origin (fresh synthetic database)"
-  REVIEW_HOST="$origin" cargo test -p server --features database-tests \
+export REVIEW_PORT="${REVIEW_PORT:-9000}"
+for target in ${REVIEW_TARGETS:-chromium:localhost chromium:127.0.0.1 chromium:network firefox:network}; do
+  browser="${target%%:*}"
+  origin="${target#*:}"
+  database="origin_${browser}_${origin//./_}"
+  latex_core_docker exec "$container" createdb -U origin_audit "$database"
+  export TEST_DATABASE_URL="postgresql://origin_audit:synthetic-test-only@127.0.0.1:$port/$database"
+  echo "Browser acceptance: $browser $origin (fresh synthetic database)"
+  REVIEW_BROWSER="$browser" REVIEW_HOST="$origin" cargo test -p server --features database-tests \
     review_regressions_browser_acceptance -- --nocapture
 done

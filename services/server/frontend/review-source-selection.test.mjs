@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {nativeSourceRange} from './review-source-selection.mjs';
+import {nativeSourceRange, openSourceContextMenu} from './review-source-selection.mjs';
 const start={},end={},outside={};
 const view={contentDOM:{contains:node=>node===start||node===end},posAtDOM:(node,offset)=>(node===start?10:100)+offset};
 test('read-only native selections retain their exact source range in either direction',()=>{
@@ -13,4 +13,21 @@ test('selection outside this editor, including another file or the comment textb
  assert.equal(nativeSourceRange(view,selection),null);
  assert.equal(nativeSourceRange(view,{...selection,isCollapsed:true}),null);
  assert.equal(nativeSourceRange(view,{...selection,rangeCount:0}),null);
+});
+
+test('valid source context menu is prevented synchronously, before anchor work', async () => {
+ const calls=[]; let resolve;
+ const anchor = new Promise(done => { resolve=done; });
+ const completed=openSourceContextMenu({preventDefault(){calls.push('prevent');}},()=>{calls.push('resolve');return anchor;},value=>calls.push(value),error=>{throw error;});
+ assert.deepEqual(calls,['prevent']);
+ await Promise.resolve(); assert.deepEqual(calls,['prevent','resolve']);
+ resolve('popup'); await completed;
+ assert.deepEqual(calls,['prevent','resolve','popup']);
+});
+test('anchor exceptions reach the actionable failure handler without opening a popup', async () => {
+ for(const resolver of [()=>{throw new Error('anchor failed');},()=>Promise.reject(new Error('anchor failed'))]) {
+  const calls=[];
+  await openSourceContextMenu({preventDefault(){calls.push('prevent');}},resolver,()=>calls.push('popup'),error=>calls.push(error.message));
+  assert.deepEqual(calls,['prevent','anchor failed']);
+ }
 });

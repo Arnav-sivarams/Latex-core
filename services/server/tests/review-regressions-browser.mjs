@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { credentialHandoff } from './credential-handoff-browser.mjs';
 import { verifyServedAssets, verifyProblems, verifyCollaboration } from './origin-workflows-browser.mjs';
@@ -12,11 +14,21 @@ const contexts = [];
 const browserFailures = [];
 const serverFailures = [];
 const blockedRequests = [];
+const assetChecks = [];
 async function client(cookie) {
   const ctx = await browser.newContext({viewport:{width:1440,height:1000},acceptDownloads:true}); contexts.push(ctx);
   ctx.setDefaultTimeout(30000);
   const [name,...value]=cookie.split('='); await ctx.addCookies([{name,value:value.join('='),url:base}]);
   const sockets=[]; const page=await ctx.newPage(); page.on('websocket',socket=>sockets.push(socket)); page.on('pageerror',e=>{browserFailures.push(e.message);console.log('BROWSER_EXCEPTION:',e.stack);});page.on('response',r=>{if(r.status()>=500)serverFailures.push(`${r.status()} ${new URL(r.url()).pathname}`);});
+  page.on('response',response=>{
+    const name=new URL(response.url()).pathname.split('/').pop();
+    if(!['writer.js','review.js'].includes(name))return;
+    assetChecks.push((async()=>{
+      const actual=await response.body(), expected=await readFile(new URL(`../static/${name}`,import.meta.url));
+      assert.deepEqual(actual,expected,`Browser-loaded ${name}, including cached bytes, must match checkout`);
+      console.log('BROWSER_ASSET_SHA256:',name,createHash('sha256').update(actual).digest('hex'));
+    })().catch(error=>browserFailures.push(error.message)));
+  });
   page.on('requestfailed', request => {
     // Navigations intentionally cancel superseded reads; security/network failures do not.
     if (!['net::ERR_ABORTED', 'NS_BINDING_ABORTED'].includes(request.failure()?.errorText)) blockedRequests.push(`${request.failure()?.errorText} ${request.url()}`);
@@ -96,13 +108,34 @@ try {
   const selectedQuote=await m.page.evaluate(()=>window.getSelection().toString());
   assert.ok(selectedQuote.length>0);
   console.log('SELECTION:',await m.page.locator('#sourceSelection').textContent(),await m.page.locator('.cm-content').evaluate(el=>({nativeLength:window.getSelection()?.toString().length,nativeInEditor:el.contains(window.getSelection()?.anchorNode)&&el.contains(window.getSelection()?.focusNode),editor:el.cmTile?.root?.view?.state.selection.main.toJSON()})),{box,end});
+  await m.page.evaluate(()=>document.addEventListener('contextmenu',event=>{window.reviewMenuPrevented=event.defaultPrevented;}));
+  // Anchor failures must suppress the native menu and report a safe code, without sending source text.
+  await m.page.evaluate(()=>{
+    const state=document.querySelector('.cm-content').cmTile.root.view.state;
+    window.restoreReviewSlice=()=>{delete state.sliceDoc;};
+    state.sliceDoc=()=>{throw new Error('Synthetic anchor resolution failure');};
+  });
+  const anchorReport=m.page.waitForResponse(r=>r.url().endsWith('/client-errors')&&r.request().method()==='POST');
   await m.page.mouse.click(sourceLeft+12,box.y+box.height/2,{button:'right'});
+  await m.page.waitForFunction(()=>document.querySelector('#reviewNotice').textContent.includes('Cannot prepare source comment: Synthetic anchor resolution failure'));
+  assert.equal(await m.page.evaluate(()=>window.reviewMenuPrevented),true);
+  assert.equal(await m.page.locator('#reviewPopover').isVisible(),false);
+  const anchorReported=await anchorReport;
+  assert.equal(anchorReported.status(),204);
+  assert.deepEqual(anchorReported.request().postDataJSON(),{schema_version:1,code:'SOURCE_ANCHOR_FAILED',round_id:round.id});
+  await m.page.evaluate(()=>window.restoreReviewSlice());
+  console.log('SOURCE_ANCHOR_FAILURE_PASS: real right-click, visible actionable error, native menu prevented, code-only report');
+  await m.page.mouse.click(sourceLeft+12,box.y+box.height/2,{button:'right'});
+  assert.equal(await m.page.evaluate(()=>window.reviewMenuPrevented),true,'actual contextmenu must be synchronously cancelled');
   await m.page.locator('#reviewPopover').waitFor({state:'visible',timeout:5000});
   const popup=await m.page.locator('#reviewPopover').boundingBox();
   assert.ok(Math.abs(popup.x-(sourceLeft+12))<40 && Math.abs(popup.y-(box.y+box.height/2))<40, 'Source popup opens at the actual selection');
   console.log('SOURCE_POPUP_PASS');
   await m.page.locator('#threadMessage').fill('Synthetic source feedback'); await m.page.locator('#createComment').click(); console.log('DRAFT_CLICKED');
   await m.page.waitForFunction(()=>document.querySelector('#draftStatus').textContent.includes('Draft saved'));
+  await m.page.locator('#reviewTitle').click({button:'right'});
+  assert.equal(await m.page.evaluate(()=>window.reviewMenuPrevented),false,'normal browser menu outside source selections is preserved');
+  await m.page.keyboard.press('Escape');
   await m.page.reload(); await m.page.locator('.cm-content').waitFor();
   const privateSource=(await json(m.ctx,review+'/threads')).threads;
   assert.equal(privateSource.length,1);
@@ -116,9 +149,60 @@ try {
   await m.page.locator('#threadMessage').fill('Synthetic PDF feedback'); await m.page.locator('#createComment').click(); console.log('DRAFT_CLICKED');
   await m.page.waitForFunction(()=>document.querySelector('#draftStatus').textContent.includes('Draft saved'));
   assert.equal((await json(w.ctx,review+'/threads')).threads.length,0,'Both source and PDF drafts remain private until Push Review');
-  await m.page.bringToFront();m.page.on('dialog',d=>{console.log('MENTOR_DIALOG:',d.type());return d.accept();}); const publication=m.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/submit')).catch(async error=>{console.log('PUSH_UI:',await m.page.locator('#reviewNotice').textContent(),await m.page.locator('#draftStatus').textContent());throw error;});await m.page.locator('#pushReview').click();const sent=await publication;assert.equal(sent.status(),200);const retry=await m.ctx.request.post(sent.url(),{data:sent.request().postDataJSON(),headers:{Origin:base}});assert.equal(retry.status(),200);
-  await m.page.waitForFunction(()=>document.querySelector('#reviewNotice').textContent.includes('Review submitted. Writers can now see your feedback.'));
+  await m.page.bringToFront();m.page.on('dialog',d=>d.accept());
+  const submitUrl = `${base}${review}/rounds/${round.id}/submit`;
+  let rejectedSubmission;
+  await m.page.route(submitUrl,async route=>{
+    const body=route.request().postDataJSON();rejectedSubmission=body.submission_id;
+    const response=await route.fetch({postData:JSON.stringify({...body,expected_revision:body.expected_revision+1})});
+    assert.equal(response.status(),409,'actual server rejects a stale publication revision');
+    await route.fulfill({response});
+  },{times:1});
+  const rejectionReport=m.page.waitForResponse(r=>r.url().endsWith('/client-errors')&&r.request().method()==='POST');
+  const rejected=m.page.waitForResponse(r=>r.url()===submitUrl&&r.status()===409);
+  await m.page.locator('#pushReview').click();await rejected;
+  assert.equal((await rejectionReport).status(),204);
+  await m.page.waitForFunction(()=>document.querySelector('#reviewNotice').textContent.includes('Drafts changed while submitting'));
+  assert.equal((await json(w.ctx,review+'/threads')).threads.length,0,'rejected publication must leave feedback private');
+  assert.equal((await json(m.ctx,review+'/rounds')).current_review_round.mentor_participation.status,'PENDING');
+  await m.page.waitForFunction(()=>!document.querySelector('#pushReview').disabled);
+  console.log('PUBLICATION_REJECTION_PASS: HTTP 409, visible error, round pending, two private drafts, zero Writer feedback');
+  const requests = [];
+  let committed;
+  await m.page.route(submitUrl, async route => {
+    requests.push(route.request().postDataJSON());
+    const response = await route.fetch();
+    assert.equal(response.status(), 200);
+    committed = await response.json();
+    // The server committed; a proxy lost the response. The next click must replay it.
+    await route.fulfill({status:503, contentType:'application/json', body:JSON.stringify({error:'Synthetic lost publication response'})});
+  }, {times:1});
+  const lost = m.page.waitForResponse(r=>r.url()===submitUrl&&r.status()===503);
+  await m.page.locator('#pushReview').click(); await lost;
+  await m.page.waitForFunction(()=>document.querySelector('#reviewNotice').textContent.includes('Synthetic lost publication response'));
+  const roundAfter = await json(m.ctx,review+'/rounds');
+  assert.equal(roundAfter.current_review_round,null,'server committed and closed the round');
+  assert.equal((await json(w.ctx,review+'/threads')).threads.length,2,'server publication is authoritative despite a lost response');
+  assert.ok(!['Review published','Review submitted'].includes(await m.page.locator('#draftStatus').textContent()),'lost response must remain unconfirmed');
+  await m.page.waitForFunction(()=>!document.querySelector('#pushReview').disabled);
+  const retryResponse=m.page.waitForResponse(r=>r.request().method()==='POST'&&r.url()===submitUrl);
+  await m.page.locator('#pushReview').click();
+  const sent=await retryResponse; assert.equal(sent.status(),200);
+  assert.notEqual(requests[0].submission_id,rejectedSubmission,'definite rejection permits a corrected publication identity');
+  assert.deepEqual(sent.request().postDataJSON(),requests[0],'actual Push Review retry retains both revision and secure submission identity');
+  const replay=await sent.json();assert.equal(replay.already_submitted,true);assert.equal(replay.submission_id,committed.submission_id);
+  await m.page.waitForFunction(()=>document.querySelector('#draftStatus').textContent==='Review published');
+  const expectedFailure=serverFailures.indexOf(`503 ${new URL(submitUrl).pathname}`);
+  assert.ok(expectedFailure>=0);serverFailures.splice(expectedFailure,1);
+  console.log('PUSH_REVIEW_RETRY_PASS:',submitUrl,'HTTP 200; same submission/revision; already_submitted=true');
   assert.equal((await json(w.ctx,review+'/threads')).threads.length,2);
+  for(let count=0;count<5;count++) {
+    const report=await m.ctx.request.post(base+review+'/client-errors',{headers:{Origin:base},data:{schema_version:1,code:'SOURCE_ANCHOR_FAILED',round_id:round.id}});
+    assert.equal(report.status(),count<3?204:429,'anchor and publication failures consumed two of five bounded reports');
+  }
+  assert.equal((await w.ctx.request.post(base+review+'/client-errors',{headers:{Origin:base},data:{schema_version:1,code:'SOURCE_ANCHOR_FAILED'}})).status(),403);
+  assert.equal((await m.ctx.request.post(base+review+'/client-errors',{headers:{Origin:'http://foreign.invalid'},data:{schema_version:1,code:'SOURCE_ANCHOR_FAILED'}})).status(),403);
+  console.log('CLIENT_DIAGNOSTICS_PASS: authenticated Mentor, exact-origin CSRF, five reports/minute');
   console.log('CORE_REVIEW_PASS');
   await w.page.bringToFront();await w.page.reload(); await w.page.locator('.cm-content').waitFor();
   await w.page.locator('#commentsToggle').click();
@@ -217,6 +301,7 @@ try {
     console.log('SUBSEQUENT_REVIEW_PASS: stale build denied, real edited report compiled during policy change, reviewed snapshot preserved');
     await admin.page.bringToFront();await credentialHandoff(admin,base);
   }
+  await Promise.all(assetChecks);
   assert.deepEqual(browserFailures,[],'No browser runtime exceptions are permitted in the accepted flow');
   assert.deepEqual(serverFailures,[],'No server errors are permitted in the accepted flow');
   assert.deepEqual(blockedRequests,[],'No blocked network requests are permitted in the accepted flow');

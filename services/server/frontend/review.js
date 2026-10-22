@@ -1,4 +1,4 @@
-import { nativeSourceRange } from './review-source-selection.mjs';
+import { nativeSourceRange, openSourceContextMenu } from './review-source-selection.mjs';
 import { digest } from 'lib0/hash/sha256';
 import { uuidv4 } from 'lib0/random';
 import { basicSetup } from 'codemirror';
@@ -72,10 +72,22 @@ const model = {
   identity: null, preferences: { font_size_px: 14, theme: 'LIGHT' },
   editorAppearance: new Compartment(), pendingDraftSave: null, draftSaveFailed: null,
   failedDraftEdit: null, failedDraftDeleteId: null,
-  pendingSubmissionId: null,
+  lastPublishedRoundId: null, pendingSubmission: null, publicationBusy: false, publicationFailure: false,
 };
 
 function notice(message, failed = false) { ui.reviewNotice.textContent = message; ui.reviewNotice.classList.toggle('danger', failed); }
+const reportedErrors = new Map();
+function reportClientError(code) {
+  const paperId = model.paper?.id;
+  if (!paperId) return;
+  const key = `${paperId}:${code}`, now = Date.now();
+  if (now - (reportedErrors.get(key) || 0) < 30000) return;
+  reportedErrors.set(key, now);
+  console.error('CLIENT_REPORTED_ERROR', { code, paper_id: paperId });
+  void api.json(`/api/v2/reviews/papers/${paperId}/client-errors`, 'POST', {
+    schema_version: 1, code, round_id: model.currentReviewRound?.id || null,
+  }).catch(() => console.warn('Client error report unavailable; see the visible review error.'));
+}
 function button(label, handler, active = false) { const node = document.createElement('button'); node.type = 'button'; node.textContent = label; if (active) node.setAttribute('aria-current', 'page'); node.addEventListener('click', handler); return node; }
 function clearNode(node, message) { node.replaceChildren(Object.assign(document.createElement('p'), { className: 'empty-copy', textContent: message })); }
 function editorAppearance(preference) {
@@ -206,11 +218,13 @@ async function sourceSelected(state, range = state.selection.main) {
   model.pendingAnchorSummary = `Source: ${model.file.path} · “${quoted.slice(0, 80)}”`;
   ui.reviewSelection.disabled = false;
   const line = state.doc.lineAt(range.from);
-  try {
-    const mapping = await api.map(model.paper.id, { direction: 'FORWARD', file_id: model.file.file_id, line: line.number, column: range.from - line.from });
+  const paperId = model.paper.id, fileId = model.file.file_id;
+  void (async () => { try {
+    const mapping = await api.map(paperId, { direction: 'FORWARD', file_id: fileId, line: line.number, column: range.from - line.from });
     const pdfAnchor = await pdfAnchorFromMapping(mapping);
     if (model.pendingAnchor === pending) { pending.pdf_anchor = pdfAnchor; renderOverlays(); }
-  } catch { /* Source annotation remains valid without a projection. */ }
+  } catch { /* Source annotation remains valid without a projection. */ } })();
+  return pending;
 }
 
 document.addEventListener('selectionchange', () => {
@@ -235,10 +249,18 @@ ui.reviewEditor.addEventListener('contextmenu', (event) => {
   const range = saved || nativeSourceRange(model.view) || model.view.state.selection.main;
   const position = model.view.posAtCoords({ x: event.clientX, y: event.clientY });
   if (range.empty || position == null || position < range.from || position > range.to) return;
-  event.preventDefault();
-  // Anchor construction runs synchronously before its optional PDF projection.
-  sourceSelected(model.view.state, range).catch((failure) => notice(failure.message, true));
-  showReviewPopover(event.clientX, event.clientY, model.pendingAnchorSummary);
+  const view = model.view, state = view.state;
+  const captured = { from: range.from, to: range.to, empty: false };
+  const x = event.clientX, y = event.clientY;
+  openSourceContextMenu(event, () => sourceSelected(state, captured), (anchor) => {
+    if (model.view !== view || model.view.state.doc !== state.doc || !canDraft()) return;
+    if (!anchor || model.pendingAnchor !== anchor) throw new Error('The selection changed. Select the source again and right-click.');
+    showReviewPopover(x, y, model.pendingAnchorSummary);
+  }, (failure) => {
+    hideComposer();
+    reportClientError('SOURCE_ANCHOR_FAILED');
+    notice(`Cannot prepare source comment: ${failure.message} Select the source again and retry.`, true);
+  });
 });
 
 // lib0 uses SHA-256 and crypto.getRandomValues, which also work without secure-context-only APIs.
@@ -256,7 +278,9 @@ async function refreshPapers() {
 }
 
 async function openPaper(paper) {
-  disposeSource(); disposePdf(); model.paper = paper; model.file = null; model.pendingAnchor = null;
+  disposeSource(); disposePdf();
+  if (model.paper?.id !== paper.id) { model.pendingSubmission = null; model.publicationFailure = false; model.lastPublishedRoundId = null; }
+  model.paper = paper; model.file = null; model.pendingAnchor = null;
   ui.reviewContext.textContent = paper.name; ui.reviewTitle.textContent = paper.name; ui.reviewSummary.textContent = `${paper.status} · ${paper.open_review_count} open · ${paper.blocking_review_count} blocking`;
   ui.compileReview.disabled = paper.status !== 'active'; ui.csvExport.href = `/api/v2/reviews/papers/${paper.id}/report.csv`; ui.printExport.href = `/api/v2/reviews/papers/${paper.id}/report.html`; ui.csvExport.removeAttribute('aria-disabled'); ui.printExport.removeAttribute('aria-disabled');
   const [detail, files] = await Promise.all([api.paper(paper.id), api.files(paper.id)]);
@@ -488,39 +512,57 @@ function renderRounds() {
   const open = reviewOpen();
   const participation = model.currentReviewRound?.mentor_participation;
   ui.reviewGateBadge.textContent = open ? (participation?.status === 'SUBMITTED' ? 'Your review submitted' : 'Review open') : 'Waiting for Team Review';
-  ui.pushReview.disabled = !open || participation?.status !== 'PENDING';
+  ui.pushReview.disabled = model.publicationBusy || (!model.pendingSubmission && (!open || participation?.status !== 'PENDING'));
   if (participation?.status === 'PENDING') ui.draftStatus.textContent = participation.draft_count ? 'Draft saved — not yet visible to writers' : 'No draft feedback yet';
-  else if (participation?.status === 'SUBMITTED') ui.draftStatus.textContent = 'Review submitted';
-  else ui.draftStatus.textContent = 'No active review';
+  else if (participation?.status === 'SUBMITTED') ui.draftStatus.textContent = 'Review published';
+  else ui.draftStatus.textContent = model.lastPublishedRoundId === model.rounds[0]?.id ? 'Review published' : 'No active review';
+  if (model.publicationFailure) ui.draftStatus.textContent = 'Publication unconfirmed — retry Push review';
+  if (model.publicationBusy) ui.draftStatus.textContent = 'Publishing review…';
   if (!model.rounds.length) clearNode(ui.roundList, 'This paper has not been sent for review.');
   else model.rounds.forEach((round) => { const row = document.createElement('div'); row.className = 'round-row'; const text = document.createElement('span'); text.textContent = `Round ${round.round_number} · ${round.status.replaceAll('_', ' ')}`; row.append(text); ui.roundList.append(row); });
   if (!open) hideComposer();
 }
 
 async function pushReview() {
-  if (model.pendingDraftSave) {
-    ui.draftStatus.textContent = 'Saving draft…';
-    try { await model.pendingDraftSave; } catch { /* handled below */ }
-  }
-  if (model.draftSaveFailed || model.failedDraftEdit || model.failedDraftDeleteId) return notice(`A draft write failed and was retained. Retry the draft save before Push review: ${model.draftSaveFailed?.message || 'pending retry'}`, true);
-  await refreshRounds();
-  const participation = model.currentReviewRound?.mentor_participation;
-  if (!participation || participation.status !== 'PENDING') return notice('Your active review assignment is no longer available. Reload its status.', true);
-  const count = Number(participation.draft_count || 0);
-  const question = count === 0 ? 'Submit review with no new comments?' : `Push review with ${count} draft comment${count === 1 ? '' : 's'}/suggestion${count === 1 ? '' : 's'}?`;
-  if (!window.confirm(question)) return;
-  const submissionId = model.pendingSubmissionId || uuidv4();
-  model.pendingSubmissionId = submissionId;
-  ui.pushReview.disabled = true; ui.draftStatus.textContent = 'Submitting review…';
+  if (model.publicationBusy) return;
+  model.publicationBusy = true;
+  ui.pushReview.disabled = true;
   try {
-    const result = await api.publish(model.paper.id, model.currentReviewRound.id, { expected_revision: participation.draft_revision, submission_id: submissionId });
-    model.pendingSubmissionId = null; model.draftSaveFailed = null;
-    await Promise.all([refreshThreads(), refreshRounds(), refreshPapers()]);
-    ui.draftStatus.textContent = 'Review submitted';
-    notice(result.remaining_mentors ? 'Review submitted. Writers can now see your feedback. Your review submitted — another Mentor is still reviewing.' : 'Review submitted. Writers can now see your feedback.');
+    if (!model.pendingSubmission) {
+      if (model.pendingDraftSave) {
+        ui.draftStatus.textContent = 'Saving private draft…';
+        try { await model.pendingDraftSave; } catch { /* checked below */ }
+      }
+      if (model.draftSaveFailed || model.failedDraftEdit || model.failedDraftDeleteId) throw new Error('A private draft write failed. Retry its save before Push review.');
+      await refreshRounds();
+      const participation = model.currentReviewRound?.mentor_participation;
+      if (!participation || participation.status !== 'PENDING') throw new Error('Your active review assignment is no longer available. Reload its status.');
+      const count = Number(participation.draft_count || 0);
+      if (!window.confirm(count === 0 ? 'Submit review with no new comments?' : `Push review with ${count} private draft comments/suggestions?`)) return;
+      model.pendingSubmission = {
+        paperId: model.paper.id, roundId: model.currentReviewRound.id,
+        body: { expected_revision: participation.draft_revision, submission_id: uuidv4() },
+      };
+    }
+    // Retry the exact request, even if a broadcast already closed this round.
+    const submission = model.pendingSubmission;
+    ui.draftStatus.textContent = 'Publishing review…';
+    const result = await api.publish(submission.paperId, submission.roundId, submission.body);
+    model.lastPublishedRoundId = submission.roundId;
+    model.pendingSubmission = null; model.publicationFailure = false; model.draftSaveFailed = null;
+    ui.draftStatus.textContent = 'Review published';
+    notice(result.remaining_mentors ? 'Review published. Writers can now see your feedback. Another Mentor is still reviewing.' : 'Review published. Writers can now see your feedback.');
+    try { await Promise.all([refreshThreads(), refreshRounds(), refreshPapers()]); }
+    catch { notice('Review published. Refresh to reload the latest feedback lists.', true); }
   } catch (failure) {
-    ui.pushReview.disabled = false; ui.draftStatus.textContent = 'Submission failed — retry Push review';
-    notice(`${failure.message} Your saved drafts were retained; retry Push review.`, true);
+    // A definite rejection allows a corrected request; transport/5xx failures retain its identity.
+    if (failure.status >= 400 && failure.status < 500) model.pendingSubmission = null;
+    model.publicationFailure = true;
+    reportClientError('PUBLICATION_UNCONFIRMED');
+    notice(`Review publication was not confirmed: ${failure.message} Retry Push review to confirm the outcome.`, true);
+  } finally {
+    model.publicationBusy = false;
+    renderRounds();
   }
 }
 
