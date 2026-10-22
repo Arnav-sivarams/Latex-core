@@ -290,6 +290,8 @@ function renderBuildQueue(jobs) {
 }
 
 const auditLabels = {
+  'review.round.opened': 'Send for Review',
+  'review.feedback.published': 'Review feedback published',
   'account.credential_email.sent': 'Credential email sent',
   'paper_team.member.changed': 'Team membership changed',
 };
@@ -298,7 +300,7 @@ function renderAudit(events) {
   content.append(element('p', '', 'Audit records important administrative and security actions: who did what, when, and to which object.'));
   if (!events.length) return content.append(element('p', 'empty-copy', 'No administrative or security actions have been recorded yet.'));
   const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>';
-  const body = document.createElement('tbody'); events.forEach((event) => { const row = element('tr'); const details = element('details'); details.append(element('summary', '', 'View'), element('p', 'muted-note', `Event type: ${event.event}`), element('p', 'muted-note', `Object ID: ${event.resource_id || 'Not recorded'}`)); const detailCell = element('td'); detailCell.append(details); row.append(element('td', '', new Date(event.created_at).toLocaleString()), element('td', '', event.actor || 'System'), element('td', '', auditLabels[event.event] || humanLabel(event.event.replaceAll('.', ' '))), element('td', '', humanLabel(event.resource)), detailCell); body.append(row); });
+  const body = document.createElement('tbody'); events.forEach((event) => { const row = element('tr'); const details = element('details'); details.append(element('summary', '', 'View'), element('p', 'muted-note', `Event type: ${event.event}`), element('p', 'muted-note', `Object ID: ${event.resource_id || 'Not recorded'}`)); if (event.paper_id) details.append(element('p', 'muted-note', `Paper/Team ID: ${event.paper_id}`), element('p', 'muted-note', `Round ID: ${event.round_id}`), element('p', 'muted-note', `Outcome: ${event.outcome}`), element('p', 'muted-note', `Actor ID: ${event.actor_user_id}`)); const detailCell = element('td'); detailCell.append(details); row.append(element('td', '', new Date(event.created_at).toLocaleString()), element('td', '', event.actor || 'System'), element('td', '', auditLabels[event.event] || humanLabel(event.event.replaceAll('.', ' '))), element('td', '', humanLabel(event.resource)), detailCell); body.append(row); });
   table.append(body); wrap.append(table); content.append(wrap);
 }
 

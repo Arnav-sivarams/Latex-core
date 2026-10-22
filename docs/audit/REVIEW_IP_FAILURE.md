@@ -195,3 +195,47 @@ bundle, review HTML/API and code-only diagnostic module, Writer cache headers,
 browser runner/asset checks, deployment verification helper and this report.
 Architecture remains Axum/PostgreSQL with private drafts and separate authorized
 idempotent publication. There are no migrations or new production services.
+
+## Final Admin Audit acceptance
+
+The final acceptance request permits an available test port on the assigned
+non-loopback IP, superseding the earlier exact-loopback-port delivery gate.
+The focused run used `http://172.19.88.175:19000`, disposable PostgreSQL/Team data,
+real browser logins, source editing, compilation and review buttons. The older
+UAT installation and existing databases/volumes were preserved.
+
+Inspection found a narrow durable-audit gap: Leader Send for Review logged a
+runtime message but no audit event. Successful new rounds now insert
+`review.round.opened` inside the same transaction as round/participation creation.
+Existing round retries return before insertion. Mentor publication retains its
+transactional `review.feedback.published` event and retry path; success metadata
+now explicitly includes the outcome. The Admin projection exposes only safe
+review identifiers and outcomes, and the real Audit UI labels and displays both
+operations with actor, paper/Team, round, timestamp and success outcome.
+
+Focused acceptance command:
+
+```sh
+CARGO_BUILD_JOBS=2 REVIEW_PORT=19000 REVIEW_TARGETS=chromium:network \
+  REVIEW_SKIP_POLICY=1 REVIEW_AUDIT_ONLY=1 ./scripts/test-origin-browser.sh
+```
+
+It passed the actual source/PDF annotation and publication workflow, checked
+Admin Audit after Leader send, after an authorized HTTP 409 revision rejection,
+and after publication/retry, and verified feedback after reload. Direct
+PostgreSQL assertions found exactly two success events: one for the authorized
+Leader and one for the assigned Mentor, referencing the same paper and round,
+with timestamps and `SUCCESS` metadata. Rejection created no publication audit;
+retry returned the original submission and created no duplicate audit record.
+
+Admin Runtime Logs was checked separately through the actual UI and returned
+HTTP 200 from the configured container source. Those logs were not substituted
+for the test API process's durable audit evidence. The runner also supports
+visibly unavailable runtime sources without inventing audit events.
+
+Only focused review/audit acceptance, scoped Clippy with warnings denied,
+formatting, JavaScript syntax and diff checks were run for this correction.
+Previously passing broad suites were not repeated locally. CPU-heavy commands
+ran sequentially with two Cargo jobs. This correction needs no migration and
+introduces no service or infrastructure changes. Staging remains UNVERIFIED;
+no staging deployment is authorized by the final acceptance request.

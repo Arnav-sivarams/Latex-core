@@ -370,6 +370,17 @@ impl V2Repository {
                 entity: "assigned Mentor participation",
             });
         }
+        sqlx::query(
+            "INSERT INTO latex_core.audit_events (id,actor_user_id,event_type,resource_type,resource_id,metadata) \
+             VALUES ($1,$2,'review.round.opened','review_round',$3,$4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(leader.as_uuid())
+        .bind(id)
+        .bind(json!({"paper_id":paper_id,"outcome":"SUCCESS"}))
+        .execute(&mut *tx)
+        .await
+        .map_err(V2Error::Database)?;
         tx.commit().await.map_err(V2Error::Database)?;
         tracing::info!(%paper_id, round_id=%id, leader_writer_user_id=%leader, %baseline_version_id, %baseline_build_id, state_hash=%baseline_state_hash, "paper sent for review");
         Ok((round_json(row)?, true))
@@ -845,7 +856,7 @@ impl V2Repository {
         .bind(submission_id)
         .bind(mentor.as_uuid())
         .bind(round_id)
-        .bind(json!({"paper_id":paper_id,"draft_revision":expected,"published_count":published}))
+        .bind(json!({"paper_id":paper_id,"draft_revision":expected,"published_count":published,"outcome":"SUCCESS"}))
         .execute(&mut *tx)
         .await
         .map_err(V2Error::Database)?;

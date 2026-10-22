@@ -54,9 +54,14 @@ try {
   console.log('ORIGIN:',base,await w.page.evaluate(()=>({secure:isSecureContext,subtle:!!crypto.subtle,randomUUID:typeof crypto.randomUUID})));
   assert.equal(await w.page.evaluate(() => isSecureContext), host === 'localhost' || host === '127.0.0.1', 'LAN HTTP must run without a browser security bypass');
   await verifyServedAssets(w.ctx, base);
-  await verifyProblems(w.page, base, config.paperId, await json(w.ctx, paper+'/files'));
+  if (!process.env.REVIEW_AUDIT_ONLY) await verifyProblems(w.page, base, config.paperId, await json(w.ctx, paper+'/files'));
   const other=await client(config.otherCookie);await login(other,config.otherEmail);
-  await verifyCollaboration(w, other, base, config.paperId, await json(w.ctx,paper+'/files'), json);
+  if (!process.env.REVIEW_AUDIT_ONLY) await verifyCollaboration(w, other, base, config.paperId, await json(w.ctx,paper+'/files'), json);
+  if (process.env.REVIEW_AUDIT_ONLY) {
+    await w.page.locator('.cm-content').click();await w.page.keyboard.press('Control+End');
+    await w.page.keyboard.insertText('\n% Synthetic audit acceptance source save\n');await w.page.keyboard.press('Control+s');
+    await w.page.waitForFunction(()=>document.querySelector('#saveStatus').dataset.state==='synced');
+  }
   await w.page.locator('#documentDetails').click();
   const panel=w.page.locator('#documentDetailsBody');
   await panel.getByText('Course code: BCSE4973',{exact:true}).waitFor();assert.equal(await panel.locator('[name="field:course_code"]').count(),0);assert.equal(await panel.locator('[name="field:course_name"]').inputValue(),'Project-I');
@@ -78,6 +83,36 @@ try {
   await w.page.waitForFunction(()=>document.querySelector('#reviewStateBadge').textContent==='In Review');
   const round=(await json(w.ctx,review+'/rounds')).current_review_round;
   console.log('LEADER_SEND_PASS:',config.paperId,round.id,round.baseline_state_hash);
+  assert.equal(round.status,'OPEN_FOR_REVIEW');
+  let auditAdmin;
+  async function verifyAdminAudit(published) {
+    if (!process.env.REVIEW_AUDIT_ONLY) return;
+    if (!auditAdmin) { auditAdmin=await client(config.adminCookie);await login(auditAdmin,config.adminEmail);await auditAdmin.page.goto(base+'/admin'); }
+    await auditAdmin.page.bringToFront();
+    const response=auditAdmin.page.waitForResponse(r=>new URL(r.url()).pathname==='/api/admin/audit');
+    await auditAdmin.page.getByRole('button',{name:'Audit',exact:true}).click();
+    const received=await response;assert.equal(received.status(),200);
+    const events=(await received.json()).filter(event=>event.round_id===round.id);
+    assert.equal(events.length,published?2:1,'only authoritative successes appear in Audit');
+    for (const [type,email,label] of [
+      ['review.round.opened',config.writerEmail,'Send for Review'],
+      ...(published?[['review.feedback.published',config.mentorEmail,'Review feedback published']]:[]),
+    ]) {
+      const matches=events.filter(event=>event.event===type);assert.equal(matches.length,1);
+      const event=matches[0];assert.equal(event.paper_id,config.paperId);assert.equal(event.resource_id,round.id);
+      assert.equal(event.actor,email);assert.ok(event.actor_user_id);assert.equal(event.outcome,'SUCCESS');
+      assert.ok(Number.isFinite(Date.parse(event.created_at)));
+      const row=auditAdmin.page.locator('#adminContent tbody tr').filter({hasText:label}).filter({hasText:round.id});
+      assert.equal(await row.count(),1);await row.locator('summary').click();
+      await row.getByText(`Paper/Team ID: ${config.paperId}`,{exact:true}).waitFor();
+      await row.getByText(`Round ID: ${round.id}`,{exact:true}).waitFor();
+      await row.getByText('Outcome: SUCCESS',{exact:true}).waitFor();
+      await row.getByText(email,{exact:true}).waitFor();
+    }
+    console.log('ADMIN_AUDIT_UI_PASS:',published?'Leader and Mentor success, one event each':'Leader success only; no publication event');
+  }
+  await verifyAdminAudit(false);
+
   await m.page.bringToFront();await m.page.goto(`${base}/review?paper=${config.paperId}`); await m.page.locator('.cm-content').waitFor();
   await m.page.waitForFunction(()=>!document.querySelector('#pushReview').disabled);
   await m.page.locator('#reviewFiles').getByRole('button',{name:'Full_Report_template_v1.0/chapters/chapter1.tex',exact:true}).click();
@@ -166,6 +201,7 @@ try {
   assert.equal((await json(w.ctx,review+'/threads')).threads.length,0,'rejected publication must leave feedback private');
   assert.equal((await json(m.ctx,review+'/rounds')).current_review_round.mentor_participation.status,'PENDING');
   await m.page.waitForFunction(()=>!document.querySelector('#pushReview').disabled);
+  await verifyAdminAudit(false);await m.page.bringToFront();
   console.log('PUBLICATION_REJECTION_PASS: HTTP 409, visible error, round pending, two private drafts, zero Writer feedback');
   const requests = [];
   let committed;
@@ -203,6 +239,7 @@ try {
   assert.equal((await w.ctx.request.post(base+review+'/client-errors',{headers:{Origin:base},data:{schema_version:1,code:'SOURCE_ANCHOR_FAILED'}})).status(),403);
   assert.equal((await m.ctx.request.post(base+review+'/client-errors',{headers:{Origin:'http://foreign.invalid'},data:{schema_version:1,code:'SOURCE_ANCHOR_FAILED'}})).status(),403);
   console.log('CLIENT_DIAGNOSTICS_PASS: authenticated Mentor, exact-origin CSRF, five reports/minute');
+  await verifyAdminAudit(true);await w.page.bringToFront();
   console.log('CORE_REVIEW_PASS');
   await w.page.bringToFront();await w.page.reload(); await w.page.locator('.cm-content').waitFor();
   await w.page.locator('#commentsToggle').click();
@@ -218,6 +255,31 @@ try {
   await m.page.reload();await m.page.locator('.cm-content').waitFor();assert.equal(await m.page.locator('#pushReview').isDisabled(),true);
   const outsider=await client(config.outsiderCookie);assert.ok([403,404].includes((await outsider.ctx.request.get(base+review+'/files')).status()));
   console.log('WRITER_FEEDBACK_PASS: navigation, reply, Done, reload, idempotent publication and denied unassigned Mentor');
+  if (process.env.REVIEW_AUDIT_ONLY) {
+    await w.page.reload();await w.page.locator('.cm-content').waitFor();
+    const persisted=(await json(w.ctx,review+'/threads')).threads;assert.equal(persisted.length,2);
+    await w.page.locator('#commentsToggle').click();
+    await w.page.locator('#writerReviewFilters [data-filter=all]').click();
+    await w.page.locator('.thread-card').filter({hasText:'Synthetic source feedback'}).waitFor();
+    await w.page.locator('.thread-card').filter({hasText:'Synthetic PDF feedback'}).waitFor();
+    await verifyAdminAudit(true);
+    const response=auditAdmin.page.waitForResponse(r=>new URL(r.url()).pathname==='/api/admin/v2/runtime-logs');
+    await auditAdmin.page.getByRole('button',{name:'Runtime Logs',exact:true}).click();
+    const runtime=await response;
+    if (runtime.status()===200) {
+      const logs=await runtime.json();assert.ok(Array.isArray(logs.records));assert.ok(Array.isArray(logs.services));
+      for(const record of logs.records)assert.ok(logs.services.includes(record.service));
+      if(logs.records.length)await auditAdmin.page.locator('.admin-log-message').first().waitFor();
+      else await auditAdmin.page.getByText('No retained log records matched.',{exact:true}).waitFor();
+      console.log('ADMIN_RUNTIME_LOGS_CHECK: HTTP 200; actual configured container source displayed; checked separately from durable review Audit');
+    } else {
+      assert.equal(runtime.status(),503);await auditAdmin.page.getByRole('alert').waitFor();
+      const expectedRuntimeFailure=serverFailures.indexOf('503 /api/admin/v2/runtime-logs');
+      assert.ok(expectedRuntimeFailure>=0);serverFailures.splice(expectedRuntimeFailure,1);
+      console.log('ADMIN_RUNTIME_LOGS_CHECK: HTTP 503; unavailable source visibly reported, separately from durable Audit');
+    }
+  }
+
   if (process.env.REVIEW_SKIP_POLICY) process.exitCode=0;
   else {
     const admin=await client(config.adminCookie);await login(admin,config.adminEmail); await admin.page.goto(base+'/admin');

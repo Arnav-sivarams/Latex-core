@@ -818,8 +818,34 @@ impl AppRepository {
         rows.into_iter().map(|r| Ok(json!({"id":r.try_get::<uuid::Uuid,_>("id").map_err(AppError::Database)?.to_string(),"workspace_id":r.try_get::<uuid::Uuid,_>("workspace_id").map_err(AppError::Database)?.to_string(),"state":r.try_get::<String,_>("state").map_err(AppError::Database)?,"requester":r.try_get::<String,_>("email").map_err(AppError::Database)?,"created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?,"started_at":r.try_get::<Option<String>,_>("started_at").map_err(AppError::Database)?,"finished_at":r.try_get::<Option<String>,_>("finished_at").map_err(AppError::Database)?}))).collect()
     }
     pub async fn admin_audit(&self) -> Result<Vec<serde_json::Value>, AppError> {
-        let rows = sqlx::query("SELECT a.event_type,a.resource_type,a.resource_id,a.created_at::text,c.email FROM latex_core.audit_events a LEFT JOIN latex_core.user_credentials c ON c.user_id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 100").fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
-        rows.into_iter().map(|r| Ok(json!({"event":r.try_get::<String,_>("event_type").map_err(AppError::Database)?,"resource":r.try_get::<String,_>("resource_type").map_err(AppError::Database)?,"resource_id":r.try_get::<Option<uuid::Uuid>,_>("resource_id").map_err(AppError::Database)?.map(|v|v.to_string()),"actor":r.try_get::<Option<String>,_>("email").map_err(AppError::Database)?,"created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?}))).collect()
+        // Expose only bounded identifiers for review events, never arbitrary audit metadata.
+        let rows = sqlx::query(
+            "SELECT a.id,a.actor_user_id,a.event_type,a.resource_type,a.resource_id,a.created_at::text,c.email, \
+             CASE WHEN a.event_type IN ('review.round.opened','review.feedback.published') \
+                  THEN a.metadata->>'paper_id' END AS paper_id, \
+             CASE WHEN a.event_type IN ('review.round.opened','review.feedback.published') \
+                  THEN 'SUCCESS' END AS outcome \
+             FROM latex_core.audit_events a \
+             LEFT JOIN latex_core.user_credentials c ON c.user_id=a.actor_user_id \
+             ORDER BY a.created_at DESC,a.id DESC LIMIT 100",
+        ).fetch_all(self.database.pool()).await.map_err(AppError::Database)?;
+        rows.into_iter().map(|r| {
+            let resource_id = r.try_get::<Option<uuid::Uuid>,_>("resource_id").map_err(AppError::Database)?;
+            let outcome = r.try_get::<Option<String>,_>("outcome").map_err(AppError::Database)?;
+            Ok(json!({
+                "schema_version":1,
+                "id":r.try_get::<uuid::Uuid,_>("id").map_err(AppError::Database)?,
+                "actor_user_id":r.try_get::<Option<uuid::Uuid>,_>("actor_user_id").map_err(AppError::Database)?,
+                "event":r.try_get::<String,_>("event_type").map_err(AppError::Database)?,
+                "resource":r.try_get::<String,_>("resource_type").map_err(AppError::Database)?,
+                "resource_id":resource_id,
+                "actor":r.try_get::<Option<String>,_>("email").map_err(AppError::Database)?,
+                "created_at":r.try_get::<String,_>("created_at").map_err(AppError::Database)?,
+                "paper_id":r.try_get::<Option<String>,_>("paper_id").map_err(AppError::Database)?,
+                "round_id":if outcome.is_some() { resource_id } else { None },
+                "outcome":outcome,
+            }))
+        }).collect()
     }
     pub async fn create_template(
         &self,

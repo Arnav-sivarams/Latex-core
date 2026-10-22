@@ -1,6 +1,7 @@
 // Disposable database, actual worker and browser; no fabricated build state.
 #[tokio::test]
 async fn review_regressions_browser_acceptance() {
+    use sqlx::Row as _;
     let _guard = SERVER_TEST_LOCK.lock().await;
     tracing_subscriber::fmt()
         .with_env_filter("off,review_metadata_failure=error,latex_core_api::review_api=info,latex_core_api::review_diagnostics=warn")
@@ -167,6 +168,28 @@ async fn review_regressions_browser_acceptance() {
     worker_task.await.unwrap();
     server.abort();
     assert!(output.success(), "review browser acceptance failed");
+    if env::var_os("REVIEW_AUDIT_ONLY").is_some() {
+        let paper_id = teams[0].as_str().unwrap().parse::<uuid::Uuid>().unwrap();
+        let rows = sqlx::query("SELECT actor_user_id,event_type,resource_id,created_at::text AS created_at,metadata FROM latex_core.audit_events WHERE event_type IN ('review.round.opened','review.feedback.published') AND metadata->>'paper_id'=$1")
+            .bind(paper_id.to_string()).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "one durable Leader event and one Mentor event despite rejected and repeated publication requests");
+        let mut round_id = None;
+        for row in rows {
+            let event: String = row.try_get("event_type").unwrap();
+            let actor: uuid::Uuid = row.try_get("actor_user_id").unwrap();
+            assert_eq!(actor, *if event == "review.round.opened" { writer_id.as_uuid() } else { mentor_id.as_uuid() });
+            let resource: uuid::Uuid = row.try_get("resource_id").unwrap();
+            if let Some(expected) = round_id { assert_eq!(resource, expected); } else { round_id = Some(resource); }
+            let timestamp: String = row.try_get("created_at").unwrap();
+            assert!(!timestamp.is_empty());
+            let metadata: serde_json::Value = row.try_get("metadata").unwrap();
+            assert_eq!(metadata["paper_id"], paper_id.to_string());
+            assert_eq!(metadata["outcome"], "SUCCESS");
+            if event == "review.feedback.published" { assert_eq!(metadata["published_count"], 2); }
+            println!("DURABLE_REVIEW_AUDIT_PASS: event={event} actor={actor} paper={paper_id} round={resource} outcome=SUCCESS");
+        }
+    }
+
     pool.close().await;
     database.close().await;
 }
