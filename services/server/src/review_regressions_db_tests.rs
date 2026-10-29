@@ -134,9 +134,34 @@ async fn review_regressions_browser_acceptance() {
     let bind = env::var("REVIEW_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_owned());
     let listener = tokio::net::TcpListener::bind(format!("{bind}:{port}")).await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let mut deployed_api = None;
+    let server = if let Some(executable) = env::var_os("LATEX_CORE_TEST_API_EXECUTABLE") {
+        drop(listener);
+        let mut child = tokio::process::Command::new(executable)
+            .env("DATABASE_URL", env::var("TEST_DATABASE_URL").unwrap())
+            .env("BLOB_STORAGE_ROOT", _storage.path())
+            .env("TEX_ENVIRONMENT_ID", state.environment.as_str())
+            .env("BIND_ADDR", format!("{bind}:{port}"))
+            .env("SESSION_COOKIE_SECURE", "false")
+            .env("ALLOW_REGISTRATION", "false")
+            .env("LATEX_CORE_MAIL_ENABLED", "false")
+            .env("LATEX_CORE_PUBLIC_BASE_URL", "http://canonical.example.invalid:9000")
+            .env("RUST_LOG", "warn,latex_core_api::review_api=info")
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        let address = format!("127.0.0.1:{port}");
+        let mut ready = false;
+        for _ in 0..100 {
+            assert!(child.try_wait().unwrap().is_none(), "exported API exited before readiness");
+            if tokio::net::TcpStream::connect(&address).await.is_ok() { ready = true; break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "exported API did not start");
+        deployed_api = Some(child);
+        None
+    } else {
+        Some(tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }))
+    };
     let worker = queue::CompilationWorker::new(
         state.queue.clone(),
         state.blobs.clone(),
@@ -166,7 +191,8 @@ async fn review_regressions_browser_acceptance() {
     .unwrap();
     shutdown.request();
     worker_task.await.unwrap();
-    server.abort();
+    if let Some(server) = server { server.abort(); }
+    if let Some(mut child) = deployed_api { child.kill().await.unwrap(); child.wait().await.unwrap(); }
     assert!(output.success(), "review browser acceptance failed");
     if env::var_os("REVIEW_AUDIT_ONLY").is_some() {
         let paper_id = teams[0].as_str().unwrap().parse::<uuid::Uuid>().unwrap();

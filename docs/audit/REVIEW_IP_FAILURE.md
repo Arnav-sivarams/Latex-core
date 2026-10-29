@@ -239,3 +239,83 @@ Previously passing broad suites were not repeated locally. CPU-heavy commands
 ran sequentially with two Cargo jobs. This correction needs no migration and
 introduces no service or infrastructure changes. Staging remains UNVERIFIED;
 no staging deployment is authorized by the final acceptance request.
+
+## IP configuration and rebuilt API identity (2026-10-29)
+
+The professor's report that changing an address in `main.rs` made review work is
+accepted as observed working evidence. The supplied location, line 12354 in
+`1e4eab11d0d91be6495b02c462b2771146ec05d5`, is the address in the network-origin
+regression fixture. Editing this compilation unit and rebuilding also rebuilds
+the executable that embeds review.js, writer.js and admin.js. That edit/rebuild
+sequence therefore changes the deployed artifact and can load corrections that
+were absent from the previous executable or browser cache.
+
+Read-only inspection of the actual development deployment demonstrated this
+source/runtime divergence. API image
+`sha256:dfeeab3052d8f7c98ce0371363b06b7fe661a296fa8911db8cd012b90824f94f`
+had no source revision label. Its served review.js matched the checkout, but its
+admin.js SHA-256 was
+`63462cbad86d1cf684617d922bb823e933ee5a7faa90a5d7179d41d8be9e386a`, exactly
+matching `6668701`, rather than the checkout's
+`a506cbe0ec42e6d9af0e3074d39fd21e0e0ed7ad5ac5189b8f4c06f93ad68aa1`.
+Thus Git HEAD and a matching Mentor asset alone were insufficient to establish
+what backend and Admin code were running. The professor's old image and full
+old/new edit were not supplied, so that remote artifact's exact history remains
+unverified. The identified line and the measured local drift support the rebuild
+mechanism; no runtime request path reads that address as an allowlist.
+
+The correction centralizes origin parsing in `http_origin.rs`. Request origin
+validation compares the browser Origin with the actual Host authority, validates
+ports and components, normalizes host case/default ports, and rejects foreign,
+null or repeated Origin headers and spoofed forwarded hosts. It introduces no
+CORS allowlist or forwarded-host trust. The existing treatment of non-browser
+requests without Origin is retained. Network regression cases now live beside
+this helper and generate multiple LAN addresses; no address in main.rs needs to
+be changed to admit a new installation.
+
+Canonical public links use the existing `LATEX_CORE_PUBLIC_BASE_URL`, validated
+as a complete HTTP(S) origin. API startup, mail configuration and installation
+validation reject credentials, paths, queries, fragments and invalid ports.
+Mail links use this canonical URL. Review HTTP requests remain relative and
+WebSockets use the current browser host and scheme, independently of the
+canonical link host. Cookie roles, review authorization, private draft visibility
+and transactional audit/publication remain unchanged.
+
+The API exposes a versioned `/api/build-info` response with its compiled source
+revision and SHA-256 identities of embedded review.js, writer.js and admin.js.
+The deployment helper requires committed source and supplies that revision to
+the image build; the image records the same revision in its OCI label. The
+read-only verifier compares the running API revision, embedded hashes and served
+bytes with the approved checkout, including Admin assets. Unknown/stale images
+fail verification instead of being inferred correct from Git HEAD. Build jobs
+are bounded at two.
+
+The focused browser fixture can execute an API binary exported from an actual
+image while using disposable PostgreSQL and BlobStore paths. This permits real
+IP editor/review/audit acceptance against that executable's exact bytes without
+changing real reports, accounts or templates. Its canonical link URL deliberately
+uses a different hostname; same-origin actions still follow the browser request.
+
+For a professor using plain HTTP directly on LAN port 9000, retain the existing
+credentials, database, project name and storage settings, and set only the
+relevant URL/listener keys (substitute the professor's actual LAN address):
+
+```dotenv
+LATEX_CORE_PUBLIC_BASE_URL=http://<PROFESSOR_LAN_IP>:9000
+SESSION_COOKIE_SECURE=false
+HTTP_PORT=9000
+HTTP_BIND_ADDRESS=0.0.0.0
+```
+
+For production HTTPS, use the real canonical origin and Secure cookies:
+
+```dotenv
+LATEX_CORE_PUBLIC_BASE_URL=https://papers.example.edu
+SESSION_COOKIE_SECURE=true
+```
+
+Keep the existing internal listener/publication port behind the HTTPS reverse
+proxy. Preserve the external Host and WebSocket upgrades through that proxy.
+No Rust address edit, wildcard CORS, forwarded-host allowlist or cookie security
+bypass is required. Use the application-only updater and then the verifier;
+reloading the browser's current asset URL must load the matching bundle.

@@ -62,6 +62,12 @@ printf 'LISTEN 0 128 127.0.0.1:19000 0.0.0.0:*\n'
 EOF
 chmod +x "$test_root/fake-bin/ss"
 
+# A real committed source fixture is required for meaningful image provenance.
+printf '.env\n.install-diagnostics/\n' >"$test_root/repo/.gitignore"
+git -C "$test_root/repo" init -q
+git -C "$test_root/repo" add .gitignore .env.example scripts deploy migrations
+git -C "$test_root/repo" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm 'Synthetic deployment fixture'
+
 export PATH="$test_root/fake-bin:$PATH"
 checksum="$(sha384sum "$test_root/repo/migrations/0001_initial_schema.sql")"
 export FAKE_MIGRATION_LINE="1|${checksum%% *}|t"
@@ -101,5 +107,17 @@ if "$test_root/repo/scripts/check-install-ports.sh" >"$test_root/out" 2>"$test_r
   exit 1
 fi
 grep -q 'HTTP port 19000 is already occupied by a host process; no service was stopped.' "$test_root/error"
+
+printf '\n# synthetic unreviewed change\n' >>"$test_root/repo/deploy/compose/docker-compose.yml"
+: >"$FAKE_DOCKER_LOG"
+if "$test_root/repo/scripts/update-deployment.sh" api >"$test_root/out" 2>"$test_root/error"; then
+  echo 'uncommitted deployment source unexpectedly passed' >&2
+  exit 1
+fi
+grep -q 'Commit reviewed source changes before updating' "$test_root/error"
+if grep -Eq '(^| )build( |$)|(^| )up( |$)' "$FAKE_DOCKER_LOG"; then
+  echo 'uncommitted source attempted a build or replacement' >&2
+  exit 1
+fi
 
 echo 'Deployment update failure-path tests passed.'

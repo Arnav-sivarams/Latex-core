@@ -12,6 +12,7 @@ mod archive;
 mod auth;
 mod collaboration;
 mod front_matter;
+mod http_origin;
 mod integration_api;
 #[allow(
     dead_code,
@@ -630,6 +631,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if let Ok(public_url) = env::var("LATEX_CORE_PUBLIC_BASE_URL") {
+        http_origin::public_base_url(&public_url).map_err(|_| "LATEX_CORE_PUBLIC_BASE_URL must be an HTTP(S) origin without credentials, path, query or fragment")?;
+    }
     let database_url = required("DATABASE_URL")?;
     let storage = required("BLOB_STORAGE_ROOT")?;
     let environment = TexEnvironmentId::parse(&required("TEX_ENVIRONMENT_ID")?)?;
@@ -1089,6 +1093,7 @@ fn router(state: AppState) -> Router {
         .route("/api/admin/templates", get(admin_templates))
         .route("/api/admin/jobs", get(admin_jobs))
         .route("/api/admin/audit", get(admin_audit))
+        .route("/api/build-info", get(build_info))
         .route("/api/admin/system", get(admin_system))
         .route("/api/projects", get(projects).post(create_project))
         .route("/api/projects/import", post(import_project))
@@ -11382,23 +11387,31 @@ const fn landing_path_for(kind: PrincipalKind, must_change_password: bool) -> &'
     }
 }
 
-fn csrf(headers: &HeaderMap) -> Result<(), Response> {
-    let Some(origin) = headers.get(header::ORIGIN) else {
-        return Ok(());
-    };
-    let origin = origin
-        .to_str()
-        .map_err(|_| error(StatusCode::FORBIDDEN, "invalid origin"))?;
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| error(StatusCode::FORBIDDEN, "missing host"))?;
-    if origin == format!("http://{host}") || origin == format!("https://{host}") {
-        Ok(())
-    } else {
-        Err(error(StatusCode::FORBIDDEN, "cross-origin request denied"))
-    }
+#[derive(Serialize)]
+struct BuildInfo {
+    schema_version: u8,
+    source_revision: &'static str,
+    review_js_sha256: String,
+    writer_js_sha256: String,
+    admin_js_sha256: String,
 }
+
+async fn build_info() -> Json<BuildInfo> {
+    use sha2::{Digest as _, Sha256};
+    Json(BuildInfo {
+        schema_version: 1,
+        source_revision: option_env!("LATEX_CORE_SOURCE_REVISION").unwrap_or("unknown"),
+        review_js_sha256: hex::encode(Sha256::digest(include_bytes!("../static/review.js"))),
+        writer_js_sha256: hex::encode(Sha256::digest(include_bytes!("../static/writer.js"))),
+        admin_js_sha256: hex::encode(Sha256::digest(include_bytes!("../static/admin.js"))),
+    })
+}
+
+fn csrf(headers: &HeaderMap) -> Result<(), Response> {
+    http_origin::validate_request_origin(headers)
+        .map_err(|failure| error(StatusCode::FORBIDDEN, failure.to_string()))
+}
+
 fn cookie(headers: &HeaderMap) -> Option<String> {
     let tokens = named_cookies(headers, COOKIE);
     // A well-formed V2 browser has precisely one root-scoped cookie.  Refusing
@@ -12345,44 +12358,6 @@ mod tests {
             HeaderValue::from_static("https://attacker.example"),
         );
         assert!(csrf(&headers).is_err());
-    }
-
-    #[test]
-    fn csrf_supports_network_origins_without_trusting_forwarded_hosts() {
-        for host in [
-            "localhost:8080",
-            "192.168.1.42:8080",
-            "[fd00::42]:8080",
-            "latex.example",
-        ] {
-            for scheme in ["http", "https"] {
-                let mut headers = HeaderMap::new();
-                headers.insert(header::HOST, host.parse().expect("valid test host"));
-                headers.insert(
-                    header::ORIGIN,
-                    format!("{scheme}://{host}")
-                        .parse()
-                        .expect("valid test origin"),
-                );
-                assert!(csrf(&headers).is_ok(), "{scheme}://{host}");
-                headers.insert(
-                    "x-forwarded-host",
-                    HeaderValue::from_static("attacker.example"),
-                );
-                headers.insert(
-                    header::ORIGIN,
-                    HeaderValue::from_static("https://attacker.example"),
-                );
-                assert!(csrf(&headers).is_err());
-                headers.insert(
-                    header::ORIGIN,
-                    format!("{scheme}://{host}.attacker.example")
-                        .parse()
-                        .expect("valid foreign test origin"),
-                );
-                assert!(csrf(&headers).is_err());
-            }
-        }
     }
 
     #[test]

@@ -100,10 +100,9 @@ impl MailSettings {
             "tls" => SmtpSecurity::Tls,
             _ => return Err(MailConfigError::Invalid("LATEX_CORE_SMTP_SECURITY")),
         };
-        let public_base_url = required("LATEX_CORE_PUBLIC_BASE_URL")?;
-        if !(public_base_url.starts_with("https://") || public_base_url.starts_with("http://")) {
-            return Err(MailConfigError::Invalid("LATEX_CORE_PUBLIC_BASE_URL"));
-        }
+        let public_base_url =
+            crate::http_origin::public_base_url(&required("LATEX_CORE_PUBLIC_BASE_URL")?)
+                .map_err(|_| MailConfigError::Invalid("LATEX_CORE_PUBLIC_BASE_URL"))?;
         let cipher = MailSecretCipher::from_base64(&required("LATEX_CORE_MAIL_SECRET_KEY")?)
             .map_err(|_| MailConfigError::Invalid("LATEX_CORE_MAIL_SECRET_KEY"))?;
         let lifetime_hours = env_number("LATEX_CORE_MAIL_SECRET_LIFETIME_HOURS", 72_u64)?;

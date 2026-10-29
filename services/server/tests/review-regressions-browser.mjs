@@ -54,6 +54,16 @@ try {
   console.log('ORIGIN:',base,await w.page.evaluate(()=>({secure:isSecureContext,subtle:!!crypto.subtle,randomUUID:typeof crypto.randomUUID})));
   assert.equal(await w.page.evaluate(() => isSecureContext), host === 'localhost' || host === '127.0.0.1', 'LAN HTTP must run without a browser security bypass');
   await verifyServedAssets(w.ctx, base);
+  if (process.env.LATEX_CORE_TEST_API_EXECUTABLE) {
+    const build=await json(w.ctx,'/api/build-info');
+    assert.equal(build.schema_version,1);assert.equal(build.source_revision,process.env.LATEX_CORE_TEST_SOURCE_REVISION);
+    for(const name of ['review','writer','admin']) {
+      const expected=createHash('sha256').update(await readFile(new URL(`../static/${name}.js`,import.meta.url))).digest('hex');
+      assert.equal(build[`${name}_js_sha256`],expected);
+    }
+    console.log('DEPLOYED_API_BUILD_PASS:',build.source_revision,'embedded and HTTP-served assets match checkout');
+  }
+
   if (!process.env.REVIEW_AUDIT_ONLY) await verifyProblems(w.page, base, config.paperId, await json(w.ctx, paper+'/files'));
   const other=await client(config.otherCookie);await login(other,config.otherEmail);
   if (!process.env.REVIEW_AUDIT_ONLY) await verifyCollaboration(w, other, base, config.paperId, await json(w.ctx,paper+'/files'), json);

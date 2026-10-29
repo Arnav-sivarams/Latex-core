@@ -36,6 +36,24 @@ sed 's|^LATEX_CORE_PUBLIC_BASE_URL=.*$|LATEX_CORE_PUBLIC_BASE_URL="http://localh
 chmod 600 "$test_root/quoted.env"
 "$root/scripts/validate-install-config.py" "$test_root/quoted.env" >/dev/null
 
+for public_url in 'http://10.42.1.87:18081' 'http://10.42.2.88:18081' 'https://papers.example.edu'; do
+  secure=false
+  [[ "$public_url" == https:* ]] && secure=true
+  sed -e "s|^LATEX_CORE_PUBLIC_BASE_URL=.*$|LATEX_CORE_PUBLIC_BASE_URL=$public_url|" \
+      -e "s|^SESSION_COOKIE_SECURE=.*$|SESSION_COOKIE_SECURE=$secure|" "$test_root/valid.env" >"$test_root/public.env"
+  chmod 600 "$test_root/public.env"
+  "$root/scripts/validate-install-config.py" "$test_root/public.env" >/dev/null
+done
+for public_url in 'http://10.42.1.87:99999' 'https://papers.example.edu/path' 'https://papers.example.edu/?query=x' 'https://papers.example.edu/#fragment'; do
+  sed "s|^LATEX_CORE_PUBLIC_BASE_URL=.*$|LATEX_CORE_PUBLIC_BASE_URL=$public_url|" "$test_root/valid.env" >"$test_root/invalid-public.env"
+  chmod 600 "$test_root/invalid-public.env"
+  if "$root/scripts/validate-install-config.py" "$test_root/invalid-public.env" >"$test_root/out" 2>"$test_root/error"; then
+    echo 'invalid public origin unexpectedly passed' >&2
+    exit 1
+  fi
+  grep -q LATEX_CORE_PUBLIC_BASE_URL "$test_root/error"
+done
+
 # A deployed main .env predates these feature-branch settings. Their runtime
 # defaults must remain compatible so an update does not require reinstalling or
 # replacing credentials/data.

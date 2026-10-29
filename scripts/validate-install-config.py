@@ -206,6 +206,12 @@ def validate(path: Path) -> None:
         public_url = urlsplit(public_url_value)
         if public_url.scheme not in {"http", "https"} or not public_url.hostname or public_url.username or public_url.password:
             raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL must be an http(s) origin without credentials")
+        if public_url.path not in {"", "/"} or public_url.query or public_url.fragment:
+            raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL must be an origin without path, query or fragment")
+        try:
+            public_url.port
+        except ValueError as error:
+            raise ConfigError("LATEX_CORE_PUBLIC_BASE_URL has an invalid port") from error
         secure = values["SESSION_COOKIE_SECURE"] == "true"
         if (public_url.scheme == "https") != secure:
             raise ConfigError("SESSION_COOKIE_SECURE must be true for https and false for http access")

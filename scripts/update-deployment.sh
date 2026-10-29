@@ -106,6 +106,11 @@ done
 phase=migration-compatibility
 "$root/scripts/check-deployment-migrations.sh"
 
+# A revision label is meaningful only when the source being built is committed.
+git -C "$root" rev-parse --verify HEAD >/dev/null || { echo 'Deployment updates require a Git checkout with an approved commit.' >&2; exit 1; }
+[[ -z "$(git -C "$root" status --porcelain)" ]] || { echo 'Commit reviewed source changes before updating the deployment.' >&2; exit 1; }
+export LATEX_CORE_SOURCE_REVISION="$(git -C "$root" rev-parse HEAD)"
+
 phase=image-build
 echo "Building application image(s): ${services[*]}"
 "${LATEX_CORE_COMPOSE[@]}" build "${services[@]}"
