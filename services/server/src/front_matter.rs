@@ -318,7 +318,9 @@ pub fn bind_single_source_values(
         }
         edits.push((target..target, additions));
     }
-    Ok(Bytes::from(source_spans::apply(source, edits)?))
+    Ok(Bytes::from(student_registration_spacing(
+        &source_spans::apply(source, edits)?,
+    )?))
 }
 
 pub fn document_owned_source(source: &str) -> bool {
@@ -936,6 +938,26 @@ fn semantic_definitions(values: &BTreeMap<String, ResolvedValue>) -> String {
     output
 }
 
+// Spaces following a TeX control word are swallowed. A control-space emits
+// one ordinary, breakable space without changing the student metadata.
+fn student_registration_spacing(source: &str) -> Result<String, FrontMatterError> {
+    let code = source_spans::mask_comments(source);
+    let mut edits = Vec::new();
+    for slot in ['A', 'B', 'C', 'D'] {
+        let name = format!("\\student{slot}name");
+        let registration = format!("(\\student{slot}regno)");
+        for (offset, _) in code.match_indices(&name) {
+            let start = offset + name.len();
+            let tail = &source[start..];
+            let trimmed = tail.trim_start_matches([' ', '\t']);
+            if trimmed.starts_with(&registration) {
+                edits.push((start..start + tail.len() - trimmed.len(), "\\ ".into()));
+            }
+        }
+    }
+    source_spans::apply(source, edits)
+}
+
 fn render_tex(
     source: &str,
     path: &str,
@@ -967,7 +989,7 @@ fn render_tex(
         cursor = end + 2;
     }
     output.push_str(&source[cursor..]);
-    Ok(output)
+    student_registration_spacing(&output)
 }
 
 fn placeholders(source: &str, path: &str) -> Result<Vec<String>, FrontMatterError> {

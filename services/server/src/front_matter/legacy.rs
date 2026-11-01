@@ -459,7 +459,14 @@ pub fn render(
             Ok(RenderedFile {
                 path: LogicalPath::parse(&format!("{MANAGED_ROOT}/{}", file.path))
                     .map_err(|_| FrontMatterError::InvalidPath(file.path.to_string()))?,
-                bytes: file.bytes.clone(),
+                bytes: if file.path.extension() == Some("tex") {
+                    Bytes::from(super::student_registration_spacing(
+                        std::str::from_utf8(&file.bytes)
+                            .map_err(|_| FrontMatterError::InvalidManifest)?,
+                    )?)
+                } else {
+                    file.bytes.clone()
+                },
             })
         })
         .collect::<Result<Vec<_>, FrontMatterError>>()?;
@@ -774,6 +781,60 @@ mod tests {
         .unwrap();
         assert!(bindings.contains(r"\renewcommand{\semester}{Fall Semester 2026-2027}"));
         assert!(bindings.contains(r"\renewcommand{\academicyear}{2026-2027}"));
+    }
+
+    #[test]
+    fn student_registration_spacing_is_breakable_on_every_generated_page() {
+        let mut pack = fixture();
+        let source = concat!(
+            "\\studentAname(\\studentAregno), ",
+            "\\studentBname  (\\studentBregno), ",
+            "\\studentCname\t(\\studentCregno), ",
+            "\\studentDname\\ (\\studentDregno)\r\n",
+            "% \\studentAname(\\studentAregno)\r\n",
+        );
+        let expected = concat!(
+            "\\studentAname\\ (\\studentAregno), ",
+            "\\studentBname\\ (\\studentBregno), ",
+            "\\studentCname\\ (\\studentCregno), ",
+            "\\studentDname\\ (\\studentDregno)\r\n",
+            "% \\studentAname(\\studentAregno)\r\n",
+        );
+        for page in [
+            "certificate.tex",
+            "acknowledgement.tex",
+            "declaration.tex",
+            "other.tex",
+        ] {
+            pack.files.retain(|file| file.path.as_str() != page);
+            pack.files.push(ImportedFile {
+                path: LogicalPath::parse(page).unwrap(),
+                bytes: Bytes::from(source),
+            });
+        }
+        let enabled = pack
+            .manifest
+            .sections
+            .iter()
+            .map(|section| (section.key.clone(), true))
+            .collect();
+        let rendered = render(&pack, &BTreeMap::new(), &enabled).unwrap();
+        for page in [
+            "certificate.tex",
+            "acknowledgement.tex",
+            "declaration.tex",
+            "other.tex",
+        ] {
+            let file = rendered
+                .iter()
+                .find(|file| file.path.as_str() == format!("{MANAGED_ROOT}/{page}"))
+                .unwrap();
+            assert_eq!(file.bytes.as_ref(), expected.as_bytes());
+        }
+        assert_eq!(
+            super::super::student_registration_spacing(expected).unwrap(),
+            expected
+        );
     }
 
     #[test]
