@@ -1,0 +1,28 @@
+# Temporary: builds the Writer/Mentor bundles for this branch and commits them. Removed by its own run.
+name: tmp-build-bundles
+on:
+  push:
+    branches: [fix/user-reports-nov]
+permissions:
+  contents: write
+jobs:
+  bundles:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Commit bundles and remove this temporary workflow
+        run: |
+          git config user.name "Arnav-sivarams"
+          git config user.email "arnav.techacademy@gmail.com"
+          git rm -q .github/workflows/tmp-build-bundles.yml
+          git add services/server/static/writer.js services/server/static/review.js services/server/static/pdf.min.mjs services/server/static/pdf.worker.min.mjs
+          git status --short
+          git commit -m "Rebuild Writer and Mentor bundles"
+          git push origin HEAD:fix/user-reports-nov
