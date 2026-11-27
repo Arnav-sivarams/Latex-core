@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>LaTeX Core</title><link rel="stylesheet" href="/static/styles.css?v=ui-consistency-theme-1">
+  <title>LaTeX Core</title><link rel="stylesheet" href="/static/styles.css?v=ui-consistency-theme-2">
   <script src="/static/theme.js?v=ui-consistency-theme-1"></script>
 </head>
 <body>
@@ -13,6 +13,7 @@
       <label>Email<input id="email" name="email" type="email" autocomplete="username" value="{{LOGIN_EMAIL}}" required></label>
       <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
       <p id="loginError" class="inline-error" role="alert">{{LOGIN_ERROR}}</p><button type="submit" class="primary wide">Sign in</button>
+      <details class="login-help"><summary>Forgot your password?</summary><p>Ask your Team Leader or Mentor to contact the LaTeX Core administrator. The administrator can issue new temporary passwords for one person or a whole Team from Admin → Paper Teams → Reset Team passwords. The new password is emailed to you (or handed over by your Team) and must be changed at your next sign-in.</p></details>
     </form>
   </section>
   <!-- login-view:end -->

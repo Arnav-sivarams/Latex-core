@@ -299,8 +299,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .member-add-form { margin-top: 8px; border-bottom: 0; }
 .primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 .danger { color: var(--danger); }
-.status-region { position: fixed; right: 18px; bottom: 18px; max-width: min(420px, calc(100vw - 36px)); padding: 10px 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: 0 12px 28px #20231d1c; }
+.status-region { position: fixed; top: 104px; left: 50%; z-index: 60; transform: translateX(-50%); display: flex; align-items: flex-start; gap: 10px; width: max-content; max-width: min(560px, calc(100vw - 36px)); padding: 11px 12px 11px 16px; border: 1px solid var(--accent); border-left-width: 5px; border-radius: 8px; background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 16px 36px #20231d33; animation: status-region-in .18s ease-out; }
+.status-region.danger { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 7%, var(--surface)); }
 .status-region:empty { display: none; }
+.status-region .status-message { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; line-height: 1.4; }
+.status-region .status-action { flex: 0 0 auto; min-height: 26px; padding: 2px 10px; border: 1px solid currentColor; border-radius: 5px; background: transparent; color: inherit; font-weight: 650; cursor: pointer; }
+.status-region .status-close { flex: 0 0 auto; width: 26px; height: 26px; min-height: 26px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: inherit; font-size: 18px; line-height: 1; cursor: pointer; }
+.status-region .status-close:hover, .status-region .status-action:hover { background: color-mix(in srgb, currentColor 12%, transparent); }
+@keyframes status-region-in { from { opacity: 0; transform: translate(-50%, -6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@media (prefers-reduced-motion: reduce) { .status-region { animation: none; } }
 
 .admin-toolbar, .admin-filters, .admin-pagination, .admin-tabs, .wizard-steps { min-width: 0; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 12px 0; }
 .admin-filters label, .admin-field, .import-form label, .manual-team-form label { min-width: 140px; display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weight: 650; }
@@ -535,7 +542,8 @@ html:has(body.workspace-shell), body.workspace-shell { overflow: hidden; }
 .pdf-pane .foundation-empty { flex: 1 1 auto; min-height: 0; }
 .pdf-pane #pdfRelation { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .pdf-location-control { display: inline-flex; align-items: center; gap: 3px; margin: 0; color: var(--muted); font-size: 10px; }
-.pdf-location-control input { width: 48px; min-height: 26px; padding: 2px 4px; }
+.pdf-location-control input { width: 64px; min-height: 26px; padding: 2px 4px; text-align: center; font-variant-numeric: tabular-nums; }
+.pdf-location-control .pdf-page-total { min-width: 2.5em; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .pdf-location-control select { width: 66px; min-height: 26px; padding: 2px 4px; }
 
 .compact-popover, .context-review-popover {
@@ -1030,3 +1038,20 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .ordered-person { grid-template-columns: auto minmax(0, 1fr) auto; }
   .ordered-person-actions { grid-column: 3; }
 }
+/* Auto-save confirmation: the save chip briefly highlights when pending edits become durable. */
+.save-status.save-pulse { animation: save-status-pulse 1.4s ease-out; }
+@keyframes save-status-pulse { 0% { color: var(--success); background: color-mix(in srgb, var(--success) 18%, transparent); } 100% { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .save-status.save-pulse { animation: none; } }
+.problem-row .problem-detail { margin-left: 6px; padding: 0 5px; border-radius: 4px; background: color-mix(in srgb, var(--text) 7%, transparent); color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+.thread-awaiting { align-self: center; color: var(--muted); font-size: 12px; font-style: italic; }
+/* PDF review regions: live drag selection, the focused comment, and the Writer's reviewed-region marker. */
+.pdf-highlight.selecting { pointer-events: none; border: 1.5px dashed var(--accent); background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.pdf-highlight.focused { z-index: 2; border: 2px solid #d9480f; background: #ff922b55; box-shadow: 0 0 0 3px #ff922b44; animation: review-region-pulse 1.6s ease-out 2; }
+.pdf-highlight.muted { opacity: .35; }
+.writer-review-region { position: absolute; z-index: 2; pointer-events: none; border: 2px solid #d9480f; border-radius: 3px; background: #ff922b40; box-shadow: 0 0 0 3px #ff922b33; animation: review-region-pulse 1.6s ease-out 2; }
+@keyframes review-region-pulse { 0% { box-shadow: 0 0 0 0 #ff922b88; } 100% { box-shadow: 0 0 0 10px #ff922b00; } }
+@media (prefers-reduced-motion: reduce) { .pdf-highlight.focused, .writer-review-region { animation: none; } }
+.paper-list .paper-row { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.paper-list .paper-row > button:first-child { flex: 1 1 auto; min-width: 0; }
+.paper-list .paper-remove { flex: 0 0 auto; width: 28px; justify-content: center; opacity: .55; }
+.paper-list .paper-row:hover .paper-remove, .paper-list .paper-remove:focus-visible { opacity: 1; color: var(--danger); }

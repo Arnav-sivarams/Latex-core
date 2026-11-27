@@ -1,4 +1,6 @@
 import { nativeSourceRange, openSourceContextMenu } from './review-source-selection.mjs';
+import { showStatusNotice } from './status-notice.mjs';
+import { reviewLocation, reviewStateLabel } from './review-location.mjs';
 import { digest } from 'lib0/hash/sha256';
 import { uuidv4 } from 'lib0/random';
 import { basicSetup } from 'codemirror';
@@ -48,12 +50,13 @@ class ReviewApi {
   map(id, body) { return this.json(`/api/v2/reviews/papers/${id}/synctex`, 'POST', body); }
   build(id) { return this.json(`/api/v2/papers/${id}/builds`, 'POST', { trigger_type: 'manual' }); }
   buildStatus(id) { return this.request(`/api/v2/papers/${id}/builds`); }
+  freeze(id, frozen) { return this.json(`/api/v2/reviews/papers/${id}/freeze`, 'POST', { frozen }); }
 }
 
 const api = new ReviewApi();
 const ui = Object.fromEntries([
   'reviewContext', 'liveStatus', 'assignedPapers', 'reviewFiles', 'csvExport', 'printExport',
-  'reviewTitle', 'reviewSummary', 'buildStatus', 'compileReview',
+  'reviewTitle', 'reviewSummary', 'buildStatus', 'compileReview', 'freezeReport',
   'reviewEditor', 'sourceSelection', 'reviewSelection', 'previousPage', 'pageLabel', 'nextPage', 'zoomOut',
   'zoomLabel', 'zoomIn', 'pdfState', 'pdfViewport', 'pdfCanvas', 'pdfOverlay',
   'reviewPopover', 'anchorSummary', 'threadType', 'threadMessage', 'cancelAnnotation',
@@ -75,7 +78,7 @@ const model = {
   lastPublishedRoundId: null, pendingSubmission: null, publicationBusy: false, publicationFailure: false,
 };
 
-function notice(message, failed = false) { ui.reviewNotice.textContent = message; ui.reviewNotice.classList.toggle('danger', failed); }
+function notice(message, failed = false, action = null) { showStatusNotice(ui.reviewNotice, message, { failed, action }); }
 const reportedErrors = new Map();
 function reportClientError(code) {
   const paperId = model.paper?.id;
@@ -282,7 +285,7 @@ async function openPaper(paper) {
   if (model.paper?.id !== paper.id) { model.pendingSubmission = null; model.publicationFailure = false; model.lastPublishedRoundId = null; }
   model.paper = paper; model.file = null; model.pendingAnchor = null;
   ui.reviewContext.textContent = paper.name; ui.reviewTitle.textContent = paper.name; ui.reviewSummary.textContent = `${paper.status} · ${paper.open_review_count} open · ${paper.blocking_review_count} blocking`;
-  ui.compileReview.disabled = paper.status !== 'active'; ui.csvExport.href = `/api/v2/reviews/papers/${paper.id}/report.csv`; ui.printExport.href = `/api/v2/reviews/papers/${paper.id}/report.html`; ui.csvExport.removeAttribute('aria-disabled'); ui.printExport.removeAttribute('aria-disabled');
+  renderFreezeControl(); ui.compileReview.disabled = paper.status !== 'active'; ui.csvExport.href = `/api/v2/reviews/papers/${paper.id}/report.csv`; ui.printExport.href = `/api/v2/reviews/papers/${paper.id}/report.html`; ui.csvExport.removeAttribute('aria-disabled'); ui.printExport.removeAttribute('aria-disabled');
   const [detail, files] = await Promise.all([api.paper(paper.id), api.files(paper.id)]);
   model.detail = detail; model.files = files.files; renderPapers(); renderFiles();
   const initial = model.files.find((file) => file.path === detail.main_file) || model.files[0]; if (initial) await openFile(initial);
@@ -342,7 +345,10 @@ async function renderPage() {
 }
 function renderOverlays() {
   ui.pdfOverlay.replaceChildren(); if (!model.viewport) return;
-  model.threads.filter((thread) => thread.pdf_anchor?.page === model.page).forEach((thread) => thread.pdf_anchor.normalized_rectangles.forEach((rectangle) => addOverlay(rectangle, `persisted ${thread.pdf_anchor.mapping_status}`, () => focusThread(thread))));
+  // The comment chosen in the list is marked on the page; the page's other comments stay visible but muted.
+  const focused = model.focusedThreadId && model.threads.some((thread) => thread.id === model.focusedThreadId && thread.pdf_anchor?.page === model.page) ? model.focusedThreadId : null;
+  model.threads.filter((thread) => thread.pdf_anchor?.page === model.page).forEach((thread) => thread.pdf_anchor.normalized_rectangles.forEach((rectangle) => addOverlay(rectangle, `persisted ${thread.pdf_anchor.mapping_status}${focused ? (thread.id === focused ? ' focused' : ' muted') : ''}`, () => focusThread(thread))));
+  ui.pdfOverlay.querySelector('.pdf-highlight.focused')?.scrollIntoView?.({ block: 'center', inline: 'nearest', behavior: 'smooth' });
   if (model.pendingAnchor?.pdf_anchor?.page === model.page) model.pendingAnchor.pdf_anchor.normalized_rectangles.forEach((rectangle) => addOverlay(rectangle, 'pending'));
 }
 function addOverlay(rectangle, className, handler) { const pixels = denormalizeRectangle(rectangle, model.viewport.width, model.viewport.height); const node = document.createElement('button'); node.type = 'button'; node.className = `pdf-highlight ${className}`; Object.assign(node.style, { left: `${pixels.x}px`, top: `${pixels.y}px`, width: `${pixels.width}px`, height: `${pixels.height}px` }); if (handler) node.addEventListener('click', handler); ui.pdfOverlay.append(node); }
@@ -354,7 +360,17 @@ async function pdfAnchorFromMapping(mapping) {
 }
 
 ui.pdfOverlay.addEventListener('pointerdown', (event) => { if (!model.viewport || event.target !== ui.pdfOverlay) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); model.dragStart = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; ui.pdfOverlay.setPointerCapture(event.pointerId); });
+// Live feedback while dragging a PDF region: the selection is tinted until the pointer is released.
+function clearSelectionBox() { model.selectionBox?.remove(); model.selectionBox = null; }
+ui.pdfOverlay.addEventListener('pointermove', (event) => {
+  if (!model.dragStart || !model.viewport) return;
+  const bounds = ui.pdfOverlay.getBoundingClientRect(); const x = event.clientX - bounds.left; const y = event.clientY - bounds.top;
+  if (!model.selectionBox) { model.selectionBox = document.createElement('div'); model.selectionBox.className = 'pdf-highlight selecting'; model.selectionBox.setAttribute('aria-hidden', 'true'); ui.pdfOverlay.append(model.selectionBox); }
+  Object.assign(model.selectionBox.style, { left: `${Math.min(x, model.dragStart.x)}px`, top: `${Math.min(y, model.dragStart.y)}px`, width: `${Math.abs(x - model.dragStart.x)}px`, height: `${Math.abs(y - model.dragStart.y)}px` });
+});
+ui.pdfOverlay.addEventListener('pointercancel', () => { model.dragStart = null; clearSelectionBox(); });
 ui.pdfOverlay.addEventListener('pointerup', async (event) => {
+  clearSelectionBox();
   if (!model.dragStart || !model.viewport) return; const bounds = ui.pdfOverlay.getBoundingClientRect(); const end = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }; const rectangle = normalizeRectangle({ x1: model.dragStart.x, y1: model.dragStart.y, x2: end.x, y2: end.y }, model.viewport.width, model.viewport.height); model.dragStart = null; if (rectangle.width < 0.005 || rectangle.height < 0.005) return;
   if (!canDraft()) return;
   const point = { x: (rectangle.x + rectangle.width / 2) * model.viewport.width / model.scale, y: (rectangle.y + rectangle.height / 2) * model.viewport.height / model.scale };
@@ -432,14 +448,14 @@ function renderThreads() {
   selected.forEach((thread) => {
     const draft = thread.publication_status === 'DRAFT';
     const card = document.createElement('article'); card.className = `thread-card${draft ? ' draft-thread' : ''}`;
-    const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'thread-title'; heading.textContent = `${thread.thread_type.replaceAll('_', ' ')} · ${draft ? 'DRAFT' : thread.state}`; heading.addEventListener('click', () => focusThread(thread));
-    const meta = document.createElement('p'); meta.textContent = `${thread.source_anchor?.path || 'PDF'} · ${mappingStatus(thread)}`;
+    const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'thread-title'; heading.textContent = `${thread.thread_type.replaceAll('_', ' ')} · ${draft ? 'DRAFT' : reviewStateLabel(thread.state, 'mentor')}`; heading.addEventListener('click', () => focusThread(thread));
+    const meta = document.createElement('p'); const where = reviewLocation(thread, model.files); meta.textContent = `${where.path || where.label}${where.path && where.lines ? ` · ${where.lines}` : ''}${where.path && where.page ? ` · ${where.page}` : ''} · ${mappingStatus(thread)}`;
     const discussion = document.createElement('div'); discussion.className = 'discussion';
     thread.messages.forEach((message) => { const row = document.createElement('p'); const author = document.createElement('strong'); author.textContent = `${message.author_email}: `; row.append(author, document.createTextNode(message.body)); discussion.append(row); });
     const actions = document.createElement('div'); actions.className = 'thread-actions';
     if (draft && canDraft()) actions.append(button('Edit draft', () => editDraft(thread)), button('Delete draft', () => deleteDraft(thread)));
     else if (!draft && reviewOpen()) actions.append(button('Reply', () => reply(thread)));
-    if (!draft && thread.state === 'ADDRESSED') actions.append(button('Done', () => transition(thread, 'RESOLVED')), button('Reopen', () => transition(thread, 'REOPENED')));
+    if (!draft && thread.state === 'ADDRESSED') actions.append(button('Confirm resolved', () => transition(thread, 'RESOLVED')), button('Reopen', () => transition(thread, 'REOPENED')));
     else if (!draft && thread.state === 'RESOLVED' && reviewOpen()) actions.append(button('Reopen', () => transition(thread, 'REOPENED')));
     card.append(heading, meta, discussion, actions); ui.threadList.append(card);
   });
@@ -485,6 +501,7 @@ async function reply(thread) { const body = prompt('Reply'); if (!body) return; 
 async function transition(thread, state) { await api.transition(model.paper.id, thread.id, state); await Promise.all([refreshThreads(), refreshRounds()]); }
 
 async function focusThread(thread) {
+  model.focusedThreadId = thread.id;
   if (thread.pdf_anchor?.page) { model.page = thread.pdf_anchor.page; await renderPage(); }
   const anchor = thread.source_anchor; if (!anchor || anchor.file_deleted) return;
   const file = model.files.find((candidate) => candidate.file_id === anchor.file_id); if (!file) return; if (model.file?.file_id !== file.file_id) await openFile(file);
@@ -588,6 +605,29 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('pointerdown', (event) => {
   if (!ui.reviewPopover.hidden && !ui.reviewPopover.contains(event.target)) hideComposer({ clearAnchor: false });
+});
+// Guide freeze: a frozen report is view/download only for the Team until the Mentor unfreezes it.
+function renderFreezeControl() {
+  const status = model.paper?.status; const frozen = status === 'frozen';
+  ui.freezeReport.disabled = !['active', 'frozen'].includes(status);
+  ui.freezeReport.setAttribute('aria-pressed', String(frozen));
+  ui.freezeReport.setAttribute('aria-label', frozen ? 'Unfreeze report' : 'Freeze report');
+  ui.freezeReport.title = frozen ? 'Unfreeze: restore editing for the Team' : 'Freeze: the Team can only view and download the report';
+  ui.freezeReport.querySelector('span:last-child').textContent = frozen ? 'Unfreeze report' : 'Freeze report';
+}
+ui.freezeReport.addEventListener('click', async () => {
+  if (!model.paper) return;
+  const freeze = model.paper.status !== 'frozen';
+  if (!window.confirm(freeze ? `Freeze ${model.paper.name}? Writers can still view and download it, but nobody can edit or compile until you unfreeze it.` : `Unfreeze ${model.paper.name}? Writers can edit and compile again.`)) return;
+  ui.freezeReport.disabled = true;
+  try {
+    const result = await api.freeze(model.paper.id, freeze);
+    model.paper = { ...model.paper, status: result.status };
+    renderFreezeControl(); ui.compileReview.disabled = model.paper.status !== 'active';
+    ui.reviewSummary.textContent = `${model.paper.status} · ${model.paper.open_review_count} open · ${model.paper.blocking_review_count} blocking`;
+    notice(freeze ? `${model.paper.name} is frozen: view and download only.` : `${model.paper.name} is unfrozen: editing restored.`);
+    await refreshPapers();
+  } catch (failure) { renderFreezeControl(); notice(`Freeze was not changed: ${failure.message}`, true); }
 });
 ui.compileReview.addEventListener('click', async () => { try { ui.buildStatus.textContent = 'Building…'; await api.build(model.paper.id); await refreshBuild(); } catch (failure) { notice(failure.message, true); } });
 ui.previousPage.addEventListener('click', async () => { if (model.page > 1) { model.page -= 1; await renderPage(); } }); ui.nextPage.addEventListener('click', async () => { if (model.page < model.pdf.numPages) { model.page += 1; await renderPage(); } }); ui.zoomOut.addEventListener('click', async () => { model.scale = Math.max(0.5, model.scale - 0.25); await renderPage(); }); ui.zoomIn.addEventListener('click', async () => { model.scale = Math.min(3, model.scale + 0.25); await renderPage(); });

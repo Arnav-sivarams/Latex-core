@@ -44,7 +44,7 @@ test('Writer review decorations, hover grace, resolution, and leader-only review
   assert.match(writer, /Decoration\.mark/);
   assert.match(writer, /data-review-thread/);
   assert.match(writer, /setTimeout\([^,]+, 140\)/);
-  assert.match(writer, /reviewState\(model\.paper\.id, thread\.id, 'RESOLVED'\)/);
+  assert.match(writer, /reviewState\(model\.paper\.id, thread\.id, 'ADDRESSED'\)/);
   assert.match(writer, /popover\.addEventListener\('mouseenter'/);
   assert.match(writer, /ui\.sendReview\.hidden = !teamLeader/);
   assert.match(writerHtml, /id="sendReview"[^>]*hidden/);

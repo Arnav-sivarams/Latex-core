@@ -1,5 +1,8 @@
 //! Small release readiness check; run where the worker's Docker socket is available.
 #![forbid(unsafe_code)]
+#[path = "../http_origin.rs"]
+#[allow(dead_code, reason = "doctor uses only the public base URL validator")]
+mod http_origin;
 #[path = "../mail.rs"]
 #[allow(
     dead_code,

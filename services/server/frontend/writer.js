@@ -1,4 +1,5 @@
 import { renderProblemList } from './writer-problems.mjs';
+import { showStatusNotice } from './status-notice.mjs';
 import { frontMatterStatus, editableDetail, needsFirstUseDetails, detailCategory } from './document-details.mjs';
 import { writerEditorSetup } from './writer-editor.mjs';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
@@ -12,6 +13,7 @@ import { yCollab } from 'y-codemirror.next';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import * as pdfjsLib from '/static/pdf.min.mjs';
 import { resolveSuggestionRange } from './review-helpers.mjs';
+import { reviewLocation, reviewStateLabel } from './review-location.mjs';
 import { pdfPointFromClient, pdfPreviewState } from './writer-pdf.mjs';
 import { installWorkspaceSplitters } from './workspace-split.mjs';
 import { buildIsStale, compileIsActive, problemsState, supportLink, recognizedBuildProblems, renderBuildLog, shortBuildState } from './writer-build.mjs';
@@ -131,7 +133,7 @@ const ui = Object.fromEntries([
   'editorMount', 'writerNotice', 'compilePaper', 'sendReview', 'endReview', 'buildStatus', 'compileSpinner', 'pdfRelation', 'pdfEmpty',
   'buildFooter', 'buildFooterBody', 'buildFooterState', 'buildFooterCount', 'buildFooterToggle', 'buildProblemsTab', 'buildLogTab', 'buildProblemsPanel', 'buildProblemsList', 'buildLogPanel', 'buildLogText',
   'pdfScroll', 'pdfViewport', 'downloadPdf', 'createCheckpoint', 'versionHistory', 'versionDiff',
-  'pdfPage', 'pdfZoom', 'locateInPdf',
+  'pdfPage', 'pdfPageTotal', 'pdfZoom', 'locateInPdf',
   'reviewCounts', 'writerReviewFilters', 'writerReviewList',
     'quickOpen', 'commandPalette', 'uploadImage', 'assetInput',
   'projectSearch', 'caseSensitive', 'searchResults', 'insertMenu', 'symbolPalette',
@@ -173,6 +175,9 @@ const model = {
   intelligenceTimer: null,
   searchTimer: null,
   compileDiagnostic: null,
+  buildStatusRequest: 0,
+  buildStatusApplied: 0,
+  buildStatusInFlight: 0,
   recoveryText: null,
   undoManager: null,
   preferences: { font_size_px: 14, theme: 'LIGHT' },
@@ -234,19 +239,23 @@ function disposeWriterPdf(capture = true) {
   model.pdfDisplayBuildId = null;
   delete ui.pdfViewport.dataset.buildId;
   ui.pdfViewport.replaceChildren();
+  if (ui.pdfPageTotal) ui.pdfPageTotal.textContent = '/ –';
 }
 async function restorePdfView() {
   const page = ui.pdfViewport.querySelector(`[data-page="${model.pdfView.page}"]`) || ui.pdfViewport.lastElementChild;
   if (!page) return;
   model.pdfView.page = Number(page.dataset.page);
   ui.pdfPage.max = String(ui.pdfViewport.children.length); ui.pdfPage.value = String(model.pdfView.page);
+  if (ui.pdfPageTotal) ui.pdfPageTotal.textContent = `/ ${ui.pdfViewport.children.length}`;
   await new Promise((resolve) => requestAnimationFrame(resolve));
   ui.pdfScroll.scrollTop = page.offsetTop + Math.max(0, Math.min(1, Number(model.pdfView.y) || 0)) * page.offsetHeight;
   ui.pdfScroll.scrollLeft = Math.max(0, Number(model.pdfView.x) || 0);
   capturePdfView();
 }
 async function showPdfLocation(pageNumber, x = 0, y = 0, normalized = false) {
-  model.pdfView.page = Math.max(1, Math.min(model.pdfDocument?.numPages || pageNumber, Number(pageNumber) || 1));
+  const available = model.pdfDocument?.numPages;
+  if (available && Number(pageNumber) > available) notice(`Page ${pageNumber} is not in this PDF (${available} pages); the report changed after it was reviewed. Showing the last page.`, true);
+  model.pdfView.page = Math.max(1, Math.min(available || pageNumber, Number(pageNumber) || 1));
   const page = ui.pdfViewport.querySelector(`[data-page="${model.pdfView.page}"]`);
   if (page) {
     model.pdfView.y = normalized ? Math.max(0, Math.min(1, Number(y) || 0)) : Math.max(0, Math.min(1, (Number(y) || 0) * ((Number(model.pdfView.zoom) || 100) / 100) / Math.max(1, page.offsetHeight)));
@@ -350,9 +359,15 @@ async function loadWriterPdf(buildId, historical = false) {
 }
 async function applyPdfView() { if (model.currentBuildId) { savePdfView(); await loadWriterPdf(model.currentBuildId); } }
 
-function notice(message, failed = false) {
-  ui.writerNotice.textContent = message;
-  ui.writerNotice.classList.toggle('danger', failed);
+function notice(message, failed = false, action = null) {
+  showStatusNotice(ui.writerNotice, message, { failed, action });
+}
+
+function downloadTextFile(text, filename) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a'); link.href = url; link.download = filename;
+  document.body.append(link); link.click(); link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function editorAppearance(preference) {
@@ -433,8 +448,14 @@ function saveState(state) {
     conflict: 'Conflict/Error',
     storage_error: 'Local recovery unavailable',
   };
-  ui.saveStatus.textContent = labels[state];
+  const previous = ui.saveStatus.dataset.state;
+  // Edits save automatically; the status chip is the auto-save confirmation (the manual Save button is hidden).
+  ui.saveStatus.textContent = state === 'synced' ? `${labels.synced} automatically · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : labels[state];
+  ui.saveStatus.title = 'Changes are saved automatically as you type. Ctrl/Cmd+S saves immediately.';
   ui.saveStatus.dataset.state = state;
+  if (state === 'synced' && previous === 'syncing') {
+    ui.saveStatus.classList.remove('save-pulse'); void ui.saveStatus.offsetWidth; ui.saveStatus.classList.add('save-pulse');
+  }
   updateSaveControl();
 }
 
@@ -457,7 +478,8 @@ function button(text, onClick, active = false) {
 }
 
 function renderPapers() {
-  renderPaperGroup(ui.myPapers, model.papers.filter((paper) => paper.kind === 'personal'), 'No personal papers yet.');
+  // Removed (archived) personal papers leave the list; Team reports are governed by their Team.
+  renderPaperGroup(ui.myPapers, model.papers.filter((paper) => paper.kind === 'personal' && paper.status !== 'archived'), 'No personal papers yet.');
   renderPaperGroup(ui.teamPapers, model.papers.filter((paper) => paper.kind === 'team'), 'No assigned team reports.');
 }
 
@@ -476,9 +498,28 @@ function renderPaperGroup(parent, papers, empty) {
     const item = button(paper.name, () => openPaper(paper), model.paper?.id === paper.id);
     item.title = paper.status === 'active' ? paper.name : `${paper.name} (${paper.status}, read-only)`;
     if (paper.status !== 'active') item.append(Object.assign(document.createElement('small'), { textContent: paper.status }));
+    if (paper.kind === 'personal') {
+      const row = document.createElement('div'); row.className = 'paper-row';
+      const remove = button('×', () => removePersonalPaper(paper));
+      remove.className = 'mini-icon paper-remove'; remove.setAttribute('aria-label', `Delete paper ${paper.name}`); remove.title = `Delete ${paper.name}`;
+      row.append(item, remove); list.append(row);
+      return;
+    }
     list.append(item);
   });
   parent.append(list);
+}
+
+async function removePersonalPaper(paper) {
+  if (!window.confirm(`Delete "${paper.name}"? It is removed from your papers. An administrator can still recover it if needed.`)) return;
+  try {
+    const response = await fetch(`/api/v2/writer/personal-papers/${encodeURIComponent(paper.id)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' } });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `Delete failed (${response.status})`);
+    model.papers = model.papers.filter((candidate) => candidate.id !== paper.id);
+    notice(`Deleted ${paper.name}.`);
+    if (model.paper?.id === paper.id) { window.location.assign('/write'); return; }
+    renderPapers();
+  } catch (error) { notice(error.message, true); }
 }
 
 function renderFiles() {
@@ -786,11 +827,11 @@ class CollaborationSession {
         saveState('conflict');
         notice(control.review_open
           ? (model.paper?.is_team_leader ? 'Under review — use End review to resume editing.' : 'Under review — your Team Leader can end the review.')
-          : 'Review ended — normal editing permissions are being restored.');
+          : 'Report access changed — refreshing editing permissions.');
         this.destroy();
         this.reloadPaperAfterControl();
       } else if (control.type === 'ERROR') {
-        if (control.code === 'authority_revoked') {
+        if (control.code === 'authority_revoked' || control.code === 'read_only') {
           this.revalidatePolicy().catch((failure) => notice(`Source access could not be refreshed: ${failure.message}. Offline edits remain in recovery storage.`, true));
         } else {
           model.conflict = true;
@@ -889,8 +930,15 @@ class CollaborationSession {
         const recovered = await this.cachedText(`${this.recoveryScope()}:${priorEpoch}`);
         if (recovered) {
           model.recoveryText = recovered;
-          notice('Source restoration changed this file generation. Previous offline text is available for recovery and was not merged.', true);
+          const fileName = (this.file?.path || 'source.tex').split('/').pop();
+          notice(`${this.file?.path || 'This file'} was restored to another version. Your earlier unsynced browser copy was kept aside and not merged.`, false, {
+            label: 'Download earlier copy',
+            run: () => downloadTextFile(recovered, fileName.replace(/(\.[^.]+)?$/, '-earlier-browser-copy$1')),
+          });
         }
+        // Remember the current generation so the same restoration is reported once, not on every open.
+        try { window.localStorage.setItem(registryKey, String(currentEpoch)); }
+        catch (_) { this.localPersistenceAvailable = false; }
       } catch (_) {
         this.localPersistenceAvailable = false;
         notice('Previous offline work may exist, but browser recovery storage is unavailable. Do not clear site data.', true);
@@ -1139,7 +1187,8 @@ async function openPaper(paper) {
   model.paperDetail = await api.paper(paper.id);
   model.version = model.paperDetail.version;
   model.files = await api.files(paper.id);
-  ui.currentPaper.textContent = `${paper.name}${model.paperDetail.review_open ? ' — under review (read-only)' : paper.status === 'active' ? '' : ` — ${paper.status} (read-only)`}`;
+  const paperStatus = model.paperDetail.paper?.status || paper.status;
+  ui.currentPaper.textContent = `${paper.name}${model.paperDetail.review_open ? ' — under review (read-only)' : paperStatus === 'active' ? '' : paperStatus === 'frozen' ? ' — frozen by Mentor (view and download only)' : ` — ${paperStatus} (read-only)`}`;
   ui.roleIdentity.textContent = paper.is_team_leader ? 'Writer · Team leader' : 'Writer';
   ui.newFile.disabled = !model.paperDetail.editable;
   ui.uploadImage.disabled = !model.paperDetail.editable;
@@ -1361,7 +1410,10 @@ async function syncCurrent(showNotice = true) {
 }
 
 async function requireDurableFlush() {
-  if (model.collaboration && !await syncCurrent(false)) return false;
+  // Read-only files (file policy, front matter) have nothing to save; they never block compiling the report.
+  const session = model.collaboration;
+  const savesSource = Boolean(session && session.access === 'read_write' && model.fileEditable);
+  if (savesSource && !await syncCurrent(false)) return false;
   try {
     model.paperDetail = await api.paper(model.paper.id);
     model.version = model.paperDetail.version;
@@ -1389,8 +1441,16 @@ async function requestBuild() {
     ui.buildStatus.textContent = 'Queued';
     ui.compileSpinner.hidden = false;
     ui.buildFooterState.textContent = 'Queued';
+    // Every compile starts from a clean Problems list: diagnostics from the previous build are flushed
+    // now and repopulated only from the new build's log and the current source analysis.
+    model.buildLog = '';
+    model.buildLogBuildId = null;
+    model.buildLogRequest += 1;
+    model.compileDiagnostic = null;
+    renderBuildLog(ui.buildLogText, 'Waiting for the new build log…');
+    renderProblems();
     await api.build(model.paper.id, 'manual');
-    await Promise.all([refreshBuildStatus(), refreshHistory()]);
+    await Promise.all([refreshBuildStatus(), refreshHistory(), refreshIntelligence()]);
   } catch (error) {
     model.pdfCompileRequested = false;
     ui.buildStatus.textContent = 'Compilation failed';
@@ -1409,9 +1469,14 @@ async function manualCompile() {
 async function refreshBuildStatus() {
   if (!model.paper) return;
   const paperId = model.paper.id;
+  const request = ++model.buildStatusRequest;
+  model.buildStatusInFlight += 1;
   try {
     const payload = await api.buildStatus(paperId);
     if (model.paper?.id !== paperId) return;
+    // Polls can overlap; never let an older response replace newer build state (and its Problems).
+    if (request < model.buildStatusApplied) return;
+    model.buildStatusApplied = request;
     const build = payload.build;
     const source = build.source_sequence;
     const pdf = build.current_source_sequence;
@@ -1464,6 +1529,8 @@ async function refreshBuildStatus() {
         && ['succeeded', 'failed'].includes(build.latest_status)) await loadBuildLog();
   } catch (error) {
     notice(error.message, true);
+  } finally {
+    model.buildStatusInFlight -= 1;
   }
 }
 
@@ -1637,7 +1704,7 @@ function renderReviews() {
   const addressed = model.reviews.filter((thread) => thread.state === 'ADDRESSED').length;
   const resolved = model.reviews.filter((thread) => thread.state === 'RESOLVED').length;
   const blocking = model.reviews.filter((thread) => thread.severity === 'BLOCKING' && thread.state !== 'RESOLVED').length;
-  ui.reviewCounts.textContent = `${active} open · ${addressed} addressed · ${resolved} resolved · ${blocking} blocking`;
+  ui.reviewCounts.textContent = `${active - addressed} open · ${addressed} awaiting Mentor · ${resolved} resolved${blocking ? ` · ${blocking} blocking` : ''}`;
   ui.toolbarReviewCount.textContent = String(active);
   applyReviewHighlights();
   const visible = model.reviews.filter((thread) => model.reviewFilter === 'all'
@@ -1652,7 +1719,8 @@ function renderReviews() {
   visible.forEach((thread) => {
     const card = document.createElement('article');
     card.className = `thread-card severity-${thread.severity.toLowerCase()}`;
-    const heading = button(`${thread.thread_type.replaceAll('_', ' ')} · ${thread.severity} · ${thread.state}`, () => focusWriterReview(thread));
+    const where = reviewLocation(thread, model.files);
+    const heading = button(`${where.label} — ${thread.thread_type.replaceAll('_', ' ').toLowerCase()} · ${reviewStateLabel(thread.state)}`, () => focusWriterReview(thread));
     heading.className = 'thread-title';
     heading.disabled = Boolean(thread._anchorUnavailable) || (!thread.source_anchor && !thread.pdf_anchor);
     heading.title = heading.disabled ? 'Exact navigation is unavailable; reviewed location details remain below.' : 'Open the exact reviewed location';
@@ -1678,7 +1746,8 @@ function renderReviews() {
     const actions = document.createElement('div');
     actions.className = 'thread-actions';
     actions.append(button('Reply', () => writerReply(thread)));
-    if (['OPEN', 'REOPENED', 'ADDRESSED'].includes(thread.state)) actions.append(button('Done', () => writerDone(thread)));
+    if (['OPEN', 'REOPENED'].includes(thread.state)) actions.append(button('Done', () => writerDone(thread)));
+    else if (thread.state === 'ADDRESSED') actions.append(Object.assign(document.createElement('span'), { className: 'thread-awaiting', textContent: 'Sent to Mentor for confirmation' }));
     if (thread.suggestion?.status === 'PENDING') actions.append(button('Accept', () => writerAcceptSuggestion(thread)), button('Reject', () => writerRejectSuggestion(thread)));
     card.append(heading, metadata, location, discussion, actions);
     ui.writerReviewList.append(card);
@@ -1696,7 +1765,7 @@ function applyReviewHighlights() {
     const body = thread.messages?.[0]?.body || 'Review annotation';
     marks.push(Decoration.mark({
       class: `review-source-highlight review-${thread.thread_type.toLowerCase()}`,
-      attributes: { 'data-review-thread': thread.id, 'data-review-kind': thread.thread_type.toLowerCase(), title: `${thread.mentor_email}: ${body} · Done` },
+      attributes: { 'data-review-thread': thread.id, 'data-review-kind': thread.thread_type.toLowerCase(), title: `${thread.mentor_email} (${reviewLocation(thread, model.files).label}): ${body} · ${reviewStateLabel(thread.state)}` },
     }).range(range.from, range.to));
   });
   model.view.dispatch({ effects: setReviewMarks.of(marks) });
@@ -1722,13 +1791,11 @@ function showWriterReviewPopover(thread, bounds) {
   const body = thread.messages?.[0]?.body || 'Review annotation';
   popover.append(
     Object.assign(document.createElement('strong'), { textContent: thread.mentor_email }),
-    Object.assign(document.createElement('span'), { className: 'review-kind', textContent: thread.thread_type.toLowerCase() }),
+    Object.assign(document.createElement('span'), { className: 'review-kind', textContent: `${thread.thread_type.toLowerCase()} · ${reviewLocation(thread, model.files).label}` }),
     Object.assign(document.createElement('p'), { textContent: body }),
   );
-  popover.append(button('Done', async () => {
-    try { await api.reviewState(model.paper.id, thread.id, 'RESOLVED'); popover.remove(); await refreshReviews(); }
-    catch (error) { notice(error.message, true); }
-  }));
+  if (thread.state === 'ADDRESSED') popover.append(Object.assign(document.createElement('span'), { className: 'thread-awaiting', textContent: 'Sent to Mentor for confirmation' }));
+  else popover.append(button('Done', async () => { popover.remove(); await writerDone(thread); }));
   if (thread.suggestion?.status === 'PENDING') popover.append(button('Apply', () => writerAcceptSuggestion(thread)));
   document.body.append(popover);
   const width = popover.offsetWidth; const height = popover.offsetHeight;
@@ -1756,9 +1823,13 @@ async function writerReply(thread) {
   catch (error) { notice(error.message, true); }
 }
 
+// Done never resolves a comment: it goes back to the Mentor, who confirms (Resolved) or reopens it.
 async function writerDone(thread) {
-  try { await api.reviewState(model.paper.id, thread.id, 'RESOLVED'); await refreshReviews(); }
-  catch (error) { notice(error.message, true); }
+  try {
+    await api.reviewState(model.paper.id, thread.id, 'ADDRESSED');
+    notice(`Marked done (${reviewLocation(thread, model.files).label}). ${thread.mentor_email || 'Your Mentor'} will confirm or reopen it.`);
+    await refreshReviews();
+  } catch (error) { notice(error.message, true); }
 }
 
 async function focusWriterReview(thread) {
@@ -1795,11 +1866,32 @@ async function focusWriterReview(thread) {
   else notice(`Source changed. Original reviewed excerpt: “${anchor?.quoted_text?.slice(0, 160) || 'unavailable'}”.`, true);
 }
 
+// Marks exactly where the Mentor commented on the page, so several comments on one page stay distinguishable.
+function markReviewedPdfRegion(thread) {
+  ui.pdfViewport.querySelectorAll('.writer-review-region').forEach((node) => node.remove());
+  const page = ui.pdfViewport.querySelector(`[data-page="${thread.pdf_anchor?.page}"]`);
+  const rectangles = thread.pdf_anchor?.normalized_rectangles || [];
+  if (!page || !rectangles.length) return;
+  page.style.position = 'relative';
+  rectangles.forEach((rectangle) => {
+    const mark = document.createElement('div'); mark.className = 'writer-review-region'; mark.title = thread.messages?.[0]?.body || 'Reviewed region';
+    Object.assign(mark.style, { left: `${rectangle.x * 100}%`, top: `${rectangle.y * 100}%`, width: `${rectangle.width * 100}%`, height: `${rectangle.height * 100}%` });
+    page.append(mark);
+  });
+  page.querySelector('.writer-review-region')?.scrollIntoView?.({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+}
+
 function showReviewedPdf(thread) {
   if (!thread.pdf_anchor) return;
   const build = thread.pdf_anchor.build_id || model.currentBuildId;
   const rectangle = thread.pdf_anchor.normalized_rectangles?.[0];
-  loadWriterPdf(build, true).then(() => showPdfLocation(thread.pdf_anchor.page, rectangle?.x || 0, rectangle?.y || 0, true)).catch((failure) => notice(failure.message, true));
+  loadWriterPdf(build, true).then(async () => {
+    await showPdfLocation(thread.pdf_anchor.page, rectangle?.x || 0, rectangle?.y || 0, true);
+    markReviewedPdfRegion(thread);
+    if (build !== model.currentBuildId && model.currentBuildId) {
+      notice(`Showing the PDF your Mentor reviewed, page ${thread.pdf_anchor.page} (${reviewLocation(thread, model.files).label}).`, false, { label: 'Back to current PDF', run: () => loadWriterPdf(model.currentBuildId) });
+    }
+  }).catch((failure) => notice(failure.message, true));
   ui.pdfScroll.hidden = false; ui.pdfEmpty.hidden = true;
 }
 
@@ -2385,8 +2477,8 @@ async function runStructural(redo) {
 
 function commandItems() {
   const items = [
-    ['New File', () => ui.newFile.click()], ['Rename File', () => ui.renameFile.click()], ['Delete File', () => ui.deleteFile.click()],
-    ['Save', () => ui.saveFile.click()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
+    // File creation, renaming and deletion stay in the Files pane; they are not palette commands.
+    ['Save now', () => syncCurrent()], ['Compile', manualCompile], ['Structural Undo', () => runStructural(false)], ['Structural Redo', () => runStructural(true)],
     ['Insert…', openInsertMenu],
     ['Open Problems', () => expandBuildFooter('problems')], ['Open History', () => openDrawer('history')], ['Open Comments', () => openDrawer('reviews')],
     ['Document details', openDocumentDetails],
@@ -2715,7 +2807,7 @@ installWorkspaceSplitters(document.querySelector('.three-pane-workspace'), 'late
 
 window.setInterval(() => {
   if (model.paper) {
-    refreshBuildStatus();
+    if (!model.buildStatusInFlight) refreshBuildStatus();
     if (model.paper.kind === 'team') {
       refreshReviews();
       refreshReviewRounds();

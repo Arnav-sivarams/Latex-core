@@ -261,7 +261,7 @@ try {
   await w.page.locator('.review-source-highlight').first().waitFor();
   const [reply]=await Promise.all([w.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/messages'),{timeout:15000}),sourceCard.getByRole('button',{name:'Reply',exact:true}).click({timeout:10000})]).catch(async error=>{console.log('WRITER_FEEDBACK_UI:',await w.page.locator('#writerNotice').textContent());await w.page.screenshot({path:'/tmp/latex-review-feedback.png',mask:[w.page.locator('.discussion')]});throw error;});assert.ok(reply.ok());await sourceCard.locator('.discussion').getByText('Synthetic Writer reply',{exact:false}).waitFor();
   const [done]=await Promise.all([w.page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/state'),{timeout:15000}),sourceCard.getByRole('button',{name:'Done',exact:true}).click({timeout:10000})]);assert.ok(done.ok());
-  assert.ok((await json(w.ctx,review+'/threads')).threads.some(t=>t.state==='RESOLVED'));
+  assert.ok((await json(w.ctx,review+'/threads')).threads.some(t=>t.state==='ADDRESSED'),'Writer Done must wait for Mentor confirmation');
   await m.page.reload();await m.page.locator('.cm-content').waitFor();assert.equal(await m.page.locator('#pushReview').isDisabled(),true);
   const outsider=await client(config.outsiderCookie);assert.ok([403,404].includes((await outsider.ctx.request.get(base+review+'/files')).status()));
   console.log('WRITER_FEEDBACK_PASS: navigation, reply, Done, reload, idempotent publication and denied unassigned Mentor');

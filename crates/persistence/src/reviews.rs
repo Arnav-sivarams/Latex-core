@@ -995,7 +995,7 @@ impl V2Repository {
             .begin()
             .await
             .map_err(V2Error::Database)?;
-        let (current, thread_type, publication) =
+        let (current, _thread_type, publication) =
             lock_thread_state_and_type(&mut tx, paper.workspace_id, thread_id).await?;
         if publication != "PUBLISHED" {
             return Err(V2Error::NotFound {
@@ -1004,16 +1004,11 @@ impl V2Repository {
         }
         reject_writer_feedback_during_review(&mut tx, role, paper.workspace_id).await?;
         let valid = match role {
-            GlobalRole::Writer => match target {
-                "ADDRESSED" => matches!(current.as_str(), "OPEN" | "REOPENED"),
-                "RESOLVED" => {
-                    matches!(
-                        thread_type.as_str(),
-                        "COMMENT" | "SUGGESTION" | "SUGGESTED_REPLACEMENT"
-                    ) && matches!(current.as_str(), "OPEN" | "ADDRESSED" | "REOPENED")
-                }
-                _ => false,
-            },
+            // A Writer's "Done" only marks a thread ADDRESSED; the assigned Mentor confirms it
+            // (RESOLVED) or reopens it, so Writers can no longer resolve feedback themselves.
+            GlobalRole::Writer => {
+                target == "ADDRESSED" && matches!(current.as_str(), "OPEN" | "REOPENED")
+            }
             GlobalRole::Mentor => {
                 (target == "RESOLVED" && current == "ADDRESSED")
                     || (target == "REOPENED"

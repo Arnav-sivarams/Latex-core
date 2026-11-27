@@ -1908,7 +1908,7 @@ impl InstitutionRepository {
         let page = filter.page.max(1);
         let offset = (page - 1).saturating_mul(limit);
         let rows = sqlx::query(
-            r"SELECT f.faculty_id,f.name,f.email,f.dept_id,f.designation,f.status,
+            r"SELECT f.faculty_id,f.name,f.email,f.dept_id,f.honorific,f.designation,f.status,
                      l.user_id,l.status AS link_status,u.email AS v2_email,
                      COALESCE((SELECT jsonb_agg(jsonb_build_object('academic_year',c.academic_year,'ug',c.ug_max_projects,'pg',c.pg_max_projects,'integrated_pg',c.integrated_pg_max_projects,'status',c.status) ORDER BY c.academic_year DESC) FROM vcap.faculty_guide_capacity c WHERE c.faculty_id=f.faculty_id),'[]'::jsonb) AS guide_capacity,
                      count(*) OVER() AS total
@@ -1935,6 +1935,7 @@ impl InstitutionRepository {
                 "name":row.try_get::<Option<String>,_>("name").map_err(InstitutionError::Database)?,
                 "email":row.try_get::<Option<String>,_>("email").map_err(InstitutionError::Database)?,
                 "department_id":row.try_get::<Option<Uuid>,_>("dept_id").map_err(InstitutionError::Database)?,
+                "honorific":row.try_get::<Option<String>,_>("honorific").map_err(InstitutionError::Database)?,
                 "designation":row.try_get::<Option<String>,_>("designation").map_err(InstitutionError::Database)?,
                 "status":row.try_get::<Option<String>,_>("status").map_err(InstitutionError::Database)?,
                 "user_id":row.try_get::<Option<Uuid>,_>("user_id").map_err(InstitutionError::Database)?,
@@ -4143,13 +4144,30 @@ fn source_row(
 }
 
 fn validate_cross_rows(rows: &mut [SourceRow]) {
-    let mut keys = HashSet::new();
+    // The same record can legitimately occur more than once in a batch (for example in both a CSV
+    // and a workbook sheet). An identical repeat is skipped; a conflicting repeat is an error.
+    let mut keys = HashMap::<(String, String), Value>::new();
     for row in rows.iter_mut() {
-        if row.error.is_none() && !keys.insert((row.table.clone(), key_token(&row.natural_key))) {
-            row.error = Some((
-                "DUPLICATE_KEY",
-                "duplicate primary key within import source".into(),
-            ));
+        if row.error.is_some() {
+            continue;
+        }
+        let key = (row.table.clone(), key_token(&row.natural_key));
+        let identical = keys.get(&key).map(|first| *first == row.payload);
+        match identical {
+            None => {
+                keys.insert(key, row.payload.clone());
+            }
+            Some(true) => {
+                if let Some(values) = row.payload.as_object_mut() {
+                    values.insert("__action".into(), Value::String("SKIP".into()));
+                }
+            }
+            Some(false) => {
+                row.error = Some((
+                    "DUPLICATE_KEY",
+                    "duplicate primary key within import source".into(),
+                ));
+            }
         }
     }
     let mut writer_orders = HashSet::new();
@@ -4158,10 +4176,9 @@ fn validate_cross_rows(rows: &mut [SourceRow]) {
     let includes_writer_sheet = rows
         .iter()
         .any(|candidate| candidate.table == "paper_team_writers");
-    for row in rows
-        .iter_mut()
-        .filter(|row| row.table == "paper_team_writers" && row.error.is_none())
-    {
+    for row in rows.iter_mut().filter(|row| {
+        row.table == "paper_team_writers" && row.error.is_none() && action_for(row) != "SKIP"
+    }) {
         let payload = row.payload.as_object().expect("payload object");
         let team = text_value(payload, "external_team_key")
             .unwrap_or_default()
@@ -4181,10 +4198,9 @@ fn validate_cross_rows(rows: &mut [SourceRow]) {
             *leaders.entry(team).or_default() += 1;
         }
     }
-    for row in rows
-        .iter_mut()
-        .filter(|row| row.table == "paper_teams" && row.error.is_none())
-    {
+    for row in rows.iter_mut().filter(|row| {
+        row.table == "paper_teams" && row.error.is_none() && action_for(row) != "SKIP"
+    }) {
         let team = text_value(
             row.payload.as_object().expect("payload object"),
             "external_team_key",
@@ -4997,6 +5013,36 @@ mod tests {
         assert_eq!(
             rows[1].error.as_ref().map(|value| value.0),
             Some("DUPLICATE_KEY")
+        );
+    }
+
+    #[test]
+    fn identical_repeated_rows_are_skipped_instead_of_rejected() {
+        let bytes = b"reg_no,name,email,programme_code\nS1,One,one@example.edu,CSE\nS1,One,one@example.edu,CSE\n";
+        let mut rows = parse_csv(
+            "students.csv",
+            None,
+            bytes,
+            ImportLimits::default(),
+            ImportMode::AddOnly,
+            0,
+        )
+        .expect("CSV parses");
+        let mut writers = parse_csv(
+            "paper_team_writers.csv",
+            None,
+            b"external_team_key,student_reg_no,writer_order,is_leader\nT1,S1,1,true\nT1,S1,1,true\n",
+            ImportLimits::default(),
+            ImportMode::AddOnly,
+            1,
+        )
+        .expect("CSV parses");
+        rows.append(&mut writers);
+        validate_cross_rows(&mut rows);
+        assert!(rows.iter().all(|row| row.error.is_none()));
+        assert_eq!(
+            rows.iter().map(action_for).collect::<Vec<_>>(),
+            ["INSERT", "SKIP", "INSERT", "SKIP"]
         );
     }
 
