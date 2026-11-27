@@ -25,3 +25,4 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 /* Authentication errors remain visible in both application themes. */
 .login-card #loginError { color: #b42318; }
 html[data-theme="dark"] .login-card #loginError { color: #ff7b72; }
+.login-help{margin-top:14px;font-size:12px}.login-help summary{cursor:pointer;color:var(--accent);font-weight:650}.login-help p{margin:8px 0 0;line-height:1.45}

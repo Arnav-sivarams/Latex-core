@@ -183,6 +183,67 @@ pub fn router() -> Router<AppState> {
             "/api/v2/reviews/papers/{paper_id}/report.html",
             get(report_html),
         )
+        .route(
+            "/api/v2/reviews/papers/{paper_id}/freeze",
+            post(set_report_freeze),
+        )
+}
+
+#[derive(Deserialize)]
+struct FreezeInput {
+    frozen: bool,
+}
+
+/// The assigned Mentor (guide) freezes a Team report so it can only be viewed and downloaded,
+/// or unfreezes it to restore editing. Only Active <-> Frozen is allowed here; Admin keeps the
+/// full lifecycle (Submitted, Archived).
+async fn set_report_freeze(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<Uuid>,
+    Json(input): Json<FreezeInput>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let mentor = match role_session(&state, &headers, GlobalRole::Mentor).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.review_paper(mentor, paper_id).await {
+        Ok((paper, GlobalRole::Mentor)) => paper,
+        Ok(_) => return error(StatusCode::FORBIDDEN, "assigned Mentor required"),
+        Err(value) => return v2_error(value),
+    };
+    let wanted = match (paper.status, input.frozen) {
+        (PaperStatus::Active, true) => PaperStatus::Frozen,
+        (PaperStatus::Frozen, false) => PaperStatus::Active,
+        (PaperStatus::Frozen, true) | (PaperStatus::Active, false) => {
+            return Json(json!({"schema_version":1,"paper_id":paper_id,"status":paper.status,"frozen":paper.status == PaperStatus::Frozen})).into_response();
+        }
+        _ => {
+            return error(
+                StatusCode::CONFLICT,
+                "only an active or frozen report can be frozen or unfrozen",
+            );
+        }
+    };
+    match state.v2.set_paper_team_status(paper_id, wanted).await {
+        Ok(_) => {
+            // Open editors reload their access so the change applies without a page refresh.
+            let review_open = match state.v2.active_review_round(paper_id).await {
+                Ok(value) => value.is_some(),
+                Err(value) => return v2_error(value),
+            };
+            state
+                .collaboration
+                .review_state_changed(paper.workspace_id, review_open)
+                .await;
+            tracing::info!(%paper_id, mentor_user_id=%mentor, status=wanted.as_str(), "Mentor changed report freeze");
+            Json(json!({"schema_version":1,"paper_id":paper_id,"status":wanted,"frozen":wanted == PaperStatus::Frozen})).into_response()
+        }
+        Err(value) => v2_error(value),
+    }
 }
 
 async fn review_js() -> Response {
@@ -1033,27 +1094,30 @@ async fn report_csv(
     };
     threads.retain(|thread| thread["publication_status"] == "PUBLISHED");
     let mut csv = String::from(
-        "round,thread_type,status,severity,category,assigned_writer,due_date,source_file,source_context,pdf_page,initial_message,created_at,resolved_at\n",
+        "round,comment_type,status,file,line,pdf_page,reviewed_text,comment,mentor,replies,created_at,resolved_at\n",
     );
     for thread in threads {
         let source = &thread["source_anchor"];
-        let message = thread["messages"]
-            .as_array()
+        let messages = thread["messages"].as_array();
+        let message = messages
             .and_then(|messages| messages.first())
             .and_then(|message| message["body"].as_str())
             .unwrap_or("");
+        let replies = messages.map_or(0, |messages| messages.len().saturating_sub(1));
+        let (file, line, page) = review_location(&thread);
         let fields = [
             thread["round_number"].to_string(),
-            text(&thread, "thread_type"),
-            text(&thread, "state"),
-            text(&thread, "severity"),
-            text(&thread, "category"),
-            text(&thread, "assigned_writer_email"),
-            text(&thread, "due_at"),
-            text(source, "path"),
+            text(&thread, "thread_type")
+                .replace('_', " ")
+                .to_lowercase(),
+            status_label(&text(&thread, "state")).to_owned(),
+            file,
+            line,
+            page,
             text(source, "quoted_text"),
-            thread["pdf_anchor"]["page"].to_string(),
             message.to_owned(),
+            text(&thread, "mentor_email"),
+            replies.to_string(),
             text(&thread, "created_at"),
             text(&thread, "resolved_at"),
         ];
@@ -1104,19 +1168,21 @@ async fn report_html(
             .and_then(|messages| messages.first())
             .and_then(|message| message["body"].as_str())
             .unwrap_or("");
+        let (file, line, page) = review_location(&thread);
         write!(
             rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             html(&thread["round_number"].to_string()),
-            html(&text(&thread, "thread_type")),
-            html(&text(&thread, "state")),
-            html(&text(&thread, "severity")),
-            html(&text(&thread, "category")),
+            html(&text(&thread, "thread_type").replace('_', " ").to_lowercase()),
+            html(status_label(&text(&thread, "state"))),
+            html(&file),
+            html(&line),
+            html(&page),
             html(message)
         )
         .expect("writing HTML into a String cannot fail");
     }
-    Html(format!("<!doctype html><html><head><meta charset=utf-8><title>Review report — {0}</title><style>body{{font:12pt system-ui;margin:2cm}}table{{width:100%;border-collapse:collapse}}th,td{{padding:6px;border:1px solid #aaa;text-align:left;vertical-align:top}}@media print{{button{{display:none}}}}</style></head><body><button onclick=\"print()\">Print / Save as PDF</button><h1>Review report — {0}</h1><p>Print-ready report for browser Print → Save as PDF.</p><table><thead><tr><th>Round</th><th>Type</th><th>Status</th><th>Severity</th><th>Category</th><th>Initial message</th></tr></thead><tbody>{1}</tbody></table></body></html>",html(&paper.name),rows)).into_response()
+    Html(format!("<!doctype html><html><head><meta charset=utf-8><title>Review report — {0}</title><style>body{{font:12pt system-ui;margin:2cm}}table{{width:100%;border-collapse:collapse}}th,td{{padding:6px;border:1px solid #aaa;text-align:left;vertical-align:top}}@media print{{button{{display:none}}}}</style></head><body><button onclick=\"print()\">Print / Save as PDF</button><h1>Review report — {0}</h1><p>Print-ready report for browser Print → Save as PDF.</p><table><thead><tr><th>Round</th><th>Type</th><th>Status</th><th>File</th><th>Line</th><th>PDF page</th><th>Comment</th></tr></thead><tbody>{1}</tbody></table></body></html>",html(&paper.name),rows)).into_response()
 }
 
 async fn participant_session(state: &AppState, headers: &HeaderMap) -> Result<UserId, Response> {
@@ -1241,6 +1307,36 @@ fn text(value: &Value, key: &str) -> String {
         .unwrap_or("")
         .to_owned()
 }
+/// Plain-language review status for exports. ADDRESSED means the Writer marked it done and the
+/// Mentor has not yet confirmed it.
+fn status_label(state: &str) -> &str {
+    match state {
+        "OPEN" => "Open",
+        "ADDRESSED" => "Done by writer, awaiting mentor confirmation",
+        "RESOLVED" => "Resolved",
+        "REOPENED" => "Reopened",
+        other => other,
+    }
+}
+
+/// File, line range and PDF page of a review comment for exports; empty when not recorded.
+fn review_location(thread: &Value) -> (String, String, String) {
+    let source = &thread["source_anchor"];
+    let pdf = &thread["pdf_anchor"];
+    let start = source["start_line"]
+        .as_i64()
+        .or_else(|| pdf["mapped_line"].as_i64());
+    let line = match (start, source["end_line"].as_i64()) {
+        (Some(start), Some(end)) if end > start => format!("{start}-{end}"),
+        (Some(start), _) => start.to_string(),
+        (None, _) => String::new(),
+    };
+    let page = pdf["page"]
+        .as_i64()
+        .map_or_else(String::new, |page| page.to_string());
+    (text(source, "path"), line, page)
+}
+
 fn csv_field(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }

@@ -15,6 +15,18 @@ function parseCsv(text) {
 const quote=value=>`"${String(value).replaceAll('"','""')}"`;
 const data=rows=>Buffer.from(rows.map(row=>row.map(quote).join(',')).join('\r\n')+'\r\n');
 
+// The Admin bundle uses stored (uncompressed) ZIP entries; read one through the central directory.
+function storedZipEntry(bytes,name) {
+  const end=bytes.length-22;assert.equal(bytes.readUInt32LE(end),0x06054b50,'credential download must be a ZIP');
+  let cursor=bytes.readUInt32LE(end+16);
+  for(let index=0;index<bytes.readUInt16LE(end+10);index+=1) {
+    const nameLength=bytes.readUInt16LE(cursor+28);const entry=bytes.subarray(cursor+46,cursor+46+nameLength).toString('utf8');
+    if(entry===name){const local=bytes.readUInt32LE(cursor+42);const start=local+30+bytes.readUInt16LE(local+26)+bytes.readUInt16LE(local+28);return bytes.subarray(start,start+bytes.readUInt32LE(cursor+20));}
+    cursor+=46+nameLength+bytes.readUInt16LE(cursor+30)+bytes.readUInt16LE(cursor+32);
+  }
+  return null;
+}
+
 export async function credentialHandoff(admin, base) {
   const suffix=randomUUID().replaceAll('-','');
   const key=label=>`${label}${suffix}`, email=label=>`${label}-${suffix}@example.invalid`;
@@ -35,7 +47,9 @@ export async function credentialHandoff(admin, base) {
   const applied=await appliedEvent;assert.equal(applied.status(),200);assert.equal(applied.headers()['cache-control'],'no-store');
   const permitted=(await applied.json()).account_provisioning.credentials;
   const download=await downloadEvent;const stream=await download.createReadStream();const chunks=[];for await(const chunk of stream)chunks.push(chunk);
-  const csv=parseCsv(Buffer.concat(chunks).toString('utf8'));const header=csv.shift();
+  const bundle=Buffer.concat(chunks);assert.match(download.suggestedFilename(),/\.zip$/);
+  for(const name of ['credentials-all-teams.xlsx','credentials-by-team.json'])assert.ok(storedZipEntry(bundle,name),`ZIP must contain ${name}`);
+  const csv=parseCsv(storedZipEntry(bundle,'credentials-all-teams.csv').toString('utf8'));const header=csv.shift();
   assert.deepEqual(header,['email','password','role','team_name','team_id','team_key','team_role','writer_order','is_team_leader']);
   assert.equal(csv.length,6);
   const groups=new Set();let previous=null;const accountPasswords=new Map();

@@ -25,9 +25,14 @@ function element(tag, className, text) {
   return node;
 }
 
+// Visible, dismissible notice; successes fade after a few seconds, failures stay until closed.
 function announce(message, failed = false) {
-  status.textContent = message;
-  status.classList.toggle('danger', failed);
+  clearTimeout(status.noticeTimer); status.classList.toggle('danger', failed);
+  if (!message) { status.replaceChildren(); return; }
+  const text = element('span', 'status-message', message); const close = element('button', 'status-close', '×'); close.type = 'button'; close.setAttribute('aria-label', 'Dismiss notification'); close.title = 'Dismiss';
+  close.addEventListener('click', () => { clearTimeout(status.noticeTimer); status.replaceChildren(); });
+  status.replaceChildren(text, close); status.setAttribute('role', failed ? 'alert' : 'status');
+  if (!failed) status.noticeTimer = setTimeout(() => status.replaceChildren(), 8000);
 }
 
 function showError(error) {
@@ -118,29 +123,192 @@ function credentialsCsv(credentials) {
 }
 
 function downloadCredentials(credentials, batchId) {
-  const blob = new Blob([credentialsCsv(credentials)], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob); const link = document.createElement('a');
-  link.href = url; link.download = `latex-core-generated-credentials-${batchId}.csv`;
-  document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+  // Team-scoped handoffs download one ZIP: all-Teams CSV/XLSX, a Team-grouped JSON and one CSV per Team.
+  if (credentials.length && credentials.every(item => Array.isArray(item.teams))) {
+    downloadBlob(new Blob([credentialBundle(credentials, batchId)], { type: 'application/zip' }), `latex-core-credentials-${batchId}.zip`);
+    return;
+  }
+  downloadBlob(new Blob([credentialsCsv(credentials)], { type: 'text/csv;charset=utf-8' }), `latex-core-generated-credentials-${batchId}.csv`);
 }
 
-function showCredentialHandoff(provisioning, batchId) {
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob); const link = document.createElement('a');
+  link.href = url; link.download = filename;
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Dependency-free ZIP (stored entries) and XLSX writers for Admin exports.
+const crcTable = (() => { const table = new Uint32Array(256); for (let n = 0; n < 256; n += 1) { let c = n; for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; } return table; })();
+function crc32(bytes) { let crc = 0xFFFFFFFF; for (let index = 0; index < bytes.length; index += 1) crc = crcTable[(crc ^ bytes[index]) & 0xFF] ^ (crc >>> 8); return (crc ^ 0xFFFFFFFF) >>> 0; }
+function zipBytes(entries, now = new Date()) {
+  const encoder = new TextEncoder(); const parts = []; const central = []; let offset = 0;
+  const time = (now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2);
+  const date = ((Math.max(now.getFullYear(), 1980) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  for (const entry of entries) {
+    const name = encoder.encode(entry.name); const data = typeof entry.data === 'string' ? encoder.encode(entry.data) : entry.data; const crc = crc32(data);
+    const local = new DataView(new ArrayBuffer(30));
+    [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, crc, 4], [18, data.length, 4], [22, data.length, 4], [26, name.length, 2], [28, 0, 2]].forEach(([at, value, size]) => size === 4 ? local.setUint32(at, value, true) : local.setUint16(at, value, true));
+    const header = new DataView(new ArrayBuffer(46));
+    [[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, crc, 4], [20, data.length, 4], [24, data.length, 4], [28, name.length, 2], [30, 0, 2], [32, 0, 2], [34, 0, 2], [36, 0, 2], [38, 0, 4], [42, offset, 4]].forEach(([at, value, size]) => size === 4 ? header.setUint32(at, value, true) : header.setUint16(at, value, true));
+    parts.push(new Uint8Array(local.buffer), name, data); central.push(new Uint8Array(header.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const centralSize = central.reduce((sum, part) => sum + part.length, 0); const end = new DataView(new ArrayBuffer(22));
+  [[0, 0x06054b50, 4], [4, 0, 2], [6, 0, 2], [8, entries.length, 2], [10, entries.length, 2], [12, centralSize, 4], [16, offset, 4], [20, 0, 2]].forEach(([at, value, size]) => size === 4 ? end.setUint32(at, value, true) : end.setUint16(at, value, true));
+  const output = new Uint8Array(offset + centralSize + 22); let cursor = 0;
+  [...parts, ...central, new Uint8Array(end.buffer)].forEach((part) => { output.set(part, cursor); cursor += part.length; });
+  return output;
+}
+function xmlText(value) {
+  return String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+}
+function columnName(index) { let name = ''; for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) name = String.fromCharCode(65 + ((n - 1) % 26)) + name; return name; }
+function sheetNames(sheets) {
+  const used = new Set();
+  return sheets.map((sheet, index) => {
+    const base = String(sheet.name || `Sheet${index + 1}`).replace(/[\[\]:*?/\\]/g, ' ').replace(/^'+|'+$/g, '').trim().slice(0, 31) || `Sheet${index + 1}`;
+    let name = base; for (let suffix = 2; used.has(name.toLowerCase()); suffix += 1) name = `${base.slice(0, 31 - String(suffix).length - 1)}~${suffix}`;
+    used.add(name.toLowerCase()); return name;
+  });
+}
+// Every cell is an inline string, so registration numbers keep leading zeros and no value is evaluated as a formula.
+function xlsxBytes(sheets) {
+  const names = sheetNames(sheets); const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'; const rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const worksheet = (rows) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="${ns}"><sheetViews><sheetView workbookViewId="0">${rows.length > 1 ? '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>' : ''}</sheetView></sheetViews><sheetData>${rows.map((row, rowIndex) => `<row r="${rowIndex + 1}">${row.map((value, columnIndex) => `<c r="${columnName(columnIndex)}${rowIndex + 1}" t="inlineStr"${rowIndex === 0 ? ' s="1"' : ''}><is><t xml:space="preserve">${xmlText(value)}</t></is></c>`).join('')}</row>`).join('')}</sheetData></worksheet>`;
+  const entries = [
+    { name: '[Content_Types].xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${names.map((_, index) => `<Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}</Types>` },
+    { name: '_rels/.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>` },
+    { name: 'xl/workbook.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="${ns}" xmlns:r="${rel}"><sheets>${names.map((name, index) => `<sheet name="${xmlText(name)}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join('')}</sheets></workbook>` },
+    { name: 'xl/_rels/workbook.xml.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${names.map((_, index) => `<Relationship Id="rId${index + 1}" Type="${rel}/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`).join('')}<Relationship Id="rId${names.length + 1}" Type="${rel}/styles" Target="styles.xml"/></Relationships>` },
+    { name: 'xl/styles.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="${ns}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>` },
+    ...sheets.map((sheet, index) => ({ name: `xl/worksheets/sheet${index + 1}.xml`, data: worksheet(sheet.rows) })),
+  ];
+  return zipBytes(entries);
+}
+
+const credentialColumns = ['email', 'password', 'role', 'team_name', 'team_id', 'team_key', 'team_role', 'writer_order', 'is_team_leader'];
+// Groups one-time credentials by Team in the same deterministic order as the CSV.
+function credentialsByTeam(credentials) {
+  const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0; const rank = team => team.is_leader ? 0 : team.team_role === 'writer' ? 1 : team.team_role === 'mentor' ? 2 : 3;
+  const groups = new Map();
+  credentials.filter(item => typeof item.temporary_password === 'string' && item.temporary_password.length).forEach((item) => {
+    (item.teams?.length ? item.teams : [{ team_name: 'Unassigned', team_id: '', team_key: '', team_role: '', writer_order: null, is_leader: false }]).forEach((team) => {
+      const key = `${team.team_name}\u0000${team.team_id}`;
+      if (!groups.has(key)) groups.set(key, { team_name: team.team_name, team_id: team.team_id || null, team_key: team.team_key || null, members: [] });
+      groups.get(key).members.push({ email: item.email, login_id: item.email, password: item.temporary_password, role: item.credential_role, team_role: team.team_role || null, writer_order: team.writer_order ?? null, is_team_leader: Boolean(team.is_leader) });
+    });
+  });
+  const teams = [...groups.values()].sort((a, b) => compare(a.team_name, b.team_name) || compare(a.team_id || '', b.team_id || ''));
+  teams.forEach((team) => team.members.sort((a, b) => rank({ is_leader: a.is_team_leader, team_role: a.team_role }) - rank({ is_leader: b.is_team_leader, team_role: b.team_role }) || (a.writer_order ?? Number.MAX_SAFE_INTEGER) - (b.writer_order ?? Number.MAX_SAFE_INTEGER) || compare(a.email, b.email)));
+  return teams;
+}
+
+function credentialBundle(credentials, batchId, now = new Date()) {
+  const teams = credentialsByTeam(credentials);
+  const rows = teams.flatMap((team) => team.members.map((member) => [member.email, member.password, member.role, team.team_name, team.team_id ?? '', team.team_key ?? '', member.team_role ?? '', member.writer_order ?? '', member.is_team_leader]));
+  const json = JSON.stringify({ schema_version: 1, generated_at: now.toISOString(), handoff: String(batchId), warning: 'Administrator-only one-time temporary passwords. Users must change them at first sign-in.', team_count: teams.length, teams }, null, 2);
+  const safeName = (value) => String(value || 'Team').replace(/[^A-Za-z0-9._ -]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || 'Team';
+  const teamFiles = teams.map((team, index) => ({ name: `teams/${String(index + 1).padStart(3, '0')} ${safeName(team.team_name)}.csv`, data: [credentialColumns.join(','), ...team.members.map((member) => [member.email, member.password, member.role, team.team_name, team.team_id ?? '', team.team_key ?? '', member.team_role ?? '', member.writer_order ?? '', member.is_team_leader].map(csvCell).join(','))].join('\r\n') + '\r\n' }));
+  return zipBytes([
+    { name: 'credentials-all-teams.csv', data: credentialsCsv(credentials) },
+    { name: 'credentials-all-teams.xlsx', data: xlsxBytes([{ name: 'All Teams', rows: [credentialColumns, ...rows] }]) },
+    { name: 'credentials-by-team.json', data: json },
+    ...teamFiles,
+  ], now);
+}
+
+async function fetchAllPages(path, limit = 100, progress = () => {}) {
+  const items = []; const separator = path.includes('?') ? '&' : '?';
+  for (let page = 1; page <= 10000; page += 1) {
+    const data = await api(`${path}${separator}${queryString({ page, limit })}`);
+    items.push(...(data.items || [])); progress(items.length, data.total);
+    if (!data.has_more || !(data.items || []).length) break;
+  }
+  return items;
+}
+
+function exportStamp(now = new Date()) { return now.toISOString().slice(0, 19).replace(/[:T]/g, '-'); }
+
+// One worksheet per import dataset, named and ordered exactly like the import format, so the file can be re-imported.
+async function exportInstitutionData() {
+  const sheets = []; const writers = []; const mentors = [];
+  for (const config of institutionDatasets) {
+    const items = await fetchAllPages(`/api/admin/v2/institution/data/${config.dataset}`, 100, (count, total) => announce(`Exporting ${config.label}: ${count.toLocaleString()} of ${Number(total || 0).toLocaleString()}…`));
+    const columns = targetColumns[config.dataset];
+    sheets.push({ name: config.dataset, rows: [columns, ...items.map((item) => columns.map((column) => item[column] ?? ''))] });
+    if (config.dataset === 'paper_teams') items.forEach((item) => { (item.writers || []).forEach((writer) => writers.push([item.external_team_key, writer.student_reg_no, writer.writer_order ?? '', Boolean(writer.is_leader)])); (item.mentors || []).forEach((mentor) => mentors.push([item.external_team_key, mentor.faculty_id])); });
+  }
+  sheets.push({ name: 'paper_team_writers', rows: [targetColumns.paper_team_writers, ...writers] }, { name: 'paper_team_mentors', rows: [targetColumns.paper_team_mentors, ...mentors] });
+  downloadBlob(new Blob([xlsxBytes(sheets)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `latex-core-institution-data-${exportStamp()}.xlsx`);
+  announce(`Institution data exported: ${sheets.reduce((sum, sheet) => sum + sheet.rows.length - 1, 0).toLocaleString()} records in ${sheets.length} sheets.`);
+}
+
+async function exportPaperTeams() {
+  const teams = new Map();
+  (await fetchAllPages('/api/admin/v2/paper-teams/query', 200, (count, total) => announce(`Exporting Paper Teams: ${count.toLocaleString()} of ${Number(total || 0).toLocaleString()}…`))).forEach((team) => teams.set(team.id, team));
+  const unresolved = await fetchAllPages('/api/admin/v2/paper-teams/query?unresolved=true', 200).catch(() => []);
+  const people = new Map();
+  const remember = (email, values) => { if (email) people.set(String(email).trim().toLowerCase(), values); };
+  try {
+    announce('Exporting Paper Teams: matching institutional names and IDs…');
+    (await fetchAllPages('/api/admin/v2/institution/data/students')).forEach((student) => { const values = { id: student.reg_no, name: student.name }; remember(student.email, values); remember(student.v2_account, values); });
+    (await fetchAllPages('/api/admin/v2/institution/data/faculty')).forEach((faculty) => { const values = { id: faculty.faculty_id, name: faculty.name }; remember(faculty.email, values); remember(faculty.v2_account, values); });
+  } catch (error) { showError(error); }
+  const who = (email) => people.get(String(email || '').trim().toLowerCase()) || {};
+  const ordered = [...teams.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)) || String(a.id).localeCompare(String(b.id)));
+  const teamRows = [['team_name', 'team_status', 'external_team_key', 'source', 'programme', 'main_template', 'review_state', 'leader_email', 'leader_name', 'leader_id', 'writers', 'mentors', 'writer_count', 'mentor_count', 'updated_at', 'team_id']];
+  const memberRows = [['team_name', 'external_team_key', 'team_status', 'role', 'writer_order', 'is_team_leader', 'email', 'name', 'institution_id', 'team_id', 'user_id']];
+  ordered.forEach((team) => {
+    const leader = who(team.leader?.email);
+    teamRows.push([team.name, team.status, team.external_team_key || '', team.source, team.dominant_programme_code || '', team.template?.name || '', team.review_state, team.leader?.email || '', leader.name || '', leader.id || '', (team.writers || []).map((writer) => `${writer.writer_order}. ${writer.email}`).join('; '), (team.mentors || []).map((mentor) => mentor.email).join('; '), team.writer_count ?? (team.writers || []).length, (team.mentors || []).length, team.updated_at, team.id]);
+    (team.writers || []).forEach((writer) => { const person = who(writer.email); memberRows.push([team.name, team.external_team_key || '', team.status, 'writer', writer.writer_order ?? '', team.leader?.user_id === writer.user_id, writer.email, person.name || '', person.id || '', team.id, writer.user_id]); });
+    (team.mentors || []).forEach((mentor) => { const person = who(mentor.email); memberRows.push([team.name, team.external_team_key || '', team.status, 'mentor', '', false, mentor.email, person.name || '', person.id || '', team.id, mentor.user_id]); });
+  });
+  const sheets = [{ name: 'Paper Teams', rows: teamRows }, { name: 'Members', rows: memberRows }];
+  if (unresolved.length) sheets.push({ name: 'Unresolved imports', rows: [['team_name', 'external_team_key', 'status', 'writer_count', 'unresolved_student_ids', 'unresolved_faculty_ids', 'error_code', 'error_message', 'source_import_job_id'], ...unresolved.map((team) => [team.name, team.external_team_key || '', team.status || '', team.writer_count ?? '', (team.unresolved_student_ids || []).join('; '), (team.unresolved_faculty_ids || []).join('; '), team.error_code || '', team.error_message || '', team.source_import_job_id || ''])] });
+  downloadBlob(new Blob([xlsxBytes(sheets)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `latex-core-paper-teams-${exportStamp()}.xlsx`);
+  announce(`Paper Teams exported: ${ordered.length.toLocaleString()} Teams, ${(memberRows.length - 1).toLocaleString()} memberships${unresolved.length ? `, ${unresolved.length} unresolved imports` : ''}.`);
+}
+
+// Issues new one-time passwords for Team members through the per-account Admin endpoint and hands them off Team-wise.
+async function resetTeamPasswords(teams) {
+  const members = teams.flatMap((team) => [...(team.writers || []).map((writer) => ({ ...writer, role: 'writer' })), ...(team.mentors || []).map((mentor) => ({ ...mentor, role: 'mentor' }))].map((member) => ({ team, member })));
+  if (!members.length) throw new Error('The selected Teams have no members.');
+  const accounts = new Set(members.map(({ member }) => member.user_id));
+  if (!confirm(`Generate new temporary passwords for ${accounts.size} account${accounts.size === 1 ? '' : 's'} in ${teams.length} Team${teams.length === 1 ? '' : 's'}? Their current passwords and sessions stop working.`)) return;
+  const issued = new Map(); let queued = 0; let failed = 0;
+  for (const userId of accounts) {
+    try { const reset = await api(`/api/admin/v2/users/${encodeURIComponent(userId)}/temporary-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); issued.set(userId, reset); if (reset.credential_email_queued) queued += 1; }
+    catch (error) { failed += 1; showError(error); }
+    announce(`Resetting Team passwords: ${issued.size + failed} of ${accounts.size}…`);
+  }
+  const credentials = new Map();
+  members.forEach(({ team, member }) => {
+    const reset = issued.get(member.user_id); if (!reset) return;
+    if (!credentials.has(member.user_id)) credentials.set(member.user_id, { email: reset.email, temporary_password: reset.temporary_password, credential_role: member.role === 'writer' ? 'student' : 'mentor', teams: [] });
+    credentials.get(member.user_id).teams.push({ team_name: team.name, team_id: team.id, team_key: team.external_team_key || '', team_role: member.role, writer_order: member.role === 'writer' ? member.writer_order ?? null : null, is_leader: member.role === 'writer' && (member.is_leader ?? team.leader?.user_id === member.user_id) });
+  });
+  showCredentialHandoff({ created: credentials.size, credential_emails_queued: queued, reused: 0, needs_attention: failed, credentials: [...credentials.values()] }, `team-reset-${exportStamp()}`, { title: 'Team password reset', createdLabel: 'temporary passwords generated' });
+}
+
+function showCredentialHandoff(provisioning, batchId, options = {}) {
   if (!provisioning) return;
   const dialog = document.querySelector('#adminDialog'); const host = document.querySelector('#adminDialogBody');
   const credentials = provisioning.credentials || [];
   const grouped = credentials.every(item => Array.isArray(item.teams));
   host.replaceChildren(
-    element('h2', '', 'Account setup'),
-    element('p', '', `${provisioning.created || 0} accounts created`),
+    element('h2', '', options.title || 'Account setup'),
+    element('p', '', `${provisioning.created || 0} ${options.createdLabel || 'accounts created'}`),
     element('p', '', `${provisioning.credential_emails_queued || 0} credential emails queued`),
     element('p', '', `${provisioning.reused || 0} existing accounts reused`),
     element('p', '', `${provisioning.needs_attention || 0} need attention`),
-    element('p', 'muted-note', 'Email is the primary credential delivery method. The CSV is an administrator fallback.'),
-    element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again. Administrator-only: do not distribute the all-Teams CSV to students.'),
-    element('p', 'muted-note', grouped ? 'Grouped by materialized Teams in this import. Accounts without a current in-scope assignment appear as Unassigned; later assignments cannot update this one-time export.' : 'Team assignments are unavailable for this account handoff. This download retains the original account-only CSV format.'),
+    element('p', 'muted-note', 'Email is the primary credential delivery method. The download is an administrator fallback.'),
+    element('p', 'danger-box', 'Save this file now. Temporary passwords cannot be viewed again. Administrator-only: do not distribute the all-Teams files to students; hand each Team only its own file from the teams folder.'),
+    element('p', 'muted-note', grouped ? 'ZIP contents: all-Teams CSV and Excel, a Team-grouped JSON, and one CSV per Team, sorted Team-wise (Leader, Writers in order, then Mentors). Accounts without a current in-scope assignment appear as Unassigned; later assignments cannot update this one-time export.' : 'Team assignments are unavailable for this account handoff. This download retains the original account-only CSV format.'),
   );
-  const download = buttonAction(grouped ? 'Download Team-grouped credentials' : 'Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
-  download.disabled = credentials.length === 0; host.append(download); openAdminDialog('Account setup');
+  const download = buttonAction(grouped && credentials.length ? 'Download Team-wise credentials (ZIP)' : 'Download generated credentials', () => downloadCredentials(credentials, batchId), 'primary');
+  download.disabled = credentials.length === 0; host.append(download); openAdminDialog(options.title || 'Account setup');
   if (credentials.length) downloadCredentials(credentials, batchId);
 }
 
@@ -710,6 +878,8 @@ async function openTeamDetail(team, templates, frontMatterPacks) {
   [['Programme', detail.summary.dominant_programme_code || '—'], ['Main Template', detail.template_pin?.template_name || 'None'], ['Front Matter', detail.front_matter.pack_name || 'None'], ['Review', humanLabel(detail.summary.review_state)]].forEach(([label, value]) => { const item = element('div'); item.append(element('small', '', label), element('strong', '', value)); summary.append(item); });
   const badges = element('p', 'admin-actions'); badges.append(statusChip(humanLabel(detail.team.status)), statusChip(team.source === 'imported' ? 'Imported' : 'Manual'));
   const membersSummary = element('section', 'admin-section'); membersSummary.append(element('h2', '', 'Members'), element('p', '', `Writers: ${writers.map((member) => `${member.writer_order}. ${member.email}${member.is_leader ? ' (Leader)' : ''}`).join(', ') || 'None'}`), element('p', '', `Leader: ${leader?.email || 'Missing'}`), element('p', '', `Mentors: ${mentors.map((member) => member.email).join(', ') || 'None'}`));
+  const resetTeam = buttonAction('Reset Team passwords', () => resetTeamPasswords([{ id: team.id, name: detail.team.name, external_team_key: team.external_team_key, writers: writers.map(({ user_id, email, writer_order, is_leader }) => ({ user_id, email, writer_order, is_leader })), mentors: mentors.map(({ user_id, email }) => ({ user_id, email })), leader }]));
+  resetTeam.title = 'Forgotten passwords: issue new temporary passwords to this Team and download them Team-wise'; membersSummary.append(resetTeam);
   host.replaceChildren(badges, summary, membersSummary);
   const advanced = element('details', 'admin-section'); advanced.append(element('summary', 'admin-section-summary', 'Advanced details'), element('p', 'muted-note', `Dominant programme: ${detail.summary.dominant_programme_code || '—'} · Resolution: ${detail.summary.resolution_method || 'unrecorded'} · Files: ${detail.summary.file_count} · Build: ${detail.summary.current_build.status || 'none'} · Updated: ${new Date(detail.team.updated_at).toLocaleString()}`));
   if (team.source === 'imported') advanced.append(element('p', 'muted-note', `External key ${team.external_team_key} · source import ${team.source_import_job_id} · last imported ${team.last_imported_at || 'unknown'}.`));
@@ -742,10 +912,12 @@ async function renderPaperTeamGrid() {
     { name: 'template_id', label: 'Template', type: 'select', options: templates.map((item) => [item.name, item.id]) }, { name: 'review_state', label: 'Review state' }, { name: 'source', label: 'Source', type: 'select', options: [['Manual', 'manual'], ['Imported', 'imported']] }, { name: 'unresolved', label: 'Unresolved', type: 'select', options: [['Only unresolved', 'true'], ['Resolved only', 'false']] },
   ], (values) => { Object.assign(state, values, { page: 1 }); load(); });
   const pageSize = document.createElement('select'); [25, 50, 100].forEach((size) => pageSize.append(new Option(`${size} per page`, size))); pageSize.addEventListener('change', () => { state.limit = Number(pageSize.value); state.page = 1; load(); }); filters.append(pageSize); content.append(filters);
+  const exportBar = element('div', 'admin-toolbar'); exportBar.append(buttonAction('Export all Paper Teams (Excel)', exportPaperTeams, 'primary')); content.append(exportBar);
   const bulk = element('div', 'admin-toolbar'); const gridHost = element('div'); content.append(bulk, gridHost);
   const load = async (page = state.page) => { state.page = page; gridHost.replaceChildren(element('p', 'empty-copy', 'Loading requested Team page…')); const data = await api(`/api/admin/v2/paper-teams/query?${queryString(state)}`); const selected = new Set();
     const runBulk = async (statusValue) => { if (!selected.size || !confirm(`${statusValue} ${selected.size} selected Teams?`)) return; const result = await api('/api/admin/v2/paper-teams/bulk-lifecycle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ team_ids: [...selected], status: statusValue, confirmed: true }) }); announce(`Bulk lifecycle: ${result.succeeded} succeeded, ${result.failed} failed.`, result.failed > 0); await load(); };
-    bulk.replaceChildren(element('strong', '', 'Selected rows:'), buttonAction('Freeze', () => runBulk('frozen')), buttonAction('Activate', () => runBulk('active')), buttonAction('Archive', () => runBulk('archived'), 'danger'));
+    const selectedTeams = () => data.items.filter((team) => selected.has(team.id));
+    bulk.replaceChildren(element('strong', '', 'Selected rows:'), buttonAction('Freeze', () => runBulk('frozen')), buttonAction('Activate', () => runBulk('active')), buttonAction('Archive', () => runBulk('archived'), 'danger'), buttonAction('Reset passwords', () => { if (!selected.size) throw new Error('Select one or more Teams first.'); return resetTeamPasswords(selectedTeams()); }));
     if (!data.items.length) { gridHost.replaceChildren(element('p', 'empty-copy', state.unresolved === 'true' ? 'No unresolved imported Teams.' : 'No Paper Teams match these server-side filters.'), pager(data, load)); return; }
     const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = '<thead><tr><th>Select</th><th>Team</th><th>Status</th><th>Writers</th><th>Leader</th><th>Mentor</th><th>Programme</th><th>Template</th><th>Review</th><th>Source</th><th>Updated</th><th>Actions</th></tr></thead>'; const body = document.createElement('tbody');
     data.items.forEach((team) => { const row = document.createElement('tr'); const selection = document.createElement('input'); selection.type = 'checkbox'; selection.disabled = !team.id; selection.setAttribute('aria-label', `Select ${team.name}`); selection.addEventListener('change', () => { if (selection.checked) selected.add(team.id); else selected.delete(team.id); row.classList.toggle('row-selected', selection.checked); }); const selectCell = element('td'); selectCell.append(selection); const source = team.source === 'imported' ? 'Imported' : 'Manual'; const action = element('td'); action.append(rowMenu(`Actions for ${team.name}`, [buttonAction('View / Manage', () => openTeamDetail(team, templates, frontMatterPacks))])); const statusCell = element('td'); statusCell.append(statusChip(humanLabel(team.status))); row.append(selectCell, element('td', '', team.name), statusCell, element('td', '', (team.writers || []).map((writer) => `${writer.writer_order}. ${writer.email}`).join(', ') || String(team.writer_count)), element('td', '', team.leader?.email || 'Missing'), element('td', '', (team.mentors || []).map((mentor) => mentor.email).join(', ') || 'None'), element('td', '', team.dominant_programme_code || '—'), element('td', '', team.template?.name || '—'), element('td', '', humanLabel(team.review_state)), element('td', '', source), element('td', '', new Date(team.updated_at).toLocaleString()), action); body.append(row); }); table.append(body); wrap.append(table); gridHost.replaceChildren(wrap, pager(data, load));
@@ -912,6 +1084,7 @@ async function renderImports(options = {}) {
   heading.replaceWith(headingRow);
   headingRow.append(heading, guideTrigger, guide);
   content.append(element('p', 'muted-note', 'Add new records, edit known records, or delete only the exact keys you provide. File order and database dependency order are handled automatically.'));
+  const exportBar = element('div', 'admin-toolbar'); const exportAll = buttonAction('Export all imported data (Excel)', exportInstitutionData); exportAll.title = 'One workbook with every dataset, in the same sheet and column format used for imports'; exportBar.append(exportAll); content.append(exportBar);
   const form = element('form', 'batch-import-form'); form.enctype = 'multipart/form-data'; const operations = element('fieldset', 'operation-control'); operations.innerHTML = '<legend>Operation</legend><label><input type="radio" name="operation" value="ADD" checked>Add</label><label><input type="radio" name="operation" value="EDIT">Edit</label><label><input type="radio" name="operation" value="DELETE">Delete</label>';
   const drop = element('div', 'import-dropzone'); drop.tabIndex = 0; drop.setAttribute('role', 'button'); drop.setAttribute('aria-label', 'Browse for CSV or XLSX files'); drop.append(element('strong', '', 'Drop CSV or XLSX files here'), element('span', '', 'or browse · multiple files supported')); const fileInput = document.createElement('input'); fileInput.type = 'file'; fileInput.multiple = true; fileInput.accept = '.csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'; fileInput.hidden = true; drop.append(fileInput); const fileHost = element('div', 'import-file-list'); const submit = element('button', 'primary', 'Review changes'); submit.type = 'submit'; submit.disabled = true; const selected = [];
   const drawFiles = () => { fileHost.replaceChildren(); selected.forEach((entry, index) => { const chip = element('div', 'import-file-chip'); chip.append(element('strong', '', entry.file.name)); if (entry.file.name.toLowerCase().endsWith('.xlsx')) chip.append(element('span', '', entry.status)); else if (entry.dataset) chip.append(element('span', '', datasetLabel(entry.dataset))); else { const select = document.createElement('select'); select.setAttribute('aria-label', `What data is ${entry.file.name}?`); select.append(new Option('What data is this?', '')); institutionTargets.forEach((target) => select.append(new Option(datasetLabel(target), target))); select.addEventListener('change', () => { entry.dataset = select.value; entry.status = entry.dataset ? 'Ready' : 'Choose dataset'; drawFiles(); }); chip.append(select); } chip.append(element('span', entry.status === 'Ready' ? 'ready' : 'muted-note', entry.status), iconAction(`Remove ${entry.file.name}`, 'delete', async () => { selected.splice(index, 1); drawFiles(); }, 'danger')); fileHost.append(chip); }); submit.disabled = !selected.length || selected.some((entry) => !entry.file.name.toLowerCase().endsWith('.xlsx') && !entry.dataset); };
@@ -926,7 +1099,7 @@ async function renderImports(options = {}) {
 
 const institutionDatasets = [
   { label: 'Students', dataset: 'students', keys: ['reg_no'], fields: ['reg_no', 'name', 'email', 'programme_code'], columns: ['reg_no', 'name', 'email', 'programme_code', 'link_status'] },
-  { label: 'Faculty', dataset: 'faculty', keys: ['faculty_id'], fields: ['faculty_id', 'name', 'email', 'dept_id', 'honorific', 'designation', 'status'], columns: ['faculty_id', 'name', 'email', 'dept_id', 'designation', 'link_status'] },
+  { label: 'Faculty', dataset: 'faculty', keys: ['faculty_id'], fields: ['faculty_id', 'name', 'email', 'dept_id', 'honorific', 'designation', 'status'], columns: ['faculty_id', 'honorific', 'name', 'email', 'dept_id', 'designation', 'link_status'] },
   { label: 'Programmes', dataset: 'programmes', keys: ['programme_code'], fields: ['programme_code', 'programme_name', 'degree_name', 'specialization', 'hod_id'], columns: ['programme_code', 'programme_name', 'degree_name', 'specialization', 'hod_id', 'template_name'] },
   { label: 'Departments', dataset: 'departments', keys: ['department_id'], fields: ['department_id', 'department_name'], columns: ['department_id', 'department_name'] },
   { label: 'Schools', dataset: 'schools', keys: ['school_id'], fields: ['school_id', 'school_name'], columns: ['school_id', 'school_name'] },
@@ -951,7 +1124,7 @@ async function renderIdentityLinkManager(host) {
 }
 
 async function renderInstitutionData(options = {}) {
-  let active = institutionDatasets.find((config) => config.label === options.tab) || institutionDatasets[0]; const tabsHost = element('div', 'admin-tabs'); const host = element('div'); institutionDatasets.forEach((config) => tabsHost.append(buttonAction(config.label, () => load(config)))); const identities = element('details', 'admin-section'); identities.append(element('summary', '', 'Identity Links')); const identityHost = element('div'); identities.append(identityHost); let identitiesLoaded = false; identities.addEventListener('toggle', () => { if (identities.open && !identitiesLoaded) { identitiesLoaded = true; renderIdentityLinkManager(identityHost).catch(showError); } }); content.append(element('p', 'muted-note', 'Search stays server-side. Add, Edit, and Delete use the same validation and dependency rules as file imports.'), tabsHost, host, identities);
+  let active = institutionDatasets.find((config) => config.label === options.tab) || institutionDatasets[0]; const tabsHost = element('div', 'admin-tabs'); const host = element('div'); institutionDatasets.forEach((config) => tabsHost.append(buttonAction(config.label, () => load(config)))); const identities = element('details', 'admin-section'); identities.append(element('summary', '', 'Identity Links')); const identityHost = element('div'); identities.append(identityHost); let identitiesLoaded = false; identities.addEventListener('toggle', () => { if (identities.open && !identitiesLoaded) { identitiesLoaded = true; renderIdentityLinkManager(identityHost).catch(showError); } }); const exportAll = buttonAction('Export all institution data (Excel)', exportInstitutionData, 'primary'); exportAll.title = 'Download every dataset as one import-compatible workbook'; const exportBar = element('div', 'admin-toolbar'); exportBar.append(exportAll); content.append(element('p', 'muted-note', 'Search stays server-side. Add, Edit, and Delete use the same validation and dependency rules as file imports.'), exportBar, tabsHost, host, identities);
   const load = async (config = active) => { active = config; [...tabsHost.children].forEach((button) => button.setAttribute('aria-current', button.textContent === config.label ? 'page' : 'false')); const state = { page: 1, limit: 50, search: '', programme_code: '', department_id: '', link_status: '' }; const filterFields = [{ name: 'search', label: `Search ${config.label}` }, ...(config.dataset === 'students' ? [{ name: 'programme_code', label: 'Programme' }] : []), ...(config.dataset === 'faculty' ? [{ name: 'department_id', label: 'Department UUID' }] : []), ...(['students', 'faculty'].includes(config.dataset) ? [{ name: 'link_status', label: 'Link status', type: 'select', options: ['LINKED', 'UNLINKED', 'AMBIGUOUS', 'ROLE_INCOMPATIBLE'].map((value) => [value]) }] : [])]; const filters = filterForm(filterFields, (values) => { Object.assign(state, values, { page: 1 }); pageLoad(); }); const add = buttonAction(`+ Add ${config.label.replace(/s$/, '')}`, () => manualInstitutionRecord(config, 'ADD', {}, pageLoad), 'primary'); const pageHost = element('div'); host.replaceChildren(element('div', 'admin-toolbar'), filters, pageHost); host.firstChild.append(add);
     const pageLoad = async (page = state.page) => { state.page = page; const data = await api(`/api/admin/v2/institution/data/${config.dataset}?${queryString(state)}`); if (!data.items.length) { pageHost.replaceChildren(element('p', 'empty-copy', `No ${config.label.toLowerCase()} records.`), pager(data, pageLoad)); return; } const wrap = element('div', 'admin-table-wrap'); const table = element('table', 'admin-table'); table.innerHTML = `<thead><tr>${config.columns.map((field) => `<th>${humanLabel(field).replace(/\bId\b/g, 'ID')}</th>`).join('')}<th>Actions</th></tr></thead>`; const body = document.createElement('tbody'); data.items.forEach((item) => { const row = document.createElement('tr'); config.columns.forEach((field) => { let value = item[field]; if (field === 'materialized_paper_team_id') value = value ? `Materialized → ${value}` : 'Not materialized'; row.append(element('td', '', value ?? '—')); }); const actions = element('td'); actions.append(buttonAction('Edit', () => manualInstitutionRecord(config, 'EDIT', item, pageLoad)), buttonAction('Delete', () => manualInstitutionRecord(config, 'DELETE', item, pageLoad), 'danger')); if (config.dataset === 'paper_teams') { const writerConfig = { label: 'Paper Team Writers', dataset: 'paper_team_writers', keys: ['external_team_key', 'student_reg_no'], fields: ['external_team_key', 'student_reg_no', 'writer_order', 'is_leader'] }; const mentorConfig = { label: 'Paper Team Mentors', dataset: 'paper_team_mentors', keys: ['external_team_key', 'faculty_id'], fields: ['external_team_key', 'faculty_id'] }; const assignment = element('details'); const writerList = element('div'); (item.writers || []).forEach((writer) => { const entry = element('p', '', `${writer.writer_order}. ${writer.student_reg_no}${writer.is_leader ? ' (Leader)' : ''} `); const values = { external_team_key: item.external_team_key, ...writer }; entry.append(buttonAction('Edit', () => manualInstitutionRecord(writerConfig, 'EDIT', values, pageLoad)), buttonAction('Remove', () => manualInstitutionRecord(writerConfig, 'DELETE', values, pageLoad), 'danger')); writerList.append(entry); }); const mentorList = element('div'); (item.mentors || []).forEach((mentor) => { const entry = element('p', '', `${mentor.faculty_id} `); const values = { external_team_key: item.external_team_key, ...mentor }; entry.append(buttonAction('Remove', () => manualInstitutionRecord(mentorConfig, 'DELETE', values, pageLoad), 'danger')); mentorList.append(entry); }); assignment.append(element('summary', '', 'Writers and Mentors'), writerList, mentorList, buttonAction('Add Writer', () => manualInstitutionRecord(writerConfig, 'ADD', { external_team_key: item.external_team_key }, pageLoad)), buttonAction('Add Mentor', () => manualInstitutionRecord(mentorConfig, 'ADD', { external_team_key: item.external_team_key }, pageLoad))); actions.prepend(assignment); } row.append(actions); body.append(row); }); table.append(body); wrap.append(table); pageHost.replaceChildren(wrap, pager(data, pageLoad)); };
     await pageLoad(); };
@@ -965,8 +1138,9 @@ async function renderAutomaticDefaults(templates, frontMatterPacks) {
 }
 
 function buttonAction(label, handler, className = '') {
-  const action = element('button', className, label); action.type = 'button';
-  action.addEventListener('click', () => Promise.resolve().then(handler).catch(showError)); return action;
+  const action = element('button', className, label); action.type = 'button'; let running = false;
+  // Ignore repeated clicks while the previous request is still running (for example a second "Add records").
+  action.addEventListener('click', () => { if (running) return; running = true; action.setAttribute('aria-busy', 'true'); Promise.resolve().then(handler).catch(showError).finally(() => { running = false; action.removeAttribute('aria-busy'); }); }); return action;
 }
 
 async function renderFilePolicies(teams) {

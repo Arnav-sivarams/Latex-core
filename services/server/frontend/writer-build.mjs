@@ -36,10 +36,24 @@ export function renderBuildLog(host, log, documentRef = document) {
   });
 }
 
+// TeX prints the offending source after an error as "l.<line> <text>"; keep it as the root-cause context.
+function errorContext(lines, index) {
+  for (let next = index + 1; next < Math.min(lines.length, index + 8); next += 1) {
+    const match = lines[next].match(/^l\.(\d+)\s?(.*)$/);
+    if (match) return { line: Number(match[1]), text: `l.${match[1]} ${match[2]}`.trimEnd() };
+    if (next > index + 1 && classifyBuildLine(lines[next]) !== 'info') return null;
+  }
+  return null;
+}
+
 export function recognizedBuildProblems(log, files = [], mainFile = '') {
   const mainDirectory = mainFile.includes('/') ? mainFile.slice(0, mainFile.lastIndexOf('/') + 1) : '';
-  return String(log || '').split(/\r?\n/).filter((line) => classifyBuildLine(line) !== 'info').map((message) => {
+  const lines = String(log || '').split(/\r?\n/);
+  const seen = new Set();
+  return lines.map((message, index) => ({ message, index })).filter(({ message }) => classifyBuildLine(message) !== 'info').map(({ message, index }) => {
     const problem = { severity: classifyBuildLine(message), message };
+    const context = problem.severity === 'error' ? errorContext(lines, index) : null;
+    if (context) problem.detail = context.text;
     const match = message.match(/^(.+?\.(?:tex|ltx|sty|cls)):(\d+):\s*(.+)$/i);
     if (!match) return problem;
     const rawPath = match[1].replace(/^\.\//, '').replace(/^\/work\//, '');
@@ -48,6 +62,11 @@ export function recognizedBuildProblems(log, files = [], mainFile = '') {
       || files.find((item) => item.path === mainDirectory + rawPath);
     return { ...problem, message: match[3], path: file?.path || rawPath,
       file_id: file?.file_id, range: { start_line: Number(match[2]), start_column: 0 } };
+  }).filter((problem) => {
+    // The same diagnostic can be printed more than once in one log; list it once.
+    const key = `${problem.severity}\u0000${problem.path || ''}\u0000${problem.range?.start_line || ''}\u0000${problem.message}`;
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
   });
 }
 

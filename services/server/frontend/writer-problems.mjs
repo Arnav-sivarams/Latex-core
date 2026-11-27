@@ -14,7 +14,7 @@ export function renderProblemList(host, diagnostics, openLocation) {
     const severity = diagnostic.severity || 'info';
     const line = diagnostic.range?.start_line;
     const location = `${diagnostic.path || 'Build'}${line ? `:${line}` : ''}`;
-    const description = `${severity}: ${diagnostic.message}\n${location}${diagnostic.code ? ` · ${diagnostic.code}` : ''}`;
+    const description = `${severity}: ${diagnostic.message}${diagnostic.detail ? `\n${diagnostic.detail}` : ''}\n${location}${diagnostic.code ? ` · ${diagnostic.code}` : ''}`;
     const row = document.createElement('button');
     row.type = 'button';
     row.className = `problem-row build-problem-${severity}`;
@@ -28,11 +28,19 @@ export function renderProblemList(host, diagnostics, openLocation) {
     const message = document.createElement('span');
     message.className = 'problem-message';
     message.textContent = diagnostic.message;
+    if (diagnostic.detail) {
+      // Root cause: the source text TeX reported for this error.
+      const detail = document.createElement('code');
+      detail.className = 'problem-detail';
+      detail.textContent = diagnostic.detail;
+      message.append(' ', detail);
+    }
     const reference = document.createElement('span');
     reference.className = 'problem-location';
     const path = document.createElement('span');
     path.className = 'problem-path';
     path.textContent = diagnostic.path?.split('/').pop() || 'Build';
+    if (diagnostic.path) path.title = diagnostic.path;
     reference.append(path);
     if (line) {
       const number = document.createElement('span');

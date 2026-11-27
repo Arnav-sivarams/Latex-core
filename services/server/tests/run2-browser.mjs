@@ -359,9 +359,9 @@ async function afterRestart() {
     && new URL(response.url()).pathname === transitionPath);
   await secondCard.getByRole('button', { name: 'Done', exact: true }).click();
   assert.equal((await resolvedResponse).status(), 204, 'Writer Done transition did not complete');
-  await assertEventuallyText(writer.page.locator('#toolbarReviewCount'), '1');
-  assert.equal(await writer.page.locator('#editorMount .review-source-highlight').count(), 0);
-  await writer.page.locator('#writerReviewFilters button[data-filter="RESOLVED"]').click();
+  // Done hands the thread back to the Mentor (ADDRESSED); it stays active until the Mentor confirms it.
+  await assertEventuallyText(writer.page.locator('#writerReviewList'), 'Sent to Mentor for confirmation');
+  await writer.page.locator('#writerReviewFilters button[data-filter="active"]').click();
   await assertEventuallyText(writer.page.locator('#writerReviewList'), 'Second-file private draft');
   await writer.page.locator('#sendReview').click();
   await assertEventuallyText(writer.page.locator('#writerNotice'), 'sent for Mentor review');

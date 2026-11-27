@@ -1,6 +1,9 @@
 //! Worker-only compiler entry point. Deploy this binary with Docker socket access, never the API.
 #![forbid(unsafe_code)]
 
+#[path = "../http_origin.rs"]
+#[allow(dead_code, reason = "worker uses only the public base URL validator")]
+mod http_origin;
 #[path = "../mail.rs"]
 #[allow(
     dead_code,

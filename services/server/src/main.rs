@@ -970,6 +970,10 @@ fn router(state: AppState) -> Router {
             "/api/v2/writer/personal-papers",
             post(v2_create_personal_paper),
         )
+        .route(
+            "/api/v2/writer/personal-papers/{paper_id}",
+            axum::routing::delete(v2_remove_personal_paper),
+        )
         .route("/api/v2/papers/{paper_id}", get(v2_paper))
         .route(
             "/api/v2/papers/{paper_id}/document-details",
@@ -5637,6 +5641,41 @@ async fn v2_create_personal_paper(
             Json(serde_json::json!({"paper":paper,"main_file":file,"version":1})),
         )
             .into_response(),
+        Err(error_value) => v2_error(error_value),
+    }
+}
+
+/// A Writer removes one of their own personal papers from their list. The paper is archived,
+/// never hard-deleted, so its history and files stay recoverable by an administrator.
+async fn v2_remove_personal_paper(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(paper_id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = csrf(&headers) {
+        return response;
+    }
+    let principal = match writer_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let paper = match state.v2.personal_paper(paper_id).await {
+        Ok(value) if value.owner_user_id == principal.user_id() => value,
+        Ok(_) => return error(StatusCode::NOT_FOUND, "personal paper not found"),
+        Err(error_value) => return v2_error(error_value),
+    };
+    if paper.status == persistence::PaperStatus::Archived {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    match state
+        .v2
+        .set_personal_paper_status(paper_id, persistence::PaperStatus::Archived)
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(%paper_id, owner_user_id=%principal.user_id(), "Writer archived personal paper");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error_value) => v2_error(error_value),
     }
 }
@@ -16701,7 +16740,35 @@ Unrelated authored LaTeX survives.
             )
             .await
             .status(),
+            StatusCode::CONFLICT,
+            "Writer Done must go back to the Mentor instead of resolving"
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&writer.cookie),
+                r#"{"state":"ADDRESSED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
             StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                &format!("{review_root}/threads/{thread_id}/state"),
+                Some(&mentor.cookie),
+                r#"{"state":"RESOLVED"}"#,
+                Some("application/json")
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT,
+            "the Mentor confirms a Writer's Done"
         );
         let durable_sequence: i64 = sqlx::query_scalar(
             "INSERT INTO latex_core.collaboration_updates (workspace_id,file_id,document_epoch,actor_user_id,update_bytes) VALUES ($1,$2,1,$3,$4) RETURNING id",
